@@ -76,6 +76,12 @@ fn normalize_lexical(base: &Path, rel: &Path) -> Option<PathBuf> {
 
 /// Canonicalize a directory into a [`TreeMetadata`] and compute its digest.
 ///
+/// `root` must be a directory: an absent root is an error (the lexical
+/// `canonicalize` fails), and a root that is not a directory (a regular
+/// file, a symlink to one) is an error too — NEVER an empty manifest. An
+/// existing EMPTY directory is a legitimate tree and canonicalizes to a
+/// manifest with no entries.
+///
 /// Rejects absolute paths, `..`, NUL bytes, newline/tab filenames (the
 /// remote verification wire format is line- and tab-separated, so the two
 /// verification paths must agree), duplicate normalized paths,
@@ -88,6 +94,12 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     let root_c = root
         .canonicalize()
         .map_err(|e| Error::materialization(format!("canonicalize {}: {e}", root.display())))?;
+    if !root_c.is_dir() {
+        return Err(Error::materialization(format!(
+            "canonicalize_tree root is not a directory: {}",
+            root.display()
+        )));
+    }
 
     for entry in WalkDir::new(root).min_depth(1).into_iter() {
         let entry = entry.map_err(|e| Error::materialization(format!("walk {e}")))?;
@@ -235,10 +247,17 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 /// verification never transfers the tree CONTENT — only the per-file hashes
 /// — which on a slow link costs a small round trip instead of a full tree
 /// download. Runs via `Remote::exec` as `perl -e <script> <root>`;
-/// `File::Find` and `Digest::SHA` are core perl modules on every supported
-/// host.
+/// `Digest::SHA` is a core perl module on every supported host.
+///
+/// A walk that did not actually enumerate the WHOLE tree must never exit 0
+/// with a short or empty listing: a root that is not a directory, and any
+/// directory the walk cannot open or read, makes the script `die` (non-zero
+/// exit) so the caller refuses it. Only a walk that covered the whole tree
+/// exits 0, and a root that IS a directory but has no entries (an existing
+/// empty directory) prints empty stdout with exit 0 — assembling to the
+/// EMPTY manifest it really is.
 pub fn remote_tree_verify_script() -> &'static str {
-    "use File::Find; use Digest::SHA qw(sha256_hex); my $root=$ARGV[0]; find(sub { my $p=$File::Find::name; my $rel=substr($p, length($root)+1); return if $rel eq q{}; my @st=lstat($p); my $t = -l $p ? q{l} : (-d $p ? q{d} : (-f $p ? q{f} : q{o})); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; }, $root);"
+    r#"use Digest::SHA qw(sha256_hex); my $root=$ARGV[0]; die qq{not a directory: $root\n} unless defined($root) && -d $root; my $emit = sub { my ($rel,$p)=@_; my @st=lstat($p); die qq{lstat $p: $!\n} unless @st; my $t = -l $p ? q{l} : (-d $p ? q{d} : (-f $p ? q{f} : q{o})); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); die qq{readlink $p: $!\n} unless defined $tg; $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; }; my $walk; $walk = sub { my ($dir,$prefix)=@_; opendir(my $dh,$dir) or die qq{opendir $dir: $!\n}; $! = 0; my @names=readdir($dh); die qq{readdir $dir: $!\n} if $!; closedir($dh) or die qq{closedir $dir: $!\n}; for my $name (@names) { next if $name eq q{.} || $name eq q{..}; my $p=qq{$dir/$name}; my $rel=length($prefix) ? qq{$prefix/$name} : $name; $emit->($rel,$p); $walk->($p,$rel) if -d $p && !-l $p; } }; $walk->($root, q{});"#
 }
 
 /// Assemble canonical tree metadata from the remote verification script's
@@ -250,6 +269,13 @@ pub fn remote_tree_verify_script() -> &'static str {
 /// corrupted or divergent remote tree produces a digest mismatch without any
 /// content transfer. `root` is the remote tree root (absolute, on the
 /// remote host) used for the in-root symlink check.
+///
+/// `output` must come from a walk that actually enumerated the whole tree:
+/// [`remote_tree_verify_script`] exits non-zero for an absent, non-directory,
+/// or unreadable root, and the caller must refuse that exit rather than
+/// assemble the short or empty listing. Only a complete walk — including an
+/// existing empty directory, whose empty stdout is the empty manifest — may
+/// be assembled here.
 pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -628,6 +654,144 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Run the remote verification script on `root` and return the raw
+    /// subprocess result, so a test can assert on the EXIT STATUS (the script
+    /// must fail closed when it cannot enumerate the whole tree).
+    fn run_remote_script_raw(root: &Path) -> std::process::Output {
+        std::process::Command::new("perl")
+            .args(["-e", remote_tree_verify_script()])
+            .arg(root)
+            .output()
+            .expect("perl must run")
+    }
+
+    /// An existing EMPTY DIRECTORY is a legitimate tree: the script exits 0
+    /// with empty stdout, and the assembler turns that into the empty manifest
+    /// it really is. This is the complement of the refusal cases below — the
+    /// empty-manifest result is only allowed when the walk really did
+    /// enumerate a directory.
+    #[test]
+    fn remote_script_accepts_an_empty_directory_as_an_empty_manifest() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("empty");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let out = run_remote_script_raw(&root);
+        assert!(
+            out.status.success(),
+            "an empty directory must exit 0: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "an empty directory must print an empty listing, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let meta =
+            canonicalize_remote_entries(&String::from_utf8_lossy(&out.stdout), &root).unwrap();
+        assert!(meta.entries.is_empty());
+        assert_eq!(
+            meta.tree_sha256.len(),
+            64,
+            "the empty manifest still carries a computed digest"
+        );
+    }
+
+    /// A MISSING root must make the script exit non-zero: perl would otherwise
+    /// print an empty listing with exit 0, which the caller would assemble into
+    /// "the far side described an empty tree" — a manifest that drives
+    /// deletions under `delete_extraneous`.
+    #[test]
+    fn remote_script_rejects_a_missing_root() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let out = run_remote_script_raw(&missing);
+        assert!(
+            !out.status.success(),
+            "a missing root must exit non-zero, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// A root that is a REGULAR FILE must exit non-zero for the same reason: a
+    /// non-directory root is not a tree with no entries.
+    #[test]
+    fn remote_script_rejects_a_regular_file_root() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("plain.txt");
+        std::fs::write(&root, b"content").unwrap();
+        let out = run_remote_script_raw(&root);
+        assert!(
+            !out.status.success(),
+            "a regular-file root must exit non-zero, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// A subdirectory the walk cannot OPEN must exit non-zero rather than
+    /// silently print a listing of the entries it happened to reach: a
+    /// permission failure is not an empty (or short) tree.
+    #[test]
+    fn remote_script_rejects_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        // Running as root defeats the permission check (DAC override), so the
+        // case is untestable there; skip rather than assert a lie.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"content").unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"content").unwrap();
+        let sub = root.join("sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = run_remote_script_raw(&root);
+
+        // Restore so the TempDir's recursive cleanup can remove the tree.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !out.status.success(),
+            "an unreadable subdirectory must exit non-zero, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// A regular-file root must be REFUSED by the local canonicalizer instead
+    /// of yielding an empty manifest: `WalkDir::new(file).min_depth(1)` yields
+    /// nothing, so without the explicit directory check the file would be
+    /// described as a tree with no entries.
+    #[test]
+    fn canonicalize_tree_rejects_a_non_directory_root() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("plain.txt");
+        std::fs::write(&root, b"content").unwrap();
+        let err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("not a directory"),
+            "a regular-file root must be refused, got: {err}"
+        );
+    }
+
+    /// An existing EMPTY DIRECTORY is still a legitimate tree and
+    /// canonicalizes to an empty manifest (the complement of the refusal above
+    /// — the directory check must not reject a real empty tree).
+    #[test]
+    fn canonicalize_tree_accepts_an_empty_directory_as_an_empty_manifest() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("empty");
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = canonicalize_tree(&root).unwrap();
+        assert!(meta.entries.is_empty(), "an empty directory has no entries");
+        assert_eq!(
+            meta.tree_sha256.len(),
+            64,
+            "the empty manifest still carries a computed digest"
+        );
     }
 
     /// A FIFO (or socket/device) must be rejected by BOTH verification
