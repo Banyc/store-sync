@@ -180,15 +180,18 @@ fn final_component_symlink_refuses_create_new_writes_and_never_touches_outside()
 
 /// The FINAL-COMPONENT REPLACE path never escapes the root.
 ///
-/// NOTE (reported, not hidden): `write_atomic_replace_fd` is NOT refused for a
+/// DESIGNED SEMANTIC: `write_atomic_replace_fd` does NOT refuse a
 /// final-component symlink. It installs the new file with `renameat`, which
 /// replaces the final directory entry itself and never opens it, so there is
 /// no final `O_NOFOLLOW` open to refuse — the write lands at the link's own
-/// in-root path. That is confinement-SAFE (the link is never followed and the
-/// outside target is never opened or modified), but it contradicts the
-/// function's doc claim that a symlink in "any path component is refused".
-/// This test pins the safety-critical half (no escape) and the observed
-/// non-refusal; the doc/implementation mismatch is reported separately.
+/// in-root path. That is the deliberate "replace, never follow" rule: the
+/// link is never followed and the outside target is never opened or modified,
+/// so the replace cannot escape the root, race-free (the rename cannot follow
+/// the link). A caller that must instead REFUSE a foreign final entry uses a
+/// primitive that opens it with `O_NOFOLLOW` — `openat_no_follow`,
+/// `write_file_fd`, `write_atomic_cas_fd`, `read_fd`, or `path_state_fd`.
+/// This test pins the safety-critical half (no escape) plus the designed
+/// non-refusal.
 #[test]
 fn final_component_symlink_replace_does_not_escape_the_root() {
     let tmp = tempfile::tempdir().unwrap();
@@ -207,7 +210,8 @@ fn final_component_symlink_replace_does_not_escape_the_root() {
         OUTSIDE_BYTES,
         "an atomic replace must never write through a final-component symlink"
     );
-    // Observed behavior: not refused — `renameat` replaces the link entry.
+    // DESIGNED: not refused — `renameat` replaces the link entry and never
+    // opens (so never follows) it.
     assert!(
         outcome.is_ok(),
         "observed non-refusal: replacing a final-component symlink replaces the link entry"

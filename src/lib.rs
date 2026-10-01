@@ -5,7 +5,10 @@
 //!
 //! * the **store substrate** — a directory tree the process owns, with
 //!   descriptor-relative path resolution that refuses a symlink injected into
-//!   any component, durable atomic writes with explicit commit points, an
+//!   any PARENT component and the FINAL component on the open/create-new/read
+//!   paths (the atomic replace instead REPLACES the final entry and never
+//!   follows it, so it cannot escape), durable atomic writes with explicit
+//!   commit points, an
 //!   advisory lock, and the validated-identifier machinery for the names of
 //!   the things stored in it ([`atomic`], [`root`], [`lock`], [`id`]);
 //! * the **transport** — the [`transport::Remote`] trait and its two

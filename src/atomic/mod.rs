@@ -15,15 +15,17 @@
 //! visible but its durability is UNCONFIRMED — never a bare `Err` (a bare
 //! `Err` would conflate "the rename never happened" with "the rename
 //! happened but the durability commit could not be verified"). The
-//! durability of these writes is the checkpoint's ordering guarantee — the
-//! floor marker must be durable BEFORE the compaction deletes anything, so
-//! an interrupted compaction can never expose history below the floor; the
-//! checkpoint's per-stage sequence (the transactional ADVANCE and its
-//! restore) lives in `crate::retention::history_floor` on top of these
-//! primitives.
+//! durability of these writes is the ordering guarantee the rest of the
+//! crate builds on: [`ReplaceOutcome::ReplacedDurable`] means the new bytes
+//! are visible AND durable BEFORE the caller proceeds, while
+//! [`ReplaceOutcome::ReplacedDurabilityUnknown`] tells the caller the
+//! content is visible but its durability is unconfirmed — so a caller's
+//! recovery step can always tell "this write committed durably" from "this
+//! write is visible but may be lost". The per-operation sequencing on top
+//! of these primitives belongs to the caller, not to this module.
 //!
-//! The helpers here are the shared plumbing — `pub` free functions
-//! imported by `crate::store::local` and `crate::retention::history_floor`:
+//! The helpers here are the shared plumbing — the `pub` free functions this
+//! crate exports as its durable-I/O layer:
 //! the tri-state existence check (`path_state`), the fail-closed
 //! parent-dir fsync (`sync_parent_dir`), unique temp naming
 //! (`temp_name_for`), the atomic marker/JSONL rewrites
@@ -51,8 +53,11 @@
 //! in the [`unix`] / [`windows`] submodules, selected by the TWO `mod`
 //! declarations below (the single cfg switch point). [`unix`] is the
 //! descriptor-relative implementation (`openat`/`renameat`/`linkat`/
-//! `unlinkat`/`mkdirat` with `O_NOFOLLOW` — the symlink-refusing
-//! confinement, plus the POSIX parent-directory fsync durability).
+//! `unlinkat`/`mkdirat` with `O_NOFOLLOW` — every PARENT component is
+//! refused as a symlink, and the open/create-new helpers refuse the FINAL
+//! component too, while the atomic replace installs with `renameat` and
+//! replaces the final entry without ever following it; see [`unix`]'s
+//! module docs — plus the POSIX parent-directory fsync durability).
 //! [`windows`] is the path-based implementation with documented weaker
 //! guarantees: no directory descriptors (the root is a path), no
 //! parent-directory fsync durability, a non-atomic replace (Windows
@@ -79,7 +84,8 @@ pub use windows::*;
 /// The path-based JSON reader — TEST-ONLY (the crash-consistency assertions
 /// read a REOPENED store's files directly to verify the on-disk state). The
 /// store's OWN record reads route through [`read_json_fd`]
-/// (descriptor-relative, symlink-refusing); no production caller uses the
+/// (descriptor-relative: a symlink in any component, final included, is
+/// refused); no production caller uses the
 /// raw-path reader, so it is `#[cfg(test)]`-gated (no `#[allow(dead_code)]`
 /// band-aid).
 #[cfg(test)]
@@ -217,8 +223,10 @@ pub struct DirEntry {
 // ---------------------------------------------------------------------
 // Unix: an open directory descriptor (`O_DIRECTORY | O_NOFOLLOW |
 // O_CLOEXEC`) — every mutation resolves component-wise with
-// `openat(O_NOFOLLOW)`, so a symlink injected into a path component can
-// never redirect a mutation outside the owned root. Windows: the root
+// `openat(O_NOFOLLOW)`: a symlink at any parent component is refused and
+// the atomic replace replaces the final entry with `renameat` without
+// following it, so a symlink injected into a path component can never
+// redirect a mutation outside the owned root. Windows: the root
 // PATH (no directory descriptors); mutations resolve path-based with
 // documented weaker guarantees — Windows symlinks require
 // admin/developer mode (a smaller symlink-injection attack surface), and

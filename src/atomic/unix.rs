@@ -1,9 +1,32 @@
 //! The Unix implementation of the store atomic I/O: the descriptor-relative
 //! owned-root confinement (`openat`/`renameat`/`linkat`/`unlinkat`/`mkdirat`
-//! with `O_NOFOLLOW` — a symlink injected into any path component is refused,
-//! never followed) plus the POSIX durability protocol (temp fsync, atomic
+//! with `O_NOFOLLOW`) plus the POSIX durability protocol (temp fsync, atomic
 //! rename, parent-directory fsync). Selected by the single `#[cfg(unix)]`
 //! `mod` declaration in [`super`].
+//!
+//! # Which path components are refused
+//!
+//! Every PARENT component is resolved with component-wise
+//! `openat(O_NOFOLLOW)` and a symlink there is REFUSED (ELOOP) — for every
+//! primitive, reads included.
+//!
+//! The OPEN / CREATE-NEW helpers — [`openat_no_follow`], [`write_file_fd`],
+//! [`write_atomic_cas_fd`] — also open the FINAL component with
+//! `O_NOFOLLOW`, so a symlink there is refused too.
+//!
+//! The atomic REPLACE path — [`write_atomic_replace_fd`] — is the exception.
+//! It installs with `renameat` into the descriptor-relative parent, and
+//! `renameat` replaces the final directory entry WITHOUT opening it, so
+//! there is no final `O_NOFOLLOW` open to raise ELOOP. A final-component
+//! symlink is therefore NOT refused; it is REPLACED by a regular file at the
+//! link's own in-root path, and the link's former target is left untouched.
+//! That is still confinement-safe and race-free (the rename can never follow
+//! the link, so it cannot escape the root), but it is "replace, never
+//! follow" rather than "refuse". A caller that must REFUSE a foreign final
+//! entry instead of overwriting it uses one of the open/create-new helpers
+//! above — [`openat_no_follow`], [`write_file_fd`], [`write_atomic_cas_fd`],
+//! or the read-side [`read_fd`] / [`path_state_fd`], all of which open the
+//! final component with `O_NOFOLLOW` and so genuinely refuse it.
 
 use super::*;
 use std::ffi::{CStr, CString};
@@ -234,42 +257,29 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // The store's mutations resolve paths relative to the owned root's open
 // directory descriptor, COMPONENT-WISE with `openat(O_NOFOLLOW)`: every
 // intermediate component is opened as a directory with `O_DIRECTORY |
-// O_NOFOLLOW` (a symlink at ANY component → ELOOP → refused), and the
-// final component is opened with `O_NOFOLLOW`. A symlink injected into a
-// path component can never redirect a mutation outside the owned root —
-// the descriptor pins the root, and no component is ever followed. The
+// O_NOFOLLOW` (a symlink at any PARENT component → ELOOP → refused). The
+// open/create-new helpers also open the FINAL component with
+// `O_NOFOLLOW`, so a symlink there is refused as well; the atomic REPLACE
+// path does not open the final entry at all — it installs with `renameat`,
+// which replaces that directory entry and cannot follow it (see
+// [`write_atomic_replace_fd`]). Either way a symlink injected into a path
+// component can never redirect a mutation outside the owned root — the
+// descriptor pins the root, and no component is ever followed. The
 // path-based free functions above stay for the retention machinery (which
 // operates on paths under a store base it does not hold a descriptor
 // for); the store's OWN mutations route through the `_fd` variants below.
-// =====================================================================
-// DESCRIPTOR-RELATIVE I/O (the owned-root confinement)
-// ---------------------------------------------------------------------
-// The store's mutations resolve paths relative to the owned root's open
-// directory descriptor, COMPONENT-WISE with `openat(O_NOFOLLOW)`: every
-// intermediate component is opened as a directory with `O_DIRECTORY |
-// O_NOFOLLOW` (a symlink at ANY component → ELOOP → refused), and the
-// final component is opened with `O_NOFOLLOW`. A symlink injected into a
-// path component can never redirect a mutation outside the owned root —
-// the descriptor pins the root, and no component is ever followed.
 // =====================================================================
 
 /// Open `rel` relative to `dir_fd` COMPONENT-WISE with `O_NOFOLLOW`: every
 /// intermediate component is opened as a directory (`O_RDONLY | O_DIRECTORY
 /// | O_NOFOLLOW | O_CLOEXEC`), and the final component is opened with
-/// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
-/// component is refused (ELOOP) — a mutation can never be redirected
-/// outside the root the descriptor pins. `mode` is used only when `flags`
-/// includes `O_CREAT`. The raw `_io` variant returns the underlying io
-/// error (so a caller can distinguish a genuine NotFound from a symlink
-/// refusal); [`openat_no_follow`] wraps it with the path context.
-/// intermediate component is opened as a directory (`O_RDONLY | O_DIRECTORY
-/// | O_NOFOLLOW | O_CLOEXEC`), and the final component is opened with
-/// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
-/// component is refused (ELOOP) — a mutation can never be redirected
-/// outside the root the descriptor pins. `mode` is used only when `flags`
-/// includes `O_CREAT`. The raw `_io` variant returns the underlying io
-/// error (so a caller can distinguish a genuine NotFound from a symlink
-/// refusal); [`openat_no_follow`] wraps it with the path context.
+/// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. Every component, INCLUDING the
+/// final one, is therefore refused (ELOOP) if it is a symlink — a mutation
+/// can never be redirected outside the root the descriptor pins. `mode` is
+/// used only when `flags` includes `O_CREAT`. The raw `_io` variant returns
+/// the underlying io error (so a caller can distinguish a genuine NotFound
+/// from a symlink refusal); [`openat_no_follow`] wraps it with the path
+/// context.
 pub fn openat_no_follow_io(
     dir_fd: &OwnedFd,
     rel: &Path,
@@ -483,11 +493,18 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 }
 
 /// The descriptor-relative atomic replace: the same four-stage protocol as
-/// [`write_atomic_replace`], but every path resolves COMPONENT-WISE
-/// relative to `root` with `openat(O_NOFOLLOW)` — a symlink injected into
-/// any path component is refused (ELOOP), never followed. The parent
-/// directory must already exist (the store creates it via
-/// [`ensure_private_dir_fd`] before the write).
+/// [`write_atomic_replace`], but the path resolves COMPONENT-WISE relative
+/// to `root` with `openat(O_NOFOLLOW)`. Every PARENT component is refused
+/// (ELOOP) if it is a symlink; the FINAL entry is NOT opened — the install
+/// is a `renameat` into the descriptor-relative parent, which replaces the
+/// final directory entry and so cannot follow it. A final-component symlink
+/// is therefore REPLACED by a regular file at the link's own in-root path
+/// (the link's former target is left untouched) rather than refused; the
+/// replace still cannot escape the root, race-free. A caller that must
+/// REFUSE a foreign final entry instead of overwriting it uses one of the
+/// open/create-new primitives — [`openat_no_follow`], [`write_file_fd`],
+/// [`write_atomic_cas_fd`], [`read_fd`], or [`path_state_fd`]. The parent
+/// directory is created via [`ensure_private_dir_fd`] if missing.
 pub fn write_atomic_replace_fd(
     root: &RootDir,
     rel: &Path,
@@ -1044,10 +1061,12 @@ pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
 // DESCRIPTOR-RELATIVE READS (the owned-root confinement, read side)
 // ---------------------------------------------------------------------
 // The store's READS resolve paths relative to the owned root's open
-// directory descriptor, COMPONENT-WISE with `openat(O_NOFOLLOW)` — the
-// SAME refusal the mutations enforce: a symlink injected into ANY path
-// component is refused (ELOOP), never followed, so a read can never be
-// redirected outside the owned root. The path-based free functions above
+// directory descriptor, COMPONENT-WISE with `openat(O_NOFOLLOW)` — every
+// PARENT component is refused and, unlike the atomic REPLACE path, the
+// FINAL component is opened with `O_NOFOLLOW` and so is refused too: a
+// symlink injected into ANY path component of a read is refused (ELOOP),
+// never followed, so a read can never be redirected outside the owned
+// root. The path-based free functions above
 // (`read_json`, `path_state`) stay for the retention machinery (which
 // operates on paths under a store base it does not hold a descriptor
 // for); the store's OWN reads route through the `_fd` variants below.
