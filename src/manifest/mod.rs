@@ -14,14 +14,18 @@ use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 /// One entry in a canonical tree object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
-    /// NFC-normalized, UTF-8 relative path within the artifact root.
+    /// NFC-normalized, UTF-8, `/`-separated path relative to the artifact
+    /// root. The spelling is host-independent: nested entries are `a/b` on
+    /// every platform. A literal `\` inside one component is an ordinary
+    /// name character (legal on Unix) and is preserved verbatim, so readers
+    /// must split on `/` only.
     pub path: String,
     /// `file`, `dir`, or `symlink`.
     #[serde(rename = "type")]
@@ -74,6 +78,89 @@ fn normalize_lexical(base: &Path, rel: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// The manifest's canonical spelling for an artifact-relative path: every
+/// [`Component::Normal`] name joined with `/`.
+///
+/// This is a COMPONENT join, never a `\` -> `/` string replacement, because
+/// `\` is an ordinary character in a Unix file name: rewriting it would
+/// corrupt a legal single-component name like `a\b`. Joining components
+/// instead makes the spelling host-independent — on Windows `a\b` is two
+/// components and becomes the portable `a/b`, while on Unix the same bytes
+/// are one component and stay `a\b`, exactly as the remote (POSIX) script
+/// already spells it. Any non-`Normal` component (a root or prefix, or a
+/// `.`/`..` component) means the path is not a portable artifact-relative
+/// path, so such a path yields `None`; an empty path (no components) yields
+/// `None` too.
+fn canonical_entry_path(rel: &Path) -> Option<String> {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(name) => {
+                if count > 0 {
+                    out.push('/');
+                }
+                out.push_str(&name.to_string_lossy());
+                count += 1;
+            }
+            _ => return None,
+        }
+    }
+    (count > 0).then_some(out)
+}
+
+/// Whether every `/`-separated component of a wire path is a normal name:
+/// non-empty, and neither `.` nor `..`. These are exactly the wire analogues
+/// of requiring every OS path `Component` to be [`Component::Normal`], so a
+/// path like `../x`, `/x`, `a/../b`, `a//b`, or `a/` can never enter a
+/// manifest. A literal `\` is NOT special here: it is an ordinary character
+/// within one component.
+fn has_only_normal_components(path: &str) -> bool {
+    path.split('/')
+        .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Validate the WIRE spelling of an entry path and return its
+/// NFC-normalized form. Both canonicalizers funnel through this so they
+/// accept exactly the same set of trees.
+///
+/// Rejects NUL bytes and newline/tab characters (the remote script's output
+/// is line- and tab-separated, so such a name would mangle the wire format
+/// and make a tree unverifiable on a remote), rejects absolute paths and any
+/// empty or traversal (`.`/`..`) component, and NFC-normalizes the result.
+fn validate_entry_path(path: &str) -> Result<String> {
+    if path.contains('\0') {
+        return Err(Error::materialization(format!(
+            "path contains NUL bytes: {path}"
+        )));
+    }
+    if path.contains('\n') || path.contains('\t') {
+        return Err(Error::materialization(format!(
+            "path contains newline or tab: {path}"
+        )));
+    }
+    if path.starts_with('/') {
+        return Err(Error::materialization(format!(
+            "absolute path not allowed: {path}"
+        )));
+    }
+    if !has_only_normal_components(path) {
+        return Err(Error::materialization(format!(
+            "path contains a traversal or empty component: {path}"
+        )));
+    }
+    let normalized: String = path.nfc().collect();
+    // NFC never changes `/`, `.`, or `..`, so this re-check can only fire if
+    // the normalization rule above grew an exotic mapping; keep it explicit
+    // so the guarantee is tied to the STORED spelling.
+    if normalized.starts_with('/') || !has_only_normal_components(&normalized) {
+        return Err(Error::materialization(format!(
+            "path contains a traversal or empty component: {normalized}"
+        )));
+    }
+    Ok(normalized)
+}
+
 /// Canonicalize a directory into a [`TreeMetadata`] and compute its digest.
 ///
 /// `root` must be a directory: an absent root is an error (the lexical
@@ -108,41 +195,25 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             .strip_prefix(root)
             .map_err(|e| Error::materialization(format!("{e}")))?;
 
-        // Unicode NFC normalization and reject NUL bytes.
-        let rel_str = rel_os.to_string_lossy();
-        if rel_str.contains('\0') {
-            return Err(Error::materialization(format!(
-                "path contains NUL bytes: {}",
+        // Build the canonical spelling from the path's COMPONENTS, never by
+        // rewriting separators in a string. Every component must be
+        // `Component::Normal`: a root/prefix, `.`, or `..` component is not a
+        // portable artifact-relative path and is refused. On Windows a
+        // nested path (`a\b`) has two components and becomes the portable
+        // `a/b`; on Unix those same bytes are ONE component, so a literal
+        // `\` inside a file name is preserved verbatim rather than
+        // corrupted into a separator.
+        let joined = canonical_entry_path(rel_os).ok_or_else(|| {
+            Error::materialization(format!(
+                "path has a non-normal component: {}",
                 path.display()
-            )));
-        }
-        // Newline/tab filenames are refused here (at staging) so the local
-        // and remote verification paths agree: the remote script's output is
-        // line- and tab-separated, so such a filename would mangle the wire
-        // format and make the tree unverifiable on a remote. Rejecting it
-        // early turns that into a clear staging error instead of a confusing
-        // remote digest mismatch.
-        if rel_str.contains('\n') || rel_str.contains('\t') {
-            return Err(Error::materialization(format!(
-                "path contains newline or tab: {}",
-                path.display()
-            )));
-        }
-        let normalized: String = rel_str.nfc().collect();
-        // Reject TRAVERSAL components — an exact `..` (or `.`) path
-        // COMPONENT, never a substring: a legitimate filename like `a..b`
-        // or `..hidden` contains ".." but is not traversal. The component
-        // check splits on '/' and refuses only the exact traversal names.
-        if normalized.split('/').any(|c| c == ".." || c == ".") {
-            return Err(Error::materialization(format!(
-                "path contains traversal components: {normalized}"
-            )));
-        }
-        if normalized.starts_with('/') {
-            return Err(Error::materialization(format!(
-                "absolute path not allowed: {normalized}"
-            )));
-        }
+            ))
+        })?;
+        // Validate the NORMALIZED spelling, because that spelling is what the
+        // remote assembler sees: NUL bytes, newline/tab, absolute paths, and
+        // empty/traversal components are refused here exactly as they are
+        // there, and NFC normalization is applied to the stored form.
+        let normalized = validate_entry_path(&joined)?;
         if !seen.insert(normalized.clone()) {
             return Err(Error::materialization(format!(
                 "duplicate normalized path: {normalized}"
@@ -291,33 +362,13 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
         let content_hash = it.next().unwrap_or("");
         let symlink_target = it.next().unwrap_or("");
 
-        // Path validation — mirror canonicalize_tree exactly.
-        if path.contains('\0') {
-            return Err(Error::materialization(format!(
-                "path contains NUL bytes: {path}"
-            )));
-        }
-        // Newline/tab are the wire-format breakers: the script's output is
-        // line- and tab-separated, so a filename containing either would
-        // mangle the fields. The local canonicalizer rejects them too, so
-        // the two verification paths agree (a tree with such a filename is
-        // refused at staging, never silently unverifiable on a remote).
-        if path.contains('\n') || path.contains('\t') {
-            return Err(Error::materialization(format!(
-                "path contains newline or tab: {path}"
-            )));
-        }
-        let normalized: String = path.nfc().collect();
-        if normalized.split('/').any(|c| c == ".." || c == ".") {
-            return Err(Error::materialization(format!(
-                "path contains traversal components: {normalized}"
-            )));
-        }
-        if normalized.starts_with('/') {
-            return Err(Error::materialization(format!(
-                "absolute path not allowed: {normalized}"
-            )));
-        }
+        // Path validation — mirror canonicalize_tree exactly by running the
+        // SAME validator on the wire spelling. Newline/tab are the
+        // wire-format breakers (the script's output is line- and
+        // tab-separated), and absolute/empty/traversal components are
+        // refused, so the two verification paths accept exactly the same
+        // trees.
+        let normalized = validate_entry_path(path)?;
         if !seen.insert(normalized.clone()) {
             return Err(Error::materialization(format!(
                 "duplicate normalized path: {normalized}"
@@ -584,6 +635,30 @@ mod tests {
             "remote-script digest must equal the local canonical digest"
         );
         assert_eq!(remote.entries, local.entries);
+
+        // The canonical spelling IS the wire format: `/`-separated on every
+        // host, so a nested entry is `sub/nested.txt` — never the Windows
+        // `sub\nested.txt`. This is the parity pin for the platform defect:
+        // before the component join, a Windows local walk and the POSIX
+        // remote script disagreed on exactly this spelling.
+        let paths: Vec<&str> = local.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["file.txt", "sub", "sub/link", "sub/nested.txt"],
+            "entry paths must be '/'-separated"
+        );
+        assert!(
+            paths.iter().all(|p| !p.contains('\\')),
+            "no entry path may carry a backslash separator: {paths:?}"
+        );
+        // The manifest is BYTE-IDENTICAL between the two walks: the two
+        // canonicalizers emit the same `tree.json` bytes, so neither can
+        // describe the same tree differently.
+        assert_eq!(
+            serde_json::to_vec(&local).unwrap(),
+            serde_json::to_vec(&remote).unwrap(),
+            "the local and remote manifests must serialize to the same bytes"
+        );
     }
 
     /// The digest binds the tree content: a local tree canonicalizes to a
@@ -638,6 +713,106 @@ mod tests {
             paths.contains(&"..hidden"),
             "a filename starting with '..' is valid, got {paths:?}"
         );
+    }
+
+    /// A nested tree canonicalizes to `a/b/c`-style paths on EVERY platform:
+    /// the separator is always `/`, never the host's native separator. This
+    /// is the property the wire format depends on.
+    #[test]
+    fn nested_tree_paths_are_forward_slash_separated() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::write(root.join("a").join("b").join("c.txt"), b"deep").unwrap();
+        let meta = canonicalize_tree(&root).unwrap();
+        let paths: Vec<&str> = meta.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a", "a/b", "a/b/c.txt"]);
+        assert!(
+            paths.iter().all(|p| !p.contains('\\')),
+            "a nested tree must never spell a separator as a backslash: {paths:?}"
+        );
+    }
+
+    /// The rule for a literal `\` inside a single file NAME: `\` is not a
+    /// separator on Unix, so such a name is ONE `Component::Normal` and the
+    /// manifest keeps the backslash verbatim — the component join only ever
+    /// inserts `/` BETWEEN components. This is exactly why normalization must
+    /// NOT be a `\` -> `/` string replacement (that would rewrite a legal
+    /// Unix filename); on Windows, where `\` IS a separator, it is instead
+    /// split into two components and becomes the portable `a/b`.
+    #[cfg(unix)]
+    #[test]
+    fn backslash_inside_a_unix_filename_is_preserved_verbatim() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        // A single-component name on Unix: this is not directory `a` with a
+        // child `b`.
+        std::fs::write(root.join("a\\b"), b"content").unwrap();
+        let meta = canonicalize_tree(&root).unwrap();
+        let paths: Vec<&str> = meta.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a\\b"],
+            "a backslash inside a Unix file name is an ordinary character"
+        );
+        assert_eq!(meta.entries[0].path, "a\\b");
+
+        // The remote (POSIX) script spells the same name the same way, so the
+        // two canonicalizers still agree byte-for-byte.
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        assert_eq!(remote.entries, meta.entries);
+        assert_eq!(remote.tree_sha256, meta.tree_sha256);
+    }
+
+    /// A path whose components are not all `Component::Normal` is refused:
+    /// the component join returns `None` for a root/prefix, `.`, or `..`
+    /// component, and the shared wire validator refuses the same spellings
+    /// (`../x`, `/x`, `a/../b`, plus empty components) with NUL rejected too.
+    #[test]
+    fn traversal_and_absolute_components_are_refused() {
+        // The local component join refuses any non-`Normal` component.
+        assert_eq!(canonical_entry_path(Path::new("../x")), None);
+        assert_eq!(canonical_entry_path(Path::new("/x")), None);
+        assert_eq!(canonical_entry_path(Path::new("a/../b")), None);
+        assert_eq!(canonical_entry_path(Path::new("./x")), None);
+        assert_eq!(canonical_entry_path(Path::new("")), None);
+        // A name containing `..` as a substring is still one normal component.
+        assert_eq!(
+            canonical_entry_path(Path::new("a..b")),
+            Some("a..b".to_string())
+        );
+
+        // The shared validator — used by BOTH canonicalizers — refuses the
+        // same spellings directly.
+        for bad in ["../x", "/x", "a/../b", "a//b", "a/", "."] {
+            assert!(
+                validate_entry_path(bad).is_err(),
+                "wire path {bad:?} must be refused"
+            );
+        }
+        assert!(validate_entry_path("a\0b").is_err(), "NUL must be refused");
+        assert!(
+            validate_entry_path("a\nb").is_err(),
+            "newline must be refused"
+        );
+        assert!(validate_entry_path("a\tb").is_err(), "tab must be refused");
+
+        // And the wire assembler refuses the same paths end to end.
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        let hash = "0".repeat(64);
+        for bad in ["../x", "/x", "a/../b", "a//b", "a/"] {
+            let output = format!("{bad}\tf\t1a4\t1\t{hash}\t\n");
+            let err = canonicalize_remote_entries(&output, &root).unwrap_err();
+            assert!(
+                err.to_string().contains("traversal or empty")
+                    || err.to_string().contains("absolute path not allowed"),
+                "wire path {bad:?} must be refused, got: {err}"
+            );
+        }
     }
 
     /// Run the remote verification script on `root` and return its stdout
