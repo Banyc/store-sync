@@ -286,7 +286,13 @@ Apply rules:
   a manifest entry and is NOT widened — it is the caller's own directory. A
   read-only destination root therefore makes every top-level mutation fail
   loudly: the failure is counted in `transfers`, the attempted path is named in
-  `indeterminate`, the root's mode is left untouched, and nothing is destroyed.
+  `indeterminate`, and the root's mode is left untouched; no UNSANCTIONED entry
+  is destroyed — a top-level `Changed` or `Missing` entry fails before any
+  mutation, so nothing is mutated at all, while a top-level removal the caller
+  SANCTIONED (an `Extraneous` directory under `delete_extraneous`) may unlink
+  that directory's children before the removal's own final `rmdir` fails on the
+  read-only root, i.e. a sanctioned deletion stops part-way rather than
+  destroying a caller entry.
   The caller widens its own root if it wants top-level writes. This is a
   deliberate limitation, not an oversight: the transport abstraction has no
   root-mode operation (a remote root may name a path on another host), so a
