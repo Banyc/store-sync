@@ -1,0 +1,3188 @@
+//! The production SSH transport group: the [`SshTransport`] over `ssh`/`scp`,
+//! host-identity verification and pinning ([`hostkey`]), and the ONE bounded
+//! subprocess runner every ssh operation goes through ([`runner`]) — hard
+//! deadline, kill, and deterministic reap.
+//!
+//! Transport setup is split into two phases: [`Remote::prepare_identity`]
+//! (verify/pin the host key) runs before ANY remote request — including a dry
+//! run's status inspection — while [`Remote::provision_layout`] (create the
+//! deployment-directory layout) runs only behind the push engine's
+//! non-dry-run gate.
+//!
+//! # Submodules
+//!
+//! * [`hostkey`] — host-identity verification and pinning.
+//! * [`runner`] — the bounded subprocess runner.
+
+mod hostkey;
+mod runner;
+
+use crate::env::SysEnv;
+use crate::error::{Error, Result};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use super::{
+    ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Layout, OpenedEntry,
+    OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict, RootedRelativePath,
+    has_normal_component_below_root, provision_receiver_id, verified_to_verdict, verify_existing,
+};
+use hostkey::{pin_known_hosts, simple_hash};
+use runner::{
+    OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, SshRunner,
+};
+
+/// The framed ssh-lstat absence protocol (see [`SshTransport::metadata_opt`]):
+/// ONE remote exec runs a small perl `lstat` helper that prints a single
+/// TAB-separated frame on stdout — the FRAME is the signal (exit 0 for every
+/// outcome, because an exit code carries no errno):
+///
+/// * `P\t<size>\t<rawmode_hex>` — the entry EXISTS (`lstat` succeeded);
+///   `<size>` is decimal and `<rawmode>` is hex, the `stat -c '%s %f'`-
+///   equivalent format, so the [`RemoteMeta`] parse is unchanged.
+/// * `A\t<errno>` — `lstat` FAILED with a CONFIRMED-ABSENCE errno: ENOENT
+///   or ENOTDIR (the ONLY errnos that mean "no such entry").
+/// * `E\t<errno>` — `lstat` FAILED with any OTHER errno (EACCES, EIO,
+///   ELOOP, ...).
+///
+/// `metadata_opt` maps ONLY the `A` frame with errno ENOENT/ENOTDIR to
+/// `Ok(None)`; every other outcome — EACCES/EIO frames, malformed frames, a
+/// signal-killed command, a nonzero exit, a transport failure — is an error.
+/// The frames carry the actual errno, which a shell boolean (`[ ! -e ]`)
+/// cannot: a permission failure is an ERROR, never absence. The errno
+/// numbers are identical on Linux and macOS (POSIX): ENOENT = 2,
+/// ENOTDIR = 20.
+const LSTAT_ERRNO_ENOENT: i32 = 2;
+const LSTAT_ERRNO_ENOTDIR: i32 = 20;
+
+/// The reserved exit code the remote `try_write_new` script (`write_new_cmd`)
+/// exits with when the no-clobber publish (perl `link(2)`) hit an EXISTING
+/// destination — the conflict/verdict decision point. It is the ONLY nonzero
+/// exit the transport
+/// maps to a verdict; every other nonzero exit (a failed pre-install step OR
+/// the final parent-directory sync) is a propagated error. `17` cannot collide
+/// with the pre-install steps' own failures (each exits nonzero, but the
+/// transport distinguishes the verdict by code, never by `exists`-sniffing),
+/// and it is deliberately distinct from [`SSH_TWRITE_PREINSTALL_EXIT`].
+/// `17` is also EEXIST (POSIX, identical on Linux and macOS) — the raw
+/// `link(2)` errno the script maps directly to this code.
+pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
+
+/// The exit code the remote `write_new_cmd` script uses for a PRE-INSTALL
+/// failure — any failure BEFORE the no-clobber publish: the parent `mkdir`,
+/// the `mktemp` allocation, the payload write, the final `chmod`, the file
+/// `sync`, or a non-EEXIST `link(2)` failure. Such a failure means the
+/// operation never reached the publish
+/// decision point, so it is a propagated Error, NEVER a verdict — the
+/// transport refuses to guess the destination's state. Deliberately distinct
+/// from [`SSH_TWRITE_CONFLICT_EXIT`] so the script can tell "the install never
+/// happened" from "the destination already existed".
+pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
+
+/// How long the SSH sidecar flock waits before giving up — mirrors
+/// `crate::transport::SIDECAR_WAIT_TIMEOUT` (2s) with a 5ms retry interval
+/// (`crate::transport::SIDECAR_RETRY_INTERVAL`). The Perl sidecars use a
+/// monotonic deadline (`clock_gettime(CLOCK_MONOTONIC)`) so the wait is bounded
+/// even if the system clock jumps.
+const SIDECAR_FLOCK_DEADLINE_SECS: f64 = 2.0;
+const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
+
+/// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
+/// `crate::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
+/// → wait `interval.min(remaining)`; `EINTR` → retry immediately; any other
+/// errno → `die "sidecar flock failed: $!"`; contended past the deadline →
+/// `die "sidecar contended"`. The prelude reads `$fh` already opened by the
+/// caller and keeps the flock held through file fsync and parent-directory sync
+/// (the same perl process does the fsyncs while still holding the descriptor).
+///
+/// TEST-ONLY contention signal: when `DEPLOY_TEST_CONTENDED_FD` is set (a
+/// numeric fd a TEST hands the child — the env var must only ever be
+/// configured by tests), the prelude writes one `CONTENDED` line to that fd
+/// EXACTLY ONCE — right after the FIRST confirmed `EWOULDBLOCK`, before any
+/// deadline accounting — then deletes the env key, so later iterations
+/// (also EWOULDBLOCKs on a retained lock) stay silent. No timing/sleep is
+/// added to the signal path. With the env unset (production) the block is
+/// skipped entirely and the emitted behavior is byte-identical to a prelude
+/// without the signal.
+fn sidecar_flock_prelude(deadline_secs: f64, interval_secs: f64) -> String {
+    format!(
+        "use Fcntl qw(:flock);\n\
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);\n\
+use Time::HiRes qw(clock_gettime usleep CLOCK_MONOTONIC);\n\
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + {deadline:?};\n\
+while (!flock($fh, LOCK_EX | LOCK_NB)) {{{{\n\
+    my $errno = 0 + $!;\n\
+    next if $errno == EINTR;\n\
+    die \"sidecar flock failed: $!\" unless $errno == EAGAIN || $errno == EWOULDBLOCK;\n\
+    if (defined $ENV{{\"DEPLOY_TEST_CONTENDED_FD\"}}) {{\n\
+        open(my $ready, \">&=\" . $ENV{{\"DEPLOY_TEST_CONTENDED_FD\"}})\n\
+            or die \"open contention signal fd: $!\";\n\
+        print {{$ready}} \"CONTENDED\\n\";\n\
+        delete $ENV{{\"DEPLOY_TEST_CONTENDED_FD\"}};\n\
+    }}\n\
+    my $remaining = $deadline - clock_gettime(CLOCK_MONOTONIC);\n\
+    die \"sidecar contended\" if $remaining <= 0;\n\
+    usleep(int(1_000_000 * ($remaining < {interval:?} ? $remaining : {interval:?})));\n\
+}}}}",
+        deadline = deadline_secs,
+        interval = interval_secs
+    )
+}
+
+/// A transport that drives a real remote host over SSH.
+pub struct SshTransport {
+    /// `user@address` passed to `ssh` as the connection target.
+    target: String,
+    /// The caller-supplied deployment layout: the bootstrap directories
+    /// `provision_layout` creates, the operation-lock path whose mutations
+    /// are sidecar-serialized, and the optional receiver-id marker.
+    layout: Layout,
+    /// Bare host/address (no `user@` prefix) passed to `ssh-keyscan`, which
+    /// expects a hostname/address, not a `user@host` connection string.
+    address: String,
+    /// Configured SSH port (passed to both `ssh -p` and `ssh-keyscan -p`).
+    port: u16,
+    root: PathBuf,
+    /// Dedicated known-hosts file used with `StrictHostKeyChecking=yes`.
+    known_hosts: Option<PathBuf>,
+    /// Pre-verified host-key fingerprint (e.g. `SHA256:...`) used to pin the
+    /// host key the first time we contact it.
+    host_key_fingerprint: Option<String>,
+    /// Managed known-hosts file holding the pinned key (used when only a
+    /// fingerprint was configured). Set only by [`SshTransport::prepare_identity`],
+    /// never at construction, so building the transport has no side effects.
+    pinned_known_hosts: std::sync::Mutex<Option<PathBuf>>,
+    /// The RESOLVED pin-cache directory for the managed known-hosts file
+    /// (the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`, else
+    /// `<temp_dir>/deploy-ssh-knownhosts`) — resolved ONCE at the
+    /// construction boundary, never read from the process env.
+    known_hosts_cache_dir: PathBuf,
+    /// The directory holding the SSH connection-multiplexing (ControlMaster)
+    /// sockets, one per `user@host:port` — a short path under the system
+    /// temp dir (`<temp_dir>/dmux`, created 0700 in
+    /// [`SshTransport::prepare_identity`] before any ssh op) because Unix
+    /// domain socket paths are length-limited (~104 bytes) and the
+    /// known-hosts cache path is too long to host them. Every ssh subprocess
+    /// this transport spawns reuses ONE persistent master connection per
+    /// remote, so the per-operation SSH handshake (banner, key exchange,
+    /// auth, session — several round trips at the link's RTT) is paid once
+    /// per push instead of once per operation; the master daemonizes into
+    /// its own process group, so the runner's foreground-only containment is
+    /// unaffected.
+    mux_socket_dir: PathBuf,
+    /// The environment snapshot (owned): the pin path's `ssh-keygen`
+    /// fingerprint-verification child receives its variables.
+    env: SysEnv,
+    /// THE bounded subprocess runner every ssh operation goes through
+    /// ([`SshRunner`]): hard deadline, kill, and deterministic reap, so no
+    /// operation can run unbounded after connection establishment.
+    runner: SshRunner,
+    /// Per-file upload tracing (`--verbose`): when set, each `upload_bytes`
+    /// emits `[trace] upload.start` / `[trace] upload.done` lines to stderr
+    /// naming the remote path, the payload size, and the elapsed time, so a
+    /// stalled push can be attributed to the exact file being transferred.
+    verbose: bool,
+}
+
+impl SshTransport {
+    /// Build a transport for `user@address` (connecting on `port`), whose
+    /// application root is the absolute `deploy_dir` path on that host — a
+    /// path with at least one normal component below the root (the
+    /// filesystem root itself is refused, mirroring the
+    /// layout rule: a transport rooted
+    /// at `/` would make the deployment cleanup operate on the system
+    /// root).
+    ///
+    /// Host identity must be configured with EXACTLY ONE source: pass a
+    /// `known_hosts` file OR a `host_key_fingerprint`. If neither is provided
+    /// the transport refuses to connect (no trust-on-first-use); if both are
+    /// provided the choice is ambiguous (the ssh arguments would silently
+    /// prefer `known_hosts`), so the construction is rejected.
+    ///
+    /// `known_hosts_cache_dir` is the RESOLVED pin-cache directory for the
+    /// managed known-hosts file (from the environment snapshot at the
+    /// boundary), and `env` is that snapshot: every child this transport
+    /// spawns (ssh, ssh-keyscan, ssh-keygen) receives its variables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        user: &str,
+        address: &str,
+        port: u16,
+        deploy_dir: &Path,
+        layout: Layout,
+        known_hosts: Option<&Path>,
+        host_key_fingerprint: Option<&str>,
+        known_hosts_cache_dir: &Path,
+        env: &SysEnv,
+        verbose: bool,
+    ) -> Result<Self> {
+        if user.is_empty() || address.is_empty() {
+            return Err(Error::transport(
+                "ssh transport requires a non-empty user and address",
+            ));
+        }
+        if deploy_dir.is_relative() {
+            return Err(Error::transport("ssh deploy_dir must be an absolute path"));
+        }
+        if !has_normal_component_below_root(deploy_dir) {
+            return Err(Error::transport(
+                "ssh deploy_dir must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
+            ));
+        }
+        // Defensive rejection of ambiguous or unusable identity states, even
+        // when the config validation was bypassed (e.g. a direct caller):
+        // exactly one of known_hosts / host_key_fingerprint may be set.
+        match (known_hosts, host_key_fingerprint) {
+            (Some(_), Some(_)) => {
+                return Err(Error::transport(
+                    "ssh host identity is ambiguous: exactly one of known_hosts or \
+                     host_key_fingerprint must be configured (both are set)",
+                ));
+            }
+            (None, None) => {
+                return Err(Error::transport(
+                    "ssh host identity is not configured: exactly one of `known_hosts` or \
+                     `host_key_fingerprint` must be provided (trust-on-first-use is disabled)",
+                ));
+            }
+            _ => {}
+        }
+        let t = SshTransport {
+            target: format!("{user}@{address}"),
+            layout,
+            address: address.to_string(),
+            port,
+            root: deploy_dir.to_path_buf(),
+            known_hosts: known_hosts.map(|p| p.to_path_buf()),
+            host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
+            pinned_known_hosts: std::sync::Mutex::new(None),
+            known_hosts_cache_dir: known_hosts_cache_dir.to_path_buf(),
+            mux_socket_dir: env.temp_dir().join("dmux"),
+            env: env.clone(),
+            runner: SshRunner::new(env),
+            verbose,
+        };
+        // NOTE: construction is side-effect-free. When a fingerprint was
+        // supplied without an explicit known-hosts file, the host key is
+        // verified and pinned by `prepare_identity` (before the first remote
+        // request), not here — a dry run must never touch the network or disk.
+        Ok(t)
+    }
+
+    /// Test-only constructor: same validation as [`SshTransport::new`], but with
+    /// an injected runner (fake seam + tiny deadlines), so the property test can
+    /// drive the deadline/kill/reap contract through the real entry points
+    /// without any real subprocess.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_runner(
+        user: &str,
+        address: &str,
+        port: u16,
+        deploy_dir: &Path,
+        known_hosts: Option<&Path>,
+        host_key_fingerprint: Option<&str>,
+        known_hosts_cache_dir: &Path,
+        env: &SysEnv,
+        runner: SshRunner,
+    ) -> Result<Self> {
+        let mut t = Self::new(
+            user,
+            address,
+            port,
+            deploy_dir,
+            Layout::empty(),
+            known_hosts,
+            host_key_fingerprint,
+            known_hosts_cache_dir,
+            env,
+            false,
+        )?;
+        t.runner = runner;
+        Ok(t)
+    }
+
+    /// Build the fixed `ssh` arguments (options + target). Errors if no host
+    /// identity has been configured, so the caller cannot accidentally fall back
+    /// to trust-on-first-use.
+    fn ssh_args(&self) -> Result<Vec<String>> {
+        let mut args: Vec<String> = vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "PreferredAuthentications=publickey".into(),
+            "-o".into(),
+            format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+            "-o".into(),
+            "Compression=yes".into(),
+            // SSH connection multiplexing: every operation of a push reuses
+            // ONE persistent master connection per user@host:port, so the
+            // multi-round-trip handshake (banner, key exchange, auth,
+            // session) is paid once per push instead of once per operation.
+            // The socket name is a short FNV hash of user@host:port (Unix
+            // domain socket paths are length-limited); the master daemonizes
+            // into its own process group, so the runner's foreground-only
+            // containment is unaffected; a stale socket (dead master) is
+            // detected and replaced by ssh itself.
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!(
+                "ControlPath={}/mux-{}",
+                self.mux_socket_dir.display(),
+                simple_hash(&format!("{}:{}", self.target, self.port))
+            ),
+            "-o".into(),
+            "ControlPersist=120".into(),
+            "-p".into(),
+            self.port.to_string(),
+        ];
+        // Read the pinned path through the lock; it is set only by
+        // `prepare_identity`.
+        let pinned = self.pinned_known_hosts.lock().ok().and_then(|g| g.clone());
+        match (&self.known_hosts, &pinned) {
+            (Some(kh), _) => {
+                args.push("-o".into());
+                args.push(format!("UserKnownHostsFile={}", kh.display()));
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=yes".into());
+            }
+            (None, Some(pinned)) => {
+                args.push("-o".into());
+                args.push(format!("UserKnownHostsFile={}", pinned.display()));
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=yes".into());
+            }
+            (None, None) => {
+                return Err(Error::transport(
+                    "ssh host identity is not configured: provide `known_hosts` or \
+                     `host_key_fingerprint` (trust-on-first-use is disabled)",
+                ));
+            }
+        }
+        args.push(self.target.clone());
+        Ok(args)
+    }
+
+    /// Verify the remote host key against the configured fingerprint and pin
+    /// it in a managed known-hosts file (see [`pin_known_hosts`]).
+    /// Fails closed if the key cannot be fetched or does not match. Takes
+    /// `&self`: the pinned path is stored through the interior-mutability
+    /// lock; the verification/cache logic itself lives in `pin_known_hosts`.
+    pub(crate) fn pin_known_hosts(&self) -> Result<()> {
+        let fingerprint = self
+            .host_key_fingerprint
+            .clone()
+            .ok_or_else(|| Error::transport("host_key_fingerprint required for pinning"))?;
+        let pinned = pin_known_hosts(
+            &fingerprint,
+            &self.target,
+            &self.address,
+            self.port,
+            &self.known_hosts_cache_dir,
+            &self.env,
+            &self.runner,
+        )?;
+        if let Ok(mut g) = self.pinned_known_hosts.lock() {
+            *g = Some(pinned);
+        }
+        Ok(())
+    }
+
+    /// Run a single remote shell command (already fully quoted) and return its
+    /// stdout/stderr/status. The command is passed as one `ssh` argument after
+    /// `--`, so OpenSSH cannot interpret any part of our data as options or as
+    /// the connection target. Runs through the shared bounded runner: once
+    /// connected, a remote command that hangs is killed after
+    /// `SSH_COMMAND_TIMEOUT_SECS` (nothing is unbounded after connection
+    /// establishment).
+    pub(crate) fn run_remote(&self, command: &str) -> Result<std::process::Output> {
+        self.run_remote_op(OpKind::Remote, command)
+    }
+
+    pub(crate) fn run_remote_ok(&self, command: &str) -> Result<()> {
+        let out = self.run_remote_op(OpKind::RemoteOk, command)?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh command failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Shared implementation of the single-command ssh operations: build the
+    /// `ssh <args> -- <command>` vector and run it through the runner under the
+    /// command deadline. `run_remote` and `run_remote_ok` differ only in the
+    /// recorded operation kind and in whether they check the exit status.
+    fn run_remote_op(&self, op: OpKind, command: &str) -> Result<std::process::Output> {
+        let argv = self.ssh_command_argv(command)?;
+        self.runner.run(op, &argv, None, None).map_err(|e| match e {
+            RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::StdinWrite(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::Wait(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::Timeout { after } => {
+                Error::transport(format!("ssh command timed out after {after:?}: {command}"))
+            }
+        })
+    }
+
+    /// Build the `ssh <args> -- <command>` argv, forcing the remote command to
+    /// run under `bash` regardless of the deployment account's login shell.
+    /// The remote scripts (globs, `[ -e ] || continue`, `stat -c`, ...) are
+    /// written for POSIX sh/bash semantics; a login shell like zsh aborts on
+    /// an unmatched glob (`no matches found`) instead of passing the pattern
+    /// through, which breaks e.g. the first `list` of an empty object store.
+    /// Wrapping the command in `bash -c '<quoted>'` means the outer login
+    /// shell only parses the trivial `bash -c '...'` invocation (single-
+    /// quoted, no globs to expand), and the inner script runs under bash.
+    fn ssh_command_argv(&self, command: &str) -> Result<Vec<String>> {
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(self.ssh_args()?);
+        argv.push("--".into());
+        argv.push(format!("bash -c {}", shell_quote(command)));
+        Ok(argv)
+    }
+
+    /// Build a remote shell command string from an `argv`, quoting every
+    /// argument so the remote shell re-tokenizes it back into exactly `argv`.
+    /// Build the remote `mv` command for an atomic path replacement.
+    ///
+    /// `-T` (no-target-directory) is REQUIRED: without it GNU mv treats a
+    /// destination that is a symlink to a directory as the directory itself
+    /// and moves `from` INTO it instead of replacing the symlink. The
+    /// `current` swap depends on replacing a symlink-to-directory in place
+    /// (the atomic per-slot commit point), and a bare `mv` silently pollutes
+    /// the object store with the temp link.
+    fn rename_cmd(root: &Path, from: &Path, to: &Path) -> String {
+        let f = root.join(from).to_string_lossy().into_owned();
+        let t = root.join(to).to_string_lossy().into_owned();
+        let parent = Path::new(&t)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        format!(
+            "mkdir -p {parent} && mv -T {f} {t}",
+            parent = shell_quote(&parent),
+            f = shell_quote(&f),
+            t = shell_quote(&t),
+        )
+    }
+
+    fn argv_cmd(argv: &[String]) -> String {
+        argv.iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Upload raw bytes to a remote path (creating parent dirs). Runs through
+    /// the shared bounded runner: the stdin payload is written as part of the
+    /// bounded wait, so an upload to a remote that stops reading (hung remote
+    /// mid-`cat`) times out after `SSH_COMMAND_TIMEOUT_SECS` instead of
+    /// blocking the push indefinitely.
+    ///
+    /// When the transport was built with `verbose` (the CLI's `--verbose`),
+    /// each upload emits `[trace] upload.start` / `[trace] upload.done` lines
+    /// to stderr naming the remote path, the payload size, and the elapsed
+    /// time — so a stalled or slow push can be attributed to the exact file
+    /// being transferred.
+    pub(crate) fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        let remote_path = self.root.join(rel);
+        let remote_path_str = remote_path.to_string_lossy().into_owned();
+        let script = format!(
+            "mkdir -p $(dirname {p}) && cat > {p}",
+            p = shell_quote(&remote_path_str)
+        );
+        let argv = self.ssh_command_argv(&script)?;
+        // Size-aware deadline: a large upload over a slow link must not be
+        // killed by the fixed command timeout mid-transfer (a truncated
+        // object would fail its post-upload integrity re-hash). The bound
+        // scales with the payload at a conservative minimum rate (the
+        // snapshot's `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override, else the
+        // 64KB/s default).
+        let bytes = data.len() as u64;
+        let min_rate = upload_min_rate_bytes_per_sec(&self.env);
+        let command_deadline = self.runner.command_deadline();
+        let transfer_timeout = upload_deadline(bytes, min_rate, command_deadline);
+        if self.verbose {
+            eprintln!("[trace] upload.start: {remote_path_str} ({bytes} bytes)");
+        }
+        let started = std::time::Instant::now();
+        let out = self
+            .runner
+            .run(OpKind::Upload, &argv, Some(data), Some(transfer_timeout))
+            .map_err(|e| match e {
+                RunError::Spawn(m) => Error::transport(format!("ssh upload spawn: {m}")),
+                RunError::StdinWrite(m) => Error::transport(format!("ssh upload stdin write: {m}")),
+                RunError::Wait(m) => Error::transport(format!("ssh upload wait: {m}")),
+                RunError::Timeout { after } => {
+                    // DIAGNOSIS, not a dead end: name the file and size, and
+                    // point at the fix (slow link vs hung remote).
+                    upload_timeout_error(
+                        after,
+                        bytes,
+                        &remote_path_str,
+                        transfer_timeout,
+                        command_deadline,
+                        min_rate,
+                    )
+                }
+            })?;
+        if self.verbose {
+            eprintln!(
+                "[trace] upload.done: {remote_path_str} +{:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+        }
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh upload failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        if mode != 0 {
+            self.run_remote_ok(&Self::argv_cmd(&[
+                "chmod".into(),
+                format!("{:o}", mode & 0o7777),
+                remote_path_str,
+            ]))?;
+        }
+        Ok(())
+    }
+
+    fn download_bytes(&self, rel: &Path) -> Result<Vec<u8>> {
+        let remote_path = self.root.join(rel);
+        let remote_path_str = remote_path.to_string_lossy().into_owned();
+        // Read the file contents with `cat`; the path is quoted so a path that
+        // happens to contain shell metacharacters (or an executable-bit path) is
+        // never executed.
+        let out = self.run_remote(&format!("cat {}", shell_quote(&remote_path_str)))?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh download failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(out.stdout)
+    }
+}
+
+/// The size-aware upload deadline: `max(runner command deadline, bytes /
+/// min_rate)` — a large upload over a slow link is never killed mid-transfer,
+/// while a hung upload (a remote that stops reading stdin) is still bounded.
+/// The BASE deadline is the runner's [`SshRunner::command_deadline`], never
+/// a hardcoded constant: the test seam injects a tiny command deadline and
+/// MUST see it applied to uploads too (the fake Hang child waits for THIS
+/// bound, not a production constant).
+fn upload_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> Duration {
+    command_deadline.max(Duration::from_secs(data_len / min_rate))
+}
+
+/// Build the DIAGNOSTIC error for an upload that hit its deadline. A size-
+/// scaled deadline (`deadline > command_deadline`) means the link is slower
+/// than the assumed minimum rate — the message says so and points at the
+/// `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override with a concrete suggested
+/// value (half the current rate), so a slow link is recoverable without
+/// reading the source. A bare command deadline means the remote stopped
+/// reading stdin (a hung remote or wedged filesystem) — a different failure
+/// that a rate override cannot fix. Both branches name the remote file and
+/// its byte size so a stalling file is attributable.
+fn upload_timeout_error(
+    after: Duration,
+    bytes: u64,
+    remote_path: &str,
+    deadline: Duration,
+    command_deadline: Duration,
+    min_rate: u64,
+) -> Error {
+    if deadline > command_deadline {
+        let suggested = (min_rate / 2).max(1024);
+        Error::transport(format!(
+            "ssh upload timed out after {after:?}: {bytes} bytes to '{remote_path}' did not finish \
+             within the size-scaled deadline (bytes / min_rate = {bytes} / {min_rate} B/s; the \
+             default minimum is {SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC} B/s, overridable via \
+             DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC). The link is slower than the assumed minimum — \
+             retry with DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC={suggested} (half the current rate) or \
+             lower so the deadline scales to the real link speed"
+        ))
+    } else {
+        Error::transport(format!(
+            "ssh upload timed out after {after:?}: {bytes} bytes to '{remote_path}' did not finish \
+             within the base command deadline ({command_deadline:?}) — the remote likely stopped \
+             reading stdin (a hung remote or wedged filesystem)"
+        ))
+    }
+}
+
+/// Resolve the upload min-rate from the environment snapshot:
+/// `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` (a positive integer) overrides the
+/// default [`SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC`]; an unset, empty,
+/// non-numeric, or non-positive value falls back to the default. Resolved
+/// ONCE per upload from the snapshot — never from the live process env.
+fn upload_min_rate_bytes_per_sec(env: &SysEnv) -> u64 {
+    env.get("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC")
+        .and_then(|v| v.into_string().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|r| *r > 0)
+        .unwrap_or(SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
+}
+
+/// Single-quote a string for safe inclusion in a remote shell token. A `'` is
+/// escaped as `'\''` (close-quote, escaped quote, reopen-quote).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the perl script for atomic compare-and-delete under the sidecar:
+/// open the sidecar, flock exclusively with bounded retry, then read the
+/// lock file, compare to `expected`, unlink if match, otherwise leave it.
+/// Prints a single verdict frame: `R` (removed), `M` (mismatch), or `A`
+/// (absent). Continuously visible for mismatch — the file is never made
+/// absent.
+fn remove_file_if_sidecar_cmd(
+    root: &Path,
+    sidecar_rel: &RootedRelativePath,
+    lock_rel: &RootedRelativePath,
+    expected: &[u8],
+) -> String {
+    let sidecar = root.join(sidecar_rel).to_string_lossy().into_owned();
+    let lock = root.join(lock_rel).to_string_lossy().into_owned();
+    let sidecar_parent = std::path::Path::new(&sidecar)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_q = shell_quote(&sidecar);
+    let sidecar_parent_q = shell_quote(&sidecar_parent);
+    let lock_q = shell_quote(&lock);
+    let expected_q = shell_quote(&String::from_utf8_lossy(expected));
+    let prelude = sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
+    format!(
+        "mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
+use Fcntl qw(:flock);
+open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\";
+{prelude}
+my $lock=$ARGV[1]; my $exp=$ARGV[2];
+if (! -e $lock && ! -l $lock) {{ print \"A\"; exit 0; }}
+open my $lf, \"<\", $lock or do {{ print \"M\"; exit 0; }};
+my $content=do {{ local $/; <$lf> }}; close $lf;
+if ($content eq $exp) {{ unlink $lock or die \"unlink: $!\"; print \"R\"; }} else {{ print \"M\"; }}
+' -- {sidecar} {lock} {exp}",
+        sidecar_parent = sidecar_parent_q,
+        sidecar = sidecar_q,
+        lock = lock_q,
+        exp = expected_q,
+        prelude = prelude,
+    )
+}
+
+/// Build the perl script for atomic recover under the sidecar: open the
+/// sidecar, flock exclusively with bounded retry, then read the lock file,
+/// compare to `observed`, unlink if match, then install `new_data` via a
+/// temp+rename with durability (chmod 644, fsync file, fsync parent). Prints
+/// a single verdict frame: `OK`, `MISMATCH`, or `ABSENT` (or dies on
+/// contended/transport failure).
+fn recover_sidecar_cmd(
+    root: &Path,
+    sidecar_rel: &RootedRelativePath,
+    lock_rel: &RootedRelativePath,
+    observed: &[u8],
+    new_data: &[u8],
+) -> String {
+    let sidecar = root.join(sidecar_rel).to_string_lossy().into_owned();
+    let lock = root.join(lock_rel).to_string_lossy().into_owned();
+    let parent = std::path::Path::new(&lock)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_q = shell_quote(&sidecar);
+    let lock_q = shell_quote(&lock);
+    let parent_q = shell_quote(&parent);
+    let observed_q = shell_quote(&String::from_utf8_lossy(observed));
+    let new_q = shell_quote(&String::from_utf8_lossy(new_data));
+    let sidecar_parent = std::path::Path::new(&sidecar)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_parent_q = shell_quote(&sidecar_parent);
+    let prelude = sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
+    format!(
+        "mkdir -p {parent} && mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
+use Fcntl qw(:flock);
+open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\";
+{prelude}
+my $lock=$ARGV[1]; my $obs=$ARGV[2]; my $new=$ARGV[3];
+if (! -e $lock && ! -l $lock) {{ print \"ABSENT\\n\"; exit 0; }}
+open my $lf, \"<\", $lock or do {{ print \"MISMATCH\\n\"; exit 0; }};
+my $content=do {{ local $/; <$lf> }}; close $lf;
+if ($content ne $obs) {{ print \"MISMATCH\\n\"; exit 0; }}
+unlink $lock or die \"unlink: $!\";
+my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\";
+my $tmp=\"$dir/.operation.lock.tmp.$$\";
+open my $tf, \">\", $tmp or die \"create tmp: $!\";
+print $tf $new; close $tf;
+chmod 0644, $tmp;
+open my $tff, \"+<\", $tmp or die;
+$tff->sync or die \"fsync tmp: $!\"; close $tff;
+rename $tmp, $lock or die \"rename: $!\";
+open my $dfh, \"<\", $dir or die;
+$dfh->sync or die \"fsync dir: $!\";
+print \"OK\\n\";
+' -- {sidecar} {lock} {obs} {new}",
+        parent = parent_q,
+        sidecar_parent = sidecar_parent_q,
+        sidecar = sidecar_q,
+        lock = lock_q,
+        obs = observed_q,
+        new = new_q,
+        prelude = prelude,
+    )
+}
+
+impl SshTransport {
+    /// Build the remote shell command implementing the durability protocol
+    /// for an immutable record at `root.join(rel)` — the remote realization
+    /// of the ONE canonical create-new primitive (`durable_create_new` in
+    /// the parent module), with the IDENTICAL seven-step sequence:
+    ///
+    /// 1. Allocate the temporary file REMOTELY with `mktemp` (exclusive
+    ///    create, O_EXCL), so the name cannot collide with another
+    ///    controller's temp no matter its pid or host: no two invocations
+    ///    are ever handed the same name, and a stale temp left behind by a
+    ///    crashed controller is never selected — and therefore never
+    ///    truncated. The name is dot-prefixed and lives INSIDE the
+    ///    destination's parent directory, so a concurrent reader never sees
+    ///    a partial record and listing-based observers skip the temp name.
+    /// 2. Write the payload — the RAW BYTES arrive on the command's STDIN
+    ///    (the transport pipes them to the ssh child; the remote `cat`
+    ///    redirects them into the temp with `cat > "$tmp"`). The payload is
+    ///    NEVER embedded in the command string — no shell escaping, no
+    ///    quoting — so ARBITRARY bytes (NULs, non-UTF8, control chars,
+    ///    quotes, shell metacharacters, long payloads) round-trip exactly:
+    ///    this is the byte-preservation contract of [`Remote::try_write_new`].
+    /// 3. Apply the FINAL MODE with `chmod` BEFORE the file fsync — the
+    ///    published inode carries the caller's mode, never the remote umask.
+    /// 4. `sync "$tmp"` — the file is durable.
+    /// 5. Install atomically WITHOUT replacement via perl's raw `link(2)`
+    ///    (the same interpreter the framed `lstat` helper relies on) — it
+    ///    FAILS if the destination exists in ANY form (a regular file, a
+    ///    directory, a symlink — never linked-inside or dereferenced the way
+    ///    a shell `ln` would), so no loser can clobber a winner. The loser's
+    ///    failure is reported through the reserved `SSH_TWRITE_CONFLICT_EXIT`
+    ///    exit code, NEVER by replacing the winner.
+    /// 6. Remove only the temporary file THIS invocation created (the
+    ///    cleanup runs on the conflict path too — the `rc` capture keeps it
+    ///    outside the `&&` chain).
+    /// 7. `sync <parent>` — the PARENT-DIRECTORY fsync whose failure
+    ///    PROPAGATES (the old script swallowed it with `2>/dev/null`): a
+    ///    failed sync is a failed install, never a silent success.
+    ///
+    /// The parent directory is created first (the remote layout is not
+    /// provisioned by SSH the way LocalTransport does it), so a fresh remote
+    /// root still allows the first lock acquisition. The PRE-INSTALL chain
+    /// (`mkdir` .. `sync "$tmp"`) is `&&`-connected and its exit status is
+    /// captured separately: if ANY pre-install step fails, the command exits
+    /// [`SSH_TWRITE_PREINSTALL_EXIT`] WITHOUT installing anything (fail
+    /// closed) — a pre-install failure is a propagated ERROR, never the
+    /// conflict verdict, because the operation never reached the publish
+    /// decision point. The publish is perl `link(2)` — RAW link semantics,
+    /// so a destination that exists in ANY form (a regular file, a DIRECTORY
+    /// — which a shell `ln` would silently link INSIDE — or a symlink) is
+    /// EEXIST, never dereferenced and never linked-into; EEXIST (17, the
+    /// same value as [`SSH_TWRITE_CONFLICT_EXIT`]) exits the reserved
+    /// conflict code directly, any other link failure is the pre-install
+    /// exit. Only a nonzero publish exit whose destination is then PRESENT
+    /// (`[ -e ]`/`[ -L ]`) is the confirmed-EEXIST verdict
+    /// [`SSH_TWRITE_CONFLICT_EXIT`] (the winner is never replaced; the
+    /// transport verifies it and decides AlreadyPresent vs Conflict); a
+    /// nonzero publish exit with the destination ABSENT is a real publish
+    /// failure, again the pre-install exit (an error). The final `sync
+    /// <parent>` runs ONLY on the install-success path, and its exit status
+    /// is the command's exit status — a real `sync <dir>`/fsync, never a
+    /// best-effort swallow. (The
+    /// AlreadyPresent retry's parent sync runs in the TRANSPORT — see
+    /// [`SshTransport::try_write_new`] — mirroring the local primitive's
+    /// "parent fsync on Created AND AlreadyPresent, never on Conflict".)
+    //
+    // Portability notes: `mktemp TEMPLATE` accepts a template argument on
+    // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
+    // (kept here), and `sync FILE` fsyncs the path on Linux (coreutils
+    // >= 8.24) and macOS (forces pending writes); the parent-dir sync is the
+    // real `sync <dir>` whose failure propagates. The payload write is a
+    // bare `cat > "$tmp"`: `cat` is POSIX, reads stdin to EOF, and the
+    // redirect opens the temp — no quoting of data anywhere.
+    fn write_new_cmd(root: &Path, rel: &Path, mode: u32) -> String {
+        let remote_path = root.join(rel);
+        let remote_path_str = remote_path.to_string_lossy().into_owned();
+        let parent = Path::new(&remote_path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        // Durability protocol — the seven-step sequence is documented on
+        // this function; the comment here only notes the pieces that are
+        // invisible in the final string: the pre-install chain fails closed
+        // with the PRE-INSTALL exit (distinct from the conflict verdict), the
+        // publish is perl `link(2)` (raw link semantics — a destination that
+        // exists in ANY form is EEXIST and exits the reserved conflict code
+        // directly, never linked-inside or dereferenced the way a shell `ln`
+        // would), the confirmed-EEXIST fallback decision is made by checking
+        // the destination's PRESENCE after a failed publish (never by
+        // swallowing every publish failure as a verdict), the `rc` capture
+        // keeps the temp cleanup outside the chain so it runs on the
+        // conflict path too, and the
+        // parent-dir sync runs ONLY after a successful install and its
+        // failure is the command's exit status.
+        let basename = Path::new(&remote_path_str)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "record".to_string());
+        // The temp lives INSIDE the destination's parent directory and is
+        // dot-prefixed, exactly like LocalTransport's durable_create_new. A
+        // sibling name (`{parent}.{basename}.tmp...`) would escape the
+        // managed remote root whenever the destination's parent IS the
+        // deployment root. The `XXXXXX` suffix is the mktemp template; it
+        // must survive shell quoting verbatim (single quotes are fine) so GNU
+        // and BSD mktemp both accept it.
+        let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
+        let mode_str = format!("{:o}", mode & 0o7777);
+        // The publish step: perl's raw `link(2)` (perl ships with every
+        // reasonable remote — the same interpreter the framed `lstat` helper
+        // already relies on). A shell `ln` would silently place the link
+        // INSIDE an existing directory destination (or follow a symlink);
+        // `link(2)` fails with EEXIST whenever the destination name exists in
+        // ANY form — a regular file, a directory, a symlink — so the
+        // immutable-record destination can never be silently created over a
+        // non-file entry. EEXIST is 17 on both Linux and macOS (POSIX),
+        // identical to the reserved [`SSH_TWRITE_CONFLICT_EXIT`]; any other
+        // link failure is the pre-install exit (a real publish error).
+        format!(
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
+            p = shell_quote(&parent),
+            tpl = shell_quote(&tmp_template),
+            mode = mode_str,
+            d = shell_quote(&remote_path_str),
+            conflict = SSH_TWRITE_CONFLICT_EXIT,
+            preinst = SSH_TWRITE_PREINSTALL_EXIT,
+            parent = shell_quote(&parent),
+        )
+    }
+
+    /// Build the perl-native command for the operation-lock `try_write_new`:
+    /// the ENTIRE seven-step durable create is performed inside the SAME Perl
+    /// process that owns the sidecar `flock`. The sidecar is created durably
+    /// (`mkdir -p`, `touch`, `chmod 644`) and never removed; the perl helper
+    /// acquires an exclusive `LOCK_EX|LOCK_NB` with a 2-second monotonic deadline
+    /// and 5ms retry interval (mirroring `SIDECAR_WAIT_TIMEOUT` /
+    /// `SIDECAR_RETRY_INTERVAL`): `EWOULDBLOCK`/`EAGAIN` waits
+    /// `interval.min(remaining)`, `EINTR` retries immediately, any other errno
+    /// fails with `sidecar flock failed`, contended past the deadline dies with
+    /// `sidecar contended`. The lock is held via the open file description until
+    /// the perl process exits — no `exec` is ever performed, so the descriptor is
+    /// never closed with `FD_CLOEXEC` before the mutation, and the flock stays
+    /// held through file fsync and parent-directory sync. Perl is used because it
+    /// ships on every Linux/macOS remote and provides portable `flock`.
+    ///
+    /// The parent-directory fsync (step 7) is performed INSIDE the Perl process
+    /// before exit by opening the directory and calling `IO::Handle->sync` on
+    /// the descriptor, so the flock is still held (the `sync` is durability,
+    /// not mutual exclusion, but keeping it inside avoids releasing the lock
+    /// before the directory entry is durable).
+    fn try_write_new_sidecar_cmd(&self, rel: &Path, mode: u32) -> String {
+        let sidecar = self
+            .root
+            .join(&self.layout.lock_sidecar)
+            .to_string_lossy()
+            .into_owned();
+        let lock = self.root.join(rel).to_string_lossy().into_owned();
+        let parent = std::path::Path::new(&lock)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let sidecar_q = shell_quote(&sidecar);
+        let parent_q = shell_quote(&parent);
+        let lock_q = shell_quote(&lock);
+        let mode_str = format!("{:o}", mode & 0o7777);
+        let mode_q = shell_quote(&mode_str);
+        let prelude =
+            sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
+        format!(
+            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; {prelude} binmode STDIN; my $data = do {{ local $/; <STDIN> }}; my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode}",
+            parent = parent_q,
+            sidecar = sidecar_q,
+            lock = lock_q,
+            mode = mode_q,
+            conflict = SSH_TWRITE_CONFLICT_EXIT,
+            preinst = SSH_TWRITE_PREINSTALL_EXIT,
+            prelude = prelude,
+        )
+    }
+
+    /// Build the remote `list` script for `rel`. The glob intentionally covers
+    /// hidden entries but excludes the `.` and `..` self/parent directories,
+    /// and each entry's real mode is fetched with `stat -c '%f'` (raw mode in
+    /// hex) so the caller can faithfully reconstruct permissions and types.
+    fn list_script(&self, rel: &Path) -> String {
+        let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        format!(
+            "for e in {p}/* {p}/.[!.]* {p}/..?*; do case \"$e\" in {p}/.|{p}/..) continue;; esac; [ -e \"$e\" ] || continue; n=$(basename \"$e\"); if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; m=$(stat -c '%f' \"$e\"); printf '%s\\t%s\\t%s\\n' \"$n\" \"$t\" \"$m\"; done"
+        )
+    }
+
+    /// Build the remote shell command implementing the atomic compare-and-
+    /// delete (the ssh mirror of `LocalTransport::remove_file_if`): CLAIM the
+    /// entry with `mv` to a mktemp-allocated same-directory name (the lock is
+    /// always a regular file, so plain `mv` — portable GNU and BSD — moves it
+    /// without the `-T` the symlink-to-directory `current` swap needs; only
+    /// ONE contender can win the claim; a failed mv with the destination
+    /// still present is a Mismatch verdict, with the destination absent an
+    /// Absent verdict), VERIFY with `cmp`, then either DELETE the claim
+    /// (match → frame `R`) or RESTORE it no-replace with `ln` (mismatch →
+    /// frame `M`; a concurrent install makes `ln` fail — the winner is never
+    /// replaced and the claim is discarded). The single stdout frame is
+    /// parsed strictly; a malformed frame is an error, never a silent
+    /// verdict.
+    fn remove_file_if_cmd(root: &Path, rel: &Path, expected: &[u8]) -> String {
+        let remote_path_str = root.join(rel).to_string_lossy().into_owned();
+        let parent = Path::new(&remote_path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let basename = Path::new(&remote_path_str)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "record".to_string());
+        // The claim temp lives INSIDE the destination's parent directory and
+        // is dot-prefixed, exactly like write_new_cmd's temp.
+        let tmp_template = format!(
+            "{}/.{}.claim.XXXXXX",
+            parent.trim_end_matches('/'),
+            basename
+        );
+        let expected_str = String::from_utf8_lossy(expected).into_owned();
+        format!(
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && rm -f \"$tmp\" && if mv {d} \"$tmp\" 2>/dev/null; then if printf '%s' {exp} | cmp -s \"$tmp\" -; then rm -f \"$tmp\"; printf 'R'; else ln \"$tmp\" {d} 2>/dev/null; rm -f \"$tmp\"; printf 'M'; fi; else if [ -e {d} ] || [ -L {d} ]; then printf 'M'; else printf 'A'; fi; fi",
+            p = shell_quote(&parent),
+            tpl = shell_quote(&tmp_template),
+            d = shell_quote(&remote_path_str),
+            exp = shell_quote(&expected_str),
+        )
+    }
+
+    /// Build the remote framed `lstat` helper for `rel`: ONE remote exec
+    /// whose single stdout frame reports the OUTCOME WITH THE ERRNO (see the
+    /// [`LSTAT_ERRNO_ENOENT`] protocol doc on this module). The helper is a
+    /// `perl -e` one-liner (perl ships with every reasonable Linux/macOS
+    /// remote — the same interpreter the test fixtures already use) that
+    /// performs a REAL `lstat` and prints `P`/`A`/`E` frames, exiting 0 for
+    /// all three outcomes — the FRAME is the signal, an exit code carries no
+    /// errno. The path is passed as a positional argument after `--` (already
+    /// single-quoted), so the shell and perl both see it verbatim.
+    fn lstat_script(&self, rel: &Path) -> String {
+        let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        format!(
+            "perl -e 'my @s = lstat($ARGV[0]); if (@s) {{ printf \"P\\t%s\\t%x\\n\", $s[7], $s[2] & 0xffff; exit 0; }} my $e = $! + 0; print(($e == 2 || $e == 20) ? \"A\\t$e\\n\" : \"E\\t$e\\n\");' -- {p}"
+        )
+    }
+
+    /// Build the remote DESCRIPTOR-BOUND verification helper for `rel`: ONE
+    /// remote exec whose SINGLE stdout payload performs the open→fstat→read
+    /// sequence on ONE opened inode — `sysopen` with `O_NOFOLLOW` (a symlink
+    /// → ELOOP, NEVER followed — even one pointing at a matching regular
+    /// file; `O_NONBLOCK` so a fifo/device open cannot block the helper),
+    /// `stat` on the SAME handle (fstat), and `sysread` THROUGH the same
+    /// handle — closing the client-side TOCTOU the old
+    /// lstat-then-separate-read left open (there is NO client round-trip
+    /// between the steps: one frame carries the fd-derived mode AND content,
+    /// or the errno). The remote-side race between the helper's OWN steps is
+    /// out of scope — the guarantee is that metadata and content come from
+    /// the SAME opened inode. Frame (stdout bytes):
+    ///
+    /// * `O\t<rawmode_hex>\n<content>` — a REGULAR file: the raw mode from
+    ///   the opened fd's fstat, then the content read through the SAME fd
+    ///   (raw bytes, possibly empty);
+    /// * `N\t<rawmode_hex>` — opened + fstat'd but NOT a regular file (the
+    ///   mode bits classify dir/symlink/other);
+    /// * `E\t<errno>` — the open/fstat/read failed (ELOOP → symlink,
+    ///   ENOENT/ENOTDIR → absent, EISDIR → directory, EACCES/... →
+    ///   unreadable; the errno numbers are POSIX, identical on Linux and
+    ///   macOS).
+    ///
+    /// The path is a positional argument after `--` (single-quoted); the
+    /// perl is multi-line inside the single-quoted `-e` argument (shell
+    /// single quotes span newlines).
+    fn verify_open_script(&self, rel: &Path) -> String {
+        let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        format!(
+            "perl -e 'use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);\n\
+             my $p = $ARGV[0];\n\
+             if (!sysopen(FH, $p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+             my @s = stat(FH);\n\
+             if (!@s) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+             my $type = $s[2] & 0170000;\n\
+             if ($type == 0100000) {{\n\
+               my $content = \"\";\n\
+               while (1) {{\n\
+                 my $n = sysread(FH, my $buf, 65536);\n\
+                 if (!defined $n) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                 last if $n == 0;\n\
+                 $content .= $buf;\n\
+               }}\n\
+               printf \"O\\t%x\\n%s\", $s[2] & 0xffff, $content;\n\
+               exit 0;\n\
+             }}\n\
+             printf \"N\\t%x\\n\", $s[2] & 0xffff;\n\
+             ' -- {p}"
+        )
+    }
+
+    /// Classify a raw mode (`stat -c '%f'`-equivalent, the `S_IFMT` type
+    /// bits) into a [`RemoteMeta`] — the shared classification of the framed
+    /// lstat protocol AND the descriptor-bound verify-open protocol.
+    fn meta_from_raw_mode(raw: u32) -> RemoteMeta {
+        let mode = raw & 0o7777;
+        let is_symlink = (raw & 0o170000) == 0o120000;
+        let is_dir = (raw & 0o170000) == 0o040000;
+        RemoteMeta {
+            is_dir,
+            is_symlink,
+            is_file: !is_symlink && !is_dir,
+            size: 0,
+            mode,
+        }
+    }
+
+    /// The [`NotRegularFileKind`] of a [`RemoteMeta`] (directory / symlink /
+    /// other) — the verify-open parser's type classification.
+    fn kind_of(meta: &RemoteMeta) -> crate::transport::NotRegularFileKind {
+        use crate::transport::NotRegularFileKind;
+        if meta.is_dir {
+            NotRegularFileKind::Directory
+        } else if meta.is_symlink {
+            NotRegularFileKind::Symlink
+        } else {
+            NotRegularFileKind::Other
+        }
+    }
+
+    /// Parse the SINGLE-frame stdout produced by
+    /// [`SshTransport::verify_open_script`] into the descriptor-bound
+    /// [`OpenedExisting`] the shared verification maps: `O` (a regular file
+    /// opened with `O_NOFOLLOW` and fstat'd+read through the SAME
+    /// descriptor — mode from the raw mode bits, content the raw bytes after
+    /// the header line), `N` (opened+fstat'd non-regular entry — dir/symlink/
+    /// other by the mode bits), or `E` (open/fstat/read failed —
+    /// ENOENT/ENOTDIR → NotFound, ELOOP → NotRegularFile{Symlink} (the
+    /// `O_NOFOLLOW` open, never followed), EISDIR → NotRegularFile{Directory},
+    /// every other errno → Unreadable). Anything malformed — garbage, wrong
+    /// prefix, extra fields, missing newline — is an error, never a silent
+    /// default.
+    fn parse_verify_open_frame(stdout: &[u8]) -> Result<OpenedExisting> {
+        let malformed = |detail: &str| {
+            Error::transport(format!(
+                "ssh verify-open: malformed frame: {detail} (stdout {:?})",
+                String::from_utf8_lossy(stdout)
+            ))
+        };
+        let nl = stdout
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| malformed("no newline"))?;
+        let header =
+            std::str::from_utf8(&stdout[..nl]).map_err(|_| malformed("non-utf8 header"))?;
+        let content = stdout[nl + 1..].to_vec();
+        let mut it = header.split('\t');
+        match it.next() {
+            // A REGULAR file: fd-derived mode + fd-derived content.
+            Some("O") => {
+                let raw = it
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| malformed(header))?;
+                if it.next().is_some() {
+                    return Err(malformed(header));
+                }
+                let meta = Self::meta_from_raw_mode(raw);
+                if !meta.is_file {
+                    // Defense in depth: the helper only emits O for a regular
+                    // file; a non-regular mode is still classified.
+                    return Ok(OpenedExisting::NotRegular {
+                        kind: Self::kind_of(&meta),
+                    });
+                }
+                Ok(OpenedExisting::Entry(OpenedEntry { meta, content }))
+            }
+            // Opened + fstat'd, NOT a regular file: the mode bits classify.
+            Some("N") => {
+                let raw = it
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| malformed(header))?;
+                if it.next().is_some() {
+                    return Err(malformed(header));
+                }
+                let meta = Self::meta_from_raw_mode(raw);
+                Ok(OpenedExisting::NotRegular {
+                    kind: Self::kind_of(&meta),
+                })
+            }
+            // The open/fstat/read failed: the errno maps to the typed reason.
+            Some("E") => {
+                let errno = it
+                    .next()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .ok_or_else(|| malformed(header))?;
+                if it.next().is_some() {
+                    return Err(malformed(header));
+                }
+                // POSIX errnos: ENOENT=2, ENOTDIR=20, EISDIR=21 on both
+                // Linux and macOS; ELOOP differs (40 on Linux, 62 on macOS)
+                // — both mean the O_NOFOLLOW open hit a symlink (EACCES=13 /
+                // EPERM=1 / EIO=... → Unreadable).
+                Ok(match errno {
+                    LSTAT_ERRNO_ENOENT | LSTAT_ERRNO_ENOTDIR => OpenedExisting::NotFound,
+                    40 | 62 => OpenedExisting::NotRegular {
+                        kind: crate::transport::NotRegularFileKind::Symlink,
+                    },
+                    21 => OpenedExisting::NotRegular {
+                        kind: crate::transport::NotRegularFileKind::Directory,
+                    },
+                    other => OpenedExisting::Unreadable(format!(
+                        "ssh verify-open failed (errno {other})"
+                    )),
+                })
+            }
+            _ => Err(malformed(header)),
+        }
+    }
+
+    /// Parse the ONE-LINE framed record produced by [`SshTransport::lstat_script`]
+    /// (see the module doc): a `P` frame parses strictly into a [`RemoteMeta`]
+    /// (exactly two TAB-separated payload fields — decimal size, hex raw
+    /// mode), an `A` frame with errno ENOENT/ENOTDIR is the ONLY `Ok(None)`
+    /// (confirmed absence), an `A` frame with any other errno and every `E`
+    /// frame are errors (a permission/IO failure is NEVER absence), and
+    /// anything malformed — garbage, missing fields, wrong prefix, extra
+    /// fields, extra lines — is an error, never a silent default.
+    fn parse_lstat_frame(stdout: &str) -> Result<Option<RemoteMeta>> {
+        let lines: Vec<&str> = stdout.lines().collect();
+        let [line] = lines.as_slice() else {
+            return Err(Error::transport(format!(
+                "ssh lstat: malformed frame: expected exactly one line, got {lines:?}"
+            )));
+        };
+        let mut it = line.split('\t');
+        match it.next() {
+            // Present: strictly parse `size` (decimal) + `rawmode` (hex).
+            Some("P") => {
+                let size = it
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::transport(format!("ssh lstat: malformed present frame: {line:?}"))
+                    })?;
+                let raw = it
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| {
+                        Error::transport(format!("ssh lstat: malformed present frame: {line:?}"))
+                    })?;
+                if it.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh lstat: malformed present frame: {line:?}"
+                    )));
+                }
+                let mut meta = Self::meta_from_raw_mode(raw);
+                meta.size = size;
+                Ok(Some(meta))
+            }
+            // Absent: ONLY ENOENT/ENOTDIR are confirmed absence; an `A` frame
+            // carrying any other errno is a helper bug/mismatch -> error.
+            Some("A") => {
+                let errno = it.next().and_then(Self::parse_lstat_errno).ok_or_else(|| {
+                    Error::transport(format!("ssh lstat: malformed absent frame: {line:?}"))
+                })?;
+                if it.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh lstat: malformed absent frame: {line:?}"
+                    )));
+                }
+                match errno {
+                    LSTAT_ERRNO_ENOENT | LSTAT_ERRNO_ENOTDIR => Ok(None),
+                    other => Err(Error::transport(format!(
+                        "ssh lstat: absent frame with non-absence errno {other}: {line:?}"
+                    ))),
+                }
+            }
+            // Error: ANY errno here is an error — EACCES/EIO/... are never
+            // absence.
+            Some("E") => {
+                let errno = it.next().and_then(Self::parse_lstat_errno).ok_or_else(|| {
+                    Error::transport(format!("ssh lstat: malformed error frame: {line:?}"))
+                })?;
+                if it.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh lstat: malformed error frame: {line:?}"
+                    )));
+                }
+                Err(Error::transport(format!(
+                    "ssh lstat failed (errno {errno}): {line:?}"
+                )))
+            }
+            _ => Err(Error::transport(format!(
+                "ssh lstat: malformed frame: {line:?}"
+            ))),
+        }
+    }
+
+    /// Parse an `<errno>` frame field: a decimal errno NUMBER (cross-platform
+    /// — ENOENT=2 and ENOTDIR=20 are identical on Linux and macOS), or the
+    /// POSIX name (`ENOENT`/`ENOTDIR`). Anything else is malformed.
+    fn parse_lstat_errno(s: &str) -> Option<i32> {
+        if let Ok(n) = s.parse::<i32>() {
+            return Some(n);
+        }
+        match s {
+            "ENOENT" => Some(LSTAT_ERRNO_ENOENT),
+            "ENOTDIR" => Some(LSTAT_ERRNO_ENOTDIR),
+            _ => None,
+        }
+    }
+
+    /// Parse the tab-delimited output produced by [`SshTransport::list_script`].
+    /// Each line is `name<TAB>type<TAB>rawmode_hex`; `.` and `..` are never
+    /// emitted by the script, but are skipped here defensively.
+    fn parse_list_output(stdout: &str) -> Vec<RemoteEntry> {
+        let mut entries = Vec::new();
+        for line in stdout.lines() {
+            let mut it = line.split('\t');
+            let name = match it.next() {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            let t = it.next().unwrap_or("f");
+            let raw = it
+                .next()
+                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                .unwrap_or(0);
+            let mode = raw & 0o7777;
+            let is_dir = t == "d";
+            let is_symlink = t == "l";
+            entries.push(RemoteEntry {
+                name,
+                is_dir,
+                is_symlink,
+                size: 0,
+                mode,
+            });
+        }
+        entries
+    }
+}
+
+impl Remote for SshTransport {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn is_local(&self) -> bool {
+        false
+    }
+
+    fn prepare_identity(&self) -> Result<()> {
+        // Create the local ControlMaster socket directory (0700) before any
+        // ssh op: the multiplexing sockets live here, keyed by
+        // `user@host:port`. Local-only, like the known-hosts pin below — a
+        // dry run's status inspection still connects over ssh and therefore
+        // needs the mux dir to exist.
+        std::fs::create_dir_all(&self.mux_socket_dir).map_err(|e| {
+            Error::transport(format!(
+                "create ssh mux dir {}: {e}",
+                self.mux_socket_dir.display()
+            ))
+        })?;
+        crate::platform::chmod(&self.mux_socket_dir, 0o700).map_err(|e| {
+            Error::transport(format!(
+                "chmod ssh mux dir {}: {e}",
+                self.mux_socket_dir.display()
+            ))
+        })?;
+        // If a fingerprint was supplied without an explicit known-hosts file,
+        // verify the host key and pin it in a managed file BEFORE any remote
+        // request — including a dry run's status inspection, which still
+        // connects over ssh and therefore needs the pinned key.
+        if self.known_hosts.is_none() && self.host_key_fingerprint.is_some() {
+            self.pin_known_hosts()?;
+        }
+        Ok(())
+    }
+
+    fn provision_layout(&self) -> Result<()> {
+        // Create the caller-supplied deployment-directory layout on the
+        // remote host. Every path is single-quoted by
+        // `argv_cmd`/`shell_quote` so it reaches `mkdir` verbatim. This runs
+        // only after the push engine's non-dry-run gate.
+        let mut argv: Vec<String> = vec!["mkdir".into(), "-p".into()];
+        argv.extend(
+            self.layout
+                .bootstrap_dirs
+                .iter()
+                .map(|d| self.root.join(d).to_string_lossy().into_owned()),
+        );
+        self.run_remote_ok(&Self::argv_cmd(&argv))?;
+        // The IMMUTABLE receiver-id marker: the PHYSICAL identity of this
+        // deploy_dir, created ONCE at provisioning and never changed (a
+        // re-provisioning adopts the existing marker).
+        if let Some(marker) = &self.layout.receiver_marker {
+            provision_receiver_id(self, marker)?;
+        }
+        Ok(())
+    }
+
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        self.download_bytes(rel.as_path())
+    }
+
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        self.upload_bytes(rel.as_path(), data, mode)
+    }
+
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), p]))
+    }
+
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), "-p".into(), p]))
+    }
+
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        self.run_remote_ok(&Self::argv_cmd(&[
+            "chmod".into(),
+            format!("{:o}", mode & 0o7777),
+            p,
+        ]))
+    }
+
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        let out = self.run_remote(&self.list_script(rel.as_path()))?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh list failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(Self::parse_list_output(&String::from_utf8_lossy(
+            &out.stdout,
+        )))
+    }
+
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        self.run_remote_ok(&SshTransport::rename_cmd(
+            &self.root,
+            from.as_path(),
+            to.as_path(),
+        ))
+    }
+
+    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        // `find -depth` visits entries DEEPEST-FIRST (children before
+        // parents), so `-exec sync {} \;` fsyncs every file and directory
+        // in the right order — the whole staged bundle is durable before the
+        // atomic install rename. `sync FILE` fsyncs the path on Linux
+        // (coreutils >= 8.24) and macOS (forces pending writes), the same
+        // primitive `write_new_cmd` already relies on.
+        let cmd = Self::argv_cmd(&[
+            "find".into(),
+            p,
+            "-depth".into(),
+            "-exec".into(),
+            "sync".into(),
+            "{}".into(),
+            ";".into(),
+        ]);
+        self.run_remote_ok(&cmd)
+    }
+
+    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        let parent = Path::new(&p)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        // `sync <dir>` fsyncs the directory on Linux (coreutils >= 8.24) and
+        // macOS (forces pending writes) — the same primitive `write_new_cmd`
+        // already relies on for its parent-dir sync. FAIL-CLOSED: a failed
+        // sync is a propagated error (the mutation's durability is
+        // unconfirmed).
+        let cmd = Self::argv_cmd(&["sync".into(), parent]);
+        self.run_remote_ok(&cmd)
+    }
+
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        let t = target.to_string_lossy().into_owned();
+        let l = self.root.join(link).to_string_lossy().into_owned();
+        let parent = Path::new(&l)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let cmd = format!(
+            "mkdir -p {parent} && ln -sfn {t} {l}",
+            parent = shell_quote(&parent),
+            t = shell_quote(&t),
+            l = shell_quote(&l),
+        );
+        self.run_remote_ok(&cmd)
+    }
+
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        let out = self.run_remote(&Self::argv_cmd(&["readlink".into(), p]))?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh readlink failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let target = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(PathBuf::from(target))
+    }
+
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        // Ignore "not found".
+        let out = self.run_remote(&Self::argv_cmd(&["rm".into(), "-f".into(), p]))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("No such file") && !stderr.contains("No such") {
+                return Err(Error::transport(format!("ssh rm failed: {stderr}")));
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        let cmd = if rel.as_path() == self.layout.lock.as_path() {
+            remove_file_if_sidecar_cmd(
+                &self.root,
+                &self.layout.lock_sidecar,
+                &self.layout.lock,
+                expected,
+            )
+        } else {
+            Self::remove_file_if_cmd(&self.root, rel.as_path(), expected)
+        };
+        let out = self.run_remote(&cmd)?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh remove_file_if failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "R" => Ok(RemoveIfVerdict::Removed),
+            "M" => Ok(RemoveIfVerdict::Mismatch),
+            "A" => Ok(RemoveIfVerdict::Absent),
+            other => Err(Error::transport(format!(
+                "ssh remove_file_if: malformed verdict frame {other:?}"
+            ))),
+        }
+    }
+
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        self.run_remote_ok(&Self::argv_cmd(&["rm".into(), "-rf".into(), p]))
+    }
+
+    fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            self.create_dir_all(&parent)?;
+        }
+        let s = self.root.join(src).to_string_lossy().into_owned();
+        let d = self.root.join(dest).to_string_lossy().into_owned();
+        // Same-filesystem `cp -a` on the remote: no bytes cross the link, and
+        // `-a` preserves modes, ownership, timestamps, and symlinks (GNU and
+        // BSD cp both handle read-only source dirs by creating the dest dirs
+        // writable and chmodding them at the end). The destination must not
+        // already exist (the caller removes a stale staging dir first).
+        self.run_remote_ok(&Self::argv_cmd(&["cp".into(), "-a".into(), s, d]))
+    }
+
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        let out = self.run_remote(&Self::argv_cmd(&["test".into(), "-e".into(), p]));
+        matches!(out, Ok(o) if o.status.success())
+    }
+
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        self.metadata_opt(rel)?.ok_or_else(|| {
+            Error::NotFound(format!(
+                "ssh stat {}: no such entry",
+                self.root.join(rel).to_string_lossy()
+            ))
+        })
+    }
+
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
+        // ONE remote exec: the framed perl `lstat` helper reports the OUTCOME
+        // WITH THE ERRNO (a `P`/`A`/`E` frame on stdout, exit 0 for every
+        // outcome). The frame is the signal — no shell booleans, no reserved
+        // exit code — so a permission failure (EACCES) can never be mistaken
+        // for absence. A transport failure, a signal-killed command, or any
+        // nonzero exit is an error; the single stdout frame is parsed
+        // strictly (malformed output is never a silent default).
+        let out = self.run_remote(&self.lstat_script(rel.as_path()))?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh lstat failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Self::parse_lstat_frame(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<crate::transport::ExecOutcome> {
+        if argv.is_empty() {
+            return Err(Error::transport("empty command"));
+        }
+        // Preserve argv boundaries: quote every argument and run them via `exec`
+        // so the program receives exactly `argv` and the remote shell cannot
+        // reinterpret spaces/metacharacters inside an argument.
+        let command = format!("exec {}", Self::argv_cmd(argv));
+        let full = self.ssh_command_argv(&command)?;
+        // Runs through THE shared runner with the caller-supplied timeout: on
+        // deadline the child is killed and reaped (deterministically) before the
+        // Timeout outcome is returned, so `exec` can never hang the push either.
+        match self.runner.run(OpKind::Exec, &full, None, Some(timeout)) {
+            Ok(out) => Ok(crate::transport::ExecOutcome {
+                exit_code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
+            Err(RunError::Spawn(m)) => Err(Error::transport(m)),
+            Err(RunError::StdinWrite(m)) => Err(Error::transport(m)),
+            Err(RunError::Wait(m)) => Err(Error::transport(m)),
+            Err(RunError::Timeout { after }) => Ok(crate::transport::ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: format!("timed out after {after:?}"),
+            }),
+        }
+    }
+
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        let p = self.root.to_string_lossy().into_owned();
+        let out = self.run_remote(&Self::argv_cmd(&["df".into(), "-kP".into(), p]))?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh df failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text
+            .lines()
+            .nth(1)
+            .ok_or_else(|| Error::transport("unexpected ssh df output".to_string()))?;
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // blocks is the 2nd column and avail the 4th (1-indexed) on both
+        // macOS and Linux; both are in 1024-byte units.
+        let total_kb = cols
+            .get(1)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| Error::transport("could not parse ssh df blocks".to_string()))?;
+        let avail_kb = cols
+            .get(3)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| Error::transport("could not parse ssh df avail".to_string()))?;
+        Ok(FsBytes {
+            total: total_kb * 1024,
+            available: avail_kb * 1024,
+        })
+    }
+
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        self.try_write_new_with(rel, data, ContentEquivalence::Exact)
+    }
+
+    fn try_write_new_with(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
+        let cmd = if rel.as_path() == self.layout.lock.as_path() {
+            self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE)
+        } else {
+            Self::write_new_cmd(&self.root, rel.as_path(), IMMUTABLE_RECORD_MODE)
+        };
+        let argv = self.ssh_command_argv(&cmd)?;
+        // The payload travels through the runner's STDIN — never through the
+        // command string (see `write_new_cmd`): the raw `data` bytes are
+        // piped to the remote `cat > "$tmp"` exactly, so arbitrary `Vec<u8>`
+        // (NULs, non-UTF8, quotes, shell metacharacters, long payloads)
+        // round-trips byte-for-byte through the ssh transport — the same
+        // byte-preserving contract the LOCAL transport delivers via
+        // `durable_create_new`. The runner pipes the payload as part of the
+        // bounded wait, so a remote that stops reading stdin is killed at the
+        // command deadline like any other stalled operation.
+        let out = self
+            .runner
+            .run(OpKind::Upload, &argv, Some(data), None)
+            .map_err(|e| match e {
+                RunError::Spawn(m) => Error::transport(format!("ssh try_write_new spawn: {m}")),
+                RunError::StdinWrite(m) => {
+                    Error::transport(format!("ssh try_write_new stdin write: {m}"))
+                }
+                RunError::Wait(m) => Error::transport(format!("ssh try_write_new wait: {m}")),
+                RunError::Timeout { after } => {
+                    Error::transport(format!("ssh try_write_new timed out after {after:?}"))
+                }
+            })?;
+        if out.status.success() {
+            // All seven steps completed: the record is installed with the
+            // final mode and a parent-directory-sync'd durable entry.
+            return Ok(CreateNewVerdict::Created);
+        }
+        // A pre-install failure (the temp allocation, the payload write, the
+        // final chmod, or the file fsync) or the final parent-dir sync failure
+        // exits with a code other than the reserved conflict code: the
+        // operation never reached (or never finished) the publish decision
+        // point, so this is a propagated ERROR — never a verdict. The
+        // transport never guesses the destination's state from a failed
+        // pre-install.
+        if out.status.code() != Some(SSH_TWRITE_CONFLICT_EXIT) {
+            return Err(Error::transport(format!(
+                "ssh try_write_new failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        // CONFIRMED EEXIST: the no-clobber publish (perl `link(2)`) found
+        // the destination already present — the verdict decision point. The
+        // winner is NEVER replaced.
+        // VERIFY the existing entry through THE ONE CENTRALIZED
+        // DESCRIPTOR-BOUND verification
+        // ([`crate::transport::verify_existing`]): ONE remote helper
+        // operation ([`SshTransport::verify_open_script`]) performs the
+        // open-with-O_NOFOLLOW → fstat-the-same-fd → read-through-the-same-fd
+        // sequence and emits ONE frame carrying the fd-derived mode + content
+        // (or the errno) — there is NO client round-trip between the metadata
+        // check and the read (the old lstat-then-separate-read left a
+        // client-side TOCTOU window open; a symlink is never followed — the
+        // `O_NOFOLLOW` open fails it with ELOOP). A regular file with the
+        // EXACT required mode and the caller's accepted content equivalence →
+        // AlreadyPresent (and the PARENT DIRECTORY is synced here, so the
+        // convergent retry returns with a durable entry — the same
+        // parent-sync guarantee a fresh Created install gets); every other
+        // outcome → Conflict carrying the TYPED reason (a different-content
+        // winner, a mode mismatch, a directory/symlink/other entry, an
+        // unreadable entry — never an undifferentiated conflict).
+        let verified = verify_existing(
+            || {
+                let out = self.run_remote(&self.verify_open_script(rel.as_path()))?;
+                if !out.status.success() {
+                    return Err(Error::transport(format!(
+                        "ssh verify-open failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )));
+                }
+                Self::parse_verify_open_frame(&out.stdout)
+            },
+            data,
+            IMMUTABLE_RECORD_MODE,
+            equivalence,
+        )?;
+        let verdict = verified_to_verdict(verified);
+        if let CreateNewVerdict::AlreadyPresent = &verdict {
+            let remote_path_str = self.root.join(rel).to_string_lossy().into_owned();
+            let parent = Path::new(&remote_path_str)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string());
+            self.run_remote_ok(&format!("sync {}", shell_quote(&parent)))?;
+            return Ok(CreateNewVerdict::AlreadyPresent);
+        }
+        Ok(verdict)
+    }
+
+    fn atomic_recover(
+        &self,
+        rel: &RootedRelativePath,
+        observed: &[u8],
+        new_data: &[u8],
+    ) -> Result<Option<()>> {
+        // Only the operation lock's recover is sidecar-serialized; other paths are not supported.
+        if rel.as_path() != self.layout.lock.as_path() {
+            return Ok(None);
+        }
+        let cmd = recover_sidecar_cmd(
+            &self.root,
+            &self.layout.lock_sidecar,
+            &self.layout.lock,
+            observed,
+            new_data,
+        );
+        let out = self.run_remote(&cmd)?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh atomic_recover failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "OK" => Ok(Some(())),
+            "MISMATCH" => Err(Error::transport(
+                "recovery refused: the lock no longer carries the observed record — a successor is never removed; re-read and re-confirm",
+            )),
+            "ABSENT" => Err(Error::transport(
+                "no lock to recover: the slot is already free (the observed record is gone) — no recovery needed",
+            )),
+            other => Err(Error::transport(format!(
+                "ssh atomic_recover: malformed verdict {other:?}"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_ssh {
+    use super::*;
+    use crate::transport::ssh::runner::SSH_COMMAND_TIMEOUT_SECS;
+    #[cfg(test)]
+    use proptest::prelude::*;
+    #[cfg(test)]
+    use proptest::test_runner::RngSeed;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    /// The unit tests construct transports with a dummy cache dir + a process
+    /// snapshot: they never pin (a known_hosts file is always configured), so
+    /// neither the cache path nor the snapshot's contents matter.
+    fn test_env() -> SysEnv {
+        SysEnv::from_process()
+    }
+
+    fn transport() -> SshTransport {
+        // Use a (dummy) known_hosts file so `new` does not attempt a live
+        // ssh-keyscan pin; the unit tests below only exercise command
+        // construction and list parsing, not real key pinning.
+        SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            Layout::empty(),
+            Some(Path::new("/dev/null")),
+            None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
+            false,
+        )
+        .unwrap()
+    }
+
+    // Host identity must be EXACTLY ONE source: both set is ambiguous, neither
+    // set is trust-on-first-use (disabled). Construction fails closed on both.
+    #[test]
+    fn new_rejects_root_deploy_dir() {
+        // The filesystem root is refused at construction (defense in depth,
+        // mirroring the AbsoluteDeployDir parse rule): a transport rooted
+        // at `/` would make the deployment cleanup operate on the system
+        // root.
+        let err = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/"),
+            Layout::empty(),
+            Some(Path::new("/dev/null")),
+            None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
+            false,
+        )
+        .err()
+        .expect("the filesystem root must be refused as a deploy_dir");
+        assert!(
+            err.to_string()
+                .contains("at least one normal path component"),
+            "error must name the rule, got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_both_identity_sources() {
+        let err = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            Layout::empty(),
+            Some(Path::new("/etc/ssh/known_hosts")),
+            Some("SHA256:abc"),
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
+            false,
+        )
+        .err()
+        .expect("both identity sources must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of known_hosts or host_key_fingerprint")
+                && msg.contains("both are set"),
+            "error must explain the ambiguity, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_missing_identity() {
+        let err = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            Layout::empty(),
+            None,
+            None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
+            false,
+        )
+        .err()
+        .expect("missing identity must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of `known_hosts` or `host_key_fingerprint`")
+                && msg.contains("trust-on-first-use is disabled"),
+            "error must refuse trust-on-first-use, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ssh_args_carries_port() {
+        let t = transport();
+        let args = t.ssh_args().unwrap();
+        let p = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[p + 1], "2222");
+        // The ssh connection target keeps the user@host form.
+        assert!(args.iter().any(|a| a == "deploy@db.example.com"));
+    }
+
+    // The fixed ssh arguments must bound the connection phase: a dead or
+    // unreachable host aborts after `SSH_CONNECT_TIMEOUT_SECS` instead of
+    // hanging the transport indefinitely.
+    #[test]
+    fn ssh_args_carries_connect_timeout() {
+        let t = transport();
+        let args = t.ssh_args().unwrap();
+        assert!(
+            args.windows(2).any(|w| {
+                w[0] == "-o" && w[1] == format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}")
+            }),
+            "ssh args must carry -o ConnectTimeout={}, got: {args:?}",
+            SSH_CONNECT_TIMEOUT_SECS
+        );
+    }
+
+    /// The size-aware upload deadline must scale with the payload at the
+    /// minimum transfer rate: a small payload keeps the command deadline, a
+    /// large payload extends it proportionally (a slow-but-healthy link is
+    /// never killed mid-transfer), and the bound still grows past the base
+    /// window the moment the payload needs more than it. The RUNNER's command
+    /// deadline is the floor — a test seam's tiny injected deadline applies to
+    /// uploads too.
+    #[test]
+    fn upload_deadline_scales_with_payload_size() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        // Small payloads (and empty ones) keep the command deadline.
+        assert_eq!(upload_deadline(0, 64 * 1024, base), base);
+        assert_eq!(upload_deadline(64 * 1024, 64 * 1024, base), base);
+        // A payload that needs more than the base window at the minimum rate
+        // extends the deadline proportionally (24MB at 64KB/s).
+        let mb24 = 24 * 1024 * 1024;
+        assert_eq!(
+            upload_deadline(mb24, 64 * 1024, base),
+            Duration::from_secs(mb24 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
+        );
+        // The boundary: a payload needing more than the base window at the
+        // minimum rate extends the deadline past the command deadline
+        // (integer division: the deadline grows only past a full rate-unit).
+        let boundary = SSH_COMMAND_TIMEOUT_SECS * SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC;
+        assert_eq!(upload_deadline(boundary, 64 * 1024, base), base);
+        assert!(
+            upload_deadline(
+                boundary + SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC,
+                64 * 1024,
+                base
+            ) > base
+        );
+        // A lower configured min-rate extends the deadline proportionally
+        // (the slow-link override: 24MB at 32KB/s is twice the 64KB/s bound).
+        assert_eq!(
+            upload_deadline(mb24, 32 * 1024, base),
+            Duration::from_secs(mb24 / (32 * 1024))
+        );
+        // The RUNNER's command deadline is the floor for an upload whose
+        // payload needs less than it (the seam's tiny injected deadline
+        // applies to uploads — the fake Hang child waits for THIS bound,
+        // never a production constant); a payload that needs MORE than the
+        // floor still scales past it.
+        let tiny = Duration::from_millis(25);
+        assert_eq!(upload_deadline(0, 64 * 1024, tiny), tiny);
+        assert_eq!(upload_deadline(7, 64 * 1024, tiny), tiny);
+        assert!(
+            upload_deadline(mb24, 64 * 1024, tiny) > tiny,
+            "a payload needing more than the floor scales past it"
+        );
+    }
+
+    /// A size-scaled upload timeout names the file, the size, the deadline
+    /// math, and the `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` fix with a concrete
+    /// suggestion — an agent hitting a slow link can recover without reading
+    /// the source.
+    #[test]
+    fn upload_timeout_error_names_file_and_rate_fix() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        let err = upload_timeout_error(
+            Duration::from_secs(372),
+            24 * 1024 * 1024,
+            "/srv/app/app/bin/linux/armv7/proxy",
+            Duration::from_secs(372),
+            base,
+            64 * 1024,
+        );
+        let msg = err.to_string();
+        // The file and byte size are attributable.
+        assert!(msg.contains("/srv/app/app/bin/linux/armv7/proxy"));
+        assert!(msg.contains("25165824 bytes"));
+        // The deadline math and the override are named.
+        assert!(msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC"));
+        assert!(msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC=32768"));
+        // It is identified as a size-scaled (slow-link) timeout, not a hang.
+        assert!(msg.contains("size-scaled"));
+    }
+
+    /// A bare command-deadline timeout is diagnosed as a hung remote (the
+    /// remote stopped reading stdin), NOT as a slow link — a rate override
+    /// cannot fix a hang, so the message must not send the user there.
+    #[test]
+    fn upload_timeout_error_distinguishes_hung_remote() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        let err =
+            upload_timeout_error(base, 512, "/srv/app/app/config.toml", base, base, 64 * 1024);
+        let msg = err.to_string();
+        assert!(msg.contains("base command deadline"));
+        assert!(msg.contains("stopped reading stdin"));
+        // The slow-link fix must NOT be suggested for a hang.
+        assert!(!msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC="));
+    }
+
+    // Finding 3: `.` and `..` are excluded, and real modes are preserved.
+    #[test]
+    fn list_excludes_dot_entries_and_keeps_modes() {
+        // name<TAB>type<TAB>rawmode_hex; 0o81ed = 100755 (executable), 0o81a4 = 100644.
+        let out = "app\tfff\t81ed\n.\td\t41ed\n..\td\t41ed\nhidden\tl\t41ed\nreadme\tf\t81a4\n";
+        let entries = SshTransport::parse_list_output(out);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"."), ". must be excluded");
+        assert!(!names.contains(&".."), ".. must be excluded");
+        assert!(names.contains(&"app"));
+        assert!(names.contains(&"hidden"));
+        assert!(names.contains(&"readme"));
+
+        let app = entries.iter().find(|e| e.name == "app").unwrap();
+        assert!(!app.is_dir && !app.is_symlink);
+        assert_eq!(app.mode, 0o755, "executable mode preserved");
+        let readme = entries.iter().find(|e| e.name == "readme").unwrap();
+        assert_eq!(readme.mode, 0o644, "file mode preserved");
+        let hidden = entries.iter().find(|e| e.name == "hidden").unwrap();
+        assert!(hidden.is_symlink, "symlink type preserved");
+    }
+
+    // Finding 3: the list script covers hidden files/executables/symlinks and
+    // never emits `.`/`..`.
+    #[test]
+    fn list_script_excludes_self_and_parent() {
+        let t = transport();
+        let script = t.list_script(Path::new("objects/sha256/abc/root"));
+        assert!(script.contains(".[!.]*"), "hidden entries covered");
+        assert!(script.contains("..?*"), "dot-dot-prefixed entries covered");
+        // The self/parent directors are explicitly skipped.
+        assert!(script.contains("continue"), "skip guard present");
+    }
+
+    // Finding 4: try_write_new creates the parent directory before the
+    // noclobber install, so a fresh remote root can host the first lock.
+    #[test]
+    fn try_write_new_creates_parent_dir() {
+        let t = transport();
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            Path::new("state/operation.lock"),
+            IMMUTABLE_RECORD_MODE,
+        );
+        assert!(
+            cmd.starts_with("mkdir -p '/srv/app/state'"),
+            "parent directory is created first, got: {cmd}"
+        );
+        // ... and the remote allocation happens only after the parent exists.
+        let mkdir_end = cmd.find("&&").unwrap();
+        assert!(
+            cmd[mkdir_end..].contains("mktemp"),
+            "mktemp allocation must follow mkdir -p, got: {cmd}"
+        );
+    }
+
+    // The `current` swap replaces a symlink-to-directory in place; GNU mv
+    // would otherwise treat that destination as the directory itself and move
+    // the temp link INTO it (silently polluting the object store). `-T` is
+    // mandatory.
+    #[test]
+    fn rename_uses_no_target_directory_flag() {
+        let t = transport();
+        let cmd = SshTransport::rename_cmd(
+            t.root(),
+            Path::new(".current.tmp.op-x"),
+            Path::new("current"),
+        );
+        assert!(
+            cmd.contains("mv -T"),
+            "rename must use mv -T (no-target-directory) so a symlink-to-dir destination is replaced, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with("'/srv/app/current'"),
+            "destination is the deployment root's `current` symlink, got: {cmd}"
+        );
+    }
+
+    /// The remote compare-and-delete script (`remove_file_if_cmd`), executed
+    /// locally with `sh -c`: it CLAIMS the entry with `mv`, deletes it on a
+    /// byte match (frame `R`), RESTORES it no-replace on mismatch (frame `M`
+    /// — the winner survives byte-for-byte), and reports genuine absence
+    /// (frame `A`).
+    #[test]
+    fn remove_file_if_script_frames() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().join("remote");
+        let rel = Path::new("state/operation.lock");
+        // The mutation-lock record: operation_id + unique acquisition id (no
+        // time anywhere in the protocol — create-once ownership with no
+        // lease/expiry).
+        let payload = "{\"operation_id\":\"a\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6\"}";
+
+        // Genuinely absent: the Absent frame.
+        let cmd = SshTransport::remove_file_if_cmd(&root, rel, payload.as_bytes());
+        let out = run_sh_stdin(&cmd, &[]);
+        assert!(out.status.success(), "script must exit 0: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "A");
+
+        // Install the record, then remove on a byte match: the Removed frame
+        // and the entry is gone.
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join(rel), payload).unwrap();
+        let out = run_sh_stdin(&cmd, &[]);
+        assert!(out.status.success(), "script must exit 0: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "R");
+        assert!(
+            !root.join(rel).exists(),
+            "the matched entry must be removed"
+        );
+
+        // Reinstall, then compare against a DIFFERENT expected record: the
+        // Mismatch frame and the entry is restored byte-for-byte.
+        std::fs::write(root.join(rel), payload).unwrap();
+        let cmd2 = SshTransport::remove_file_if_cmd(
+            &root,
+            rel,
+            b"{\"operation_id\":\"b\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b7\"}",
+        );
+        let out = run_sh_stdin(&cmd2, &[]);
+        assert!(out.status.success(), "script must exit 0: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "M");
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            payload.as_bytes(),
+            "the mismatch must restore the winner byte-for-byte"
+        );
+    }
+
+    // The unique temp file for the durability protocol must live INSIDE the
+    // destination's parent directory and be dot-prefixed (mirroring
+    // LocalTransport), never a sibling of the parent: a sibling name would
+    // escape the managed remote root whenever the destination's parent IS the
+    // deployment root. The name is allocated remotely by `mktemp`, so the
+    // XXXXXX template suffix must survive quoting verbatim.
+    #[test]
+    fn try_write_new_temp_is_dot_prefixed_inside_destination_parent() {
+        let t = transport();
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            Path::new("state/operation.lock"),
+            IMMUTABLE_RECORD_MODE,
+        );
+        assert!(
+            cmd.contains("mktemp '/srv/app/state/.operation.lock.tmp.XXXXXX'"),
+            "temp must be inside the destination parent, dot-prefixed, and mktemp-allocated, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("/srv/app.state.operation.lock"),
+            "temp must not be a dot-sibling of the destination parent, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("/srv/app/.state.operation.lock"),
+            "temp must not leak above the destination parent, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(".tmp.XXXXXX"),
+            "mktemp template must carry XXXXXX at the end of the last component, got: {cmd}"
+        );
+    }
+
+    // Regression: when the destination sits directly in the deployment root,
+    // the old sibling naming (`{root}.{basename}.tmp...`) placed the temp OUTSIDE
+    // the managed root entirely.
+    #[test]
+    fn try_write_new_temp_stays_inside_root_for_root_level_dest() {
+        let t = transport();
+        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("files"), IMMUTABLE_RECORD_MODE);
+        assert!(
+            cmd.contains("mktemp '/srv/app/.files.tmp.XXXXXX'"),
+            "temp for a root-level destination must stay inside the root, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("/srv.files.tmp."),
+            "temp must not escape the managed root, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn try_write_new_sidecar_is_perl_native_and_holds_flock() {
+        let tr = transport();
+        let cmd =
+            tr.try_write_new_sidecar_cmd(Path::new("state/operation.lock"), IMMUTABLE_RECORD_MODE);
+        assert!(
+            !cmd.contains("exec"),
+            "the sidecar flock must survive to process exit: the perl must not exec"
+        );
+        assert!(
+            cmd.contains("<STDIN"),
+            "the perl-native acquire must read the payload from STDIN, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("link("),
+            "the perl-native acquire must install via link(2), got: {cmd}"
+        );
+        assert!(
+            cmd.contains("flock($fh"),
+            "the perl-native acquire must hold the flock loop, got: {cmd}"
+        );
+        // Verify the command is the sidecar-wrapped perl, not the ordinary shell write_new.
+        assert!(
+            cmd.contains("operation.lock.mutex"),
+            "the sidecar command must reference the mutex file, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("operation.lock"),
+            "the sidecar command must reference the lock file, got: {cmd}"
+        );
+        // Ensure the exit-code protocol parity is preserved (conflict and preinstall).
+        assert!(
+            cmd.contains(&SSH_TWRITE_CONFLICT_EXIT.to_string()),
+            "the sidecar command must encode the conflict exit code, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(&SSH_TWRITE_PREINSTALL_EXIT.to_string()),
+            "the sidecar command must encode the preinstall exit code, got: {cmd}"
+        );
+        // Ordinary (non-lock) writes keep the shell implementation — they must not go through the sidecar perl.
+        let ordinary = SshTransport::write_new_cmd(
+            tr.root(),
+            Path::new("state/other.json"),
+            IMMUTABLE_RECORD_MODE,
+        );
+        assert!(
+            !ordinary.contains("operation.lock.mutex"),
+            "ordinary writes must not be sidecar-wrapped"
+        );
+        assert!(
+            ordinary.contains("mktemp"),
+            "ordinary writes retain mktemp-based shell implementation, got: {ordinary}"
+        );
+        // New deadline policy: shared prelude uses monotonic deadline, EINTR retry,
+        // and distinguishes contention from other errno.
+        assert!(
+            cmd.contains("while (!flock($fh"),
+            "sidecar flock must use deadline while loop, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("clock_gettime(CLOCK_MONOTONIC)"),
+            "sidecar flock must use monotonic clock, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("usleep"),
+            "sidecar flock must use usleep with bounded interval, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("EINTR"),
+            "sidecar flock must handle EINTR, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn sidecar_flock_prelude_contains_expected_branches() {
+        let prelude =
+            sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
+        assert!(prelude.contains("use Fcntl qw(:flock)"), "missing Fcntl");
+        assert!(
+            prelude.contains("use Errno qw(EINTR EAGAIN EWOULDBLOCK)"),
+            "missing Errno"
+        );
+        assert!(
+            prelude.contains("use Time::HiRes qw(clock_gettime usleep CLOCK_MONOTONIC)"),
+            "missing Time::HiRes"
+        );
+        assert!(
+            prelude.contains("clock_gettime(CLOCK_MONOTONIC)"),
+            "missing deadline"
+        );
+        assert!(
+            prelude.contains("while (!flock($fh, LOCK_EX | LOCK_NB))"),
+            "missing while flock"
+        );
+        assert!(
+            prelude.contains("next if $errno == EINTR"),
+            "missing EINTR retry"
+        );
+        assert!(
+            prelude.contains("sidecar flock failed"),
+            "missing non-contention die"
+        );
+        assert!(
+            prelude.contains("EAGAIN") && prelude.contains("EWOULDBLOCK"),
+            "missing contention check"
+        );
+        assert!(
+            prelude.contains("sidecar contended"),
+            "missing contended die"
+        );
+        assert!(prelude.contains("usleep"), "missing usleep");
+        // test-only contention signal: env-gated (inert in production), fires
+        // exactly once after the first confirmed EWOULDBLOCK
+        assert!(
+            prelude.contains("DEPLOY_TEST_CONTENDED_FD"),
+            "missing test-only contention signal gate"
+        );
+        assert!(
+            prelude.contains("CONTENDED"),
+            "missing test-only contention signal"
+        );
+        // production constants
+        assert!(
+            prelude.contains("2"),
+            "deadline 2.0 missing, got: {prelude}"
+        );
+        assert!(
+            prelude.contains("0.005"),
+            "interval 0.005 missing, got: {prelude}"
+        );
+        // parameterized variant
+        let short = sidecar_flock_prelude(0.05, 0.005);
+        assert!(
+            short.contains("0.05"),
+            "short deadline not embedded, got: {short}"
+        );
+    }
+
+    #[test]
+    fn sidecar_flock_prelude_all_builders_share_deadline_policy() {
+        let remove = remove_file_if_sidecar_cmd(
+            Path::new("/srv/app"),
+            &RootedRelativePath::parse(Path::new("state/operation.lock.mutex")).unwrap(),
+            &RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap(),
+            b"exp",
+        );
+        let recover = recover_sidecar_cmd(
+            Path::new("/srv/app"),
+            &RootedRelativePath::parse(Path::new("state/operation.lock.mutex")).unwrap(),
+            &RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap(),
+            b"obs",
+            b"new",
+        );
+        let tr = transport();
+        let create =
+            tr.try_write_new_sidecar_cmd(Path::new("state/operation.lock"), IMMUTABLE_RECORD_MODE);
+        for (name, cmd) in [
+            ("remove", remove),
+            ("recover", recover),
+            ("create-new", create),
+        ] {
+            assert!(
+                cmd.contains("while (!flock($fh"),
+                "{name} missing while loop"
+            );
+            assert!(
+                cmd.contains("clock_gettime(CLOCK_MONOTONIC)"),
+                "{name} missing monotonic clock"
+            );
+            assert!(cmd.contains("EINTR"), "{name} missing EINTR");
+            assert!(
+                cmd.contains("EAGAIN") && cmd.contains("EWOULDBLOCK"),
+                "{name} missing EAGAIN/EWOULDBLOCK"
+            );
+            assert!(
+                cmd.contains("sidecar flock failed"),
+                "{name} missing flock failed"
+            );
+            assert!(
+                cmd.contains("sidecar contended"),
+                "{name} missing contended"
+            );
+            assert!(cmd.contains("usleep"), "{name} missing usleep");
+            // the old bounded-retry loop is gone (flock part); the create-new tmp-name
+            // allocation loop is a different O_EXCL concern and is intentionally kept.
+            // So we don't assert absence of "for (1..32)" globally.
+        }
+        // The tmp-name O_EXCL allocation loop in create-new is still present.
+        let tr2 = transport();
+        let create2 =
+            tr2.try_write_new_sidecar_cmd(Path::new("state/operation.lock"), IMMUTABLE_RECORD_MODE);
+        assert!(
+            create2.contains("sysopen($tfh"),
+            "create-new must retain tmp sysopen loop"
+        );
+        assert!(
+            create2.contains("O_EXCL"),
+            "create-new must retain O_EXCL tmp allocation"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Synchronized flock-contention tests: process scheduling is exercised
+    // with DETERMINISTIC synchronization — a real OS pipe handshake — never
+    // elapsed-time guesses. The old `sidecar_flock_prelude_runtime_with_
+    // short_deadline` proptest slept a holder thread and compared wall
+    // clocks against a 50 ms deadline, which flaked under parallel load.
+    // The input space here is three discrete concurrency states, so these
+    // are plain deterministic `#[test]`s: the sidecar reports its FIRST
+    // confirmed EWOULDBLOCK through the prelude's env-gated
+    // `DEPLOY_TEST_CONTENDED_FD` signal, the parent is signal-driven off
+    // that pipe, and every assertion checks a STATE TRANSITION (deadline
+    // error vs success) — never an elapsed-millisecond comparison. The pure
+    // prelude-generation proptests stay.
+    // ------------------------------------------------------------------
+
+    /// The flock contention window the synchronized tests exercise (passed as
+    /// the prelude's deadline AND the sidecar's own contention window): 500 ms.
+    /// The tests assert only the state transitions, never elapsed
+    /// milliseconds, so this needn't match the 2 s production constant; the
+    /// outer harness cap below is meaningfully longer.
+    const SIDECAR_FLOCK_TEST_DEADLINE: Duration = Duration::from_millis(500);
+
+    /// The outer cap on every parent-side bounded wait (contention signal,
+    /// child exit): meaningfully longer than [`SIDECAR_FLOCK_TEST_DEADLINE`],
+    /// so the outcome is decided by the sidecar's OWN deadline — a harness
+    /// timeout would be a test failure, never the thing under test. 5 s also
+    /// leaves room for a wedged child to be killed and reaped.
+    const SIDECAR_FLOCK_TEST_OUTER_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// The typed sidecar exit contract, classified from the child's
+    /// stdout/stderr per the real sidecar protocol (`OK` / `sidecar contended`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SidecarErrorCode {
+        /// Exit 0 with `OK` on stdout: the sidecar acquired the flock.
+        Success,
+        /// Nonzero exit with `sidecar contended` on stderr: the deadline
+        /// elapsed while the flock stayed contended.
+        LockDeadlineExceeded,
+    }
+
+    /// Harness-side failure; every variant names the state transition that
+    /// did not happen (the tests assert transitions, never timings).
+    #[derive(Debug)]
+    // The variant payloads exist for `{:?}` diagnostics in assertion
+    // messages; equality is by variant, so the fields are never destructured.
+    #[allow(dead_code)]
+    enum TestError {
+        /// The outer cap elapsed before the child reported its contention
+        /// signal.
+        ContentionSignalTimeout,
+        /// The child exited without ever writing the contention signal
+        /// (EOF on the pipe, no data).
+        ChildExitedWithoutSignal,
+        /// The child wrote something else where `CONTENDED` was expected.
+        WrongContentionSignal(String),
+        /// The outer cap elapsed while the child still ran; the harness
+        /// killed and reaped it.
+        ChildExitTimeout,
+        /// The uncontended path produced an outcome other than `Success`.
+        UnexpectedSidecarCode(SidecarErrorCode),
+        /// The child exited with an outcome the contract does not cover
+        /// (nonzero without `sidecar contended`, or success without `OK`).
+        UnexpectedChildExit {
+            status: std::process::ExitStatus,
+            stderr: String,
+        },
+        Io(std::io::Error),
+    }
+
+    /// Equality by variant only: the tests compare an outcome against
+    /// `Ok(SidecarErrorCode::…)`, never the payloads of two errors, and
+    /// `std::io::Error` no longer carries a `PartialEq` impl on this
+    /// toolchain. `std::mem::discriminant` keeps the comparison meaningful
+    /// exactly where it is used.
+    impl PartialEq for TestError {
+        fn eq(&self, other: &Self) -> bool {
+            std::mem::discriminant(self) == std::mem::discriminant(other)
+        }
+    }
+
+    impl From<std::io::Error> for TestError {
+        fn from(err: std::io::Error) -> Self {
+            TestError::Io(err)
+        }
+    }
+
+    type TestOutcome = std::result::Result<SidecarErrorCode, TestError>;
+
+    /// A Rust-side exclusive flock holder: opens the lock path read-write
+    /// (creating it like the real sidecar's mutex file) and takes `LOCK_EX`;
+    /// the `Drop` releases the lock deterministically — including on a test
+    /// panic — instead of a `sleep`-timed release.
+    struct HolderGuard {
+        file: std::fs::File,
+    }
+
+    /// Acquire the flock on `path` exclusively, creating the file if needed.
+    fn acquire_exclusive_lock(path: &Path) -> HolderGuard {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false) // the mutex file's (empty) content is untouched
+            .open(path)
+            .unwrap_or_else(|e| panic!("open lock path {path:?} for the holder: {e}"));
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(
+            rc,
+            0,
+            "flock LOCK_EX on {path:?} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        HolderGuard { file }
+    }
+
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            use std::os::unix::io::AsRawFd;
+            // Unlock is best-effort (the fd closes right after anyway).
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
+    /// An instrumented sidecar child plus the read end of the contention
+    /// pipe its perl holds (via `DEPLOY_TEST_CONTENDED_FD`, a raw `pipe(2)`
+    /// write end inherited without `FD_CLOEXEC`).
+    struct InstrumentedSidecar {
+        child: std::process::Child,
+        contention_rx: std::fs::File,
+    }
+
+    /// The full `perl -e` script the synchronized tests run: the shared
+    /// prelude (test deadline, production interval) preceded by the caller
+    /// side's `$fh` open and followed by the `OK` success line — the shape
+    /// of every real sidecar command.
+    fn sidecar_flock_script(deadline: Duration) -> String {
+        let prelude = sidecar_flock_prelude(deadline.as_secs_f64(), SIDECAR_FLOCK_INTERVAL_SECS);
+        format!(
+            "open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\"; {prelude} print \"OK\\n\";"
+        )
+    }
+
+    /// Spawn the instrumented sidecar: `perl -e <prelude-script> -- <path>`
+    /// with `DEPLOY_TEST_CONTENDED_FD` set to a fresh pipe's write end. The
+    /// raw `pipe(2)` fd carries no `FD_CLOEXEC`, so it survives the exec into
+    /// perl. The parent closes its write-end copy immediately after the
+    /// spawn, so the read end sees EOF the moment the child exits; the child
+    /// writes `CONTENDED` to that fd exactly once (the prelude deletes the
+    /// env key after the first signal).
+    fn spawn_instrumented_sidecar(path: &Path, deadline: Duration) -> InstrumentedSidecar {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "pipe() for the contention handshake failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let child = std::process::Command::new("perl")
+            .arg("-e")
+            .arg(sidecar_flock_script(deadline))
+            .arg("--")
+            .arg(path)
+            .env("DEPLOY_TEST_CONTENDED_FD", write_fd.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(err) => {
+                // Do not leak the pipe on a spawn failure.
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+                panic!("spawn instrumented sidecar: {err}");
+            }
+        };
+        unsafe { libc::close(write_fd) };
+        let contention_rx = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        InstrumentedSidecar {
+            child,
+            contention_rx,
+        }
+    }
+
+    impl InstrumentedSidecar {
+        /// Block until the child reports its first CONFIRMED contention (the
+        /// prelude's env-gated signal, fired exactly once after the first
+        /// `EWOULDBLOCK`), or until `outer` elapses. `poll(2)` on the pipe
+        /// read end makes the wait signal-driven: the parent sleeps in the
+        /// kernel until the child writes — never on a timer.
+        fn read_confirmed_contention(&self, outer: Duration) -> std::result::Result<(), TestError> {
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::io::AsRawFd;
+            let timeout_ms = i32::try_from(outer.as_millis()).unwrap_or(i32::MAX);
+            let mut pfd = libc::pollfd {
+                fd: self.contention_rx.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+            if rc == 0 {
+                return Err(TestError::ContentionSignalTimeout);
+            }
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if (pfd.revents & libc::POLLIN) == 0 {
+                // HUP/ERR with no data: the child exited without ever
+                // confirming contention.
+                return Err(TestError::ChildExitedWithoutSignal);
+            }
+            let mut line = String::new();
+            // dup the read end so the read consumes only the local clone.
+            let mut rx = BufReader::new(self.contention_rx.try_clone()?);
+            rx.read_line(&mut line)?;
+            if line.trim() != "CONTENDED" {
+                return Err(TestError::WrongContentionSignal(line));
+            }
+            Ok(())
+        }
+
+        /// Wait for the child with a hard `outer` cap, then classify its exit
+        /// against the sidecar contract (see [`bounded_wait_for_child`]).
+        fn wait_with_outer_timeout(&mut self, outer: Duration) -> TestOutcome {
+            bounded_wait_for_child(&mut self.child, outer)
+        }
+    }
+
+    /// Bounded, signal-driven wait for a sidecar child: the child closes its
+    /// stdout on exit, so `poll(2)` on the stdout pipe fires exactly when the
+    /// process is gone — on macOS a closed pipe write end is reported as
+    /// `POLLIN|POLLHUP` (never as a bare `POLLHUP` with `events: 0`, which
+    /// does not wake at all); a still-open write end with no data never
+    /// wakes the parent. `wait()` then reaps immediately and the (now-EOF)
+    /// streams are drained. No timer-based polling, no unbounded `wait()`.
+    fn bounded_wait_for_child(child: &mut std::process::Child, outer: Duration) -> TestOutcome {
+        use std::os::unix::io::AsRawFd;
+        let stdout_fd = child
+            .stdout
+            .as_ref()
+            .expect("sidecar stdout must be piped")
+            .as_raw_fd();
+        let timeout_ms = i32::try_from(outer.as_millis()).unwrap_or(i32::MAX);
+        let mut pfd = libc::pollfd {
+            fd: stdout_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+        if rc == 0 {
+            // Wedged child: kill and reap so the suite leaks nothing.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TestError::ChildExitTimeout);
+        }
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let status = child.wait().map_err(TestError::Io)?;
+        let (stdout, stderr) = drain_output(child);
+        classify_sidecar_exit(status, stdout, stderr)
+    }
+
+    /// Drain the child's (now-EOF) stdout/stderr: the child has exited, so
+    /// both pipes are already closed by the kernel — no locking dance needed,
+    /// and the per-sidecar output is a few bytes, far below pipe capacity.
+    fn drain_output(child: &mut std::process::Child) -> (String, String) {
+        use std::io::Read;
+        let mut stdout = String::new();
+        if let Some(mut so) = child.stdout.take() {
+            let _ = so.read_to_string(&mut stdout);
+        }
+        let mut stderr = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut stderr);
+        }
+        (stdout, stderr)
+    }
+
+    /// Classify the child's exit against the sidecar protocol.
+    fn classify_sidecar_exit(
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    ) -> TestOutcome {
+        if status.success() && stdout.trim() == "OK" {
+            return Ok(SidecarErrorCode::Success);
+        }
+        if !status.success() && stderr.contains("sidecar contended") {
+            return Ok(SidecarErrorCode::LockDeadlineExceeded);
+        }
+        Err(TestError::UnexpectedChildExit { status, stderr })
+    }
+
+    /// The uncontended path (test 1): the PRODUCTION prelude — the
+    /// `DEPLOY_TEST_CONTENDED_FD` env is explicitly removed, so the signal
+    /// block is inert — against a fresh lock path, which is immediately
+    /// acquirable.
+    fn run_sidecar_with_deadline(
+        path: &Path,
+        deadline: Duration,
+    ) -> std::result::Result<(), TestError> {
+        let mut child = std::process::Command::new("perl")
+            .arg("-e")
+            .arg(sidecar_flock_script(deadline))
+            .arg("--")
+            .arg(path)
+            .env_remove("DEPLOY_TEST_CONTENDED_FD")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(TestError::Io)?;
+        match bounded_wait_for_child(&mut child, SIDECAR_FLOCK_TEST_OUTER_TIMEOUT) {
+            Ok(SidecarErrorCode::Success) => Ok(()),
+            Ok(other) => Err(TestError::UnexpectedSidecarCode(other)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Test 1 (uncontended): a fresh lock path with NO holder — the sidecar
+    /// acquires immediately and reports OK.
+    #[test]
+    fn sidecar_flock_uncontended_acquisition_succeeds() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let lock_path = dir.path().join("sidecar.flock");
+        std::fs::write(&lock_path, b"").unwrap();
+        let result = run_sidecar_with_deadline(&lock_path, SIDECAR_FLOCK_TEST_DEADLINE);
+        assert!(
+            result.is_ok(),
+            "an uncontended fresh lock must be acquired immediately, got: {result:?}"
+        );
+    }
+
+    /// Test 2 (confirmed contention, holder RETAINED): the sidecar must
+    /// report its production deadline error (`sidecar contended`). The holder
+    /// is released only during cleanup, AFTER the assertion — so the
+    /// assertion runs against a still-held lock; the guard also drops on a
+    /// panic.
+    #[test]
+    fn sidecar_flock_contention_times_out_while_retained() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let lock_path = dir.path().join("sidecar.flock");
+        let holder = acquire_exclusive_lock(&lock_path);
+        let mut sidecar = spawn_instrumented_sidecar(&lock_path, SIDECAR_FLOCK_TEST_DEADLINE);
+        sidecar
+            .read_confirmed_contention(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT)
+            .expect("child must report confirmed contention");
+        let outcome = sidecar.wait_with_outer_timeout(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT);
+        assert_eq!(
+            outcome,
+            Ok(SidecarErrorCode::LockDeadlineExceeded),
+            "a retained lock must drive the sidecar to its deadline error"
+        );
+        drop(holder);
+    }
+
+    /// Test 3 (confirmed contention, holder RELEASED): the sidecar must
+    /// acquire the freed lock and report OK.
+    #[test]
+    fn sidecar_flock_contention_succeeds_after_release() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let lock_path = dir.path().join("sidecar.flock");
+        let holder = acquire_exclusive_lock(&lock_path);
+        let mut sidecar = spawn_instrumented_sidecar(&lock_path, SIDECAR_FLOCK_TEST_DEADLINE);
+        sidecar
+            .read_confirmed_contention(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT)
+            .expect("child must report confirmed contention");
+        drop(holder); // release happens BEFORE the wait
+        let outcome = sidecar.wait_with_outer_timeout(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT);
+        assert_eq!(
+            outcome,
+            Ok(SidecarErrorCode::Success),
+            "the released lock must let the sidecar acquire and report OK"
+        );
+    }
+
+    /// Execute `sh -c "$command"` with `stdin` piped to the shell — the
+    /// payload the remote script's `cat > "$tmp"` consumes, exactly as the
+    /// transport pipes it through the ssh child (never embedded in the
+    /// command string).
+    fn run_sh_stdin(command: &str, stdin: &[u8]) -> std::process::Output {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh -c");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin)
+            .expect("write payload");
+        child.wait_with_output().expect("wait sh -c")
+    }
+
+    // The old temp name derived from the LOCAL pid + a per-process counter, so
+    // two controllers on different hosts could share a pid and collide on the
+    // same remote temp name; `printf ... > tmp` then truncated the collided
+    // path, and the no-clobber publish could install the WRONG payload. With
+    // remote `mktemp` allocation, concurrent controllers can never be handed
+    // the same name: exactly one install wins, every loser reports failure,
+    // and no reader ever observes torn/mixed content.
+    #[test]
+    fn try_write_new_concurrent_controllers_never_collide() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // SLOW-test gate: spawns many concurrent shells and exceeds the fast
+        // suite's budget; run it under the full suites.
+        if !crate::test_support::slow_tests_enabled() {
+            eprintln!("skipped: slow test — set STORE_SYNC_FULL_TESTS=1 to run");
+            return;
+        }
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let dest = root.join(rel);
+        let payloads: Vec<String> = (0..8)
+            .map(|i| format!("payload-{i}:{}", "x".repeat(64 + i * 7)))
+            .collect();
+
+        std::thread::scope(|s| {
+            let done = Arc::new(AtomicBool::new(false));
+
+            // Writers: every controller runs the exact generated command for
+            // the same destination with a different payload.
+            let mut writers = Vec::new();
+            for payload in &payloads {
+                let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+                let payload = payload.clone();
+                writers.push(s.spawn(move || run_sh_stdin(&cmd, payload.as_bytes())));
+            }
+
+            // Readers: while the writers race, any observation of the
+            // destination must be a complete payload — never torn, empty, or
+            // mixed. Dot-prefixed temp names are what listing-based observers
+            // skip, exactly as in LocalTransport::try_write_new.
+            let done2 = done.clone();
+            let parent = dest.parent().unwrap().to_path_buf();
+            let payloads2 = payloads.clone();
+            let dest3 = dest.clone();
+            s.spawn(move || {
+                while !done2.load(Ordering::SeqCst) {
+                    let Ok(entries) = std::fs::read_dir(&parent) else {
+                        continue;
+                    };
+                    for e in entries.flatten() {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name != "op.json" {
+                            assert!(
+                                name.starts_with('.'),
+                                "observer must only ever see the final name or dot-prefixed temps, got {name}"
+                            );
+                            continue;
+                        }
+                        let data = std::fs::read(&dest3).unwrap_or_default();
+                        assert!(
+                            payloads2.iter().any(|p| p.as_bytes() == data),
+                            "reader observed a torn/mixed/partial record: {:?}",
+                            String::from_utf8_lossy(&data)
+                        );
+                    }
+                }
+            });
+
+            let results: Vec<std::process::Output> =
+                writers.into_iter().map(|h| h.join().unwrap()).collect();
+            done.store(true, Ordering::SeqCst);
+
+            // Exactly one controller installs; every other reports failure.
+            let wins = results.iter().filter(|r| r.status.success()).count();
+            assert_eq!(
+                wins, 1,
+                "exactly one concurrent controller must win the no-clobber install"
+            );
+            let data = std::fs::read(&dest).unwrap();
+            assert!(
+                payloads.iter().any(|p| p.as_bytes() == data),
+                "installed content must be one complete payload, got {:?}",
+                String::from_utf8_lossy(&data)
+            );
+        });
+    }
+
+    // Recovery: a controller crashed AFTER `ln` but BEFORE `rm -f "$tmp"`,
+    // leaving the destination installed plus a stale hard-linked temp (nlink
+    // 2) in the same name space. A fresh invocation must allocate a DIFFERENT
+    // temp name, never touch the stale temp or the installed destination, and
+    // remove only its own temp.
+    #[test]
+    fn try_write_new_recovers_from_stale_hardlinked_temp() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let dest = root.join(rel);
+        let parent = dest.parent().unwrap();
+
+        // First invocation: installs the record and cleans up its own temp.
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out1 = run_sh_stdin(&cmd1, b"gen-1");
+        assert!(
+            out1.status.success(),
+            "first install failed: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"gen-1");
+        let temps = || {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n != "op.json"
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(temps().is_empty(), "first invocation left temps behind");
+
+        // Crash AFTER `ln` but BEFORE `rm -f "$tmp"`: the stale temp is a
+        // second hard link to the installed inode (nlink 2), sitting in the
+        // same name space a future mktemp draws from.
+        let stale = parent.join(".op.json.tmp.crashed");
+        std::fs::hard_link(&dest, &stale).unwrap();
+        let stale_meta = std::fs::metadata(&stale).unwrap();
+        assert_eq!(
+            stale_meta.nlink(),
+            2,
+            "stale temp must hard-link the installed inode"
+        );
+
+        // Fresh invocation with a different payload: must fail (already
+        // exists), leave dest and stale untouched, and clean up its own temp.
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out2 = run_sh_stdin(&cmd2, b"gen-2");
+        assert_eq!(
+            out2.status.code(),
+            Some(SSH_TWRITE_CONFLICT_EXIT),
+            "reinstall after a winner must exit the reserved conflict code"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"gen-1",
+            "installed destination must stay intact"
+        );
+        let stale_after = std::fs::metadata(&stale).unwrap();
+        assert_eq!(
+            stale_after.nlink(),
+            2,
+            "stale temp must not have been truncated or removed"
+        );
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"gen-1",
+            "stale temp content must be untouched"
+        );
+        let left = temps();
+        assert_eq!(
+            left,
+            vec![stale.file_name().unwrap().to_string_lossy().into_owned()],
+            "only the stale temp may remain; the fresh invocation's own temp must be removed"
+        );
+    }
+
+    /// The remote script implements the canonical seven-step sequence: the
+    /// FINAL MODE is chmod'd onto the temp BEFORE the file fsync and the
+    /// no-clobber install, and the PARENT-DIRECTORY sync is a real
+    /// `sync <dir>` whose failure is never swallowed (`2>/dev/null` is gone).
+    #[test]
+    fn try_write_new_cmd_final_chmod_and_real_parent_sync() {
+        let t = transport();
+        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("state/operation.lock"), 0o640);
+        // Step 3 (final chmod) BEFORE step 4 (file fsync) BEFORE step 5
+        // (no-replace install): the published inode carries the caller's
+        // mode, never the remote umask.
+        let chmod_pos = cmd
+            .find("chmod 640 \"$tmp\"")
+            .expect("the final chmod step must be present");
+        let fsync_pos = cmd
+            .find("sync \"$tmp\"")
+            .expect("the file fsync step must be present");
+        let publish_pos = cmd
+            .find("link($ARGV[0], $ARGV[1])")
+            .expect("the no-replace install must be present");
+        assert!(
+            chmod_pos < fsync_pos && fsync_pos < publish_pos,
+            "step order must be chmod -> file fsync -> install, got: {cmd}"
+        );
+        // Step 7: a real `sync <dir>` — and no `2>/dev/null` swallow.
+        assert!(
+            cmd.contains("sync '/srv/app/state'"),
+            "the parent-dir sync must be a real sync <dir>, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("2>/dev/null"),
+            "the parent-dir sync failure must never be swallowed, got: {cmd}"
+        );
+    }
+
+    /// The final chmod step is EXECUTED before the install: under a
+    /// restrictive umask the published record still carries the intended
+    /// mode, never the umask-derived one.
+    #[test]
+    fn try_write_new_installs_final_mode_not_umask() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd = SshTransport::write_new_cmd(&root, rel, 0o644);
+        // `mktemp` under umask 077 creates the temp 0600; without the chmod
+        // step the installed record would keep 0600. The final chmod must
+        // make it 0644 before the install. The payload is piped on stdin,
+        // exactly as the transport delivers it.
+        let out = run_sh_stdin(&format!("umask 077; {cmd}"), b"payload-data");
+        assert!(
+            out.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let meta = std::fs::metadata(root.join(rel)).unwrap();
+        assert_eq!(
+            meta.mode() & 0o7777,
+            0o644,
+            "the published record must carry the intended final mode, not the umask"
+        );
+        assert_eq!(std::fs::read(root.join(rel)).unwrap(), b"payload-data");
+    }
+
+    /// The parent-directory sync failure PROPAGATES: a fake `sync` on PATH
+    /// that fsyncs regular files but fails on directories lets the file fsync
+    /// (step 4) pass, then the parent-dir sync (step 7) fails — the command
+    /// exits with the fake sync's status, never a swallowed success. The old
+    /// `sync 2>/dev/null` was exactly this bug.
+    #[test]
+    fn try_write_new_parent_sync_failure_propagates() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let fakebin = dir.path().join("fakebin");
+        std::fs::create_dir_all(&fakebin).unwrap();
+        std::fs::write(
+            fakebin.join("sync"),
+            "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fakebin.join("sync"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let out = run_sh_stdin(
+            &format!(
+                "PATH={fake}:$PATH; {cmd}",
+                fake = shell_quote(&fakebin.to_string_lossy())
+            ),
+            b"payload-data",
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(9),
+            "the parent-dir sync failure must propagate (never swallowed)"
+        );
+        // The install itself succeeded (ln ran) — the propagated failure is
+        // EXACTLY the final durability step, and the record is complete.
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            b"payload-data",
+            "the record must be fully installed before the parent-dir sync"
+        );
+    }
+
+    /// The no-clobber conflict is reported through the reserved exit code and
+    /// NEVER replaces the winner: a second invocation with different content
+    /// exits `SSH_TWRITE_CONFLICT_EXIT` and the winner's bytes stay intact.
+    #[test]
+    fn try_write_new_conflict_exits_reserved_code_and_never_replaces() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out1 = run_sh_stdin(&cmd1, b"gen-1");
+        assert!(
+            out1.status.success(),
+            "first install failed: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out2 = run_sh_stdin(&cmd2, b"gen-2");
+        assert_eq!(
+            out2.status.code(),
+            Some(SSH_TWRITE_CONFLICT_EXIT),
+            "a loser must exit the reserved conflict code"
+        );
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            b"gen-1",
+            "the conflict must NEVER replace the winner"
+        );
+    }
+
+    /// The stage-failure dimension of the ssh protocol: a failure at EVERY
+    /// script-failable stage must exit with a code that is NEITHER 0 NOR the
+    /// reserved conflict verdict — a pre-install failure or a real publish/
+    /// sync failure is a propagated ERROR, never a verdict (the verdict is
+    /// ONLY a CONFIRMED EEXIST at the no-clobber publish). `Unlink` is not
+    /// script-failable (`rm -f` is best-effort cleanup by design); that crash
+    /// point is covered by the local primitive's `FailAt(Unlink)` case and by
+    /// `try_write_new_recovers_from_stale_hardlinked_temp`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SshStageFailure {
+        /// `mktemp` fails — the temp allocation (step 1).
+        CreateTemp,
+        /// The payload write fails — a fake `mktemp` hands back an unwritable
+        /// path so the `cat > "$tmp"` redirect fails to open (step 2; the
+        /// redirect is a shell-level error, so a PATH fake cannot shadow it —
+        /// `cat` never runs).
+        Write,
+        /// `chmod` fails (step 3).
+        Chmod,
+        /// `sync "$tmp"` fails (step 4).
+        FileFsync,
+        /// `ln` fails for a reason OTHER than EEXIST (step 5) — with the
+        /// destination ABSENT, so the script must NOT call it a verdict. The
+        /// publish is perl `link(2)`, so the stage is faulted by a fake
+        /// `perl` that exits 1.
+        Publish,
+        /// `sync <dir>` fails (step 7) — the file sync passes, the
+        /// parent-dir sync is the propagated failure.
+        ParentFsync,
+    }
+
+    fn ssh_stage_failure() -> impl Strategy<Value = SshStageFailure> {
+        prop_oneof![
+            Just(SshStageFailure::CreateTemp),
+            Just(SshStageFailure::Write),
+            Just(SshStageFailure::Chmod),
+            Just(SshStageFailure::FileFsync),
+            Just(SshStageFailure::Publish),
+            Just(SshStageFailure::ParentFsync),
+        ]
+    }
+
+    proptest! {
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn write_new_cmd_stage_failures_propagate(stage in ssh_stage_failure()) {
+            let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = Path::new("state/op.json");
+            let dest = root.join(rel);
+            let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+            let fakebin = dir.path().join("fakebin");
+            std::fs::create_dir_all(&fakebin).unwrap();
+
+            let (name, body) = match stage {
+                SshStageFailure::CreateTemp => ("mktemp", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::Write => (
+                    "mktemp",
+                    "#!/bin/sh\nprintf '%s\\n' '/definitely/unwritable/.op.json.tmp.XXXXXX'\n",
+                ),
+                SshStageFailure::Chmod => ("chmod", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::FileFsync => ("sync", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::Publish => ("perl", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::ParentFsync => (
+                    "sync",
+                    "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
+                )};
+            let p = fakebin.join(name);
+            std::fs::write(&p, body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let out = run_sh_stdin(
+                &format!(
+                    "PATH={fake}:$PATH; {cmd}",
+                    fake = shell_quote(&fakebin.to_string_lossy())
+                ),
+                b"payload-data",
+            );
+            prop_assert_ne!(
+                out.status.code(),
+                Some(0),
+                "the faulted stage must fail the attempt"
+            );
+            prop_assert_ne!(
+                out.status.code(),
+                Some(SSH_TWRITE_CONFLICT_EXIT),
+                "a stage failure is NEVER the conflict verdict — the verdict is ONLY a confirmed EEXIST, got: {:?}",
+                out.status.code()
+            );
+            match stage {
+                SshStageFailure::ParentFsync => {
+                    // The install completed; the failure is EXACTLY the final
+                    // durability step, and the record is fully written.
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        b"payload-data",
+                        "the parent-sync failure must come after a fully-written install"
+                    );
+                }
+                _ => {
+                    prop_assert!(
+                        !dest.exists(),
+                        "a pre-install/publish failure must install nothing"
+                    );
+                }
+            }
+        }
+    }
+}

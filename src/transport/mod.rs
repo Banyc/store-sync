@@ -1,2 +1,3294 @@
-//! The transport stack: the `Remote` trait and its realizations. See
-//! `EXTRACTION.md` slice-transport.
+//! The transport stack: connectivity to one server's remote root.
+//!
+//! The [`Remote`] trait plus the in-process [`LocalTransport`] lead this
+//! module; the production SSH transport over `ssh`/`scp`, host-identity
+//! verification and pinning (a strict known-hosts file or a pre-verified
+//! fingerprint, never trust-on-first-use), and the ONE bounded subprocess
+//! runner every ssh operation goes through live in the `ssh` submodule group.
+//!
+//! Transport setup is split into two phases: [`Remote::prepare_identity`]
+//! (verify/pin the host key) runs before ANY remote request — including a dry
+//! run's status inspection — while [`Remote::provision_layout`] (create the
+//! deployment-directory layout) runs only behind the push engine's
+//! non-dry-run gate.
+//!
+//! # Submodules
+//!
+//! * `runner` — the shared bounded child-runner: synchronized child
+//!   ownership, process-group termination, and mandatory wait/reap before
+//!   every returned outcome (used by [`LocalTransport::exec`]).
+//! * `scripted` — the deterministic fake exec the property tests inject
+//!   (test-only): scripted outcomes keyed by argv, no subprocess, no
+//!   wall-clock — the parallel-safety seam.
+//! * `ssh` — the SSH transport group: the [`SshTransport`] itself plus
+//!   host-key verification (`ssh::hostkey`) and the bounded subprocess
+//!   runner (`ssh::runner`).
+//!
+//! The transport is application-domain-free: the on-server layout (bootstrap
+//! directories, the operation-lock paths, and the immutable receiver marker)
+//! is the caller-supplied [`Layout`]; the receiver identity is the opaque
+//! [`ReceiverId`].
+
+mod rooted;
+mod runner;
+#[cfg(test)]
+pub(crate) mod scripted;
+mod ssh;
+
+pub use rooted::RootedRelativePath;
+#[cfg(unix)]
+pub use runner::kill_process_group;
+pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
+pub use ssh::SshTransport;
+
+use crate::env::SysEnv;
+use crate::error::{Error, Result};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use walkdir::WalkDir;
+
+/// The caller-supplied deployment layout: the rooted relative paths the
+/// transport anchors under its root. The crate carries no application layout
+/// of its own — a caller that knows the on-server directory names supplies
+/// them here.
+///
+/// * [`Layout::bootstrap_dirs`] — the directories `provision_layout` creates
+///   before the first mutation.
+/// * [`Layout::lock`] — the operation-lock record. Every sidecar-serialized
+///   mutation of THIS path (create-new, compare-and-delete, recover) runs
+///   under the flock on [`Layout::lock_sidecar`].
+/// * [`Layout::lock_sidecar`] — the flock mutex file serializing mutations of
+///   [`Layout::lock`]. Created once durably and never removed, so every
+///   participant flocks the same inode.
+/// * [`Layout::receiver_marker`] — the OPTIONAL immutable receiver-id marker.
+///   When `Some`, `provision_layout` creates it once and `read_receiver_id`
+///   reads it back; when `None` the transport has no receiver identity.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    pub bootstrap_dirs: Vec<RootedRelativePath>,
+    pub lock: RootedRelativePath,
+    pub lock_sidecar: RootedRelativePath,
+    pub receiver_marker: Option<RootedRelativePath>,
+}
+
+impl Layout {
+    /// A layout with no bootstrap directories and no receiver marker, whose
+    /// lock paths are the conventional `state/operation.lock` and
+    /// `state/operation.lock.mutex` — for callers that need no provisioning
+    /// and never touch those two paths.
+    pub fn empty() -> Layout {
+        Layout {
+            bootstrap_dirs: Vec::new(),
+            lock: RootedRelativePath::from_validated(PathBuf::from("state/operation.lock")),
+            lock_sidecar: RootedRelativePath::from_validated(PathBuf::from(
+                "state/operation.lock.mutex",
+            )),
+            receiver_marker: None,
+        }
+    }
+}
+
+/// The length of the opaque receiver id: 40 lowercase hex characters (160
+/// bits).
+pub const RECEIVER_ID_LEN: usize = 40;
+
+/// The opaque receiver identity: 40 lowercase hex characters generated from
+/// 20 bytes of OS entropy, stored at [`Layout::receiver_marker`] as
+/// `<id>\n`, read and validated (never regenerated) once provisioned. The
+/// type is a newtype with a validating [`ReceiverId::parse`] and no unchecked
+/// constructor, so a malformed marker can never be accepted as an identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReceiverId(String);
+
+impl ReceiverId {
+    /// Generate a fresh receiver id from 20 bytes of OS entropy (40 lowercase
+    /// hex characters). Fails closed if the OS entropy source is unavailable.
+    pub fn generate() -> Result<ReceiverId> {
+        let mut bytes = [0u8; RECEIVER_ID_LEN / 2];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| Error::transport(format!("receiver id entropy: {e}")))?;
+        Ok(ReceiverId(hex::encode(bytes)))
+    }
+
+    /// Validate `s` as a receiver id: EXACTLY 40 lowercase hex characters.
+    /// Anything else (empty, wrong length, uppercase, non-hex) is rejected.
+    pub fn parse(s: &str) -> Result<ReceiverId> {
+        let valid = s.len() == RECEIVER_ID_LEN
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if valid {
+            Ok(ReceiverId(s.to_string()))
+        } else {
+            Err(Error::transport(format!(
+                "invalid receiver id {s:?}: expected {RECEIVER_ID_LEN} lowercase hex characters"
+            )))
+        }
+    }
+
+    /// The id as a string slice (40 lowercase hex characters).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The wire form stored at the marker: the id followed by a newline.
+    pub fn wire_bytes(&self) -> Vec<u8> {
+        let mut out = self.0.as_bytes().to_vec();
+        out.push(b'\n');
+        out
+    }
+}
+
+impl std::fmt::Display for ReceiverId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The remote-state protocol version. Bumped 1 -> 2 when the remote
+/// generation record (`generations/<gen>/assignment.json`) gained the OWNER
+/// MARKER (`application`/`slot`): a protocol-1 client would parse a
+/// protocol-2 record WITHOUT the owner fields (serde ignores unknown
+/// fields) and drive state whose ownership it cannot verify, so the
+/// handshake must refuse a version mismatch in either direction (an old
+/// client can never drive a state directory written by a newer one, and
+/// vice versa). The protocol-2 read path additionally fails closed on a
+/// record WITHOUT the owner marker (a required-field parse failure — a
+/// legacy/transplanted record is never read as a valid deployment).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Clone, Debug)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteMeta {
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub is_file: bool,
+    pub size: u64,
+    pub mode: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecOutcome {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ExecOutcome {
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
+/// THE command-execution seam behind [`LocalTransport::exec`]. Production
+/// uses [`ChildRunner`] (the bounded real runner: spawn into an own process
+/// group, bounded wait, group termination, mandatory reap before every
+/// outcome); the deterministic deployment/state-machine properties inject a
+/// scripted fake (`ScriptedExec`, test-only: scripted outcomes keyed by argv
+/// — no subprocess, no wall-clock). The seam is what makes the property
+/// suites parallel-safe: the deterministic tests exercise the SAME logic
+/// branches (verification success/failure, activation, compensation) without
+/// spawning real processes or contending for the pid space.
+pub trait Exec: Send + Sync {
+    /// Execute `argv` (no shell) bounded by `timeout`, returning the
+    /// outcome. A conforming implementation never leaves a live process
+    /// behind and never blocks past `timeout`.
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
+}
+
+/// The REAL exec: [`ChildRunner`] through the outcome mapping the transport
+/// always applied (a timed-out child surfaces as `exit_code: -1` with the
+/// runner's stderr; a kill/reap failure is an error, never a fake success).
+impl Exec for ChildRunner {
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        match ChildRunner::exec(self, argv, timeout) {
+            Ok(RunOutcome::Exited {
+                exit_code,
+                stdout,
+                stderr,
+            }) => Ok(ExecOutcome {
+                exit_code,
+                stdout,
+                stderr,
+            }),
+            Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr,
+            }),
+            Err(e) => Err(Error::transport(e.to_string())),
+        }
+    }
+}
+
+/// Total and available bytes on the filesystem backing a remote root, as
+/// reported by `df`. `total` is the filesystem's full size; `available` is
+/// the free space a new upload can consume. Both are in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsBytes {
+    pub total: u64,
+    pub available: u64,
+}
+
+/// Filesystem + execution surface for one server's remote root.
+///
+/// Every path a transport operation receives is a validated
+/// [`RootedRelativePath`]: relative to the deployment root, never absolute,
+/// never traversal-bearing — so `root.join(rel)` inside a transport is safe
+/// by construction and a caller can never escape the deployment root.
+pub trait Remote {
+    fn root(&self) -> &Path;
+    /// Whether `root()` names a path on THIS host (a [`LocalTransport`]) or
+    /// a path on a REMOTE host (an [`SshTransport`]). Callers that must
+    /// choose between direct local filesystem access and a remote exec (tree
+    /// verification) branch on this DECLARED nature — never on a local
+    /// filesystem probe of the root path, which is meaningless for a remote
+    /// root and would silently verify a same-named local directory in place
+    /// of the remote tree. Every transport MUST declare its nature (no
+    /// default): a new remote transport that forgets is a compile error, not
+    /// a silent local-verification bug.
+    fn is_local(&self) -> bool;
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
+    /// Atomically create `rel` with `data` only if it does not already exist,
+    /// and make the install DURABLE before returning: the create-new
+    /// primitive (`durable_create_new`) writes a unique temp inside the
+    /// destination directory, applies the FINAL MODE, fsyncs the file,
+    /// publishes WITHOUT replacement (a concurrent winner is never replaced),
+    /// removes the temp, and fsyncs the PARENT DIRECTORY — every failure
+    /// propagates. Returns the TYPED [`CreateNewVerdict`]: `Created` when the
+    /// record was durably installed by this call; `AlreadyPresent` ONLY when
+    /// the destination already existed and VERIFIED as an identical entry —
+    /// a DESCRIPTOR-BOUND verification (the entry is OPENED with `O_NOFOLLOW`
+    /// and fstat'd + read through the SAME descriptor): a REGULAR FILE with
+    /// the EXACT final mode and byte-identical
+    /// content, all from the ONE opened inode (the identical retry converges —
+    /// the parent directory is
+    /// synced here too, so the retry returns with a durable entry);
+    /// `Conflict` carrying the TYPED [`VerifiedExisting`] reason when it
+    /// existed but did NOT verify (different bytes, a MODE MISMATCH, a
+    /// directory/symlink/other entry — a symlink is never followed — or an
+    /// unreadable entry; the winner is NEVER replaced or modified, and the
+    /// caller receives the typed reason, never an undifferentiated conflict
+    /// it can reinterpret); or `Err` on every other failure (a pre-install
+    /// failure, a failed parent-dir sync, a transport fault — never a
+    /// verdict). This is
+    /// the non-racy primitive used for lock acquisition:
+    /// `exists`-then-`write` would let two controllers both observe "no lock"
+    /// and both proceed.
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict>;
+    /// [`Remote::try_write_new`] with a CALLER-CHOSEN content equivalence for
+    /// the EEXIST verification: `Semantic` (JSON parse-equal, byte-exact
+    /// fallback) is used by the release-file publisher whose idempotent
+    /// re-publication legitimately re-serializes the same contract with
+    /// different key order/whitespace. Transports whose centralized
+    /// verification can apply the equivalence directly (LocalTransport,
+    /// SshTransport) override this; the default performs the byte-exact
+    /// [`Remote::try_write_new`] and, for `Semantic`, re-reads and
+    /// semantically compares a `ContentMismatch` conflict — the identical
+    /// outcome a direct application would produce.
+    fn try_write_new_with(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
+        let verdict = self.try_write_new(rel, data)?;
+        if equivalence != ContentEquivalence::Semantic {
+            return Ok(verdict);
+        }
+        match verdict {
+            CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {
+                // The transport's Exact verification reported a content
+                // mismatch; the caller's SEMANTIC equivalence may still
+                // accept the winner (JSON key order/whitespace are not part
+                // of the contract). Type and mode were already verified
+                // (that is why the reason is ContentMismatch, not
+                // NotRegularFile/ModeMismatch), so only the content needs
+                // re-comparing.
+                let existing = self.read(rel)?;
+                if content_equivalent(&existing, data, ContentEquivalence::Semantic) {
+                    Ok(CreateNewVerdict::AlreadyPresent)
+                } else {
+                    Ok(CreateNewVerdict::Conflict(
+                        VerifiedExisting::ContentMismatch,
+                    ))
+                }
+            }
+            v => Ok(v),
+        }
+    }
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()>;
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
+    /// Apply a permission mode to an existing remote entry (file or directory).
+    /// Uploads must preserve the canonical tree's modes exactly, or the
+    /// post-upload integrity re-hash diverges on hosts with a permissive umask
+    /// (a bare `mkdir`/`cat` inherits the remote umask, so modes must be
+    /// applied explicitly).
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()>;
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>>;
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()>;
+    /// Create a symlink at `link` (a rooted relative path) pointing at
+    /// `target`. `target` is a LINK TARGET, relative to the link's own
+    /// directory — it legitimately traverses up to the object store
+    /// (`../../objects/...`), so it is a plain `&Path`, never a
+    /// [`RootedRelativePath`].
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()>;
+    /// Read the target of the symlink at `rel`. The returned target is a
+    /// LINK TARGET (relative to the link's directory, legitimately
+    /// `../../...`), so it is a plain `PathBuf`, never a
+    /// [`RootedRelativePath`].
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
+    /// Recursively copy the tree at `src` to `dest` — the per-file dedup's
+    /// staging base (the previous tree is copied into the staging dir, then
+    /// only the changed files are uploaded). `dest` must not already exist
+    /// (the caller removes a stale staging dir first); its parent is
+    /// created. The DEFAULT is a naive list/read/write walk — correct for
+    /// every transport, and for a [`LocalTransport`] it is a real local-disk
+    /// copy (the "download" is a local read); the [`SshTransport`] overrides
+    /// it with a same-filesystem `cp -a` on the remote so no bytes cross the
+    /// link. The walk is TWO-PHASE (directories are created owner-writable
+    /// and chmodded to their final mode deepest-first after every child is
+    /// copied), so a read-only source tree copies cleanly.
+    fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            self.create_dir_all(&parent)?;
+        }
+        // (dest, final_mode, depth) collected during the walk for phase 2.
+        let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
+        copy_tree_recursive(self, src, dest, 0, &mut dirs)?;
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
+        for (d, mode, _depth) in dirs {
+            self.set_mode(&d, mode)?;
+        }
+        Ok(())
+    }
+    /// Recursively fsync every file and directory under `rel` (the staged
+    /// release bundle), making the WHOLE tree durable before the atomic
+    /// install rename — a crash after the fsync but before the rename loses
+    /// at most the disposable staging dir, never a partial final release
+    /// directory. The DEFAULT is a no-op (test wrappers that delegate to an
+    /// inner transport inherit the inner's implementation); the production
+    /// transports ([`LocalTransport`], [`SshTransport`]) realize it for
+    /// real.
+    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        let _ = rel;
+        Ok(())
+    }
+    /// Fsync the PARENT DIRECTORY of `rel` so a rename/removal/creation
+    /// inside it survives power loss — the durability commit point of every
+    /// atomic mutation (the staged-publish renames, the `current` symlink
+    /// swap, the record replaces): a mutation's success is reported ONLY
+    /// after this succeeds. FAIL-CLOSED: a failed open OR a failed fsync is
+    /// a propagated `Err` (never a silent success — the directory entry's
+    /// durability is unconfirmed). The DEFAULT is a no-op (test wrappers
+    /// that delegate to an inner transport inherit the inner's
+    /// implementation); the production transports ([`LocalTransport`],
+    /// [`SshTransport`]) realize it for real.
+    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
+        let _ = rel;
+        Ok(())
+    }
+    /// Atomically remove `rel` ONLY IF its content is byte-identical to
+    /// `expected` — the compare-and-delete primitive that makes stale
+    /// releases and expired-lease breaks safe. Returns the TYPED verdict
+    /// ([`RemoveIfVerdict`]); every transport failure propagates as `Err`
+    /// (never a fabricated verdict, never a silent no-op). The production
+    /// transports ([`LocalTransport`], [`SshTransport`]) realize it
+    /// ATOMICALLY: the entry is CLAIMED by an atomic rename to a unique
+    /// same-directory temp (only one contender can win), verified against
+    /// `expected`, and either deleted (match) or RESTORED no-replace
+    /// (mismatch — a successor's lock is never removed, never replaced).
+    /// The DEFAULT implementation is the NON-ATOMIC read-compare-remove
+    /// fallback: adequate for single-process test wrappers that never race
+    /// the lock, and only those; production must override it.
+    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        // Typed absence probe first: a transport failure is an `Err`, never
+        // a silent `Absent`.
+        let Some(_) = self.metadata_opt(rel)? else {
+            return Ok(RemoveIfVerdict::Absent);
+        };
+        let cur = self.read(rel)?;
+        if cur == expected {
+            self.remove_file(rel)?;
+            Ok(RemoveIfVerdict::Removed)
+        } else {
+            Ok(RemoveIfVerdict::Mismatch)
+        }
+    }
+    fn exists(&self, rel: &RootedRelativePath) -> bool;
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta>;
+    /// The TYPED replacement for the `exists`/`metadata` pair: `Ok(Some(meta))`
+    /// when the entry exists, `Ok(None)` ONLY for a CONFIRMED `NotFound`, and
+    /// `Err` for every other failure (permission, transport fault, ...). A
+    /// failed read is NEVER indistinguishable from absence — callers must
+    /// never consult `exists` (a `bool` that swallows errors) to disambiguate.
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
+        match self.metadata(rel) {
+            Ok(m) => Ok(Some(m)),
+            Err(crate::error::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    /// Execute a command vector (no shell). Returns the outcome.
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
+    /// Total and available bytes on the filesystem backing the remote root.
+    /// `total` is the filesystem's full size; `available` is the free space a
+    /// new upload can consume. Capacity preflight needs both: the percent
+    /// reserve is a percentage of the TOTAL size, while the fit check
+    /// compares against the AVAILABLE space.
+    fn filesystem_bytes(&self) -> Result<FsBytes>;
+
+    /// Atomic recover of the operation lock: remove `rel` iff it equals
+    /// `observed`, then install `new_data`, all while holding the sidecar
+    /// mutex exclusively. Returns `Ok(Some(()))` on success, `Ok(None)` if
+    /// not implemented (caller falls back to helper-layer flock), `Err` on
+    /// mismatch/absent/contended/transport failure. Object-safe so
+    /// `RemoteHelper` can call it via `&dyn Remote` without knowing the
+    /// transport.
+    fn atomic_recover(
+        &self,
+        rel: &RootedRelativePath,
+        observed: &[u8],
+        new_data: &[u8],
+    ) -> Result<Option<()>> {
+        let _ = (rel, observed, new_data);
+        Ok(None)
+    }
+
+    /// Prepare the host identity (verify/pin the host key) before ANY remote
+    /// request, including read-only status inspection in a dry run. A dry run
+    /// still connects over the transport to inspect status, so the identity
+    /// must be prepared first. Construction is side-effect-free; identity
+    /// preparation happens before the first request that needs to connect.
+    /// Default: no-op (transports without a host-identity concept, like
+    /// `LocalTransport`).
+    fn prepare_identity(&self) -> Result<()> {
+        let _ = self;
+        Ok(())
+    }
+
+    /// Create the deployment-directory layout before the first mutation.
+    /// Construction is side-effect-free; layout provisioning happens only after
+    /// the push engine's non-dry-run gate. The DEFAULT is a no-op (the trait
+    /// method has no access to a [`Layout`]); the transports that override it
+    /// ([`LocalTransport`], [`SshTransport`]) create the caller's bootstrap
+    /// directories AND, when [`Layout::receiver_marker`] is `Some`, the
+    /// immutable receiver-id marker (created ONCE at provisioning and never
+    /// changed).
+    fn provision_layout(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
+    root.join(rel.as_path())
+}
+
+/// The naive recursive half of [`Remote::copy_tree`]'s default: walk `src`
+/// with [`Remote::list`], recreating every entry at `dest` (directories
+/// owner-writable during the walk, files/symlinks with their final modes),
+/// collecting `(dest, final_mode, depth)` for the caller's phase-2 finalize.
+fn copy_tree_recursive<R: Remote + ?Sized>(
+    remote: &R,
+    src: &RootedRelativePath,
+    dest: &RootedRelativePath,
+    depth: usize,
+    dirs: &mut Vec<(RootedRelativePath, u32, usize)>,
+) -> Result<()> {
+    remote.create_dir_all(dest)?;
+    for e in remote.list(src)? {
+        let s = src.join(&e.name)?;
+        let d = dest.join(&e.name)?;
+        if e.is_dir {
+            remote.create_dir_all(&d)?;
+            remote.set_mode(&d, (e.mode | 0o200) & 0o7777)?;
+            dirs.push((d.clone(), e.mode & 0o7777, depth));
+            copy_tree_recursive(remote, &s, &d, depth + 1, dirs)?;
+        } else if e.is_symlink {
+            let target = remote.read_link(&s)?;
+            remote.symlink(&target, &d)?;
+        } else {
+            let data = remote.read(&s)?;
+            remote.write(&d, &data, e.mode & 0o7777)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read the immutable receiver-id marker at `marker` and parse it. Fails
+/// closed on a MISSING marker (the deploy_dir was never provisioned) and on
+/// a MALFORMED marker (a tampered/foreign marker is never accepted as a
+/// physical identity).
+pub(crate) fn read_receiver_id<R: Remote + ?Sized>(
+    remote: &R,
+    marker: &RootedRelativePath,
+) -> Result<ReceiverId> {
+    read_receiver_id_opt(remote, marker)?.ok_or_else(|| {
+        Error::transport(format!(
+            "deploy_dir {}: no receiver-id marker ({marker} was never provisioned)",
+            remote.root().display()
+        ))
+    })
+}
+
+/// Read the receiver-id marker, returning `Ok(None)` ONLY for a CONFIRMED
+/// absent marker (a not-yet-provisioned deploy_dir — the marker is created by
+/// [`provision_receiver_id`] during provisioning). A read failure or a
+/// malformed marker is an `Err` (fail closed — a marker that exists but
+/// cannot be parsed is never silently treated as absent).
+pub(crate) fn read_receiver_id_opt<R: Remote + ?Sized>(
+    remote: &R,
+    marker: &RootedRelativePath,
+) -> Result<Option<ReceiverId>> {
+    if remote.metadata_opt(marker)?.is_none() {
+        return Ok(None);
+    }
+    let data = remote.read(marker)?;
+    let s = std::str::from_utf8(&data).map_err(|e| {
+        Error::transport(format!(
+            "deploy_dir {}: the receiver-id marker is not valid UTF-8: {e}",
+            remote.root().display()
+        ))
+    })?;
+    ReceiverId::parse(s.trim())
+        .map_err(|e| {
+            Error::transport(format!(
+                "deploy_dir {}: the receiver-id marker is malformed: {e}",
+                remote.root().display()
+            ))
+        })
+        .map(Some)
+}
+
+/// Provision the immutable receiver-id marker at `marker`: create it ONCE
+/// (a fresh [`ReceiverId`], stored as `<id>\n`) and return the deploy_dir's
+/// physical identity. The marker is never replaced: a re-provisioning or a
+/// concurrent provisioner adopts the EXISTING marker (the first writer wins —
+/// the deploy_dir's physical identity is whatever was created first), and a
+/// marker with different content is adopted too (fail closed on a malformed
+/// marker, never on a differing-but-valid one: the physical identity is
+/// immutable, so the existing marker is the truth).
+pub(crate) fn provision_receiver_id<R: Remote + ?Sized>(
+    remote: &R,
+    marker: &RootedRelativePath,
+) -> Result<ReceiverId> {
+    // Fast path: the deploy_dir already carries its immutable identity.
+    if remote.metadata_opt(marker)?.is_some() {
+        return read_receiver_id(remote, marker);
+    }
+    let id = ReceiverId::generate()?;
+    match remote.try_write_new(marker, &id.wire_bytes())? {
+        CreateNewVerdict::Created => Ok(id),
+        // A concurrent provisioner won the create-new race (or the marker
+        // exists with different content): the deploy_dir's identity is
+        // whatever was created FIRST — adopt it, never replace it.
+        CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict(_) => {
+            read_receiver_id(remote, marker)
+        }
+    }
+}
+
+/// True when `p` has at least one NORMAL path component below the root —
+/// i.e. `p` is not the filesystem root (nor a root-with-only-dots form that
+/// normalizes to it, like `//` or `/./`). A transport must never operate on
+/// `/`: deployment cleanup (rotation/retention deleting stale generations,
+/// the GC sweep) would otherwise run against system-level directories.
+pub(crate) fn has_normal_component_below_root(p: &Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
+    RemoteMeta {
+        is_dir: m.is_dir(),
+        is_symlink: m.file_type().is_symlink(),
+        is_file: m.is_file(),
+        size: m.len(),
+        mode: crate::platform::metadata_mode(m),
+    }
+}
+
+/// The canonical FINAL MODE for immutable records installed through
+/// [`Remote::try_write_new`]: the same `0o644` every sibling JSON record is
+/// written with (the inventory, transactions, and the force-path lock rewrite
+/// all use `Remote::write(..., 0o644)`). The published inode must carry THIS
+/// mode — never the process umask the temp was created with — or the record's
+/// permissions would silently depend on the caller's umask.
+pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
+
+/// How long a contender waits for the sidecar mutex before failing: a
+/// MONOTONIC deadline (not an attempt count). Ordinary critical sections
+/// (file syncs inside the flock) finish well within it; a holder that is
+/// still alive after the deadline is a genuinely stuck/unbounded operation.
+pub(crate) const SIDECAR_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The sleep between non-blocking flock retries (bounded by the remaining
+/// time to the deadline, so no retry ever extends past it).
+pub(crate) const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+// Thread-local re-entrancy depth for the sidecar critical section. When
+// `>0`, the current thread already holds the sidecar flock, so nested
+// transport calls for the lock path skip re-acquiring it. Depth is
+// incremented on entry and decremented on exit, even on error.
+thread_local! {
+    static SIDECAR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ensure the sidecar mutex file exists durably: create the parent
+/// directory, create the file with `create_new` (so a concurrent creator
+/// is not truncated), `fsync` the file and `fsync` the parent directory.
+/// The file is created once and never removed/renamed, so every
+/// participant flocks the same inode. Mode 0o644, durable.
+pub(crate) fn ensure_operation_lock_sidecar_durable(
+    base: &Path,
+    sidecar: &RootedRelativePath,
+) -> Result<()> {
+    let p = join(base, sidecar);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    // Fast path: already exists.
+    if p.exists() {
+        return Ok(());
+    }
+    // Create with create_new to avoid truncating a concurrent winner.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)
+    {
+        Ok(f) => {
+            let _ = crate::platform::chmod(&p, 0o644);
+            f.sync_all()
+                .map_err(|e| Error::transport(format!("fsync {}: {e}", p.display())))?;
+            drop(f);
+            if let Some(parent) = p.parent() {
+                let dir = std::fs::File::open(parent)
+                    .map_err(|e| Error::transport(format!("open dir {}: {e}", parent.display())))?;
+                dir.sync_all().map_err(|e| {
+                    Error::transport(format!("fsync dir {}: {e}", parent.display()))
+                })?;
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(Error::transport(format!("create {}: {e}", p.display()))),
+    }
+}
+
+/// Run `f` while holding an exclusive `flock` on the sidecar mutex file.
+/// The sidecar is ensured durably before locking. Uses non-blocking
+/// `LOCK_EX|LOCK_NB` with a monotonic deadline (`SIDECAR_WAIT_TIMEOUT`)
+/// and a 5ms sleep between attempts (bounded by the remaining time to the
+/// deadline); a contended sidecar after the deadline fails with an explicit
+/// transport error, never hangs. Re-entrant: if the current thread already
+/// holds the sidecar (depth>0), `f` runs directly.
+pub(crate) fn with_operation_lock_sidecar<R>(
+    base: &Path,
+    sidecar: &RootedRelativePath,
+    f: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    let depth = SIDECAR_DEPTH.with(|c| c.get());
+    if depth > 0 {
+        return f();
+    }
+    ensure_operation_lock_sidecar_durable(base, sidecar)?;
+    let p = join(base, sidecar);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&p)
+        .map_err(|e| Error::transport(format!("open sidecar {}: {e}", p.display())))?;
+    // The platform lock (flock on Unix, LockFileEx on Windows — the split
+    // lives in [`crate::lock`]): the closure returns the
+    // 0/-1 convention `wait_for_sidecar_flock` expects.
+    let try_lock = || match crate::lock::try_lock(&file) {
+        crate::lock::LockAttempt::Acquired => 0,
+        _ => -1,
+    };
+    wait_for_sidecar_flock(
+        &p,
+        SIDECAR_WAIT_TIMEOUT,
+        SIDECAR_RETRY_INTERVAL,
+        try_lock,
+        || std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        Instant::now,
+        std::thread::sleep,
+    )?;
+    SIDECAR_DEPTH.with(|c| c.set(depth + 1));
+    let res = f();
+    SIDECAR_DEPTH.with(|c| c.set(depth));
+    crate::lock::unlock(&file);
+    res
+}
+
+/// The flock-contention wait, with the OS interactions injected so the
+/// timeout/retry policy can be property-tested deterministically. `try_flock`
+/// returns the flock(2) result convention (0 = acquired, -1 = error with
+/// errno consultable via `last_errno`), `now` the monotonic clock, `sleep`
+/// the wait primitive. The policy: keep acquiring until the deadline —
+/// `EWOULDBLOCK` sleeps `interval.min(deadline - now)`, `EINTR` retries
+/// immediately, any other errno fails immediately; a holder that is still
+/// contended when the deadline passes fails with the timeout error.
+pub(crate) fn wait_for_sidecar_flock(
+    path: &std::path::Path,
+    timeout: Duration,
+    interval: Duration,
+    mut try_flock: impl FnMut() -> i32,
+    mut last_errno: impl FnMut() -> i32,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    let deadline = now() + timeout;
+    loop {
+        if try_flock() == 0 {
+            break;
+        }
+        let errno = last_errno();
+        match errno {
+            x if x == crate::lock::contended_errno() => {
+                let cur = now();
+                if cur >= deadline {
+                    return Err(Error::transport(format!(
+                        "sidecar mutex remained contended for {:?}: {}",
+                        timeout,
+                        path.display()
+                    )));
+                }
+                sleep(interval.min(deadline - cur));
+            }
+            // EINTR (Unix only — Windows has no equivalent): retry
+            // immediately.
+            #[cfg(unix)]
+            x if x == libc::EINTR => continue,
+            _ => {
+                return Err(Error::transport(format!(
+                    "flock sidecar {}: {}",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(errno)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The verdict of one atomic compare-and-delete attempt
+/// ([`Remote::remove_file_if`]): the entry was removed because it carried
+/// EXACTLY the expected bytes ([`RemoveIfVerdict::Removed`]), the entry
+/// existed but did NOT match ([`RemoveIfVerdict::Mismatch`] — it is never
+/// removed, and a no-replace restore put it back), or the entry was
+/// GENUINELY absent ([`RemoveIfVerdict::Absent`]). `pub` because it crosses
+/// the [`Remote`] trait boundary: every transport's `remove_file_if` returns
+/// it, and every caller (and external test crate) branches on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveIfVerdict {
+    /// The entry existed with content byte-identical to `expected` and was
+    /// removed: the slot is now free.
+    Removed,
+    /// The entry existed but its content differed from `expected`: it was
+    /// restored (or left as the winner's), NEVER removed. A stale release or
+    /// a stale break lands here — the successor's lock survives.
+    Mismatch,
+    /// The entry was genuinely absent: nothing to remove (an idempotent
+    /// success for a release, a free slot for an acquire).
+    Absent,
+}
+
+/// The verdict of one canonical create-new attempt (`durable_create_new`).
+/// `pub` because it crosses the [`Remote`] trait boundary: every transport's
+/// `try_write_new` returns it, and every caller (and external test crate)
+/// branches on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateNewVerdict {
+    /// The record was durably installed: exact bytes, the final mode, and a
+    /// parent-directory-fsync'd directory entry all hold.
+    Created,
+    /// The destination already existed and VERIFIED as an identical entry:
+    /// the `lstat` succeeded, the entry is a REGULAR FILE, its mode matched
+    /// EXACTLY, and its content matched per the caller's requested
+    /// equivalence — the identical retry converges, no error, no replace.
+    AlreadyPresent,
+    /// The destination already existed but did NOT verify as an identical
+    /// entry: the TYPED [`VerifiedExisting`] reason says why (not a regular
+    /// file — directory/symlink/other, never followed; a MODE MISMATCH; a
+    /// CONTENT MISMATCH per the caller's equivalence; unreadable; or
+    /// vanished). The winner is NEVER replaced or modified, and the caller
+    /// receives the typed reason — it can never reinterpret an
+    /// undifferentiated conflict as "already present, fine".
+    Conflict(VerifiedExisting),
+}
+
+/// The seven stages of the canonical create-new sequence — the crash/failure
+/// model's injection points. Test-only in practice (the proptest arms exactly
+/// one stage), but plain `pub(crate)` so the primitive can consult it in both
+/// build profiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreateNewStep {
+    CreateTemp,
+    Write,
+    Chmod,
+    FileFsync,
+    Publish,
+    Unlink,
+    ParentFsync,
+}
+
+/// One-shot stage failure injection for [`durable_create_new`]: armed for
+/// EXACTLY ONE step, fires ONCE (then disarms), per-fixture (never a
+/// process-global slot — two fixtures' faults can never consume each other).
+/// Production code never arms one (the `None` options path); the durability
+/// proptest arms exactly one stage to model a crash at that point.
+#[derive(Debug)]
+pub(crate) struct CreateNewFault {
+    step: CreateNewStep,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl CreateNewFault {
+    /// Arm a one-shot fault for `step`. Test-only (production never arms a
+    /// fault); the type itself stays plain `pub(crate)` because the
+    /// primitive's options carry it in both build profiles.
+    #[cfg(test)]
+    pub(crate) fn new(step: CreateNewStep) -> Self {
+        Self {
+            step,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Consume the fault: fire exactly once when `step` matches the armed
+    /// stage (and never again).
+    pub(crate) fn consume(&self, step: CreateNewStep) -> bool {
+        use std::sync::atomic::Ordering;
+        self.step == step && self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// The caller-chosen content-equivalence relation applied to an EXISTING
+/// entry during create-new verification: the create-new EEXIST path verifies
+/// the existing entry and the CALLER decides whether byte-exact equality is
+/// required or whether a semantic (JSON parse-equal) relation is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentEquivalence {
+    /// Byte-exact: the existing entry's bytes must equal the intended bytes.
+    /// Every immutable record's identical retry (markers, locks, the protocol
+    /// marker, assignment records) converges under this relation.
+    Exact,
+    /// Semantic: JSON parse-equal (object key order and whitespace are not
+    /// part of the contract), falling back to byte-exact when either side is
+    /// not JSON. Used by the release-file publisher whose idempotent
+    /// re-publication legitimately re-serializes the same contract with
+    /// different key order/whitespace.
+    Semantic,
+}
+
+/// WHY an existing create-new destination is not a clean identical retry —
+/// the typed companion of [`CreateNewVerdict::Conflict`]. Every reason is a
+/// distinct variant: a caller can never reinterpret an undifferentiated
+/// conflict (a directory, a symlink, a mode mismatch, or unreadable entry
+/// can never be silently accepted as "already present, fine").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotRegularFileKind {
+    /// A directory occupies the destination path.
+    Directory,
+    /// A symlink occupies the destination path — reported from the
+    /// `O_NOFOLLOW` open's ELOOP (never followed — a symlink pointing at a
+    /// matching regular file is still a conflict, never an accepted retry).
+    Symlink,
+    /// Any other non-regular kind: a fifo, socket, device, ...
+    Other,
+}
+
+/// The TYPED result of verifying an EXISTING create-new destination against
+/// the intended content — the single DESCRIPTOR-BOUND verification shared by
+/// BOTH transports (the local `durable_create_new` verify-on-retry and the
+/// SSH transport's EEXIST verification): the entry is opened with `O_NOFOLLOW`
+/// and the type/mode AND the content all come from the ONE opened inode
+/// (fstat + read through the SAME descriptor — never an lstat followed by a
+/// separate, symlink-following path re-open). `Ok` is reached ONLY when the
+/// open succeeded AND the OPENED inode is a REGULAR FILE AND its content was
+/// read through the same descriptor; every other outcome is one of the
+/// explicit reasons below. The verdict [`CreateNewVerdict::AlreadyPresent`]
+/// is produced ONLY when this is [`VerifiedExisting::Ok`] with `mode_ok` true
+/// (the mode matched EXACTLY) and the content matched per the caller's
+/// requested equivalence; EVERY other variant is
+/// [`CreateNewVerdict::Conflict`] carrying this reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifiedExisting {
+    /// The descriptor-bound open succeeded, the OPENED inode is a REGULAR
+    /// FILE, and its content was read THROUGH THE SAME opened descriptor.
+    /// `mode_ok` records whether the entry's mode matched the
+    /// required mode EXACTLY (a mismatch is reported as
+    /// [`VerifiedExisting::ModeMismatch`]; `mode_ok` stays a first-class
+    /// dimension so the verdict constructor must consult it — an entry is
+    /// only ever [`CreateNewVerdict::AlreadyPresent`] when it is true) and
+    /// `content` records the caller's requested content equivalence, which
+    /// HELD (a failed comparison is [`VerifiedExisting::ContentMismatch`]).
+    Ok {
+        mode_ok: bool,
+        content: ContentEquivalence,
+    },
+    /// The `O_NOFOLLOW` open reported the destination absent (ENOENT/ENOTDIR).
+    /// Should not happen on the
+    /// EEXIST-confirmed path (the no-clobber publish observed the
+    /// destination), but typed rather than assumed.
+    NotFound,
+    /// The opened (fstat'd) inode is NOT a regular file: a
+    /// directory, a symlink (never followed), or another kind.
+    NotRegularFile { kind: NotRegularFileKind },
+    /// The entry is a regular file whose mode does NOT match the required
+    /// mode EXACTLY — the mode is part of the immutable record, so a mode
+    /// mismatch is a real conflict, never an accepted retry.
+    ModeMismatch { actual: u32, required: u32 },
+    /// The entry is a regular file with the EXACT required mode, but its
+    /// content did NOT match per the caller's requested equivalence.
+    ContentMismatch,
+    /// The entry exists (and is a regular file) but its content could not be
+    /// read during verification (permission, I/O fault): a real failure, never
+    /// a fabricated verdict. The payload carries the errno-bearing error text.
+    Unreadable(String),
+}
+
+/// Settings for one [`durable_create_new`] attempt: the FINAL MODE the
+/// published inode must carry, the caller-chosen CONTENT EQUIVALENCE the
+/// EEXIST verification applies to the existing entry, and (test-only) the
+/// one-shot stage fault.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CreateNewOptions<'a> {
+    pub(crate) mode: u32,
+    pub(crate) content: ContentEquivalence,
+    pub(crate) fault: Option<&'a CreateNewFault>,
+}
+
+/// THE ONE CANONICAL CREATE-NEW PRIMITIVE — the durable install protocol for
+/// immutable records (commit markers, locks, the protocol marker, assignment
+/// and release records). Realized by [`LocalTransport::try_write_new`] on
+/// this host and by the `SshTransport` remote script (`write_new_cmd`) with
+/// the IDENTICAL seven-step sequence:
+///
+/// 1. **create temp** — a unique, dot-prefixed temp name INSIDE the
+///    destination directory (so the no-replace publish is atomic within the
+///    same directory), created with create-new semantics;
+/// 2. **write** — all bytes;
+/// 3. **final chmod** — the caller's FINAL MODE is applied to the temp
+///    BEFORE the fsync, so the published inode carries the exact mode, never
+///    the process umask;
+/// 4. **file fsync** — the temp file is durable;
+/// 5. **no-replace publish** — `link(2)` under the final name: `EEXIST` is
+///    the conflict verdict (the winner is NEVER replaced), every other
+///    failure propagates;
+/// 6. **unlink temp** — the temp name is removed (best-effort cleanup — the
+///    ERROR path propagates the REAL failure);
+/// 7. **parent-directory fsync** — the PARENT DIRECTORY is fsync'd (the step
+///    the old code claimed but never performed) so the directory entry is
+///    durable; a FAILED parent fsync is a propagated error.
+///
+/// Every state failure in every step PROPAGATES as an error — `Ok(Created)`
+/// therefore implies exact bytes (the fully-written inode), the final mode,
+/// and a DURABLE directory entry. On a conflict (step 5's `EEXIST`) the
+/// existing entry is VERIFIED through the ONE centralized DESCRIPTOR-BOUND
+/// verification ([`verify_existing`] — the local [`open_verify_local`]
+/// opens with `O_NOFOLLOW` and fstats + reads through the SAME opened
+/// descriptor, so the metadata and the content provably come from the same
+/// opened inode): only a regular file whose mode matched
+/// EXACTLY and whose content matched per the caller's requested equivalence
+/// → [`CreateNewVerdict::AlreadyPresent`] (the identical retry converges —
+/// no error, no replace); EVERY other outcome →
+/// [`CreateNewVerdict::Conflict`] carrying the TYPED [`VerifiedExisting`]
+/// reason (never an undifferentiated conflict — a directory, a symlink that
+/// is never followed, a mode mismatch, or an unreadable entry is a real
+/// conflict). `Ok(AlreadyPresent)` runs the parent fsync too, so the
+/// convergent path still returns with a durable entry.
+pub(crate) fn durable_create_new(
+    base: &Path,
+    rel: &RootedRelativePath,
+    data: &[u8],
+    options: CreateNewOptions<'_>,
+) -> Result<CreateNewVerdict> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let p = join(base, rel);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    // 1. create temp: a unique dot-prefixed name inside the destination
+    //    directory, with create-new semantics (never truncates a stale temp
+    //    a crashed controller left behind).
+    let tmp = p.with_file_name(format!(
+        ".{}.tmp.{}.{}",
+        p.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    let fail = |step: CreateNewStep| options.fault.is_some_and(|f| f.consume(step));
+    if fail(CreateNewStep::CreateTemp) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::CreateTemp
+        )));
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::transport(format!("create {}: {e}", tmp.display())));
+        }
+    };
+    // 2. write — all bytes.
+    if fail(CreateNewStep::Write) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Write
+        )));
+    }
+    f.write_all(data)
+        .map_err(|e| Error::transport(format!("write {}: {e}", tmp.display())))?;
+    // 3. final chmod — the FINAL MODE is applied to the temp BEFORE the
+    //    fsync, so the published inode carries the caller's mode, never the
+    //    process umask.
+    if fail(CreateNewStep::Chmod) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Chmod
+        )));
+    }
+    crate::platform::chmod(&tmp, options.mode & 0o7777)
+        .map_err(|e| Error::transport(format!("chmod {}: {e}", tmp.display())))?;
+    // 4. file fsync — the temp file is durable.
+    if fail(CreateNewStep::FileFsync) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::FileFsync
+        )));
+    }
+    f.sync_all()
+        .map_err(|e| Error::transport(format!("fsync {}: {e}", tmp.display())))?;
+    drop(f);
+    // 5. no-replace publish — link(2) fails with EEXIST when a concurrent
+    //    writer won; the winner is NEVER replaced. On EEXIST the existing
+    //    entry is VERIFIED (verify-on-retry) through THE ONE CENTRALIZED
+    //    lstat-based verification ([`verify_existing`] — a regular file with
+    //    the EXACT required mode and the caller's accepted content
+    //    equivalence → AlreadyPresent, the identical retry converges; every
+    //    other outcome → Conflict carrying the TYPED reason).
+    if fail(CreateNewStep::Publish) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Publish
+        )));
+    }
+    let verdict = match std::fs::hard_link(&tmp, &p) {
+        Ok(()) => CreateNewVerdict::Created,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The DESCRIPTOR-BOUND verification (the LOCAL side opens with
+            // `O_NOFOLLOW` — a symlink at the destination makes the open
+            // fail with ELOOP → NotRegularFile{Symlink}, so a symlink is
+            // NEVER followed, even when it points at a matching regular
+            // file — then fstats and reads through the SAME opened
+            // descriptor, so the metadata and the content provably come
+            // from the same opened inode) and the shared verdict
+            // construction.
+            let p2 = p.clone();
+            let verified = verify_existing(
+                || {
+                    open_verify_local(
+                        &p2,
+                        #[cfg(test)]
+                        None,
+                    )
+                },
+                data,
+                options.mode,
+                options.content,
+            );
+            match verified {
+                Ok(v) => verified_to_verdict(v),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::transport(format!("install {}: {e}", p.display())));
+        }
+    };
+    // 6. unlink temp — remove ONLY the temp this invocation created
+    //    (best-effort cleanup; the REAL failure above already propagated).
+    if fail(CreateNewStep::Unlink) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Unlink
+        )));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    // 7. parent-directory fsync — the step the old code CLAIMED but never
+    //    performed: fsync the PARENT DIRECTORY so the published directory
+    //    entry survives a crash. FAIL-CLOSED: a failed open OR a failed
+    //    fsync is a propagated error (never swallowed). Runs for a Created
+    //    install AND for an AlreadyPresent retry (the convergent entry is
+    //    made durable too); a Conflict's entry is not ours to bless — it is
+    //    only ever read, never modified.
+    if matches!(
+        verdict,
+        CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+    ) && let Some(parent) = p.parent()
+    {
+        if fail(CreateNewStep::ParentFsync) {
+            return Err(Error::transport(format!(
+                "test fault: create-new step {step:?} forced to fail (once)",
+                step = CreateNewStep::ParentFsync
+            )));
+        }
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| Error::transport(format!("open dir {}: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::transport(format!("fsync dir {}: {e}", parent.display())))?;
+    }
+    Ok(verdict)
+}
+
+/// Compare two byte slices under the caller's requested content equivalence:
+/// `Exact` is byte equality; `Semantic` is JSON parse-equality (object key
+/// order and whitespace are not part of the contract), falling back to byte
+/// equality when either side does not parse as JSON. The ONE content
+/// comparison used by the centralized verification ([`verify_existing`]) and
+/// by the trait's default [`Remote::try_write_new_with`] semantic fallback.
+pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquivalence) -> bool {
+    match equivalence {
+        ContentEquivalence::Exact => a == b,
+        ContentEquivalence::Semantic => {
+            if a == b {
+                return true;
+            }
+            match (
+                serde_json::from_slice::<serde_json::Value>(a),
+                serde_json::from_slice::<serde_json::Value>(b),
+            ) {
+                (Ok(va), Ok(vb)) => va == vb,
+                _ => false,
+            }
+        }
+    }
+}
+
+/// THE ONE CENTRALIZED verification of an EXISTING create-new destination —
+/// used by BOTH transports (the local [`durable_create_new`] verify-on-retry
+/// and the SSH transport's EEXIST verification), so the two can never drift.
+/// The verification is DESCRIPTOR-BOUND: the single `open` closure performs
+/// the ONE open→fstat→read sequence on a SINGLE opened inode
+/// ([`OpenedExisting::Entry`] carries the metadata from the fstat of the
+/// OPENED descriptor AND the content read THROUGH THE SAME descriptor), so a
+/// concurrent actor that swaps the entry at the path between the checks can
+/// never mix two inodes' observations — a swap AFTER the open is irrelevant
+/// (the descriptor pins the inode; the checks observe the pinned inode
+/// consistently), and a swap BEFORE the open merely changes WHAT was opened
+/// (the checks then run on the swapped inode consistently). The checks run
+/// IN ORDER and the FIRST APPLICABLE class WINS — this first-failure
+/// precedence IS the source of truth the create-new verification ORACLE
+/// mirrors (the cross-product proptest in the ssh test module computes its
+/// expected [`VerifiedExisting`] class from THIS order, never from ad-hoc
+/// per-cell logic):
+///
+/// 1. **open** — the transport's `O_NOFOLLOW` open (the local
+///    [`open_verify_local`] / the ssh framed helper), the FIRST check: an
+///    ABSENT destination (ENOENT/ENOTDIR) → [`VerifiedExisting::NotFound`];
+///    a SYMLINK → `NotRegularFile`{Symlink} (the `O_NOFOLLOW` open's ELOOP —
+///    NEVER followed, even a symlink pointing at a matching regular file);
+///    an UNREADABLE entry (EACCES/EPERM/EIO on the open/fstat/read) →
+///    [`VerifiedExisting::Unreadable`]; a DIRECTORY → `NotRegularFile`
+///    {Directory};
+/// 2. **regular-file type** — from the OPENED descriptor's fstat: a
+///    directory/symlink/other is [`VerifiedExisting::NotRegularFile`]. The
+///    type check runs BEFORE readability, mode, and content: an unreadable or
+///    wrong-mode DIRECTORY is still `NotRegularFile`, never `Unreadable` or
+///    `ModeMismatch`;
+/// 3. **readability** — the content read happens BEFORE the mode check: a
+///    regular file whose content cannot be read is
+///    [`VerifiedExisting::Unreadable`] (never a fabricated verdict) even
+///    when its mode is wrong;
+/// 4. **exact mode** — a regular file whose mode (masked to `0o7777`) does
+///    not match the required mode is [`VerifiedExisting::ModeMismatch`],
+///    decided BEFORE the content comparison;
+/// 5. **the caller's content equivalence** ([`ContentEquivalence`]: exact
+///    bytes or semantic JSON equality, per the caller's request) — the LAST
+///    check: only a readable, mode-exact regular file is ever compared, and
+///    a failed comparison is [`VerifiedExisting::ContentMismatch`].
+///
+/// `Ok` — and therefore [`CreateNewVerdict::AlreadyPresent`] via
+/// [`verified_to_verdict`] — is produced ONLY when EVERY check held on the
+/// ONE opened inode.
+pub(crate) fn verify_existing(
+    open: impl FnOnce() -> Result<OpenedExisting>,
+    intended: &[u8],
+    required_mode: u32,
+    equivalence: ContentEquivalence,
+) -> Result<VerifiedExisting> {
+    // 1. open — the descriptor-bound open→fstat→read sequence (one inode).
+    let opened = open()?;
+    let OpenedExisting::Entry(entry) = opened else {
+        return Ok(match opened {
+            OpenedExisting::NotFound => VerifiedExisting::NotFound,
+            OpenedExisting::NotRegular { kind } => VerifiedExisting::NotRegularFile { kind },
+            OpenedExisting::Unreadable(m) => VerifiedExisting::Unreadable(m),
+            OpenedExisting::Entry(_) => unreachable!(),
+        });
+    };
+    let meta = entry.meta;
+    // 2. regular-file type — from the OPENED descriptor's fstat (a symlink
+    //    is unrepresentable here — the `O_NOFOLLOW` open never opened one —
+    //    but kept for defense in depth).
+    let kind = if meta.is_dir {
+        NotRegularFileKind::Directory
+    } else if meta.is_symlink {
+        NotRegularFileKind::Symlink
+    } else if meta.is_file {
+        // 3. exact mode — the mode is part of the immutable record.
+        let actual = meta.mode & 0o7777;
+        let required = required_mode & 0o7777;
+        if actual != required {
+            return Ok(VerifiedExisting::ModeMismatch { actual, required });
+        }
+        // 4. the caller's content equivalence.
+        if content_equivalent(&entry.content, intended, equivalence) {
+            return Ok(VerifiedExisting::Ok {
+                mode_ok: true,
+                content: equivalence,
+            });
+        }
+        return Ok(VerifiedExisting::ContentMismatch);
+    } else {
+        NotRegularFileKind::Other
+    };
+    Ok(VerifiedExisting::NotRegularFile { kind })
+}
+
+/// The descriptor-bound observation of an EXISTING create-new destination:
+/// the type/mode (from `fstat` on the OPENED descriptor) and the content
+/// (read THROUGH THE SAME descriptor). Metadata and content provably come
+/// from the SAME OPENED INODE — the property that closes the
+/// check-then-use (TOCTOU) hole: a concurrent actor that swaps the entry at
+/// the path AFTER the open is irrelevant, because the descriptor pins the
+/// inode.
+#[derive(Clone, Debug)]
+pub(crate) struct OpenedEntry {
+    pub(crate) meta: RemoteMeta,
+    pub(crate) content: Vec<u8>,
+}
+
+/// The OUTCOME of the descriptor-bound open — [`verify_existing`]'s single
+/// `open` step (the LOCAL [`open_verify_local`] / the ssh framed helper):
+/// the entry was opened with `O_NOFOLLOW` and its metadata + content were
+/// observed through the SAME opened descriptor ([`OpenedExisting::Entry`]),
+/// or the open/fstat/read failed with a TYPED reason — absent
+/// (ENOENT/ENOTDIR → [`OpenedExisting::NotFound`]), a symlink (the
+/// `O_NOFOLLOW` open's ELOOP — NEVER followed, even when the symlink points
+/// at a matching regular file), a directory (EISDIR from the open, or the
+/// opened inode's own type), or unreadable (EACCES/EPERM/EIO/... — a real
+/// failure, never a fabricated verdict).
+#[derive(Clone, Debug)]
+pub(crate) enum OpenedExisting {
+    /// The opened inode's metadata (fstat) AND content (read through the
+    /// same descriptor): the checks run on ONE consistent inode.
+    Entry(OpenedEntry),
+    /// The `O_NOFOLLOW` open reported the destination absent (ENOENT/ENOTDIR).
+    NotFound,
+    /// The opened (or fstat'd) inode is NOT a regular file: a directory, a
+    /// symlink (never followed), or another kind.
+    NotRegular { kind: NotRegularFileKind },
+    /// The entry could not be opened/fstat'd/read (EACCES/EPERM/EIO/...): a
+    /// real failure, never a fabricated verdict.
+    Unreadable(String),
+}
+
+/// The boundary of [`verify_existing`]'s descriptor-bound sequence at which a
+/// one-shot test swap fires: BEFORE the `O_NOFOLLOW` open (the swap changes
+/// WHAT is opened), or AFTER the open / AFTER the fstat (the swap changes the
+/// PATH while the descriptor keeps pinning the ORIGINAL inode — the
+/// fd-bound property under test).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifySwapBoundary {
+    BeforeOpen,
+    AfterOpen,
+    AfterFstat,
+}
+
+/// The one-shot test-only entry a [`VerifySwap`] places at the destination
+/// (originally a REGULAR file): a SYMLINK (pointing at the pre-staged
+/// `swap_target` regular file — a following open would ACCEPT it, the
+/// `O_NOFOLLOW` open must reject it), a DIRECTORY, or a DIFFERENT-INODE
+/// regular file (the pre-staged `swap_target`, moved onto the destination).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifySwapKind {
+    Symlink,
+    Directory,
+    DifferentInode,
+}
+
+/// One-shot swap injection for [`verify_existing`]'s descriptor-bound
+/// sequence: at the chosen [`VerifySwapBoundary`], replaces the destination
+/// with a [`VerifySwapKind`] entry (the original is moved aside, so the
+/// fd-pinned inode stays observable). Fires EXACTLY ONCE, per fixture
+/// (never a process-global slot — two fixtures' swaps can never consume each
+/// other). Test-only (production never arms one); the swap-at-every-boundary
+/// proptest arms exactly one.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct VerifySwap {
+    boundary: VerifySwapBoundary,
+    kind: VerifySwapKind,
+    /// The pre-staged SWAP entry: the symlink target (a regular file) or the
+    /// different-inode regular file (the directory swap ignores it).
+    swap_target: PathBuf,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl VerifySwap {
+    pub(crate) fn new(
+        boundary: VerifySwapBoundary,
+        kind: VerifySwapKind,
+        swap_target: &Path,
+    ) -> Self {
+        Self {
+            boundary,
+            kind,
+            swap_target: swap_target.to_path_buf(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Fire the swap exactly once when the boundary matches; `true` when it
+    /// fired (the destination was replaced with the swap entry).
+    pub(crate) fn fire(&self, boundary: VerifySwapBoundary, p: &Path) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.boundary != boundary || !self.armed.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        self.swap(p);
+        true
+    }
+
+    fn swap(&self, p: &Path) {
+        // Move the ORIGINAL entry aside (its inode survives for identity
+        // checks — and for the post-open boundaries, the opened descriptor
+        // keeps pinning it), then place the swap entry at the destination.
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let backup = p.with_file_name(format!(".{name}.swap-orig"));
+        let _ = std::fs::rename(p, &backup);
+        match self.kind {
+            VerifySwapKind::Symlink => {
+                let _ = std::os::unix::fs::symlink(&self.swap_target, p);
+            }
+            VerifySwapKind::Directory => {
+                let _ = std::fs::create_dir(p);
+            }
+            VerifySwapKind::DifferentInode => {
+                let _ = std::fs::rename(&self.swap_target, p);
+            }
+        }
+    }
+}
+
+/// Open `p` with `O_NOFOLLOW` (a symlink at the path → ELOOP →
+/// [`OpenedExisting::NotRegular`]{Symlink} — NEVER followed, even when it
+/// points at a matching regular file), `fstat` the SAME descriptor, and read
+/// THROUGH THE SAME descriptor — the LOCAL realization of the descriptor-
+/// bound sequence [`verify_existing`] requires (the ssh transport's framed
+/// helper performs the SAME sequence in ONE remote exec). `O_NONBLOCK`
+/// keeps the open from blocking on a fifo/device (the entry is then
+/// classified by its `fstat` type, never read). A swap at the path AFTER the
+/// open is irrelevant — the descriptor pins the inode.
+fn open_verify_local(p: &Path, #[cfg(test)] swap: Option<&VerifySwap>) -> Result<OpenedExisting> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(test)]
+    if swap.is_some_and(|s| s.fire(VerifySwapBoundary::BeforeOpen, p)) {
+        // The swap consumed: the destination was replaced BEFORE the open,
+        // so the open observes the SWAPPED entry.
+    }
+    let mut f = match opts.open(p) {
+        Ok(f) => f,
+        Err(e) => return Ok(local_open_err(p, e)),
+    };
+    #[cfg(test)]
+    if swap.is_some_and(|s| s.fire(VerifySwapBoundary::AfterOpen, p)) {
+        // The swap consumed: the PATH was replaced AFTER the open — the fd
+        // pins the ORIGINAL inode, so the fstat and read below still
+        // observe it (the swap is harmless).
+    }
+    let meta = match f.metadata() {
+        Ok(m) => meta_to_remote(&m),
+        Err(e) => {
+            return Ok(OpenedExisting::Unreadable(format!(
+                "verify fstat {}: {e}",
+                p.display()
+            )));
+        }
+    };
+    #[cfg(test)]
+    if swap.is_some_and(|s| s.fire(VerifySwapBoundary::AfterFstat, p)) {
+        // The swap consumed: the PATH was replaced AFTER the fstat — the fd
+        // still pins the ORIGINAL inode, so the read below observes it.
+    }
+    if meta.is_dir {
+        return Ok(OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Directory,
+        });
+    }
+    if meta.is_symlink {
+        return Ok(OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Symlink,
+        });
+    }
+    if !meta.is_file {
+        return Ok(OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Other,
+        });
+    }
+    let mut content = Vec::new();
+    if let Err(e) = f.read_to_end(&mut content) {
+        return Ok(OpenedExisting::Unreadable(format!(
+            "verify read {}: {e}",
+            p.display()
+        )));
+    }
+    Ok(OpenedExisting::Entry(OpenedEntry { meta, content }))
+}
+
+/// Map a failed `O_NOFOLLOW` open to the TYPED reason in the
+/// [`VerifiedExisting`] first-failure order: ENOENT/ENOTDIR → NotFound; ELOOP
+/// → NotRegularFile{Symlink} (the open NEVER follows a symlink — even one
+/// pointing at a matching regular file); EISDIR → NotRegularFile{Directory};
+/// every other errno (EACCES/EPERM/EIO/...) → Unreadable (a real failure,
+/// never a fabricated verdict).
+fn local_open_err(p: &Path, e: std::io::Error) -> OpenedExisting {
+    match e.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) => OpenedExisting::NotFound,
+        Some(libc::ELOOP) => OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Symlink,
+        },
+        Some(libc::EISDIR) => OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Directory,
+        },
+        _ => OpenedExisting::Unreadable(format!("verify open {}: {e}", p.display())),
+    }
+}
+
+/// The ONE verdict-construction path: [`CreateNewVerdict::AlreadyPresent`]
+/// ONLY when the typed verification is `Ok` WITH the mode check held (the
+/// entry was a regular file whose mode matched EXACTLY — `content` already
+/// held by construction); EVERY other reason is
+/// [`CreateNewVerdict::Conflict`] carrying the typed reason. Callers receive
+/// the typed reason and can never reinterpret an undifferentiated conflict.
+pub(crate) fn verified_to_verdict(v: VerifiedExisting) -> CreateNewVerdict {
+    match v {
+        VerifiedExisting::Ok { mode_ok: true, .. } => CreateNewVerdict::AlreadyPresent,
+        v => CreateNewVerdict::Conflict(v),
+    }
+}
+
+/// A transport that operates on a local directory, executing commands on the
+/// host. It mirrors the SSH remote layout exactly.
+pub struct LocalTransport {
+    base: PathBuf,
+    /// The caller-supplied deployment layout: the bootstrap directories
+    /// `provision_layout` creates, the operation-lock path whose mutations
+    /// are sidecar-serialized, and the optional receiver-id marker.
+    layout: Layout,
+    /// The child environment snapshot: every spawned child (`df`)
+    /// receives THIS snapshot as its ENTIRE environment
+    /// ([`SysEnv::apply_to_command`]: `env_clear` first, then the snapshot's
+    /// variables) — a deterministic HERMETIC environment resolved at the
+    /// construction boundary, never whatever the parent env looks like at
+    /// spawn time, and nothing else.
+    env: SysEnv,
+    /// THE command-execution seam every `exec` goes through: production uses
+    /// [`ChildRunner`] (the bounded real runner: owns the child from spawn
+    /// to the mandatory reap, terminates the whole process GROUP on timeout
+    /// (TERM, grace, KILL), and returns every outcome — success, timeout,
+    /// error — only after the child was reaped; a timeout-kill failure is an
+    /// error, never a successful timeout outcome); the deterministic
+    /// properties inject a scripted fake (no subprocess, no wall-clock).
+    exec: Box<dyn Exec>,
+}
+
+impl LocalTransport {
+    /// Build a transport rooted at `base` whose children run with the
+    /// environment snapshot `env` (see [`SysEnv::apply_to_command`]) as their
+    /// ENTIRE environment. Construction
+    /// is side-effect-free: no directories are created and nothing is
+    /// touched on disk. Call [`Remote::provision_layout`] to create the
+    /// deployment layout before the first mutation (the push engine does
+    /// this behind its non-dry-run gate).
+    ///
+    /// The FILESYSTEM ROOT is refused (defense in depth): a transport rooted
+    /// at `/` would make the deployment cleanup operate on the system root,
+    /// so the base must have at least one normal path component below the
+    /// root.
+    pub fn new(env: &SysEnv, base: PathBuf, layout: Layout) -> Result<Self> {
+        let runner_base = base.clone();
+        Self::with_exec(
+            env,
+            base,
+            layout,
+            ChildRunner::new(env, runner_base, RunnerConfig::production()),
+        )
+    }
+
+    /// Build a transport whose `exec` calls are handled by `exec` instead of
+    /// the production [`ChildRunner`]. Construction stays side-effect-free
+    /// (no directories created, nothing spawned). Test-support seam: the
+    /// deterministic properties inject a scripted fake so the push LOGIC
+    /// (verification/activation outcomes) is exercised without spawning real
+    /// processes.
+    pub fn with_exec(
+        env: &SysEnv,
+        base: PathBuf,
+        layout: Layout,
+        exec: impl Exec + 'static,
+    ) -> Result<Self> {
+        if !has_normal_component_below_root(&base) {
+            return Err(Error::transport(format!(
+                "deploy_dir {:?} must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
+                base
+            )));
+        }
+        Ok(LocalTransport {
+            base,
+            layout,
+            env: env.clone(),
+            exec: Box::new(exec),
+        })
+    }
+}
+
+impl Remote for LocalTransport {
+    fn root(&self) -> &Path {
+        &self.base
+    }
+
+    fn is_local(&self) -> bool {
+        true
+    }
+
+    fn provision_layout(&self) -> Result<()> {
+        if !self.base.exists() {
+            std::fs::create_dir_all(&self.base)
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;
+        }
+        // Provision the caller-supplied top-level layout.
+        for d in &self.layout.bootstrap_dirs {
+            let p = self.base.join(d);
+            if !p.exists() {
+                std::fs::create_dir_all(&p)
+                    .map_err(|e| Error::transport(format!("mkdir {}: {e}", p.display())))?;
+            }
+        }
+        // The IMMUTABLE receiver-id marker: the PHYSICAL identity of this
+        // deploy_dir, created ONCE at provisioning and never changed (a
+        // re-provisioning adopts the existing marker).
+        if let Some(marker) = &self.layout.receiver_marker {
+            provision_receiver_id(self, marker)?;
+        }
+        Ok(())
+    }
+
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        std::fs::read(join(&self.base, rel))
+            .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
+    }
+
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        let p = join(&self.base, rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        std::fs::write(&p, data)
+            .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
+        if mode != 0 {
+            crate::platform::chmod(&p, mode)
+                .map_err(|e| Error::transport(format!("chmod {}: {e}", p.display())))?;
+        }
+        Ok(())
+    }
+
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::create_dir(join(&self.base, rel))
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
+    }
+
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::create_dir_all(join(&self.base, rel))
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
+    }
+
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
+            .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
+    }
+
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        let dir = join(&self.base, rel);
+        // An unprovisioned remote root has no directories yet; report an empty
+        // listing rather than erroring so read-only inspection stays valid.
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(Error::transport(format!("read_dir {}: {e}", dir.display())));
+            }
+        };
+        let mut out = Vec::new();
+        for e in rd {
+            let e = e.map_err(|e| Error::transport(format!("entry: {e}")))?;
+            // `symlink_metadata` (not `metadata`) so a symlink is reported as a
+            // symlink with its own mode rather than being followed to its target.
+            let m = std::fs::symlink_metadata(e.path())
+                .map_err(|e| Error::transport(format!("meta: {e}")))?;
+            out.push(RemoteEntry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                is_dir: m.is_dir(),
+                is_symlink: m.file_type().is_symlink(),
+                size: m.len(),
+                mode: crate::platform::metadata_mode(&m),
+            });
+        }
+        Ok(out)
+    }
+
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        let f = join(&self.base, from);
+        let t = join(&self.base, to);
+        if let Some(parent) = t.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::rename(&f, &t).map_err(|e| {
+            Error::transport(format!("rename {} -> {}: {e}", f.display(), t.display()))
+        })
+    }
+
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        let l = join(&self.base, link);
+        if let Some(parent) = l.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let _ = std::fs::remove_file(&l);
+        let res = crate::platform::symlink(target, &l);
+        res.map_err(|e| {
+            Error::transport(format!(
+                "symlink {} -> {}: {e}",
+                l.display(),
+                target.display()
+            ))
+        })
+    }
+
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        let p = join(&self.base, rel);
+        std::fs::read_link(&p)
+            .map_err(|e| Error::transport(format!("readlink {}: {e}", p.display())))
+    }
+
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = join(&self.base, rel);
+        std::fs::remove_file(&p)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
+    }
+
+    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        // If this is the lock path, serialize through the sidecar mutex so
+        // the compare-then-delete becomes operation-atomic: a contender's
+        // create-if-absent cannot win the freed path mid-operation.
+        if rel.as_path() == self.layout.lock.as_path() {
+            return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
+                self.remove_file_if_inner(rel, expected)
+            });
+        }
+        self.remove_file_if_inner(rel, expected)
+    }
+
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        if rel.as_path() == self.layout.lock.as_path() {
+            return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
+                self.try_write_new_inner(rel, data)
+            });
+        }
+        self.try_write_new_inner(rel, data)
+    }
+
+    fn try_write_new_with(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
+        if rel.as_path() == self.layout.lock.as_path() {
+            return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
+                self.try_write_new_with_inner(rel, data, equivalence)
+            });
+        }
+        self.try_write_new_with_inner(rel, data, equivalence)
+    }
+
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = join(&self.base, rel);
+        std::fs::remove_dir_all(&p)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+    }
+
+    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        let root = join(&self.base, rel);
+        // Every file is fsynced; directories are collected and fsynced
+        // DEEPEST-FIRST (a parent's fsync runs only after every child's), so
+        // the whole tree is durable before the atomic install rename.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in WalkDir::new(&root).into_iter() {
+            let entry = entry.map_err(|e| Error::transport(format!("walk: {e}")))?;
+            let p = entry.path();
+            let meta = std::fs::symlink_metadata(p)
+                .map_err(|e| Error::transport(format!("stat {}: {e}", p.display())))?;
+            if meta.is_dir() {
+                dirs.push(p.to_path_buf());
+            } else if meta.is_file() {
+                let f = std::fs::File::open(p)
+                    .map_err(|e| Error::transport(format!("open {}: {e}", p.display())))?;
+                f.sync_all()
+                    .map_err(|e| Error::transport(format!("fsync {}: {e}", p.display())))?;
+            }
+        }
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for d in dirs {
+            let f = std::fs::File::open(&d)
+                .map_err(|e| Error::transport(format!("open dir {}: {e}", d.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::transport(format!("fsync dir {}: {e}", d.display())))?;
+        }
+        Ok(())
+    }
+
+    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = join(&self.base, rel);
+        let parent = p.parent().ok_or_else(|| {
+            Error::transport(format!(
+                "fsync parent of {}: no parent directory",
+                p.display()
+            ))
+        })?;
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| Error::transport(format!("open parent dir {}: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::transport(format!("fsync parent dir {}: {e}", parent.display())))
+    }
+
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
+        join(&self.base, rel).exists()
+    }
+
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        self.metadata_opt(rel)?.ok_or_else(|| {
+            Error::NotFound(format!(
+                "stat {}: not found",
+                join(&self.base, rel).display()
+            ))
+        })
+    }
+
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
+        let p = join(&self.base, rel);
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) => Ok(Some(meta_to_remote(&m))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::transport(format!("stat {}: {e}", p.display()))),
+        }
+    }
+
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        if argv.is_empty() {
+            return Err(Error::transport("empty command"));
+        }
+        // THE command-execution seam: production is the bounded child-runner
+        // (spawn into an OWN process group, bounded wait, group termination,
+        // mandatory reap before any outcome escapes); the deterministic
+        // properties inject a scripted fake — same trait surface, no process.
+        self.exec.exec(argv, timeout)
+    }
+
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        let mut cmd = std::process::Command::new("df");
+        self.env.apply_to_command(&mut cmd);
+        let out = cmd
+            .args(["-k", self.base.to_string_lossy().as_ref()])
+            .output()
+            .map_err(|e| Error::transport(format!("df: {e}")))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Second line: Filesystem  blocks  used  avail  capacity  mount
+        let line = text
+            .lines()
+            .nth(1)
+            .ok_or_else(|| Error::transport("unexpected df output".to_string()))?;
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // blocks is the 2nd column and avail the 4th (1-indexed) on both
+        // macOS and Linux; both are in 1024-byte units.
+        let total_kb = cols
+            .get(1)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| Error::transport("could not parse df blocks".to_string()))?;
+        let avail_kb = cols
+            .get(3)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| Error::transport("could not parse df avail".to_string()))?;
+        Ok(FsBytes {
+            total: total_kb * 1024,
+            available: avail_kb * 1024,
+        })
+    }
+}
+
+impl LocalTransport {
+    fn remove_file_if_inner(
+        &self,
+        rel: &RootedRelativePath,
+        expected: &[u8],
+    ) -> Result<RemoveIfVerdict> {
+        let p = join(&self.base, rel);
+        // When already holding the sidecar (we are inside with_operation_lock_sidecar),
+        // the mutation is already serialized, so a simple read-compare-unlink
+        // keeps the record continuously visible for a mismatched remove (no
+        // transient absence) and is safe from TOCTOU.
+        if SIDECAR_DEPTH.with(|c| c.get() > 0) {
+            let cur = match std::fs::read(&p) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(RemoveIfVerdict::Absent);
+                }
+                Err(e) => return Err(Error::transport(format!("read {}: {e}", p.display()))),
+            };
+            if cur == expected {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => return Ok(RemoveIfVerdict::Removed),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(RemoveIfVerdict::Absent);
+                    }
+                    Err(e) => return Err(Error::transport(format!("remove {}: {e}", p.display()))),
+                }
+            } else {
+                return Ok(RemoveIfVerdict::Mismatch);
+            }
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // Fallback claim path (when not under sidecar, e.g. non-lock paths
+        // or direct calls): atomic rename claim, verify, delete or restore.
+        // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
+        // destination's parent directory (same filesystem, same directory
+        // namespace as the lock), exactly like durable_create_new's temps.
+        let tmp = p.with_file_name(format!(
+            ".{}.claim.{}.{}",
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id(),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        // CLAIM: rename the entry to the temp — atomic, so only ONE
+        // contender can ever win the claim; every other breaker's rename
+        // fails with NotFound (the slot was already claimed or free).
+        match std::fs::rename(&p, &tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RemoveIfVerdict::Absent);
+            }
+            Err(e) => {
+                return Err(Error::transport(format!("claim {}: {e}", p.display())));
+            }
+        }
+        // VERIFY the claimed entry against the expectation.
+        let content = match std::fs::read(&tmp) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::transport(format!("verify {}: {e}", tmp.display())));
+            }
+        };
+        if content == expected {
+            // MATCH: the claimed entry was EXACTLY the expected record —
+            // delete it; the slot is now free.
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(RemoveIfVerdict::Removed);
+        }
+        // MISMATCH: the entry changed under the reader (a successor's newer
+        // generation). RESTORE it no-replace — the moved record is
+        // re-created with the canonical final mode only while the path is
+        // still free; a CONCURRENT install is never replaced (Conflict) and
+        // the moved claim is discarded, never destroying the winner. Either
+        // way a successor's lock survives untouched.
+        let restored = durable_create_new(
+            &self.base,
+            rel,
+            &content,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                content: ContentEquivalence::Exact,
+                fault: None,
+            },
+        );
+        let _ = std::fs::remove_file(&tmp);
+        match restored {
+            // Created (restored), AlreadyPresent (a concurrent identical
+            // restore), or Conflict (a different winner is in place): the
+            // lock is intact — the compare failed, never a delete.
+            Ok(_) => Ok(RemoveIfVerdict::Mismatch),
+            // A transport failure on the no-replace restore propagates
+            // EXPLICITLY (the moved claim was the only thing lost; the slot
+            // is not blocked — the lease is the backstop).
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_write_new_inner(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> Result<CreateNewVerdict> {
+        self.try_write_new_with_inner(rel, data, ContentEquivalence::Exact)
+    }
+
+    fn try_write_new_with_inner(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
+        durable_create_new(
+            &self.base,
+            rel,
+            data,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                content: equivalence,
+                fault: None,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
+
+    /// The deploy_dir's IMMUTABLE receiver-id marker: `provision_layout`
+    /// creates it ONCE (stored as `<id>\n`), a re-provisioning adopts the
+    /// SAME identity (never a new one), and `read_receiver_id` reads it back.
+    #[test]
+    fn provision_layout_creates_immutable_receiver_id() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let marker = RootedRelativePath::parse(Path::new("receiver-marker")).unwrap();
+        let layout = Layout {
+            receiver_marker: Some(marker.clone()),
+            ..Layout::empty()
+        };
+        let t = LocalTransport::new(
+            &SysEnv::from_process(),
+            dir.path().join("r"),
+            layout.clone(),
+        )
+        .unwrap();
+        t.provision_layout().unwrap();
+        assert!(
+            t.exists(&marker),
+            "provisioning creates the receiver-id marker"
+        );
+        let first = read_receiver_id(&t, &marker).expect("the marker reads back");
+        assert_eq!(
+            first.as_str().len(),
+            RECEIVER_ID_LEN,
+            "the marker carries a 40-hex receiver id, got {:?}",
+            first.as_str()
+        );
+        assert!(
+            first
+                .as_str()
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "the receiver id is lowercase hex, got {:?}",
+            first.as_str()
+        );
+        // The wire form is `<id>\n`.
+        assert_eq!(
+            t.read(&marker).unwrap(),
+            format!("{}\n", first.as_str()).into_bytes(),
+            "the marker is stored as <id>\\n"
+        );
+        // Re-provisioning (a second push to the same deploy_dir) adopts the
+        // SAME immutable identity — never a new one.
+        t.provision_layout().unwrap();
+        let second = read_receiver_id(&t, &marker).expect("the marker reads back");
+        assert_eq!(
+            first, second,
+            "the receiver id is IMMUTABLE: re-provisioning adopts the existing marker"
+        );
+        // A pre-existing marker with DIFFERENT content is adopted too (the
+        // first writer wins — the physical identity is whatever was created
+        // first), and a malformed marker fails closed.
+        let t2 = LocalTransport::new(
+            &SysEnv::from_process(),
+            dir.path().join("r2"),
+            layout.clone(),
+        )
+        .unwrap();
+        t2.provision_layout().unwrap();
+        let foreign = ReceiverId::generate().expect("entropy for a receiver id");
+        t2.write(&marker, &foreign.wire_bytes(), 0o644).unwrap();
+        t2.provision_layout().unwrap();
+        assert_eq!(
+            read_receiver_id(&t2, &marker).expect("the existing marker is adopted"),
+            foreign,
+            "a re-provisioning never replaces the existing marker"
+        );
+        let t3 =
+            LocalTransport::new(&SysEnv::from_process(), dir.path().join("r3"), layout).unwrap();
+        t3.provision_layout().unwrap();
+        t3.write(&marker, b"not-a-receiver-id", 0o644).unwrap();
+        read_receiver_id(&t3, &marker).expect_err("a malformed marker fails closed");
+    }
+
+    /// Concurrent readers must only ever observe the destination file fully
+    /// written: installs happen by hard-linking a synced, complete temporary
+    /// inode, so a partial record is unrepresentable.
+    #[test]
+    fn try_write_new_concurrent_readers_never_observe_partial_content() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let t = LocalTransport::new(
+            &SysEnv::from_process(),
+            dir.path().join("r"),
+            Layout::empty(),
+        )
+        .unwrap();
+        let markers = dir.path().join("r/markers");
+        const PAYLOAD: &str =
+            r#"{"committed":true,"generation":"gen-1","servers":["server-01","server-02"]}"#;
+
+        // Set even if the writer panics (Drop runs during unwind), so the
+        // readers always terminate instead of hanging the test binary.
+        struct DoneGuard(Arc<AtomicBool>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        std::thread::scope(|s| {
+            let done = Arc::new(AtomicBool::new(false));
+            let writer_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+            {
+                let done = done.clone();
+                let writer_error = writer_error.clone();
+                s.spawn(move || {
+                    let _done = DoneGuard(done);
+                    for i in 0..100 {
+                        let rel = RootedRelativePath::parse(
+                            &Path::new("markers").join(format!("m{i}.json")),
+                        )
+                        .unwrap();
+                        if let Err(e) = t.try_write_new(&rel, PAYLOAD.as_bytes()) {
+                            *writer_error.lock().unwrap() = Some(e.to_string());
+                            return;
+                        }
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let done = done.clone();
+                let markers = markers.clone();
+                s.spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        let Ok(entries) = std::fs::read_dir(&markers) else {
+                            continue;
+                        };
+                        for e in entries.flatten() {
+                            // Temporary files are dot-prefixed precisely so that
+                            // listing-based observers can skip them; a real
+                            // reader of a marker path never touches them.
+                            if e.file_name().to_string_lossy().starts_with('.') {
+                                continue;
+                            }
+                            let data = std::fs::read(e.path()).unwrap_or_default();
+                            assert_eq!(
+                                String::from_utf8_lossy(&data).as_ref(),
+                                PAYLOAD,
+                                "partial marker observed by concurrent reader"
+                            );
+                        }
+                    }
+                });
+            }
+
+            // The writer must have completed every install successfully.
+            assert_eq!(
+                writer_error.lock().unwrap().as_deref(),
+                None,
+                "writer failed to install all markers"
+            );
+        });
+
+        // Every marker installed exactly once with full content.
+        for i in 0..100 {
+            let data = std::fs::read(markers.join(format!("m{i}.json"))).unwrap();
+            assert_eq!(String::from_utf8_lossy(&data).as_ref(), PAYLOAD);
+        }
+    }
+
+    #[test]
+    fn new_refuses_root_deploy_dir() {
+        // The filesystem root (and any form that normalizes to it) is
+        // refused at construction: a transport rooted at `/` would make the
+        // deployment cleanup operate on the system root.
+        for bad in ["/", "//", "/./", "/../"] {
+            let err = LocalTransport::new(
+                &SysEnv::from_process(),
+                std::path::PathBuf::from(bad),
+                Layout::empty(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("root deploy_dir {bad:?} must be refused"));
+            assert!(
+                err.to_string()
+                    .contains("at least one normal path component"),
+                "error must name the rule, got: {err}"
+            );
+        }
+        // A deploy_dir with at least one normal component below the root is
+        // accepted (construction stays side-effect-free).
+        for ok in ["/srv", "/srv/app/", "/srv//app"] {
+            LocalTransport::new(
+                &SysEnv::from_process(),
+                std::path::PathBuf::from(ok),
+                Layout::empty(),
+            )
+            .expect("a deploy_dir with a normal component below the root is accepted");
+        }
+    }
+
+    #[test]
+    fn symlink_rename_exists() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let t = LocalTransport::new(
+            &SysEnv::from_process(),
+            dir.path().join("r"),
+            Layout::empty(),
+        )
+        .unwrap();
+        t.create_dir_all(&RootedRelativePath::parse(Path::new("generations/gen1")).unwrap())
+            .unwrap();
+        t.symlink(
+            Path::new("generations/gen1"),
+            &RootedRelativePath::parse(Path::new(".tmp.x")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            t.exists(&RootedRelativePath::parse(Path::new(".tmp.x")).unwrap()),
+            "symlink should exist"
+        );
+        t.rename(
+            &RootedRelativePath::parse(Path::new(".tmp.x")).unwrap(),
+            &RootedRelativePath::parse(Path::new("current")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            t.exists(&RootedRelativePath::parse(Path::new("current")).unwrap()),
+            "current should exist after rename"
+        );
+        let target = t
+            .read_link(&RootedRelativePath::parse(Path::new("current")).unwrap())
+            .unwrap();
+        assert_eq!(target, Path::new("generations/gen1"));
+    }
+
+    /// The transport-level contract of the shared primitive: `try_write_new`
+    /// reports `Ok(Created)` for a fresh DURABLE install, `Ok(AlreadyPresent)`
+    /// for an identical retry (convergent — the winner is verified
+    /// byte-and-mode identical, never replaced), and `Ok(Conflict)` for a
+    /// different-content OR different-mode winner (the winner is never
+    /// touched; the caller's read-back comparison decides the semantic
+    /// verdict). The TYPED verdict survives the trait boundary — no bool
+    /// collapse. The installed record carries the canonical final mode, not
+    /// the process umask.
+    #[test]
+    fn try_write_new_durable_install_and_conflict_contract() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let t = LocalTransport::new(
+            &SysEnv::from_process(),
+            dir.path().join("r"),
+            Layout::empty(),
+        )
+        .unwrap();
+        let rel = RootedRelativePath::parse(Path::new("state/op.json")).unwrap();
+        let data = b"{\"op\":\"1\"}";
+
+        assert_eq!(
+            t.try_write_new(&rel, data).unwrap(),
+            CreateNewVerdict::Created,
+            "a fresh install wins"
+        );
+        let p = t.root().join(rel.as_path());
+        assert_eq!(std::fs::read(&p).unwrap(), data, "exact bytes installed");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().mode() & 0o7777,
+            IMMUTABLE_RECORD_MODE & 0o7777,
+            "the record must carry the canonical final mode"
+        );
+        // Identical retry: convergent — AlreadyPresent, no error, no replace.
+        assert_eq!(
+            t.try_write_new(&rel, data).unwrap(),
+            CreateNewVerdict::AlreadyPresent,
+            "an identical retry converges to already-present"
+        );
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            data,
+            "the identical retry must not touch the winner"
+        );
+        // Different content: the conflict verdict — never replaced.
+        assert!(
+            matches!(
+                t.try_write_new(&rel, b"other").unwrap(),
+                CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+            ),
+            "a different-content conflict is the verdict"
+        );
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            data,
+            "the conflict must NEVER replace the winner"
+        );
+    }
+
+    /// The compare-and-delete primitive's contract: `Removed` for a
+    /// byte-identical match (the entry is gone), `Mismatch` for different
+    /// content (the winner is RESTORED — never removed, never replaced),
+    /// and `Absent` for genuine absence. This is the primitive the mutation
+    /// lock's stale-release/expired-break safety rests on.
+    #[test]
+    fn remove_file_if_compare_and_delete_verdicts() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let t = LocalTransport::new(
+            &SysEnv::from_process(),
+            dir.path().join("r"),
+            Layout::empty(),
+        )
+        .unwrap();
+        let rel = RootedRelativePath::parse(Path::new("state/op.lock")).unwrap();
+        let data = b"{\"owner\":\"a\",\"token\":1}";
+
+        // Absent: nothing to remove — the idempotent verdict.
+        assert_eq!(
+            t.remove_file_if(&rel, data).unwrap(),
+            RemoveIfVerdict::Absent,
+            "a genuinely absent entry is Absent, never an error"
+        );
+        // Match: the entry carried EXACTLY the expected bytes — removed.
+        t.try_write_new(&rel, data).unwrap();
+        assert_eq!(
+            t.remove_file_if(&rel, data).unwrap(),
+            RemoveIfVerdict::Removed,
+            "a byte-identical match is removed"
+        );
+        assert!(
+            t.metadata_opt(&rel).unwrap().is_none(),
+            "the matched entry must be gone"
+        );
+        // Mismatch: different content — the winner is restored untouched,
+        // NEVER removed, NEVER replaced.
+        t.try_write_new(&rel, data).unwrap();
+        assert_eq!(
+            t.remove_file_if(&rel, b"{\"owner\":\"b\",\"token\":2}")
+                .unwrap(),
+            RemoveIfVerdict::Mismatch,
+            "different content is a Mismatch, never a delete"
+        );
+        assert_eq!(
+            t.read(&rel).unwrap(),
+            data,
+            "the mismatch must restore the winner byte-for-byte"
+        );
+    }
+
+    /// The durability property's scenario dimension: the healthy install, a
+    /// one-shot crash/failure at one of the SEVEN stages, and the
+    /// pre-existing-winner retry cases (identical / different content /
+    /// different mode / published-before-parent-sync / the retry's parent
+    /// fsync faulted).
+    #[derive(Clone, Copy, Debug)]
+    enum CreateNewScenario {
+        Healthy,
+        FailAt(CreateNewStep),
+        PreExistingIdentical,
+        PreExistingDifferent,
+        PreExistingDifferentMode,
+        /// A crash-simulated state: the entry EXISTS with the intended bytes
+        /// and mode, but its parent directory was never fsync'd (a crash
+        /// after publish, before the parent fsync).
+        PublishedBeforeParentSync,
+        /// The retry over an identical existing entry arms a one-shot
+        /// ParentFsync fault: the AlreadyPresent branch must RUN the parent
+        /// fsync, so the faulted retry propagates an error instead of
+        /// claiming durability.
+        IdenticalRetryParentFsyncFault,
+    }
+
+    fn create_new_scenario() -> impl Strategy<Value = CreateNewScenario> {
+        prop_oneof![
+            Just(CreateNewScenario::Healthy),
+            Just(CreateNewScenario::PreExistingIdentical),
+            Just(CreateNewScenario::PreExistingDifferent),
+            Just(CreateNewScenario::PreExistingDifferentMode),
+            Just(CreateNewScenario::PublishedBeforeParentSync),
+            Just(CreateNewScenario::IdenticalRetryParentFsyncFault),
+            Just(CreateNewScenario::FailAt(CreateNewStep::CreateTemp)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Write)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Chmod)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::FileFsync)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Publish)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Unlink)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::ParentFsync)),
+        ]
+    }
+
+    #[cfg(test)]
+    use proptest::prelude::*;
+    #[cfg(test)]
+    use proptest::test_runner::RngSeed;
+
+    proptest! {
+        // THE DURABILITY CRASH/FAILURE MODEL — one property, every case:
+        //
+        // * `Ok(Created)` implies EXACT BYTES, the FINAL MODE, and a DURABLE
+        //   DIRECTORY ENTRY — a fresh read of the destination directory (a
+        //   simulated crash-after-return) still sees the entry, because the
+        //   parent fsync established it;
+        // * CONFLICT NEVER REPLACES: a destination pre-existing with
+        //   DIFFERENT bytes (or a different mode over identical bytes) is
+        //   never modified — the primitive returns the conflict verdict and
+        //   the winner stays intact;
+        // * RETRIES CONVERGE: after a one-shot failure at ANY of the seven
+        //   stages, an IDENTICAL retry succeeds and leaves the destination
+        //   EITHER the fully-written identical content OR absent — never a
+        //   partial/torn record;
+        // * FAILURE PROPAGATION: the faulted attempt is an `Err` naming the
+        //   injected stage — never a swallowed `Ok` that claims durability.
+        //
+        // Bounded cases (full budget under `DEPLOY_FULL_TESTS=1`, fast
+        // default), fixed seed 0x5EED_5EED (house style), no persistence, and
+        // each case drives its OWN fixture (per-fixture one-shot fault,
+        // structurally isolated).
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn durable_create_new_crash_failure_model(
+            content in prop::collection::vec(any::<u8>(), 0..128),
+            mode in prop_oneof![
+                Just(0o600u32),
+                Just(0o644u32),
+                Just(0o755u32),
+                Just(0o640u32),
+            ],
+            scenario in create_new_scenario(),
+        ) {
+            let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let dest = root.join(rel.as_path());
+            let dest_name = rel.file_name().unwrap().to_string_lossy().into_owned();
+
+            match scenario {
+                CreateNewScenario::Healthy => {
+                    let verdict = durable_create_new(
+                        &root,
+                        &rel,
+                        &content,
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
+                    )
+                    .expect("the healthy install must succeed");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Created);
+                    // Ok(Created) implies EXACT BYTES ...
+                    prop_assert_eq!(
+                        std::fs::read(&dest).expect("installed record must be readable"),
+                        content,
+                        "Ok(Created) must imply exact bytes"
+                    );
+                    // ... the FINAL MODE (never the process umask) ...
+                    let meta = std::fs::metadata(&dest).expect("installed record must exist");
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        mode & 0o7777,
+                        "Ok(Created) must imply the final mode"
+                    );
+                    // ... and a DURABLE DIRECTORY ENTRY: the parent fsync
+                    // established it, so a fresh directory read (a simulated
+                    // crash-after-return) still sees the entry.
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .expect("the parent must be readable")
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the parent fsync must have established the directory entry, dir has: {names:?}"
+                    );
+                }
+                CreateNewScenario::FailAt(step) => {
+                    let fault = CreateNewFault::new(step);
+                    // FAILURE PROPAGATION: the faulted attempt is an Err
+                    // naming the injected stage — never a swallowed Ok.
+                    let err = durable_create_new(
+                        &root,
+                        &rel,
+                        &content,
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: Some(&fault) },
+                    )
+                    .expect_err("a failure at every stage must propagate as Err");
+                    prop_assert!(
+                        err.to_string().contains("forced to fail (once)"),
+                        "the injected fault must be the propagated failure, got: {err}"
+                    );
+                    // RETRIES CONVERGE: an identical retry (the fault is
+                    // one-shot, already consumed) must succeed and leave the
+                    // destination EITHER the fully-written identical content
+                    // OR absent — never a partial/torn file.
+                    let retry = durable_create_new(
+                        &root,
+                        &rel,
+                        &content,
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
+                    )
+                    .expect("the identical retry must converge");
+                    prop_assert!(
+                        matches!(
+                            retry,
+                            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+                        ),
+                        "the identical retry must converge, got: {retry:?}"
+                    );
+                    if dest.exists() {
+                        prop_assert_eq!(
+                            std::fs::read(&dest).expect("installed record must be readable"),
+                            content,
+                            "the destination must be the fully-written identical content, never partial"
+                        );
+                        let meta = std::fs::metadata(&dest).expect("installed record must exist");
+                        prop_assert_eq!(
+                            meta.mode() & 0o7777,
+                            mode & 0o7777,
+                            "the converged record must carry the intended final mode"
+                        );
+                    }
+                }
+                CreateNewScenario::PreExistingIdentical => {
+                    // A previous successful publish (identical bytes + mode):
+                    // the identical retry converges — AlreadyPresent, no
+                    // error, no replace.
+                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        .expect("the first install must succeed");
+                    let verdict =
+                        durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                            .expect("an identical retry must converge, not error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the identical retry must not touch the winner"
+                    );
+                }
+                CreateNewScenario::PreExistingDifferent => {
+                    // A concurrent winner with DIFFERENT content: a genuine
+                    // conflict — the verdict, never a replace, and the
+                    // winner's bytes stay intact. The winner is pre-created
+                    // WITH THE INTENDED MODE: the verification's
+                    // first-failure precedence checks the mode BEFORE the
+                    // content (see [`verify_existing`] step 4 before step 5),
+                    // so a winner left at `std::fs::write`'s umask-default
+                    // mode would be reported as a MODE mismatch — this cell
+                    // tests a CONTENT-only mismatch, where content must be
+                    // the ONLY difference.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    let other: Vec<u8> = if content.is_empty() {
+                        vec![0u8]
+                    } else {
+                        content.iter().map(|b| b.wrapping_add(1)).collect()
+                    };
+                    prop_assert_ne!(&other, &content, "the winner must differ from the intent");
+                    std::fs::write(&dest, &other).unwrap();
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(mode & 0o7777),
+                    )
+                    .unwrap();
+                    let verdict = durable_create_new(
+                        &root,
+                        &rel,
+                        &content,
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
+                    )
+                    .expect("a conflict is a verdict, not an I/O error");
+                    prop_assert!(matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                    ));
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        other,
+                        "the conflict must NEVER replace the winner"
+                    );
+                }
+                CreateNewScenario::PreExistingDifferentMode => {
+                    // Identical bytes but a DIFFERENT mode: still a genuine
+                    // conflict (the mode is part of the record) — the verdict,
+                    // never a replace.
+                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        .expect("the first install must succeed");
+                    let other_mode = if (mode & 0o7777) == 0o600 { 0o644 } else { 0o600 };
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(other_mode),
+                    )
+                    .unwrap();
+                    let verdict =
+                        durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                            .expect("a mode mismatch is a verdict, not an I/O error");
+                    let is_mode_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { .. })
+                    );
+                    prop_assert!(is_mode_mismatch);
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        other_mode,
+                        "the mode mismatch must never be replaced"
+                    );
+                }
+                CreateNewScenario::PublishedBeforeParentSync => {
+                    // A crash-simulated state: the entry EXISTS with the
+                    // intended bytes and mode but its parent directory was
+                    // NEVER fsync'd (a crash after publish, before the parent
+                    // fsync). The identical retry must verify it as
+                    // AlreadyPresent — and ESTABLISH the parent durability:
+                    // the AlreadyPresent branch runs the parent fsync, so a
+                    // fresh directory read (a simulated crash-after-return)
+                    // still sees the entry.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(mode & 0o7777),
+                    )
+                    .unwrap();
+                    let verdict = durable_create_new(
+                        &root,
+                        &rel,
+                        &content,
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
+                    )
+                    .expect("the identical retry over a published-before-parent-sync entry must converge");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the winner must stay intact"
+                    );
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        mode & 0o7777,
+                        "the winner's mode must stay intact"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .expect("the parent must be readable")
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the AlreadyPresent retry must have established the parent durability, dir has: {names:?}"
+                    );
+                }
+                CreateNewScenario::IdenticalRetryParentFsyncFault => {
+                    // The retry's AlreadyPresent branch RUNS the parent fsync:
+                    // arm the one-shot ParentFsync fault for a retry over an
+                    // identical existing entry — the retry must return Err
+                    // (the faulted parent fsync), never a false
+                    // Ok(AlreadyPresent) that claims durability.
+                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        .expect("the first install must succeed");
+                    let fault = CreateNewFault::new(CreateNewStep::ParentFsync);
+                    let err = durable_create_new(
+                        &root,
+                        &rel,
+                        &content,
+                        CreateNewOptions {
+                            mode,
+                            content: ContentEquivalence::Exact,
+                            fault: Some(&fault)},
+                    )
+                    .expect_err(
+                        "the AlreadyPresent retry must run — and propagate the failure of — the parent fsync",
+                    );
+                    prop_assert!(
+                        err.to_string().contains("forced to fail (once)"),
+                        "the faulted parent fsync must be the propagated failure, got: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `Remote` wrapper that arms ONE one-shot stage fault inside
+    /// `try_write_new` — the trait-level stage-failure model for
+    /// `LocalTransport` (production `LocalTransport` never arms one; the
+    /// fault is the same `CreateNewFault` the primitive proptest uses). Every
+    /// other method delegates to the inner transport untouched.
+    struct FaultyLocalRemote {
+        inner: LocalTransport,
+        fault: CreateNewFault,
+    }
+
+    impl Remote for FaultyLocalRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+
+        fn is_local(&self) -> bool {
+            true
+        }
+
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            durable_create_new(
+                self.inner.root(),
+                rel,
+                data,
+                CreateNewOptions {
+                    mode: IMMUTABLE_RECORD_MODE,
+                    content: ContentEquivalence::Exact,
+                    fault: Some(&self.fault),
+                },
+            )
+        }
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// The trait-level verdict matrix for [`Remote::try_write_new`] on
+    /// `LocalTransport` — the typed verdict survives the trait boundary, no
+    /// bool collapse:
+    ///
+    /// * `Created` for a FRESH write (exact bytes, final mode, durable entry);
+    /// * `AlreadyPresent` for an EXACT existing entry — the identical retry —
+    ///   which must ESTABLISH the parent durability (the parent fsync runs on
+    ///   the AlreadyPresent branch; a fresh directory read still sees the
+    ///   entry);
+    /// * `Conflict` for DIFFERENT BYTES and for a MODE MISMATCH over identical
+    ///   bytes (the spec: "a mode mismatch must remain Conflict") — the
+    ///   winner is never replaced or modified;
+    /// * published-before-parent-sync: an existing entry whose parent was
+    ///   never synced is verified as `AlreadyPresent` (bytes+mode match) and
+    ///   the retry establishes the parent durability;
+    /// * every STAGE FAILURE (via the one-shot fault through the trait)
+    ///   propagates as an `Err` naming the injected stage — never a false
+    ///   verdict — and the identical retry converges.
+    #[derive(Clone, Copy, Debug)]
+    enum TransportVerdictState {
+        Fresh,
+        ExactExisting,
+        DifferentBytes,
+        DifferentMode,
+        PublishedBeforeParentSync,
+        FailAt(CreateNewStep),
+    }
+
+    fn transport_verdict_state() -> impl Strategy<Value = TransportVerdictState> {
+        prop_oneof![
+            Just(TransportVerdictState::Fresh),
+            Just(TransportVerdictState::ExactExisting),
+            Just(TransportVerdictState::DifferentBytes),
+            Just(TransportVerdictState::DifferentMode),
+            Just(TransportVerdictState::PublishedBeforeParentSync),
+            Just(TransportVerdictState::FailAt(CreateNewStep::CreateTemp)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Write)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Chmod)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::FileFsync)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Publish)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Unlink)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::ParentFsync)),
+        ]
+    }
+
+    proptest! {
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_verdict_matrix(
+            content in prop::collection::vec(any::<u8>(), 0..128),
+            state in transport_verdict_state(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r"), Layout::empty()).unwrap();
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let dest = t.root().join(rel.as_path());
+            let dest_name = rel.file_name().unwrap().to_string_lossy().into_owned();
+            let final_mode = IMMUTABLE_RECORD_MODE & 0o7777;
+
+            match state {
+                TransportVerdictState::Fresh => {
+                    let verdict = t
+                        .try_write_new(&rel, &content)
+                        .expect("the fresh install must succeed");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Created);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "Ok(Created) must imply exact bytes"
+                    );
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        final_mode,
+                        "Ok(Created) must imply the final mode"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "Ok(Created) must imply a durable directory entry, dir has: {names:?}"
+                    );
+                }
+                TransportVerdictState::ExactExisting => {
+                    // An EXACT existing entry (bytes AND mode identical): the
+                    // identical retry converges — AlreadyPresent, and the
+                    // parent durability is established (the parent fsync runs
+                    // on this branch).
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, &content)
+                        .expect("an identical retry must converge, not error");
+                    prop_assert!(matches!(verdict, CreateNewVerdict::AlreadyPresent));
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the identical retry must not touch the winner"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the AlreadyPresent retry must leave the durable entry, dir has: {names:?}"
+                    );
+                }
+                TransportVerdictState::DifferentBytes => {
+                    // A winner with DIFFERENT bytes: Conflict, never replaced.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    let other: Vec<u8> = if content.is_empty() {
+                        vec![0u8]
+                    } else {
+                        content.iter().map(|b| b.wrapping_add(1)).collect()
+                    };
+                    prop_assert_ne!(&other, &content, "the winner must differ from the intent");
+                    std::fs::write(&dest, &other).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, &content)
+                        .expect("a different-content winner is a verdict, not an I/O error");
+                    prop_assert!(matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                    ));
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        other,
+                        "the conflict must NEVER replace the winner"
+                    );
+                }
+                TransportVerdictState::DifferentMode => {
+                    // Identical bytes but a DIFFERENT mode: still Conflict —
+                    // the mode is part of the record, and a mode mismatch must
+                    // remain Conflict (never a convergent AlreadyPresent).
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    let other_mode = if final_mode == 0o600 { 0o640 } else { 0o600 };
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(other_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, &content)
+                        .expect("a mode mismatch is a verdict, not an I/O error");
+                    let is_mode_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { .. })
+                    );
+                    prop_assert!(is_mode_mismatch);
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        other_mode,
+                        "the mode mismatch must never be replaced"
+                    );
+                }
+                TransportVerdictState::PublishedBeforeParentSync => {
+                    // A crash-simulated state: the entry EXISTS with the
+                    // intended bytes and mode, but its parent was never synced.
+                    // The retry verifies it as AlreadyPresent AND establishes
+                    // the parent durability.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, &content)
+                        .expect("the retry over a published-before-parent-sync entry must converge");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the winner must stay intact"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the AlreadyPresent retry must establish the parent durability, dir has: {names:?}"
+                    );
+                }
+                TransportVerdictState::FailAt(step) => {
+                    // EVERY STAGE FAILURE through the trait boundary: the
+                    // faulted attempt propagates as Err naming the injected
+                    // stage — never a false verdict — and the one-shot fault
+                    // being consumed, the identical retry converges.
+                    let w = FaultyLocalRemote {
+                        inner: t,
+                        fault: CreateNewFault::new(step)};
+                    let err = w
+                        .try_write_new(&rel, &content)
+                        .expect_err("a failure at every stage must propagate as Err");
+                    prop_assert!(
+                        err.to_string().contains("forced to fail (once)"),
+                        "the injected fault must be the propagated failure, got: {err}"
+                    );
+                    let retry = w
+                        .try_write_new(&rel, &content)
+                        .expect("the identical retry must converge");
+                    prop_assert!(
+                        matches!(
+                            retry,
+                            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+                        ),
+                        "the identical retry must converge, got: {retry:?}"
+                    );
+                    if dest.exists() {
+                        prop_assert_eq!(
+                            std::fs::read(&dest).unwrap(),
+                            content,
+                            "the destination must be the fully-written identical content, never partial"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The swap-at-every-boundary property of the descriptor-bound
+    /// verification (the LOCAL leg): a REGULAR→SYMLINK / REGULAR→DIRECTORY /
+    /// REGULAR→DIFFERENT-INODE swap is injected at EVERY boundary of the
+    /// open→fstat→read sequence — BEFORE the `O_NOFOLLOW` open, BETWEEN the
+    /// open and the fstat, BETWEEN the fstat and the read — and the verdict
+    /// must NEVER mix two inodes' observations:
+    ///
+    /// * a swap BEFORE the open changes WHAT is opened: the verdict reflects
+    ///   the SWAPPED entry consistently — a symlink →
+    ///   NotRegularFile{Symlink} (the `O_NOFOLLOW` open NEVER follows, even
+    ///   a symlink pointing at a regular file whose bytes+mode match the
+    ///   intent), a directory → NotRegularFile{Directory}, a different-inode
+    ///   regular file (mode AND content both differing from the intent) →
+    ///   ModeMismatch naming the SWAPPED inode's mode — a REJECTION;
+    /// * a swap AFTER the open (between open/fstat or fstat/read) is
+    ///   HARMLESS: the descriptor pins the ORIGINAL inode, so the verdict is
+    ///   AlreadyPresent with the ORIGINAL inode's mode AND content (the
+    ///   symlink target / the different inode carry DIFFERENT content and
+    ///   the directory is unreadable as a file — a path-following read or a
+    ///   re-open would NOT yield AlreadyPresent, so the assertion catches
+    ///   any metadata/content mix).
+    ///
+    /// Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+    fn swap_case() -> impl Strategy<Value = (VerifySwapBoundary, VerifySwapKind)> {
+        prop_oneof![
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::BeforeOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterFstat,
+                VerifySwapKind::DifferentInode
+            )),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn verify_existing_swap_at_every_boundary(
+            (boundary, kind) in swap_case(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let dest = root.join(rel.as_path());
+            let required = IMMUTABLE_RECORD_MODE & 0o7777;
+            let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };
+            let intended: &[u8] = br#"{"a":1,"b":2}"#;
+            // The swapped-in observations differ from the original's: a
+            // path-following read (or a metadata/content mix) is therefore
+            // detectable — only the SAME-inode verdict passes the table.
+            let swapped_content: &[u8] = br#"{"a":9,"b":9}"#;
+
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            // The ORIGINAL entry: a regular file matching the intent (bytes
+            // AND mode) — a no-swap verification would accept it.
+            std::fs::write(&dest, intended).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
+            // The pre-staged swap entry: the symlink target AND the
+            // different-inode regular file (a fresh inode with mode + content
+            // both differing from the intent).
+            let target = dest.with_file_name("record.json.swap-target");
+            std::fs::write(&target, swapped_content).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(wrong_mode)).unwrap();
+
+            let swap = VerifySwap::new(boundary, kind, &target);
+            let verified = verify_existing(
+                || open_verify_local(&dest, Some(&swap)),
+                intended,
+                required,
+                ContentEquivalence::Exact,
+            )
+            .expect("the descriptor-bound verification is a verdict, not an I/O error");
+            let verdict = verified_to_verdict(verified);
+
+            // THE INVARIANT: success (AlreadyPresent) ONLY when the metadata
+            // AND the content came from the SAME OPENED INODE — the
+            // fd-pinned ORIGINAL for a post-open swap, the SWAPPED entry
+            // (consistently, as a rejection) for a pre-open swap.
+            match boundary {
+                VerifySwapBoundary::BeforeOpen => match kind {
+                    VerifySwapKind::Symlink => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Symlink}),
+                        "a pre-open symlink swap must be rejected — the O_NOFOLLOW open never follows"
+                    ),
+                    VerifySwapKind::Directory => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Directory}),
+                        "a pre-open directory swap must be rejected"
+                    ),
+                    VerifySwapKind::DifferentInode => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                            actual: wrong_mode & 0o7777,
+                            required}),
+                        "a pre-open different-inode swap must be rejected with the SWAPPED inode's mode"
+                    )},
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => {
+                    prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::AlreadyPresent,
+                        "a post-open swap is harmless: the descriptor pins the ORIGINAL inode, so the verdict must reflect ITS metadata AND content — never a mix"
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn wait_for_sidecar_flock_simulated_contention(
+            hold_ms in prop_oneof![
+                Just(0u64),
+                Just(1u64),
+                Just(1999u64),
+                Just(2000u64),
+                Just(2500u64),
+                Just(3000u64),
+                0u64..=3000u64,
+            ],
+        ) {
+            let timeout = SIDECAR_WAIT_TIMEOUT;
+            let interval = SIDECAR_RETRY_INTERVAL;
+            let hold = Duration::from_millis(hold_ms);
+            let start = Instant::now();
+            let release_at = start + hold;
+            let deadline = start + timeout;
+            let simulated = std::cell::Cell::new(start);
+            let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+            let try_count = std::cell::Cell::new(0usize);
+            let last_now = std::cell::Cell::new(None::<Instant>);
+            let path = Path::new("/tmp/sidecar.test");
+            let res = wait_for_sidecar_flock(
+                path,
+                timeout,
+                interval,
+                || {
+                    try_count.set(try_count.get() + 1);
+                    last_now.set(Some(simulated.get()));
+                    if simulated.get() > release_at { 0 } else { -1 }
+                },
+                || libc::EWOULDBLOCK,
+                || simulated.get(),
+                |d| {
+                    sleeps.borrow_mut().push(d);
+                    simulated.set(simulated.get() + d);
+                },
+            );
+            if hold < timeout {
+                prop_assert!(res.is_ok(), "hold {hold:?} < timeout {timeout:?} must succeed, got {res:?} sleeps={:?} try_count={}", sleeps.borrow(), try_count.get());
+                // Success must have observed the release.
+                prop_assert!(simulated.get() >= release_at, "simulated time must have reached release_at");
+            } else {
+                prop_assert!(res.is_err(), "hold {hold:?} >= timeout {timeout:?} must fail");
+                let msg = res.unwrap_err().to_string();
+                prop_assert!(msg.contains("remained contended for"), "timeout error must contain 'remained contended for', got: {msg}");
+                // Failure happens only after deadline.
+                let last = last_now.get().expect("at least one try");
+                prop_assert!(last >= deadline, "failure must happen only after deadline: last_now={last:?} deadline={deadline:?}");
+                // No sleep extends beyond deadline.
+                for s in sleeps.borrow().iter() {
+                    prop_assert!(*s <= interval, "every sleep <= interval, got {s:?}");
+                }
+                let elapsed = simulated.get().duration_since(start);
+                prop_assert!(elapsed <= timeout + interval, "total elapsed {elapsed:?} must be <= timeout+interval {:?}", timeout + interval);
+                // Also no sleep took us beyond deadline+interval: simulated never beyond deadline+epsilon.
+                prop_assert!(simulated.get() <= deadline + interval, "simulated {:?} must not exceed deadline+interval", simulated.get());
+            }
+            // Every sleep is bounded by interval and by remaining time (checked above for interval, and elapsed bound covers deadline).
+            for s in sleeps.borrow().iter() {
+                prop_assert!(*s <= interval);
+            }
+        }
+    }
+
+    #[test]
+    fn wait_for_sidecar_flock_non_contention_fails_immediately() {
+        let timeout = SIDECAR_WAIT_TIMEOUT;
+        let interval = SIDECAR_RETRY_INTERVAL;
+        let start = Instant::now();
+        let simulated = std::cell::Cell::new(start);
+        let try_count = std::cell::Cell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let path = Path::new("/tmp/sidecar.test");
+        let res = wait_for_sidecar_flock(
+            path,
+            timeout,
+            interval,
+            || {
+                try_count.set(try_count.get() + 1);
+                -1
+            },
+            || libc::EIO,
+            || simulated.get(),
+            |d| {
+                sleeps.borrow_mut().push(d);
+                simulated.set(simulated.get() + d);
+            },
+        );
+        assert!(res.is_err(), "EIO must fail");
+        assert_eq!(
+            try_count.get(),
+            1,
+            "non-contention error must fail immediately (one try)"
+        );
+        assert!(sleeps.borrow().is_empty(), "no sleeps on immediate failure");
+        assert!(
+            !res.unwrap_err()
+                .to_string()
+                .contains("remained contended for")
+        );
+    }
+
+    #[test]
+    fn wait_for_sidecar_flock_eintr_retries_without_sleep() {
+        let timeout = SIDECAR_WAIT_TIMEOUT;
+        let interval = SIDECAR_RETRY_INTERVAL;
+        let start = Instant::now();
+        let simulated = std::cell::Cell::new(start);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let calls = std::cell::Cell::new(0usize);
+        let path = Path::new("/tmp/sidecar.test");
+        let res = wait_for_sidecar_flock(
+            path,
+            timeout,
+            interval,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 { -1 } else { 0 }
+            },
+            || if calls.get() == 1 { libc::EINTR } else { 0 },
+            || simulated.get(),
+            |d| {
+                sleeps.borrow_mut().push(d);
+                simulated.set(simulated.get() + d);
+            },
+        );
+        assert!(res.is_ok(), "EINTR then success must retry and succeed");
+        assert_eq!(calls.get(), 2, "should have retried once after EINTR");
+        assert!(
+            sleeps.borrow().is_empty(),
+            "EINTR must retry without sleeping"
+        );
+    }
+}
