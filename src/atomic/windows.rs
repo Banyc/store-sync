@@ -328,6 +328,16 @@ pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
         .map_err(|e| Error::store(format!("read {}: {e}", rel.display())))
 }
 
+/// Path-based read of the target of the symlink at `rel` under the root.
+/// Windows has no fd-relative resolution, so this does NOT refuse a symlink
+/// injected into a parent component — the documented weaker guarantee of the
+/// Windows port (Windows symlinks also require admin/developer mode, a
+/// smaller injection surface).
+pub fn read_link_fd(root: &RootDir, rel: &Path) -> Result<PathBuf> {
+    std::fs::read_link(root.path().join(rel))
+        .map_err(|e| Error::store(format!("readlink {}: {e}", rel.display())))
+}
+
 /// [`read_fd`] + JSON deserialization.
 pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) -> Result<T> {
     let bytes = read_fd(root, rel)?;

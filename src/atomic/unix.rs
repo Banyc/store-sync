@@ -32,7 +32,7 @@ use super::*;
 use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 
 pub fn set_private(path: &Path) -> Result<()> {
@@ -1084,6 +1084,43 @@ pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
     read_fd_to_end(&f)
 }
 
+/// Read the target of the symlink at `rel` relative to `root`, the fd-confined
+/// counterpart of the path-based `std::fs::read_link`. The PARENT is resolved
+/// COMPONENT-WISE with `openat(O_NOFOLLOW)` (a symlink injected into any parent
+/// component is refused — ELOOP — never followed), and the target itself is
+/// read with `readlinkat` without following it. A final component that is not a
+/// symlink is an error, and a missing entry is the same [`Error::store`] class
+/// the other `_fd` primitives report.
+pub fn read_link_fd(root: &RootDir, rel: &Path) -> Result<PathBuf> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| Error::store("readlink path component with NUL"))?;
+    let mut buf: Vec<u8> = vec![0; 256];
+    loop {
+        let n = unsafe {
+            libc::readlinkat(
+                parent_fd.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(Error::store(format!(
+                "readlinkat {}: {}",
+                rel.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let n = n as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
+        }
+        buf.resize(buf.len() * 2, 0);
+    }
+}
+
 /// [`read_fd`] + JSON deserialization (the descriptor-relative mirror of
 /// [`read_json`] for the store's own record reads).
 pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) -> Result<T> {
@@ -1145,4 +1182,84 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
         Ok(())
     })?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, RootDir, read_link_fd};
+    use std::path::{Path, PathBuf};
+
+    fn owned_root() -> (tempfile::TempDir, RootDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = RootDir::open(dir.path()).expect("open the owned root");
+        (dir, root)
+    }
+
+    /// A normal symlink resolves to its stored target through the fd path.
+    #[test]
+    fn read_link_fd_returns_a_symlink_target() {
+        let (dir, root) = owned_root();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link")).unwrap();
+        assert_eq!(
+            read_link_fd(&root, Path::new("link")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+    }
+
+    /// A symlink injected at a PARENT component is refused by the
+    /// component-wise open, and the outside link is never read.
+    #[test]
+    fn read_link_fd_refuses_a_parent_component_symlink() {
+        let (dir, root) = owned_root();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink("OUTSIDE-TARGET", outside.join("secret")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("sub")).unwrap();
+
+        let err = read_link_fd(&root, Path::new("sub/secret"))
+            .expect_err("a read through a symlink-injected parent must be refused");
+        assert!(
+            matches!(err, Error::Store(_)),
+            "the refusal must be a store error, got: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("openat"),
+            "the refusal must name the component-wise open, got: {text}"
+        );
+        assert!(
+            !text.contains("OUTSIDE-TARGET"),
+            "the outside link's target must never be read, got: {text}"
+        );
+        assert_eq!(
+            std::fs::read_link(outside.join("secret")).unwrap(),
+            PathBuf::from("OUTSIDE-TARGET"),
+            "the outside link must be untouched"
+        );
+    }
+
+    /// A final component that is not a symlink is an error, never a
+    /// fabricated target.
+    #[test]
+    fn read_link_fd_errors_when_the_final_component_is_not_a_symlink() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join("plain.txt"), b"x").unwrap();
+        let err = read_link_fd(&root, Path::new("plain.txt"))
+            .expect_err("a non-symlink final component must be an error");
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("readlinkat"),
+            "the error must come from readlinkat, got: {err}"
+        );
+    }
+
+    /// A missing entry is the same store-error class the other `_fd`
+    /// primitives report for a missing path.
+    #[test]
+    fn read_link_fd_reports_a_missing_entry_as_a_store_error() {
+        let (_dir, root) = owned_root();
+        let err =
+            read_link_fd(&root, Path::new("missing")).expect_err("a missing entry must error");
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+    }
 }
