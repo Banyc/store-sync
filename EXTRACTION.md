@@ -53,6 +53,23 @@ cargo test
 
 `cargo fmt` is allowed to reformat; the other two must pass.
 
+## Wave 1 review notes
+
+* `test_support.rs` carries a module-level `#![allow(dead_code)]`: it is a
+  test-only module shared by suites that land in separate waves, so a helper
+  no current suite calls is not a defect.
+* **Known gap from slice-root.** Deploy's
+  `src/store/local/owned_root.rs:350` and `:389`
+  (`symlink_injected_path_component_cannot_redirect_a_mutation` /
+  `..._a_read`) were dropped because they drive the symlink injection through
+  `LocalStore`/`TargetName`/`retention_debt`, which are forbidden here. The
+  *property* those tests cover — a symlink injected into a path component
+  cannot redirect a mutation or a read outside the owned root — is the whole
+  point of the `_fd` primitives, so it must reappear as a crate-level
+  integration test (`tests/confinement.rs`) against `RootDir`/`OwnedRoot`
+  plus `atomic`'s `_fd` family once slice-atomic has landed. This is a
+  required follow-up, not an accepted loss.
+
 ## Slices
 
 ### slice-core — `src/digest.rs`, `src/platform.rs`, `src/trace.rs`, `src/id.rs`
