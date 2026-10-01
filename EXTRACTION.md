@@ -266,10 +266,21 @@ as the default "make the destination match the source".
 
 Apply rules:
 
-* Only `Missing` and `Changed` entries are eligible. `Extraneous` is REPORTED
-  and never deleted unless the caller explicitly asks for it (a
-  `delete_extraneous` flag, default false). `Same` is skipped with NO I/O —
-  transferring an unchanged entry is a bug, and a test must count the writes.
+* Only `Missing` and `Changed` entries are eligible for transfer. `Extraneous`
+  is REPORTED and never deleted unless the caller explicitly asks for it (a
+  `delete_extraneous` flag, default false), and any removal must happen only
+  AFTER the transfers and verification have succeeded, so a failed sync
+  destroys nothing. `Same` entries are neither transferred nor verified.
+  **The honest invariant, NOT an absolute: a `Same` entry's content and final
+  mode are unchanged and it is not re-transferred — but a read-only directory
+  holding a `Changed` child MUST be transiently widened to install that child.**
+  That widening must be (a) decided from the DESTINATION's current mode, never
+  the source's, (b) restored on the success AND the error path, and (c) COUNTED
+  and NAMED: `transfers` counts every destination mutation, a `transient_dirs`
+  field names each path temporarily adjusted, and no such path may appear in
+  `skipped`. A report that names a path `skipped` while having mutated it is a
+  defect; an absolute "`Same` implies zero I/O" is unachievable and must not be
+  tested for.
 * A `Refuse` conflict or a `Diverged` append leaves the destination
   byte-identical. Assert it in tests.
 * Directories are created before their children. Modes and symlinks are
@@ -298,7 +309,14 @@ Acceptance (tests against `LocalTransport` over a second temp directory, plus
 `SshTransport` argument/script coverage where no live connection is needed):
 
 * push makes the destination equal to the source manifest; pull does the reverse;
-* unchanged entries cause no writes (count transfer operations);
+* unchanged entries cause no writes (count transfer operations), and a read-only
+  `Same` directory with no changed child still performs zero transfers;
+* a read-only `Same` directory WITH a changed child is widened, counted in
+  `transfers`, named in `transient_dirs`, absent from `skipped`, and left at its
+  original mode — on the failure path too, where the partial report must be
+  reachable from the error;
+* `AppendTail` constrains BYTES only: when no bytes need appending it still
+  applies a differing mode and never touches content;
 * `Refuse` leaves a differing destination byte-identical and reports a conflict;
 * `AppendTail` appends the missing tail when one side is a prefix;
 * `AppendTail` on divergent content reports a conflict and changes nothing;
