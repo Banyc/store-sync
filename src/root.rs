@@ -77,6 +77,17 @@ impl fmt::Display for EndpointKey {
 /// local marker itself and the deploy_dir is the sole physical root.
 pub const LOCAL_ENDPOINT_MARKER: &str = "local";
 
+/// THE overlap rule: whether two CANONICAL directories are EQUAL or one is an
+/// ANCESTOR or DESCENDANT of the other. This is the SINGLE definition of the
+/// overlap [`OwnedRoot::parse`] refuses; any caller that must relate two roots
+/// (the sync's source and destination, say) reuses THIS predicate rather than
+/// writing a second comparison, so the two can never drift apart. The
+/// comparison is component-wise ([`Path::starts_with`]), so `a/bc` is not
+/// treated as a descendant of `a/b`.
+pub(crate) fn roots_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
 /// The process-global ownership registry: for each resolved endpoint, the
 /// set of canonical roots currently owned by a LIVE [`OwnedRoot`]. A root
 /// is registered at [`OwnedRoot::parse`] and released when the LAST live
@@ -180,10 +191,7 @@ impl OwnedRoot {
         let mut registry = OWNED_ROOTS.lock().unwrap();
         if let Some(owned) = registry.get(endpoint) {
             for existing in owned {
-                if canonical == *existing
-                    || canonical.starts_with(existing)
-                    || existing.starts_with(&canonical)
-                {
+                if roots_overlap(&canonical, existing) {
                     return Err(Error::store(format!(
                         "refusing to own {}: it overlaps the already-owned root {} on endpoint {}",
                         canonical.display(),

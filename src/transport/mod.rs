@@ -24,6 +24,47 @@
 //!   host-key verification (`ssh::hostkey`) and the bounded subprocess
 //!   runner (`ssh::runner`).
 //!
+//! # Symlink-component confinement
+//!
+//! On Unix, every [`LocalTransport`] operation that resolves a NON-EMPTY
+//! root-relative path BELOW the root does so COMPONENT-WISE from an fd-pinned
+//! root with `openat(O_NOFOLLOW)` (see the `FD-CONFINED OPERATIONS` block on
+//! the impl): a symlink injected at ANY component below the root is REFUSED,
+//! never followed, with NO check-then-act window — the same guarantee the
+//! crate's fd-confined `Side::Local` destination gives. That includes the
+//! READS used as verification sources — `read`, `read_link`, and `metadata_opt`
+//! (and therefore `metadata`, and `kind_opt`/`mode_opt` over a [`Remote`]), plus
+//! `exists` — so a content/kind/mode verdict can never be computed from an
+//! object outside the pinned root.
+//!
+//! The operations that are NOT component-wise confined are named precisely, and
+//! each is documented at its definition:
+//!
+//! * the destination ROOT listing ([`Remote::list`] with the EMPTY path) is
+//!   path-based ([`LocalTransport::list_path_based`]): `read_dir_fd` refuses the
+//!   empty path, and the root path itself is the trusted anchor — the residual
+//!   ROOT-swap race is the one this module documents;
+//! * the durability helpers [`Remote::fsync_parent`] and [`Remote::fsync_tree`]
+//!   open their directories by path (they fsync; they never redirect a
+//!   mutation or source a verification verdict);
+//! * [`Remote::provision_layout`] creates the caller-supplied BOOTSTRAP
+//!   directories by path (`base.join(d)`), not by `mkdirat` — a trusted layout
+//!   name, not destination content the applier resolves;
+//! * [`Remote::copy_tree`] inherits the default list/read/write walk, which is
+//!   component-wise confined for every non-root path it visits, but is not a
+//!   single fd-pinned operation;
+//! * the `#[cfg(not(unix))]` Windows bodies are path-based (the Windows port has
+//!   no directory descriptors), the documented weaker guarantee of that port.
+//!
+//! The [`SshTransport`] far side is a shell script this crate may not change
+//! (the `ssh` submodule group), so it CANNOT give that guarantee on its own.
+//! There the applier's `sync` preflight is the guarantee: every destination
+//! mutation first verifies, with `lstat`, that every strict ancestor component
+//! is a REAL directory, so a PRE-EXISTING symlink component is refused before
+//! the operation runs. A component SWAPPED between that preflight check and the
+//! operation remains a residual race — the same class as the already-documented
+//! root-swap race — and is NOT claimed to be closed for `SshTransport`.
+//!
 //! The transport is application-domain-free: the on-server layout (bootstrap
 //! directories, the operation-lock paths, and the immutable receiver marker)
 //! is the caller-supplied [`Layout`]; the receiver identity is the opaque
@@ -348,6 +389,37 @@ pub trait Remote {
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
+    /// Remove the DIRECTORY at `rel` NON-RECURSIVELY (`rmdir` semantics): the
+    /// call fails when the directory is not empty, so a child created after the
+    /// caller enumerated the directory is REFUSED LOUDLY, never destroyed
+    /// unnamed. This is the leaf primitive of a deepest-first removal walk: the
+    /// walk has already removed and authorized every child it enumerated, so an
+    /// EMPTY directory is the only thing this may delete, and the walk's claim
+    /// "everything under here was sanctioned" is re-established by the
+    /// filesystem AT THE MOMENT OF REMOVAL rather than merely at enumeration
+    /// time. The DEFAULT runs `rmdir` through the transport's [`Remote::exec`]
+    /// seam with `--` so a path beginning with `-` is never parsed as an option
+    /// and the remote shell cannot reinterpret the quoted argument; the
+    /// production [`LocalTransport`] overrides it with a descriptor-relative
+    /// `unlinkat(AT_REMOVEDIR)`.
+    fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        let path = self.root().join(rel.as_path());
+        let argv = vec![
+            "rmdir".to_string(),
+            "--".to_string(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let out = self.exec(&argv, Duration::from_secs(60))?;
+        if out.exit_code == 0 {
+            Ok(())
+        } else {
+            Err(Error::transport(format!(
+                "rmdir {}: {}",
+                rel.display(),
+                out.stderr.trim()
+            )))
+        }
+    }
     /// Recursively copy the tree at `src` to `dest` — the per-file dedup's
     /// staging base (the previous tree is copied into the staging dir, then
     /// only the changed files are uploaded). `dest` must not already exist
@@ -1646,73 +1718,481 @@ impl LocalTransport {
     }
 }
 
-impl Remote for LocalTransport {
-    fn root(&self) -> &Path {
-        &self.base
-    }
+impl LocalTransport {
+    // =================================================================
+    // FD-CONFINED OPERATIONS (the applier's destination surface, `unix`)
+    // -------------------------------------------------------------
+    // Every operation the sync applier issues on a `LocalTransport`
+    // destination — MUTATIONS and the READS it verifies against — resolves
+    // COMPONENT-WISE from an fd-pinned root with `openat(O_NOFOLLOW)` when it
+    // names a non-empty path below the root: a symlink injected at ANY
+    // component below the root is refused (never followed), exactly as the
+    // fd-confined `Side::Local` destination already does. The reads (`read`,
+    // `read_link`, `metadata_opt`/`metadata`, `exists`) are confined so a
+    // verification verdict cannot be sourced from outside the pinned root. The
+    // path-based bodies below are kept `#[cfg(not(unix))]` (the Windows port
+    // has no directory descriptors and keeps its documented weaker guarantee)
+    // or are the NAMED exceptions: the destination ROOT listing, and the
+    // durability helpers (`fsync_parent`/`fsync_tree`).
+    // =================================================================
 
-    fn is_local(&self) -> bool {
-        true
-    }
-
-    fn provision_layout(&self) -> Result<()> {
-        if !self.base.exists() {
+    /// Open the transport root as an fd-pinned directory. With `create`, a
+    /// MISSING root path is created first (path-based: the root itself is the
+    /// trusted anchor, and its swap race is the one the module documents).
+    /// `Ok(None)` ONLY when the root does not exist and `create` is false, so
+    /// the absent-root-enumerates-as-empty behaviour is preserved. Every
+    /// COMPONENT BELOW the root is then resolved with `openat(O_NOFOLLOW)`.
+    #[cfg(unix)]
+    fn root_dir(&self, create: bool) -> Result<Option<crate::atomic::RootDir>> {
+        if create && !self.base.exists() {
             std::fs::create_dir_all(&self.base)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;
         }
-        // Provision the caller-supplied top-level layout.
-        for d in &self.layout.bootstrap_dirs {
-            let p = self.base.join(d);
-            if !p.exists() {
-                std::fs::create_dir_all(&p)
-                    .map_err(|e| Error::transport(format!("mkdir {}: {e}", p.display())))?;
+        match crate::atomic::RootDir::open(&self.base) {
+            Ok(root) => Ok(Some(root)),
+            Err(error) => {
+                if self.base.exists() {
+                    Err(error)
+                } else {
+                    Ok(None)
+                }
             }
         }
-        // The IMMUTABLE receiver-id marker: the PHYSICAL identity of this
-        // deploy_dir, created ONCE at provisioning and never changed (a
-        // re-provisioning adopts the existing marker).
-        if let Some(marker) = &self.layout.receiver_marker {
-            provision_receiver_id(self, marker)?;
-        }
-        Ok(())
     }
 
-    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
-        std::fs::read(join(&self.base, rel))
-            .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
+    /// Create the parent chain of `rel` fd-relatively, preserving the mode of
+    /// an EXISTING directory and creating only MISSING components (0o700, the
+    /// local intermediate mode; the caller finalizes the real mode). A symlink
+    /// at any component is refused.
+    #[cfg(unix)]
+    fn ensure_dir_confined(
+        &self,
+        root: &crate::atomic::RootDir,
+        rel: &RootedRelativePath,
+    ) -> Result<()> {
+        let Some(parent) = rel.parent() else {
+            return Ok(());
+        };
+        match crate::atomic::path_kind_fd(root, parent.as_path()) {
+            Ok(Some(crate::atomic::PathKind::Dir)) => Ok(()),
+            Ok(Some(_)) => Err(Error::transport(format!(
+                "mkdir {}: a parent component exists but is not a directory",
+                rel.display()
+            ))),
+            // A missing parent component (or any other failure resolving the
+            // final entry) is handled by the fd-safe create below, which
+            // REFUSES a symlink at any component.
+            Ok(None) | Err(_) => crate::atomic::ensure_private_dir_fd(root, parent.as_path())
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display()))),
+        }
     }
 
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
-        let p = join(&self.base, rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
-        }
-        std::fs::write(&p, data)
-            .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
+    #[cfg(unix)]
+    fn write_confined(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = self.root_dir(true)?.ok_or_else(|| {
+            Error::transport(format!(
+                "write {}: the destination root is unavailable",
+                rel.display()
+            ))
+        })?;
+        self.ensure_dir_confined(&root, rel)?;
+        crate::atomic::write_file_fd(&root, rel.as_path(), data)
+            .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
         if mode != 0 {
-            crate::platform::chmod(&p, mode)
-                .map_err(|e| Error::transport(format!("chmod {}: {e}", p.display())))?;
+            let fd = crate::atomic::openat_no_follow(
+                root.as_fd(),
+                rel.as_path(),
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            )?;
+            std::fs::File::from(fd)
+                .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))?;
         }
         Ok(())
     }
 
-    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        std::fs::create_dir(join(&self.base, rel))
+    #[cfg(unix)]
+    fn create_dir_all_confined(&self, rel: &RootedRelativePath) -> Result<()> {
+        let root = self.root_dir(true)?.ok_or_else(|| {
+            Error::transport(format!(
+                "mkdir {}: the destination root is unavailable",
+                rel.display()
+            ))
+        })?;
+        match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+            // An EXISTING directory (whatever its mode) is left exactly as it
+            // is: `create_dir_all` never chmods an existing directory.
+            Ok(Some(crate::atomic::PathKind::Dir)) => return Ok(()),
+            Ok(Some(_)) => {
+                return Err(Error::transport(format!(
+                    "mkdir {}: the path exists but is not a directory",
+                    rel.display()
+                )));
+            }
+            // A missing component (or any failure) is handled by the fd-safe
+            // create below, which refuses a symlink at any component.
+            Ok(None) | Err(_) => {}
+        }
+        crate::atomic::ensure_private_dir_fd(&root, rel.as_path())
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        std::fs::create_dir_all(join(&self.base, rel))
-            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
-    }
-
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
-        crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
+    #[cfg(unix)]
+    fn set_mode_confined(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = self.root_dir(false)?.ok_or_else(|| {
+            Error::transport(format!(
+                "chmod {}: the destination root is absent",
+                rel.display()
+            ))
+        })?;
+        let fd = crate::atomic::openat_no_follow(
+            root.as_fd(),
+            rel.as_path(),
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        std::fs::File::from(fd)
+            .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
             .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
     }
 
-    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+    #[cfg(unix)]
+    fn rename_confined(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        let root = self.root_dir(false)?.ok_or_else(|| {
+            Error::transport(format!(
+                "rename {}: the destination root is absent",
+                from.display()
+            ))
+        })?;
+        // The destination parent must exist (the old path-based rename created
+        // it, best-effort); creating it here is component-wise with
+        // `O_NOFOLLOW`.
+        self.ensure_dir_confined(&root, to)?;
+        crate::atomic::renameat_paths(&root, from.as_path(), to.as_path()).map_err(|e| {
+            Error::transport(format!(
+                "rename {} -> {}: {e}",
+                from.display(),
+                to.display()
+            ))
+        })
+    }
+
+    #[cfg(unix)]
+    fn symlink_confined(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let root = self.root_dir(true)?.ok_or_else(|| {
+            Error::transport(format!(
+                "symlink {}: the destination root is unavailable",
+                link.display()
+            ))
+        })?;
+        self.ensure_dir_confined(&root, link)?;
+        let parent_rel = link
+            .as_path()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty());
+        let parent_fd = match parent_rel {
+            Some(parent) => crate::atomic::openat_no_follow(
+                root.as_fd(),
+                parent,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?,
+            None => root
+                .as_fd()
+                .try_clone()
+                .map_err(|e| Error::transport(format!("dup root dir: {e}")))?,
+        };
+        let name = link
+            .file_name()
+            .ok_or_else(|| Error::transport(format!("symlink {}: no file name", link.display())))?;
+        let name_c =
+            CString::new(name.as_bytes()).map_err(|_| Error::transport("symlink name with NUL"))?;
+        let target_c = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| Error::transport("symlink target with NUL"))?;
+        // Remove any existing entry at the link path (never following it),
+        // then create the link — all relative to the SAME parent descriptor.
+        let r = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), 0) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(Error::transport(format!("unlink {}: {e}", link.display())));
+            }
+        }
+        let r =
+            unsafe { libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), name_c.as_ptr()) };
+        if r < 0 {
+            return Err(Error::transport(format!(
+                "symlink {} -> {}: {}",
+                link.display(),
+                target.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn remove_file_confined(&self, rel: &RootedRelativePath) -> Result<()> {
+        let Some(root) = self.root_dir(false)? else {
+            return Ok(());
+        };
+        match crate::atomic::remove_file_fd(&root, rel.as_path()) {
+            Ok(()) => Ok(()),
+            Err(error) => match crate::atomic::openat_no_follow_io(
+                root.as_fd(),
+                rel.as_path(),
+                libc::O_RDONLY,
+                0,
+            ) {
+                // A missing entry OR a missing parent component is the
+                // old path-based `remove_file`'s tolerated `NotFound`.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(Error::transport(format!(
+                    "remove {}: {error}",
+                    rel.display()
+                ))),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_dir_all_confined(&self, rel: &RootedRelativePath) -> Result<()> {
+        let Some(root) = self.root_dir(false)? else {
+            return Ok(());
+        };
+        match crate::atomic::remove_dir_all_fd(&root, rel.as_path()) {
+            Ok(()) => Ok(()),
+            Err(error) => match crate::atomic::openat_no_follow_io(
+                root.as_fd(),
+                rel.as_path(),
+                libc::O_RDONLY,
+                0,
+            ) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(Error::transport(format!(
+                    "rmdir {}: {error}",
+                    rel.display()
+                ))),
+            },
+        }
+    }
+
+    /// The descriptor-relative NON-RECURSIVE directory removal: resolve the
+    /// PARENT component-wise with `O_NOFOLLOW`, then `unlinkat(AT_REMOVEDIR)`
+    /// the final name. `AT_REMOVEDIR` refuses a non-empty directory with
+    /// `ENOTEMPTY`, so a child created after a removal walk enumerated the
+    /// directory is never destroyed unnamed. A confirmed absence is success.
+    #[cfg(unix)]
+    fn remove_dir_confined(&self, rel: &RootedRelativePath) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let Some(root) = self.root_dir(false)? else {
+            return Ok(());
+        };
+        let parent_rel = rel.as_path().parent().unwrap_or(Path::new(""));
+        let parent_fd = if parent_rel.as_os_str().is_empty() {
+            root.as_fd()
+                .try_clone()
+                .map_err(|e| Error::transport(format!("dup root dir: {e}")))?
+        } else {
+            match crate::atomic::openat_no_follow_io(
+                root.as_fd(),
+                parent_rel,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            ) {
+                Ok(fd) => fd,
+                // A missing parent component is a confirmed absence.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(Error::transport(format!("rmdir {}: {e}", rel.display())));
+                }
+            }
+        };
+        let name = rel
+            .as_path()
+            .file_name()
+            .ok_or_else(|| Error::transport(format!("rmdir {}: no file name", rel.display())))?;
+        let name_c = std::ffi::CString::new(name.as_encoded_bytes())
+            .map_err(|_| Error::transport("rmdir name with NUL"))?;
+        let r =
+            unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(Error::transport(format!("rmdir {}: {e}", rel.display())));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn list_confined(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        let Some(root) = self.root_dir(false)? else {
+            return Ok(Vec::new());
+        };
+        let entries = match crate::atomic::read_dir_fd(&root, rel.as_path()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // Preserve the absent-directory-enumerates-as-empty contract;
+                // a MISSING entry or parent component (a genuine `NotFound`)
+                // is empty, while EVERY other failure — including a symlink
+                // component (`ELOOP`), which `read_dir_fd` refuses — is
+                // propagated.
+                return match crate::atomic::openat_no_follow_io(
+                    root.as_fd(),
+                    rel.as_path(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    0,
+                ) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                    _ => Err(Error::transport(format!(
+                        "read_dir {}: {error}",
+                        rel.display()
+                    ))),
+                };
+            }
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let child = rel.join(&entry.name)?;
+            let (is_dir, is_symlink) = match crate::atomic::path_kind_fd(&root, child.as_path())? {
+                Some(crate::atomic::PathKind::Dir) => (true, false),
+                Some(crate::atomic::PathKind::Symlink) => (false, true),
+                Some(crate::atomic::PathKind::File) | Some(crate::atomic::PathKind::Other) => {
+                    (false, false)
+                }
+                None => continue,
+            };
+            let name = entry.name.into_string().map_err(|_| {
+                Error::transport(format!(
+                    "read_dir {}: entry name is not valid UTF-8, so the listing cannot be compared byte-exactly (distinct names would both decode to U+FFFD); refusing: {}",
+                    rel.display(),
+                    child.display()
+                ))
+            })?;
+            let (size, mode) = self.entry_size_mode_confined(&root, &child, is_symlink)?;
+            out.push(RemoteEntry {
+                name,
+                is_dir,
+                is_symlink,
+                size,
+                mode,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The size and mode of one live child. A FILE or DIRECTORY is opened
+    /// `O_NOFOLLOW` relative to the pinned root and `fstat`ed through the SAME
+    /// descriptor (no path re-resolution). A SYMLINK is classified without
+    /// following it and its OWN size/mode come from a component-wise
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` ([`LocalTransport::confined_lstat`]); it is
+    /// never followed.
+    #[cfg(unix)]
+    fn entry_size_mode_confined(
+        &self,
+        root: &crate::atomic::RootDir,
+        child: &RootedRelativePath,
+        is_symlink: bool,
+    ) -> Result<(u64, u32)> {
+        if !is_symlink {
+            let fd = crate::atomic::openat_no_follow(
+                root.as_fd(),
+                child.as_path(),
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            )?;
+            let meta = std::fs::File::from(fd)
+                .metadata()
+                .map_err(|e| Error::transport(format!("fstat {}: {e}", child.display())))?;
+            let remote = meta_to_remote(&meta);
+            return Ok((remote.size, remote.mode));
+        }
+        let remote = self.confined_lstat(root, child)?.ok_or_else(|| {
+            Error::transport(format!("lstat {}: the entry vanished", child.display()))
+        })?;
+        Ok((remote.size, remote.mode))
+    }
+
+    /// The metadata of the entry at `rel`, obtained from an
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` whose parent directory is resolved
+    /// COMPONENT-WISE with `openat(O_NOFOLLOW)`. The FINAL component is never
+    /// opened and its link is never followed, so this is a pure, side-effect-free
+    /// stat that cannot be redirected outside the pinned root by a symlink at any
+    /// component. A missing final component OR a missing parent component is
+    /// ABSENCE (`Ok(None)`), exactly matching the path-based
+    /// `symlink_metadata` it replaces; every other filesystem error propagates.
+    #[cfg(unix)]
+    fn confined_lstat(
+        &self,
+        root: &crate::atomic::RootDir,
+        rel: &RootedRelativePath,
+    ) -> Result<Option<RemoteMeta>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let path = rel.as_path();
+        let name = path
+            .file_name()
+            .ok_or_else(|| Error::transport(format!("lstat {}: no file name", rel.display())))?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let parent_fd = match parent {
+            Some(parent) => match crate::atomic::openat_no_follow_io(
+                root.as_fd(),
+                parent,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                0,
+            ) {
+                Ok(fd) => fd,
+                // A missing parent component names no entry: absence.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(Error::transport(format!("lstat {}: {e}", rel.display())));
+                }
+            },
+            None => root
+                .as_fd()
+                .try_clone()
+                .map_err(|e| Error::transport(format!("dup root dir: {e}")))?,
+        };
+        let name_c = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| Error::transport(format!("lstat {}: name with NUL", rel.display())))?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                name_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(Error::transport(format!("lstat {}: {e}", rel.display())));
+        }
+        let file_type = st.st_mode & libc::S_IFMT;
+        Ok(Some(RemoteMeta {
+            is_dir: file_type == libc::S_IFDIR,
+            is_symlink: file_type == libc::S_IFLNK,
+            is_file: file_type == libc::S_IFREG,
+            size: st.st_size.max(0) as u64,
+            mode: st.st_mode as u32,
+        }))
+    }
+
+    /// The path-based listing, used for the destination ROOT on Unix (the
+    /// `read_dir_fd` helper refuses the empty root-relative path) and for
+    /// EVERY path on the Windows port.
+    fn list_path_based(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         let dir = join(&self.base, rel);
         // An unprovisioned remote root has no directories yet; report an empty
         // listing rather than erroring so read-only inspection stays valid.
@@ -1756,7 +2236,155 @@ impl Remote for LocalTransport {
         }
         Ok(out)
     }
+}
 
+impl Remote for LocalTransport {
+    fn root(&self) -> &Path {
+        &self.base
+    }
+
+    fn is_local(&self) -> bool {
+        true
+    }
+
+    fn provision_layout(&self) -> Result<()> {
+        if !self.base.exists() {
+            std::fs::create_dir_all(&self.base)
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;
+        }
+        // Provision the caller-supplied top-level layout.
+        for d in &self.layout.bootstrap_dirs {
+            let p = self.base.join(d);
+            if !p.exists() {
+                std::fs::create_dir_all(&p)
+                    .map_err(|e| Error::transport(format!("mkdir {}: {e}", p.display())))?;
+            }
+        }
+        // The IMMUTABLE receiver-id marker: the PHYSICAL identity of this
+        // deploy_dir, created ONCE at provisioning and never changed (a
+        // re-provisioning adopts the existing marker).
+        if let Some(marker) = &self.layout.receiver_marker {
+            provision_receiver_id(self, marker)?;
+        }
+        Ok(())
+    }
+
+    /// Read the bytes at `rel`, descriptor-relative on Unix: the parent is
+    /// resolved COMPONENT-WISE with `openat(O_NOFOLLOW)` and the final component
+    /// is opened `O_NOFOLLOW`, so a symlink at any component is REFUSED and the
+    /// bytes can never be sourced from outside the pinned root. This is what
+    /// makes the applier's content verification a verdict about the CONFINED
+    /// object rather than a path that may have been swapped.
+    #[cfg(unix)]
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        let Some(root) = self.root_dir(false)? else {
+            return Err(Error::transport(format!(
+                "read {}: the destination root is absent",
+                rel.display()
+            )));
+        };
+        crate::atomic::read_fd(&root, rel.as_path())
+            .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
+    }
+
+    #[cfg(not(unix))]
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        std::fs::read(join(&self.base, rel))
+            .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
+    }
+
+    #[cfg(unix)]
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        self.write_confined(rel, data, mode)
+    }
+
+    #[cfg(unix)]
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.create_dir_all_confined(rel)
+    }
+
+    #[cfg(unix)]
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        self.set_mode_confined(rel, mode)
+    }
+
+    #[cfg(unix)]
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        if rel.as_path().as_os_str().is_empty() {
+            // The destination ROOT itself: `read_dir_fd` refuses the empty
+            // path (it must name at least one normal component), so the pinned
+            // root PATH is read directly. This is the ONE name read that is
+            // not descriptor-relative (the manifest walk is path-based too),
+            // and the residual root-swap race is the one the module documents.
+            return self.list_path_based(rel);
+        }
+        self.list_confined(rel)
+    }
+
+    #[cfg(unix)]
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        self.rename_confined(from, to)
+    }
+
+    #[cfg(unix)]
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        self.symlink_confined(target, link)
+    }
+
+    #[cfg(unix)]
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_file_confined(rel)
+    }
+
+    #[cfg(unix)]
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_dir_all_confined(rel)
+    }
+
+    #[cfg(unix)]
+    fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_dir_confined(rel)
+    }
+
+    #[cfg(not(unix))]
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        let p = join(&self.base, rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        std::fs::write(&p, data)
+            .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
+        if mode != 0 {
+            crate::platform::chmod(&p, mode)
+                .map_err(|e| Error::transport(format!("chmod {}: {e}", p.display())))?;
+        }
+        Ok(())
+    }
+
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::create_dir(join(&self.base, rel))
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
+    }
+
+    #[cfg(not(unix))]
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::create_dir_all(join(&self.base, rel))
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
+            .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
+    }
+
+    #[cfg(not(unix))]
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        self.list_path_based(rel)
+    }
+
+    #[cfg(not(unix))]
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         let f = join(&self.base, from);
         let t = join(&self.base, to);
@@ -1768,6 +2396,7 @@ impl Remote for LocalTransport {
         })
     }
 
+    #[cfg(not(unix))]
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         let l = join(&self.base, link);
         if let Some(parent) = l.parent() {
@@ -1784,12 +2413,30 @@ impl Remote for LocalTransport {
         })
     }
 
+    /// Read the target of the symlink at `rel`, descriptor-relative on Unix:
+    /// the parent is resolved COMPONENT-WISE with `openat(O_NOFOLLOW)` and the
+    /// link is read with `readlinkat` on the pinned parent (never followed), so
+    /// a symlink injected at any component is refused.
+    #[cfg(unix)]
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        let Some(root) = self.root_dir(false)? else {
+            return Err(Error::transport(format!(
+                "readlink {}: the destination root is absent",
+                rel.display()
+            )));
+        };
+        crate::atomic::read_link_fd(&root, rel.as_path())
+            .map_err(|e| Error::transport(format!("readlink {}: {e}", rel.display())))
+    }
+
+    #[cfg(not(unix))]
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
         let p = join(&self.base, rel);
         std::fs::read_link(&p)
             .map_err(|e| Error::transport(format!("readlink {}: {e}", p.display())))
     }
 
+    #[cfg(not(unix))]
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = join(&self.base, rel);
         std::fs::remove_file(&p)
@@ -1838,6 +2485,7 @@ impl Remote for LocalTransport {
         self.try_write_new_with_inner(rel, data, equivalence)
     }
 
+    #[cfg(not(unix))]
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = join(&self.base, rel);
         #[cfg(unix)]
@@ -1863,6 +2511,20 @@ impl Remote for LocalTransport {
                 })
                 .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
         }
+    }
+
+    #[cfg(not(unix))]
+    fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = join(&self.base, rel);
+        std::fs::remove_dir(&p)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
     }
 
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
@@ -1909,6 +2571,21 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("fsync parent dir {}: {e}", parent.display())))
     }
 
+    /// The TRI-STATE existence check, descriptor-relative on Unix: `rel` is
+    /// resolved component-wise with `O_NOFOLLOW` and the final component is
+    /// `fstat`ed, so a symlink at any component is refused rather than followed.
+    /// `bool` swallows the error by this trait's contract (callers that must
+    /// distinguish a failure from absence use [`Remote::metadata_opt`], which is
+    /// also descriptor-relative on Unix).
+    #[cfg(unix)]
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
+        match self.root_dir(false) {
+            Ok(Some(root)) => self.confined_lstat(&root, rel).is_ok_and(|m| m.is_some()),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(unix))]
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         join(&self.base, rel).exists()
     }
@@ -1922,6 +2599,18 @@ impl Remote for LocalTransport {
         })
     }
 
+    #[cfg(unix)]
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
+        let Some(root) = self.root_dir(false)? else {
+            return Ok(None);
+        };
+        // A single component-wise `fstatat(AT_SYMLINK_NOFOLLOW)` — the FINAL
+        // component is never opened and a link is never followed, so the size,
+        // mode, and kind cannot be sourced from outside the pinned root.
+        self.confined_lstat(&root, rel)
+    }
+
+    #[cfg(not(unix))]
     fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
         let p = join(&self.base, rel);
         match std::fs::symlink_metadata(&p) {
@@ -2433,6 +3122,192 @@ mod tests {
         assert_eq!(target, Path::new("generations/gen1"));
     }
 
+    /// The `LocalTransport` operations the applier issues resolve
+    /// COMPONENT-WISE with `openat(O_NOFOLLOW)` from an fd-pinned root: a
+    /// symlink injected at a PARENT component is refused for every one of
+    /// them, and the OUTSIDE tree is never touched. This is the same
+    /// no-window guarantee the fd-confined `Side::Local` destination gives.
+    #[cfg(unix)]
+    #[test]
+    fn local_transport_refuses_a_parent_component_symlink_for_every_mutation() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(outside.join("x"), b"OUTSIDE").unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        symlink(&outside, base.join("link")).unwrap();
+
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let link = RootedRelativePath::parse(Path::new("link")).unwrap();
+        let link_x = RootedRelativePath::parse(Path::new("link/x")).unwrap();
+        let link_sub = RootedRelativePath::parse(Path::new("link/sub")).unwrap();
+        let link_new = RootedRelativePath::parse(Path::new("link/new")).unwrap();
+
+        assert!(t.list(&link).is_err(), "list must refuse a symlinked root");
+        assert!(
+            t.write(&link_new, b"nope", 0o644).is_err(),
+            "write must refuse a symlinked parent"
+        );
+        assert!(
+            t.create_dir_all(&link_sub).is_err(),
+            "create_dir_all must refuse a symlinked parent"
+        );
+        assert!(
+            t.set_mode(&link_x, 0o600).is_err(),
+            "set_mode must refuse a symlinked parent"
+        );
+        assert!(
+            t.symlink(Path::new("t"), &link_new).is_err(),
+            "symlink must refuse a symlinked parent"
+        );
+        assert!(
+            t.remove_file(&link_x).is_err(),
+            "remove_file must refuse a symlinked parent"
+        );
+        assert!(
+            t.remove_dir_all(&link_sub).is_err(),
+            "remove_dir_all must refuse a symlinked parent"
+        );
+        assert!(
+            t.rename(&link_x, &link_new).is_err(),
+            "rename must refuse a symlinked parent"
+        );
+
+        // Nothing outside was created, changed, or destroyed, and the link is
+        // still a link.
+        assert_eq!(std::fs::read(outside.join("x")).unwrap(), b"OUTSIDE");
+        assert!(outside.join("sub").is_dir());
+        assert!(!outside.join("new").exists());
+        assert!(
+            std::fs::symlink_metadata(base.join("link"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    /// FINDING 4/5: the READS the applier verifies against are descriptor-relative
+    /// too. Pre-fix `read`, `read_link`, `exists`, and `metadata_opt` were
+    /// PATH-based (`std::fs::read`/`read_link`/`exists`/`symlink_metadata`), so a
+    /// symlink injected at a PARENT component made them FOLLOW it: a content
+    /// hash — and therefore an `applied` verdict — could be computed from an
+    /// object OUTSIDE the pinned root. Each must now refuse a symlinked parent,
+    /// and the outside bytes must never be returned.
+    #[cfg(unix)]
+    #[test]
+    fn local_transport_refuses_a_parent_component_symlink_for_every_read() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(outside.join("planted"), b"OUTSIDE-CONTENT").unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        symlink("OUTSIDE-TARGET", outside.join("slink")).unwrap();
+        symlink(&outside, base.join("link")).unwrap();
+
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let link_planted = RootedRelativePath::parse(Path::new("link/planted")).unwrap();
+        let link_slink = RootedRelativePath::parse(Path::new("link/slink")).unwrap();
+
+        assert!(
+            t.read(&link_planted).is_err(),
+            "read must refuse a symlinked parent"
+        );
+        assert!(
+            t.read_link(&link_slink).is_err(),
+            "read_link must refuse a symlinked parent"
+        );
+        assert!(
+            !t.exists(&link_planted),
+            "exists must refuse a symlinked parent, never follow it"
+        );
+        assert!(
+            t.metadata_opt(&link_planted).is_err(),
+            "metadata_opt must refuse a symlinked parent"
+        );
+        assert!(
+            t.metadata(&link_planted).is_err(),
+            "metadata must refuse a symlinked parent"
+        );
+        // The outside file's bytes were never returned and it is untouched.
+        assert_eq!(
+            std::fs::read(outside.join("planted")).unwrap(),
+            b"OUTSIDE-CONTENT"
+        );
+    }
+
+    /// The busy-writer TOCTOU class check, re-run against the confinement fix: a
+    /// writer thread continuously swaps the `d` component between a real
+    /// directory and a symlink to an outside tree while the main thread issues
+    /// every guarded operation. No write may land outside the root and no read
+    /// may return outside content, whatever order the swap and the syscall
+    /// interleave in.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_component_swapper_never_redirects_a_confinement_guarded_operation() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(base.join("d")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("planted"), b"OUTSIDE-CONTENT").unwrap();
+
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let rel_x = RootedRelativePath::parse(Path::new("d/x")).unwrap();
+        let rel_planted = RootedRelativePath::parse(Path::new("d/planted")).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = std::sync::Arc::clone(&stop);
+            let base = base.clone();
+            let outside = outside.clone();
+            std::thread::spawn(move || {
+                let mut swaps = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) && swaps < 200 {
+                    let _ = std::fs::remove_dir_all(base.join("d"));
+                    let _ = symlink(&outside, base.join("d"));
+                    let _ = std::fs::remove_file(base.join("d"));
+                    let _ = std::fs::create_dir_all(base.join("d"));
+                    swaps += 1;
+                }
+            })
+        };
+
+        let mut ops = 0usize;
+        while ops < 200 {
+            let _ = t.write(&rel_x, b"IN-ROOT", 0o644);
+            if let Ok(bytes) = t.read(&rel_planted) {
+                assert_ne!(
+                    bytes.as_slice(),
+                    b"OUTSIDE-CONTENT",
+                    "a read escaped the pinned root and returned OUTSIDE content"
+                );
+            }
+            let _ = t.exists(&rel_planted);
+            let _ = t.metadata_opt(&rel_planted);
+            assert!(
+                !outside.join("x").exists(),
+                "a confinement-guarded write escaped the pinned root"
+            );
+            ops += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert_eq!(
+            std::fs::read(outside.join("planted")).unwrap(),
+            b"OUTSIDE-CONTENT",
+            "the outside tree was never written through"
+        );
+    }
+
     /// The transport-level contract of the shared primitive: `try_write_new`
     /// reports `Ok(Created)` for a fresh DURABLE install, `Ok(AlreadyPresent)`
     /// for an identical retry (convergent — the winner is verified
@@ -2941,6 +3816,9 @@ mod tests {
         }
         fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
+        }
+        fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
