@@ -202,12 +202,106 @@ duplicated normalized path is refused; the remote script's output parses into
 the same `TreeMetadata` the local walk produces for the same tree (test the
 two paths against one fixture).
 
-### slice-sync — `src/sync.rs` (new code — separate wave)
+### slice-sync — `src/sync/` (new code, wave 3)
 
-Not part of the first extraction. Push = produce a local manifest, ask the
-other side for its manifest, send only what differs. Pull = the reverse, then
-apply. Application is per record kind and is the caller's rule, not this
-crate's: the crate compares and transfers, and exposes the diff
-(`Missing`/`Changed`/`Diverged`) for the caller to merge. Never overwrite a
-destination entry that the manifest says differs without the caller's
-explicit rule.
+Purpose: move a tree between two hosts, transferring only what differs, and
+never destroying a destination entry the caller did not sanction. This is the
+capability that makes the crate more than local storage: a record book is
+pushed to another host and pulled back.
+
+Build it as two committed changes, in order, both inside `src/sync/` (convert
+the `src/sync.rs` stub into `src/sync/{mod.rs,diff.rs,apply.rs}`; `lib.rs`
+already declares `pub mod sync`).
+
+#### 3a — `sync::diff` (comparison; mutates nothing)
+
+A manifest is [`crate::manifest::TreeMetadata`]. Produce one per side:
+
+* local: `manifest::canonicalize_tree(root)`;
+* remote: branch on `Remote::is_local()` — NEVER probe the filesystem to
+decide. A local remote is canonicalized directly at
+`remote.root().join(rel)`; a remote one is hashed on the far side with
+`remote.exec(&["perl".into(), "-e".into(),
+manifest::remote_tree_verify_script().into(), abs_path])` and assembled with
+`manifest::canonicalize_remote_entries`, so only hashes cross the link.
+
+Compare into a typed, path-ordered diff:
+
+```rust
+pub enum EntryDiff { Missing, Changed, Extraneous, Same }
+pub struct TreeDiff {
+    pub source: TreeMetadata,
+    pub dest: TreeMetadata,
+    pub entries: Vec<(String, EntryDiff)>,   // sorted by path
+}
+```
+
+* `Missing` — in the source, not in the destination.
+* `Changed` — present on both, but kind, mode, or content hash differs.
+* `Extraneous` — in the destination only.
+* `Same` — metadata identical.
+
+The diff is the whole decision surface; producing it must not read content
+beyond what a manifest already holds.
+
+#### 3b — `sync::apply` (transfer, one direction)
+
+```rust
+pub enum Direction { Push, Pull }
+pub enum EntryPolicy { Replace, Refuse, AppendTail }
+pub trait Policy { fn for_path(&self, rel: &str, kind: EntryKind) -> EntryPolicy; }
+```
+
+`Replace` overwrites the destination entry. `Refuse` leaves it alone and
+reports a conflict. `AppendTail` is the append-only rule: if the destination
+is a PREFIX of the source, the source's tail is appended; if the source is a
+prefix of the destination, nothing is written; otherwise the two `Diverged`
+— reported as a conflict, never merged, never truncated. `AppendTail` must
+read both sides' bytes (a manifest carries hashes, not bytes) and accept a
+prefix relation as the ONLY mergeable case.
+
+The crate must not encode any application's file names: the caller supplies
+the `Policy`, keyed on the path and entry kind. Provide a `ReplaceAll` policy
+as the default "make the destination match the source".
+
+Apply rules:
+
+* Only `Missing` and `Changed` entries are eligible. `Extraneous` is REPORTED
+  and never deleted unless the caller explicitly asks for it (a
+  `delete_extraneous` flag, default false). `Same` is skipped with NO I/O —
+  transferring an unchanged entry is a bug, and a test must count the writes.
+* A `Refuse` conflict or a `Diverged` append leaves the destination
+  byte-identical. Assert it in tests.
+* Directories are created before their children. Modes and symlinks are
+  transferred faithfully; a symlink is never followed.
+* Pull writes locally through this crate's durable, confined primitives
+  (`crate::atomic`), never a bare `fs::write`, so an interrupted pull cannot
+  leave a torn entry. Push writes through
+  `Remote::{write, try_write_new, create_dir_all, symlink, set_mode}`.
+* After applying, VERIFY: re-read each written entry and compare its hash to
+  the source manifest's. A mismatch is an error, never a silent success.
+
+Report:
+
+```rust
+pub struct SyncReport {
+    pub applied: Vec<String>,
+    pub skipped: Vec<String>,
+    pub conflicts: Vec<Conflict>,
+    pub extraneous: Vec<String>,
+}
+```
+
+Diff and report are ordered by path, deterministically.
+
+Acceptance (tests against `LocalTransport` over a second temp directory, plus
+`SshTransport` argument/script coverage where no live connection is needed):
+
+* push makes the destination equal to the source manifest; pull does the reverse;
+* unchanged entries cause no writes (count transfer operations);
+* `Refuse` leaves a differing destination byte-identical and reports a conflict;
+* `AppendTail` appends the missing tail when one side is a prefix;
+* `AppendTail` on divergent content reports a conflict and changes nothing;
+* `Extraneous` is reported and survives a default sync;
+* a symlink and a non-default mode round-trip;
+* a failed write is reported, never a success.
