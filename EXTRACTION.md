@@ -281,6 +281,16 @@ Apply rules:
   `skipped`. A report that names a path `skipped` while having mutated it is a
   defect; an absolute "`Same` implies zero I/O" is unachievable and must not be
   tested for.
+
+  **Scope of the widening: MANIFEST ENTRIES only.** The destination ROOT is not
+  a manifest entry and is NOT widened — it is the caller's own directory. A
+  read-only destination root therefore makes every top-level mutation fail
+  loudly: the failure is counted in `transfers`, the attempted path is named in
+  `indeterminate`, the root's mode is left untouched, and nothing is destroyed.
+  The caller widens its own root if it wants top-level writes. This is a
+  deliberate limitation, not an oversight: the transport abstraction has no
+  root-mode operation (a remote root may name a path on another host), so a
+  local-only widen would make the invariant depend on direction and transport.
 * A `Refuse` conflict or a `Diverged` append leaves the destination
   byte-identical. Assert it in tests.
 * Directories are created before their children. Modes and symlinks are
@@ -314,7 +324,8 @@ Acceptance (tests against `LocalTransport` over a second temp directory, plus
 * a read-only `Same` directory WITH a changed child is widened, counted in
   `transfers`, named in `transient_dirs`, absent from `skipped`, and left at its
   original mode — on the failure path too, where the partial report must be
-  reachable from the error;
+  reachable from the error (manifest entries only; the destination root is
+  excluded — see the scope note above);
 * `AppendTail` constrains BYTES only: when no bytes need appending it still
   applies a differing mode and never touches content;
 * `Refuse` leaves a differing destination byte-identical and reports a conflict;
