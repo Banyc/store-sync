@@ -218,6 +218,27 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// The kind of a directory entry, classified WITHOUT following a symlink.
+///
+/// [`path_kind_fd`] returns this for the entry at a root-relative path. The
+/// classification is deliberately independent of the entry's target: a
+/// symlink whose TARGET is a directory is [`PathKind::Symlink`], never
+/// [`PathKind::Dir`] — exactly the distinction [`DirEntry::is_dir`] cannot
+/// make, and the answer [`path_state_fd`] cannot report (its `O_NOFOLLOW`
+/// open raises `ELOOP` for a symlink instead of answering "this entry
+/// exists and is a symlink").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathKind {
+    /// A regular file (`S_IFREG`).
+    File,
+    /// A directory (`S_IFDIR`).
+    Dir,
+    /// A symbolic link (`S_IFLNK`), whatever its target's kind.
+    Symlink,
+    /// Any other entry kind (FIFO, socket, device, ...).
+    Other,
+}
+
 // =====================================================================
 // THE OWNED ROOT (the store's mutation anchor)
 // ---------------------------------------------------------------------

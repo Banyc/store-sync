@@ -1187,6 +1187,58 @@ pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
     }
 }
 
+/// The KIND of the entry at `rel` relative to `root`, classified WITHOUT
+/// following a final-component symlink — the companion of [`path_state_fd`]
+/// for callers that must HANDLE a symlink rather than refuse it (a sync
+/// that replaces or removes a symlink destination).
+///
+/// The PARENT is resolved component-wise with [`parent_fd_of`]
+/// (`openat(O_NOFOLLOW)`), so a symlink injected at any parent component is
+/// REFUSED (ELOOP), never followed, and `rel` is validated as
+/// ROOT-RELATIVE first, so an absolute path, a `..`, a `.`, and the empty
+/// path are refused before any `openat` — the same guards as every other
+/// `_fd` primitive. The final component is then classified with
+/// `fstatat(parent_fd, name, AT_SYMLINK_NOFOLLOW)` from the mode's
+/// `S_IFMT`, so a symlink whose TARGET is a directory is
+/// [`PathKind::Symlink`], never [`PathKind::Dir`]. A missing entry is
+/// ABSENCE (`Ok(None)`); every other filesystem error is a real failure →
+/// [`Error::store`].
+///
+/// [`parent_fd_of`]: super::parent_fd_of
+pub fn path_kind_fd(root: &RootDir, rel: &Path) -> Result<Option<PathKind>> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    let c = CString::new(name.as_bytes()).map_err(|_| Error::store("path component with NUL"))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::fstatat(
+            parent_fd.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(Error::store(format!("fstatat {}: {e}", rel.display())));
+    }
+    Ok(Some(kind_from_mode(st.st_mode)))
+}
+
+/// Classify an entry kind from a POSIX `S_IFMT` mode (`stat`'s
+/// `st_mode`), WITHOUT consulting any symlink target (the mode is the
+/// link's own mode because the caller passed `AT_SYMLINK_NOFOLLOW`).
+fn kind_from_mode(mode: libc::mode_t) -> PathKind {
+    match mode & libc::S_IFMT {
+        libc::S_IFREG => PathKind::File,
+        libc::S_IFDIR => PathKind::Dir,
+        libc::S_IFLNK => PathKind::Symlink,
+        _ => PathKind::Other,
+    }
+}
+
 /// Read the entries of the directory at `rel` relative to `dir_fd`,
 /// resolved COMPONENT-WISE with `openat(O_NOFOLLOW)` (a symlink injected
 /// at any component is refused — ELOOP — never followed). Each entry is
@@ -1225,7 +1277,8 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, RootDir, read_fd, read_link_fd};
+    use super::{Error, PathKind, RootDir, path_kind_fd, read_fd, read_link_fd};
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
     fn owned_root() -> (tempfile::TempDir, RootDir) {
@@ -1324,6 +1377,104 @@ mod tests {
         let err =
             read_link_fd(&root, Path::new("missing")).expect_err("a missing entry must error");
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+    }
+
+    /// Every entry kind is classified from the entry's OWN mode:
+    /// a regular file is `File`, a directory is `Dir`, a symlink is
+    /// `Symlink` — INCLUDING a symlink whose TARGET is a directory (the
+    /// whole point: it must never read as `Dir`) — a FIFO is `Other`, and
+    /// a missing path is `Ok(None)`.
+    #[test]
+    fn path_kind_fd_classifies_without_following_a_symlink() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("dir"), dir.path().join("dirlink")).unwrap();
+
+        let fifo = dir.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo must succeed"
+        );
+
+        assert_eq!(
+            path_kind_fd(&root, Path::new("file")).unwrap(),
+            Some(PathKind::File),
+            "a regular file is File"
+        );
+        assert_eq!(
+            path_kind_fd(&root, Path::new("dir")).unwrap(),
+            Some(PathKind::Dir),
+            "a directory is Dir"
+        );
+        assert_eq!(
+            path_kind_fd(&root, Path::new("link")).unwrap(),
+            Some(PathKind::Symlink),
+            "a symlink is Symlink, never its target's kind"
+        );
+        assert_eq!(
+            path_kind_fd(&root, Path::new("dirlink")).unwrap(),
+            Some(PathKind::Symlink),
+            "a symlink TO A DIRECTORY must still be Symlink, never Dir"
+        );
+        assert_eq!(
+            path_kind_fd(&root, Path::new("fifo")).unwrap(),
+            Some(PathKind::Other),
+            "a FIFO is Other"
+        );
+        assert_eq!(
+            path_kind_fd(&root, Path::new("missing")).unwrap(),
+            None,
+            "a missing path is absence"
+        );
+    }
+
+    /// A symlink injected at a PARENT component is refused by the
+    /// component-wise `openat(O_NOFOLLOW)` guard, never followed — the
+    /// outside directory is not even stat'd for the entry.
+    #[test]
+    fn path_kind_fd_refuses_a_parent_component_symlink() {
+        let (dir, root) = owned_root();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"OUTSIDE").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("sub")).unwrap();
+
+        let err = path_kind_fd(&root, Path::new("sub/secret"))
+            .expect_err("a parent-component symlink must be refused, not followed");
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("openat"),
+            "the refusal must name the component-wise open, got: {err}"
+        );
+    }
+
+    /// An absolute path, a `..` walk, a `.`, and the empty path are refused
+    /// by the ROOT-RELATIVE guard — before any `fstatat` — exactly as the
+    /// other `_fd` primitives refuse them.
+    #[test]
+    fn path_kind_fd_refuses_escaping_spellings() {
+        let (dir, root) = owned_root();
+        let absolute = dir.path().join("outside").as_os_str().to_os_string();
+        for spelling in [
+            PathBuf::from("/etc"),
+            PathBuf::from(&absolute),
+            PathBuf::from(".."),
+            PathBuf::from("../secret"),
+            PathBuf::from("a/../secret"),
+            PathBuf::from("."),
+            PathBuf::new(),
+        ] {
+            let err = path_kind_fd(&root, &spelling)
+                .expect_err("an escaping or empty spelling must be refused");
+            assert!(
+                matches!(err, Error::Store(_)) && err.to_string().contains("normal component"),
+                "{spelling:?} must be refused by the root-relative guard, got: {err}"
+            );
+        }
     }
 
     /// A real directory opens with and without a trailing slash, and both

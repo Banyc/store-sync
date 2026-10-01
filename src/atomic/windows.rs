@@ -365,6 +365,48 @@ pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
     path_state(&rel_join(root, rel)?)
 }
 
+/// The KIND of the entry at `rel` under the root path, classified WITHOUT
+/// following a final-component symlink.
+///
+/// Path-based, with the documented weaker guarantee of the Windows port,
+/// and the guarantee is split precisely:
+///
+/// * GUARANTEED: the FINAL component is classified with `symlink_metadata`
+///   (the path-based `lstat`), so a symlink there is NOT followed and is
+///   reported as [`PathKind::Symlink`] whatever its target's kind — a
+///   symlink TO A DIRECTORY is never [`PathKind::Dir`]. A missing entry is
+///   ABSENCE (`Ok(None)`); every other filesystem error is [`Error::store`].
+///   `rel` is validated as ROOT-RELATIVE first ([`rel_join`]), so an
+///   absolute path, a `..`, a `.`, and the empty path are refused.
+/// * NOT GUARANTEED: a symlink injected at a PARENT component IS followed
+///   (`Path::join` has no component-wise `O_NOFOLLOW`), and a non-symlink
+///   reparse point is reported by its resolved kind (the classification
+///   uses Rust's `FileType`, which does not surface every reparse tag).
+///   Windows symlinks also require admin/developer mode, the smaller
+///   injection surface the Windows port documents elsewhere.
+pub fn path_kind_fd(root: &RootDir, rel: &Path) -> Result<Option<PathKind>> {
+    match std::fs::symlink_metadata(rel_join(root, rel)?) {
+        Ok(md) => Ok(Some(kind_from_file_type(md.file_type()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::store(format!("stat {}: {e}", rel.display()))),
+    }
+}
+
+/// Classify an entry kind from a [`std::fs::FileType`] obtained WITHOUT
+/// following the final component (`symlink_metadata`). A symlink is tested
+/// FIRST so a link to a directory can never be reported as `Dir`.
+fn kind_from_file_type(ft: std::fs::FileType) -> PathKind {
+    if ft.is_symlink() {
+        PathKind::Symlink
+    } else if ft.is_file() {
+        PathKind::File
+    } else if ft.is_dir() {
+        PathKind::Dir
+    } else {
+        PathKind::Other
+    }
+}
+
 /// Read the entries of the directory at `rel` under the root path.
 pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
     let mut out = Vec::new();
@@ -381,4 +423,79 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, PathKind, RootDir, path_kind_fd};
+    use std::path::{Path, PathBuf};
+
+    fn owned_root() -> (tempfile::TempDir, RootDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = RootDir::open(dir.path()).expect("open the owned root");
+        (dir, root)
+    }
+
+    /// The kinds Windows can always create: a regular file is `File`, a
+    /// directory is `Dir`, a missing entry is `Ok(None)`.
+    #[test]
+    fn path_kind_fd_classifies_a_file_a_directory_and_absence() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        assert_eq!(
+            path_kind_fd(&root, Path::new("file")).unwrap(),
+            Some(PathKind::File)
+        );
+        assert_eq!(
+            path_kind_fd(&root, Path::new("dir")).unwrap(),
+            Some(PathKind::Dir)
+        );
+        assert_eq!(path_kind_fd(&root, Path::new("missing")).unwrap(), None);
+    }
+
+    /// A symlink is `Symlink` — never its target's kind — when Windows lets
+    /// the test create one. Symlink creation requires admin/developer mode,
+    /// so a refusal is skipped: there is nothing to classify (the
+    /// documented weaker Windows guarantee).
+    #[test]
+    fn path_kind_fd_reports_a_symlink_when_one_can_be_created() {
+        let (dir, root) = owned_root();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        if std::os::windows::fs::symlink_dir(dir.path().join("dir"), dir.path().join("dirlink"))
+            .is_err()
+        {
+            return;
+        }
+        assert_eq!(
+            path_kind_fd(&root, Path::new("dirlink")).unwrap(),
+            Some(PathKind::Symlink),
+            "a symlink TO A DIRECTORY must still be Symlink, never Dir"
+        );
+    }
+
+    /// An absolute path, a `..` walk, a `.`, and the empty path are refused
+    /// by the ROOT-RELATIVE guard, exactly as the other `_fd` primitives
+    /// refuse them.
+    #[test]
+    fn path_kind_fd_refuses_escaping_spellings() {
+        let (dir, root) = owned_root();
+        let absolute = dir.path().join("outside").as_os_str().to_os_string();
+        for spelling in [
+            PathBuf::from("C:\\outside"),
+            PathBuf::from(".."),
+            PathBuf::from("..\\secret"),
+            PathBuf::from("a/../secret"),
+            PathBuf::from("."),
+            PathBuf::new(),
+            PathBuf::from(&absolute),
+        ] {
+            let err = path_kind_fd(&root, &spelling)
+                .expect_err("an escaping or empty spelling must be refused");
+            assert!(
+                matches!(err, Error::Store(_)) && err.to_string().contains("normal component"),
+                "{spelling:?} must be refused by the root-relative guard, got: {err}"
+            );
+        }
+    }
 }
