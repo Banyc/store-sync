@@ -4,6 +4,12 @@
 //! vocabulary; only the four environment/tmpdir/proptest helpers are generic,
 //! and they are reproduced here. Add to this file rather than introducing a
 //! second test-support surface.
+//!
+//! The module is test-only and shared by suites that land in separate waves,
+//! so a helper no current suite calls is not a defect: the dead-code lint is
+//! allowed here rather than letting one suite's unused helper fail another's
+//! `-D warnings` gate.
+#![allow(dead_code)]
 
 use crate::env::SysEnv;
 
