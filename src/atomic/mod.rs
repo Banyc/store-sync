@@ -237,10 +237,86 @@ pub struct RootDir(OwnedFd);
 #[cfg(windows)]
 pub struct RootDir(PathBuf);
 
+/// Normalize the spelling of an owned-root path so two spellings that name
+/// the same directory open the same root. Trailing path separators are
+/// stripped, along with repeated separators and non-leading `.`
+/// components that [`Path::components`] erases anyway (all of these name
+/// the same directory). The filesystem root is preserved: `/` normalizes
+/// to `/`, never to the empty path.
+///
+/// The strip is load-bearing, not cosmetic. A trailing separator DEFEATS
+/// `O_DIRECTORY | O_NOFOLLOW`, because POSIX resolves `link/` by following
+/// `link` as an INTERMEDIATE component (the final component is empty), so
+/// the symlink-refusing open never sees the link — while the same root
+/// spelled `link` is refused. Normalizing before the open makes both
+/// spellings take the same path. A `..` in the root is the caller's own
+/// trusted base and is left intact; a `..` in a ROOT-RELATIVE entry path
+/// is refused by [`validate_rel`].
+fn normalize_root(base: &Path) -> PathBuf {
+    base.components().collect()
+}
+
+/// Validate that `path` is a ROOT-RELATIVE entry path, refusing every
+/// spelling that could resolve outside the owned root. Only
+/// [`std::path::Component::Normal`] components are admitted:
+///
+/// * an absolute path contributes a `RootDir`/`Prefix` component, and
+///   `openat` IGNORES the root descriptor for an absolute path (on the
+///   Windows port `Path::join` REPLACES the root instead), so the
+///   operation would resolve against the real filesystem root — a
+///   confinement escape;
+/// * a `..` (`ParentDir`) component walks ABOVE the root;
+/// * `.` (`CurDir`) and the empty path name the root directory itself,
+///   never an entry under it.
+///
+/// Trailing and repeated separators are NOT refused: [`Path`] erases them,
+/// so `a/b/` and `a//b` are the same components as `a/b` and the spellings
+/// keep resolving identically. Every refusal is an
+/// [`std::io::ErrorKind::InvalidInput`] so each caller folds it into its
+/// own path-contextual store error (fail-closed: a path error, never an
+/// interesting resolution).
+fn validate_rel(path: &Path) -> std::io::Result<()> {
+    let mut names_an_entry = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => names_an_entry = true,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a root-relative path may contain only normal components \
+                     (no absolute path, no `..`, no `.`)",
+                ));
+            }
+        }
+    }
+    if !names_an_entry {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a root-relative path must name at least one normal component \
+             (the empty path is refused)",
+        ));
+    }
+    Ok(())
+}
+
 impl RootDir {
-    /// Open the owned root: `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` on
-    /// Unix (the descriptor pins the root); the canonical path on Windows.
+    /// Open the owned root.
+    ///
+    /// The path is normalized first ([`normalize_root`]): trailing path
+    /// separators are stripped, so `dir/` and `dir` open the SAME root. On
+    /// Unix the open is `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, so the
+    /// descriptor pins the root and a real directory opens, a
+    /// symlink-to-directory is refused (`ENOTDIR`/`ELOOP`), and a regular
+    /// file is refused (`ENOTDIR`) — IDENTICALLY for both spellings.
+    ///
+    /// Windows (the path-based port) stores the normalized path, so both
+    /// spellings name the same root for every later mutation. It does NOT
+    /// guarantee the same refusal: there is no directory descriptor and no
+    /// `O_NOFOLLOW` equivalent here, so a symlink root (which on Windows
+    /// requires admin/developer mode) is not refused at open — the
+    /// documented weaker guarantee of the Windows port.
     pub fn open(base: &Path) -> Result<RootDir> {
+        let base = normalize_root(base);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -248,13 +324,13 @@ impl RootDir {
             opts.read(true);
             opts.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
             let f = opts
-                .open(base)
+                .open(&base)
                 .map_err(|e| Error::store(format!("open root {}: {e}", base.display())))?;
             Ok(RootDir(f.into()))
         }
         #[cfg(windows)]
         {
-            Ok(RootDir(base.to_path_buf()))
+            Ok(RootDir(base))
         }
     }
 
@@ -271,7 +347,7 @@ impl RootDir {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplaceOutcome, ReplaceStage, write_atomic_replace};
+    use super::{ReplaceOutcome, ReplaceStage, normalize_root, validate_rel, write_atomic_replace};
     use crate::error::Error;
     use crate::test_support::{fixture_env, fixture_tmpdir, proptest_cases, slow_tests_enabled};
     use proptest::prelude::*;
@@ -366,5 +442,53 @@ mod tests {
             ReplaceOutcome::ReplacedDurabilityUnknown { .. }
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"NEW".to_vec());
+    }
+
+    /// The root spelling is NORMALIZED: a trailing separator, a repeated
+    /// separator, and a non-leading `.` all name the same root as the plain
+    /// spelling, while the filesystem root itself is preserved (`/` never
+    /// becomes the empty path).
+    #[test]
+    fn normalize_root_strips_trailing_separators_and_preserves_the_root() {
+        use std::path::{Path, PathBuf};
+        for (spelling, want) in [
+            ("a/b", "a/b"),
+            ("a/b/", "a/b"),
+            ("a/b//", "a/b"),
+            ("a//b", "a/b"),
+            ("a/./b", "a/b"),
+            ("a/b///", "a/b"),
+        ] {
+            assert_eq!(
+                normalize_root(Path::new(spelling)),
+                PathBuf::from(want),
+                "{spelling:?} must normalize to {want:?}"
+            );
+        }
+        assert_eq!(normalize_root(Path::new("/")), PathBuf::from("/"));
+        assert_eq!(normalize_root(Path::new("//")), PathBuf::from("/"));
+    }
+
+    /// The root-relative path guard: trailing and repeated separators are
+    /// accepted (they name the same components), while an absolute path, a
+    /// `..` walk, a `.`, and the empty path are refused as path errors.
+    #[test]
+    fn validate_rel_accepts_normal_spellings_and_refuses_escapes() {
+        use std::path::Path;
+        for ok in ["a", "a/b", "a/b/", "a//b", "a/./b", "a/b/c/"] {
+            assert!(
+                validate_rel(Path::new(ok)).is_ok(),
+                "{ok:?} must be accepted"
+            );
+        }
+        for bad in ["", ".", "./", "..", "../b", "a/../b", "a/..", "/b", "/"] {
+            let err = validate_rel(Path::new(bad))
+                .expect_err("an escaping or empty spelling must be refused");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{bad:?} must be an invalid-input path error"
+            );
+        }
     }
 }

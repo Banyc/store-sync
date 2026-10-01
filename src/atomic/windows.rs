@@ -5,6 +5,10 @@
 //! * no symlink-refusing component-wise resolution (Windows symlinks
 //!   require admin/developer mode, so the injection attack surface is
 //!   smaller);
+//! * every `_fd` path is validated as ROOT-RELATIVE first ([`validate_rel`]):
+//!   an absolute path, a `..`, a `.`, or the empty path is refused as a
+//!   path error, so the spelling of `rel` cannot redirect a `Path::join`
+//!   outside the root — symlinks INSIDE the root are still not refused;
 //! * no parent-directory fsync durability (a directory cannot be opened
 //!   as a file on Windows) — the rename is the only commit point;
 //! * a NON-atomic replace (Windows `rename` does not overwrite an
@@ -186,6 +190,17 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // weaker guarantees above.
 // =====================================================================
 
+/// Join `rel` under the root path, REFUSING every spelling that could
+/// resolve outside the root first (see [`validate_rel`]). The guard is what
+/// keeps the path-based port under the owned root too: [`Path::join`]
+/// REPLACES the root when `rel` is absolute (`C:\...`, `\...`) and a `..`
+/// component walks out of it, so the join is never performed on an
+/// unvalidated spelling. The root itself is the normalized [`RootDir`] path.
+fn rel_join(root: &RootDir, rel: &Path) -> Result<PathBuf> {
+    validate_rel(rel).map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
+    Ok(root.path().join(rel))
+}
+
 /// Path-based atomic replace (see [`write_atomic_replace`]).
 pub fn write_atomic_replace_fd(
     root: &RootDir,
@@ -193,14 +208,14 @@ pub fn write_atomic_replace_fd(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
-    write_atomic_replace(&root.path().join(rel), bytes, fault)
+    write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
 }
 
 /// Path-based create-or-compare CAS: the create-new install is the
 /// atomicity primitive (a racing loser fails on AlreadyExists and can
 /// never clobber a winner); there is no parent-directory fsync durability.
 pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
-    let path = root.path().join(rel);
+    let path = rel_join(root, rel)?;
     // If the file exists, its content must be byte-identical.
     match std::fs::read(&path) {
         Ok(existing) => {
@@ -229,14 +244,14 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
 
 /// Path-based private-directory creation (see [`ensure_private_dir`]).
 pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    ensure_private_dir(&root.path().join(rel))
+    ensure_private_dir(&rel_join(root, rel)?)
 }
 
 /// Path-based DURABLE private-directory creation (see
 /// [`ensure_private_dir_durable`] — the durable commit is a no-op on
 /// Windows).
 pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool> {
-    ensure_private_dir_durable(&root.path().join(rel))
+    ensure_private_dir_durable(&rel_join(root, rel)?)
 }
 
 /// Windows has no directory fsync: a no-op (documented weaker durability
@@ -247,12 +262,12 @@ pub fn sync_parent_dir_fd(_root: &RootDir, _rel: &Path) -> Result<()> {
 
 /// Path-based private chmod (see [`set_private`] — a no-op on Windows).
 pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    set_private(&root.path().join(rel))
+    set_private(&rel_join(root, rel)?)
 }
 
 /// Path-based remove of a single file.
 pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    std::fs::remove_file(root.path().join(rel))
+    std::fs::remove_file(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
 }
 
@@ -260,8 +275,8 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// root. Windows `rename` does not overwrite an existing target: remove it
 /// first (documented weaker guarantee — not atomic).
 pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
-    let from = root.path().join(from);
-    let to = root.path().join(to);
+    let from = rel_join(root, from)?;
+    let to = rel_join(root, to)?;
     let _ = std::fs::remove_file(&to);
     std::fs::rename(&from, &to).map_err(|e| {
         Error::store(format!(
@@ -274,7 +289,7 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 
 /// Path-based recursive removal of a directory tree.
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    std::fs::remove_dir_all(root.path().join(rel))
+    std::fs::remove_dir_all(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
 }
 
@@ -283,7 +298,7 @@ pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// require admin/developer mode) — the documented weaker guarantee of the
 /// Windows port.
 pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
-    let dst = root.path().join(dst_rel);
+    let dst = rel_join(root, dst_rel)?;
     std::fs::create_dir_all(&dst)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
     for entry in std::fs::read_dir(src)
@@ -318,13 +333,13 @@ pub fn fsync_tree_recursive_fd(_root: &RootDir, _rel: &Path) -> Result<()> {
 
 /// Path-based plain file write (create-or-truncate).
 pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(root.path().join(rel), bytes)
+    std::fs::write(rel_join(root, rel)?, bytes)
         .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))
 }
 
 /// Read the whole file at `rel` under the root path.
 pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
-    std::fs::read(root.path().join(rel))
+    std::fs::read(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("read {}: {e}", rel.display())))
 }
 
@@ -334,7 +349,7 @@ pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
 /// Windows port (Windows symlinks also require admin/developer mode, a
 /// smaller injection surface).
 pub fn read_link_fd(root: &RootDir, rel: &Path) -> Result<PathBuf> {
-    std::fs::read_link(root.path().join(rel))
+    std::fs::read_link(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("readlink {}: {e}", rel.display())))
 }
 
@@ -347,13 +362,13 @@ pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) 
 
 /// The TRI-STATE existence check under the root path (see [`path_state`]).
 pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
-    path_state(&root.path().join(rel))
+    path_state(&rel_join(root, rel)?)
 }
 
 /// Read the entries of the directory at `rel` under the root path.
 pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(root.path().join(rel))
+    for entry in std::fs::read_dir(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("read_dir {}: {e}", rel.display())))?
     {
         let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;

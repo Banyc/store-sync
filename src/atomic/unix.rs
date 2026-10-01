@@ -4,6 +4,19 @@
 //! rename, parent-directory fsync). Selected by the single `#[cfg(unix)]`
 //! `mod` declaration in [`super`].
 //!
+//! # Which path SPELLINGS are refused
+//!
+//! Every path this module resolves is validated as ROOT-RELATIVE first
+//! ([`validate_rel`]): only normal components are admitted, so an ABSOLUTE
+//! path (whose `RootDir`/`Prefix` component makes `openat` ignore the root
+//! descriptor) and a `..` component (which walks ABOVE the root) are
+//! refused as path errors, as are `.` and the empty path (they name the
+//! root, not an entry under it). Trailing and repeated separators are NOT
+//! refused — [`Path::components`] erases them, so `a/b/` and `a//b` name
+//! the same entry as `a/b` and resolve identically. The owned root itself
+//! is normalized the same way before it is opened
+//! ([`super::normalize_root`]), so `dir/` and `dir` are one root.
+//!
 //! # Which path components are refused
 //!
 //! Every PARENT component is resolved with component-wise
@@ -270,12 +283,26 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // for); the store's OWN mutations route through the `_fd` variants below.
 // =====================================================================
 
+/// Split a ROOT-RELATIVE path into its components, refusing every spelling
+/// that could resolve outside the owned root (see [`validate_rel`]) and
+/// returning the remaining components as raw bytes for the `openat`/
+/// `mkdirat` loops. [`Path::components`] has already erased trailing and
+/// repeated separators, so `a/b/` and `a//b` yield the same `a`, `b` as
+/// `a/b` and keep resolving identically.
+fn rel_components(rel: &Path) -> std::io::Result<Vec<&[u8]>> {
+    validate_rel(rel)?;
+    Ok(rel.components().map(|c| c.as_os_str().as_bytes()).collect())
+}
+
 /// Open `rel` relative to `dir_fd` COMPONENT-WISE with `O_NOFOLLOW`: every
 /// intermediate component is opened as a directory (`O_RDONLY | O_DIRECTORY
 /// | O_NOFOLLOW | O_CLOEXEC`), and the final component is opened with
 /// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. Every component, INCLUDING the
 /// final one, is therefore refused (ELOOP) if it is a symlink — a mutation
-/// can never be redirected outside the root the descriptor pins. `mode` is
+/// can never be redirected outside the root the descriptor pins. `rel` is
+/// validated as ROOT-RELATIVE first ([`rel_components`]): an absolute path,
+/// a `..`, a `.`, or the empty path is refused before any `openat`, so the
+/// spelling can never move the resolution off the root. `mode` is
 /// used only when `flags` includes `O_CREAT`. The raw `_io` variant returns
 /// the underlying io error (so a caller can distinguish a genuine NotFound
 /// from a symlink refusal); [`openat_no_follow`] wraps it with the path
@@ -287,7 +314,7 @@ pub fn openat_no_follow_io(
     mode: u32,
 ) -> std::io::Result<OwnedFd> {
     let mut cur: OwnedFd = dir_fd.try_clone()?;
-    let comps: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
+    let comps = rel_components(rel)?;
     for (i, comp) in comps.iter().enumerate() {
         let is_last = i == comps.len() - 1;
         let f = if is_last {
@@ -315,8 +342,17 @@ pub fn openat_no_follow(dir_fd: &OwnedFd, rel: &Path, flags: i32, mode: u32) -> 
 }
 
 /// Open the parent directory of `rel` relative to `root` (component-wise
-/// with O_NOFOLLOW), returning the parent fd and the final file name.
+/// with O_NOFOLLOW), returning the parent fd and the final file name. The
+/// full `rel` is validated as ROOT-RELATIVE FIRST ([`rel_components`]):
+/// without that guard `rel.parent()` alone would let `/b` (whose parent is
+/// `/`) and `a/../b` (whose parent is `a/..`) resolve an OUTSIDE directory.
 fn parent_fd_of<'a>(root: &OwnedFd, rel: &'a Path) -> Result<(OwnedFd, &'a OsStr)> {
+    if let Err(e) = rel_components(rel) {
+        return Err(Error::store(format!(
+            "refusing path {}: {e}",
+            rel.display()
+        )));
+    }
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     let parent_fd = if parent_rel.as_os_str().is_empty() {
         root.try_clone()
@@ -672,11 +708,12 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
 /// (the same contract as [`ensure_private_dir`]). A symlink at any
 /// component is refused (ELOOP) — never followed.
 pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let comps = rel_components(rel)
+        .map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
     let mut cur: OwnedFd = root
         .as_fd()
         .try_clone()
         .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
-    let comps: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
     for (i, comp) in comps.iter().enumerate() {
         let is_last = i == comps.len() - 1;
         let dir = open_or_create_dir(&cur, comp)?;
@@ -700,7 +737,8 @@ pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// new path's own parent — all through directory fds. Returns `true` when
 /// this call created at least one directory.
 pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool> {
-    let comps: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
+    let comps = rel_components(rel)
+        .map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
     let mut dirs: Vec<OwnedFd> = Vec::with_capacity(comps.len());
     let mut cur: OwnedFd = root
         .as_fd()
@@ -975,10 +1013,11 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
 /// components are outside the tree root, so their modes do not affect the
 /// tree digest).
 fn create_dir_chain_fd(root: &OwnedFd, rel: &Path, mode: u32) -> Result<()> {
+    let comps = rel_components(rel)
+        .map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
     let mut cur: OwnedFd = root
         .try_clone()
         .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
-    let comps: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
     for (i, comp) in comps.iter().enumerate() {
         let is_last = i == comps.len() - 1;
         let dir = open_or_create_dir(&cur, comp)?;
@@ -1186,13 +1225,37 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, RootDir, read_link_fd};
+    use super::{Error, RootDir, read_fd, read_link_fd};
     use std::path::{Path, PathBuf};
 
     fn owned_root() -> (tempfile::TempDir, RootDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = RootDir::open(dir.path()).expect("open the owned root");
         (dir, root)
+    }
+
+    /// The same path spelled with a TRAILING separator.
+    fn with_trailing_separator(path: &Path) -> PathBuf {
+        let mut spelled = path.as_os_str().to_os_string();
+        spelled.push("/");
+        PathBuf::from(spelled)
+    }
+
+    /// Open a root that must be refused, returning the refusal.
+    fn open_must_fail(path: &Path) -> Error {
+        match RootDir::open(path) {
+            Ok(_) => panic!("RootDir::open({}) must be refused", path.display()),
+            Err(e) => e,
+        }
+    }
+
+    /// `(device, inode)` of the directory an owned root descriptor pins: two
+    /// descriptors with the same pair name the same directory.
+    fn dir_identity(root: &RootDir) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let f = std::fs::File::from(root.as_fd().try_clone().unwrap());
+        let md = f.metadata().unwrap();
+        (md.dev(), md.ino())
     }
 
     /// A normal symlink resolves to its stored target through the fd path.
@@ -1261,5 +1324,117 @@ mod tests {
         let err =
             read_link_fd(&root, Path::new("missing")).expect_err("a missing entry must error");
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+    }
+
+    /// A real directory opens with and without a trailing slash, and both
+    /// descriptors pin the SAME directory inode: `dir/` is one root with
+    /// `dir`, never a different (or symlink-followed) resolution.
+    #[test]
+    fn root_dir_open_normalizes_a_trailing_separator_to_the_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = RootDir::open(dir.path()).expect("the plain spelling opens");
+        let spelled = RootDir::open(&with_trailing_separator(dir.path()))
+            .expect("the trailing-separator spelling opens the same directory");
+        assert_eq!(
+            dir_identity(&plain),
+            dir_identity(&spelled),
+            "`dir/` and `dir` must pin the same directory inode"
+        );
+    }
+
+    /// A symlink-to-directory root is REFUSED with and without a trailing
+    /// slash: normalization strips the separator, so the `O_NOFOLLOW` open
+    /// sees the link (ELOOP/ENOTDIR) instead of following it as an
+    /// intermediate component.
+    #[test]
+    fn root_dir_open_refuses_a_symlink_root_with_and_without_a_trailing_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        for spelling in [link.clone(), with_trailing_separator(&link)] {
+            let err = open_must_fail(&spelling);
+            assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+            assert!(
+                err.to_string().contains("open root"),
+                "the refusal must come from the root open, got: {err}"
+            );
+        }
+    }
+
+    /// A regular-file root is REFUSED with and without a trailing slash
+    /// (`O_DIRECTORY`): the two spellings agree.
+    #[test]
+    fn root_dir_open_refuses_a_regular_file_with_and_without_a_trailing_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        for spelling in [file.clone(), with_trailing_separator(&file)] {
+            let err = open_must_fail(&spelling);
+            assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+            assert!(
+                err.to_string().contains("open root"),
+                "the refusal must come from the root open, got: {err}"
+            );
+        }
+    }
+
+    /// The root-relative spelling rule, pinned: trailing and repeated
+    /// separators name the SAME in-root entry, while an absolute path, a
+    /// `..` walk, `.`, and the empty path are refused by the ROOT-RELATIVE
+    /// GUARD — not incidentally by a missing or symlinked outside entry —
+    /// and so can never resolve to an outside entry.
+    #[test]
+    fn relative_path_spelling_resolves_identically_or_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        let root = RootDir::open(&root_path).expect("open the owned root");
+        std::fs::create_dir_all(root_path.join("a")).unwrap();
+        std::fs::write(root_path.join("a/b"), b"IN-ROOT").unwrap();
+        for spelling in ["a/b", "a/b/", "a//b", "a/./b"] {
+            assert_eq!(
+                read_fd(&root, Path::new(spelling)).unwrap(),
+                b"IN-ROOT".to_vec(),
+                "{spelling:?} must name the same entry as a/b"
+            );
+        }
+
+        // A real OUTSIDE file a `..` walk would reach if it were resolved:
+        // the root lives one level down, so `../outside-secret` is a real
+        // sibling. Without the guard the read would SUCCEED and leak it.
+        let outside = tmp.path().join("outside-secret");
+        std::fs::write(&outside, b"OUTSIDE-SECRET").unwrap();
+        let absolute = outside.as_os_str().to_os_string();
+        for spelling in [
+            PathBuf::from("/b"),
+            PathBuf::from(".."),
+            PathBuf::from("../outside-secret"),
+            PathBuf::from("a/../../outside-secret"),
+            PathBuf::from("a/../b"),
+            PathBuf::from("."),
+            PathBuf::new(),
+            Path::new(&absolute).to_path_buf(),
+        ] {
+            let err = read_fd(&root, &spelling)
+                .expect_err("an escaping or empty spelling must be refused");
+            let text = err.to_string();
+            assert!(
+                matches!(err, Error::Store(_)) && text.contains("normal component"),
+                "{spelling:?} must be refused by the root-relative guard, got: {text}"
+            );
+        }
+
+        // A mutation spelling is refused the same way: nothing lands outside.
+        let err = super::write_file_fd(&root, Path::new("../outside-secret"), b"NOPE")
+            .expect_err("a `..` mutation spelling must be refused");
+        assert!(err.to_string().contains("normal component"), "got: {err}");
+        assert_eq!(
+            std::fs::read(&outside).unwrap().as_slice(),
+            b"OUTSIDE-SECRET",
+            "the outside file must be untouched and its bytes never returned"
+        );
     }
 }
