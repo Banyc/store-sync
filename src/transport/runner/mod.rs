@@ -286,13 +286,185 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
-    /// True while `pid` answers `kill(pid, 0)`. A REAPED child (or a child
-    /// that never existed) is gone: an uncollected ZOMBIE would still answer
-    /// success, so this probe is the observable form of "killed AND reaped".
-    fn pid_alive(pid: u32) -> bool {
-        // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+    /// How long the oracle polls for a process to disappear. The runner's own
+    /// reap/kill bound is seconds, so this must outlast a correct run while
+    /// staying finite: a genuinely live leftover keeps the assertion failing
+    /// after the budget instead of hanging the suite.
+    const GONE_BUDGET: Duration = Duration::from_secs(5);
+
+    /// The identity of a process: its pid plus the kernel's start-time token.
+    /// The token is fixed for a process's whole life and distinct between any
+    /// two processes that ever held the same pid, so a pid the OS recycled to
+    /// an unrelated process can never be mistaken for the tracked one.
+    #[derive(Clone, Copy, Debug)]
+    struct ProcessId {
+        pid: u32,
+        start: u64,
+    }
+
+    /// The kernel's view of a pid. A ZOMBIE has exited but is not yet reaped.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProcessState {
+        Live,
+        Zombie,
+    }
+
+    /// The kernel's `(state, start-time token)` for `pid`, or `None` when the
+    /// pid names no process at all (reaped, or never existed). A ZOMBIE is
+    /// reported with the start token it had while alive — which is what lets
+    /// [`ProcessId::capture`] record a child that exited before the observer
+    /// ran — but is never reported as live: the runner's `live_group_members`
+    /// deliberately excludes zombies from "live", and this oracle must agree
+    /// with that definition rather than with `kill(pid, 0)` (which a zombie
+    /// still answers).
+    #[cfg(target_os = "macos")]
+    fn probe_process(pid: u32) -> Option<(ProcessState, u64)> {
+        // `KERN_PROC_PID` fills a `struct kinfo_proc`: `p_starttime` is two
+        // u64 halves at offset 0 and `p_stat` at offset 36 — and, unlike
+        // `proc_pidinfo(PROC_PIDTBSDINFO)` (which returns nothing for a
+        // zombie), it ALSO describes zombies, the property the identity
+        // capture relies on. The buffer is DELIBERATELY larger than today's
+        // 648-byte struct (whose prefix layout is the stable part) so a future
+        // growth still returns a readable entry rather than a short write. A
+        // reaped pid yields a zero-length result (rc == 0, len == 0).
+        const P_STAT_OFFSET: usize = 36;
+        const SZOMB: u8 = 5;
+        let mut buf = [0u8; 1024];
+        let mut len = buf.len();
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as i32,
+        ];
+        // SAFETY: `sysctl` writes the kernel's process entry into `buf`; the
+        // mib is the documented `KERN_PROC_PID` selector and `len` starts as
+        // the buffer size and is updated by the kernel to the bytes written.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || len < P_STAT_OFFSET + 1 {
+            return None;
+        }
+        let sec = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let usec = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let state = if buf[P_STAT_OFFSET] == SZOMB {
+            ProcessState::Zombie
+        } else {
+            ProcessState::Live
+        };
+        Some((state, sec * 1_000_000 + usec))
+    }
+
+    /// Linux: `/proc/<pid>/stat` — `pid (comm) state ppid ...`, with
+    /// `starttime` as field 22 (19 fields after `state`). A zombie is still
+    /// listed (it holds the pid) with its original start token; a reaped pid
+    /// is unreadable and reads as absent.
+    #[cfg(target_os = "linux")]
+    fn probe_process(pid: u32) -> Option<(ProcessState, u64)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `comm` may contain spaces AND ')' — anchor on the LAST ')'.
+        let rest = stat.rsplit_once(')')?.1;
+        let mut fields = rest.split_whitespace();
+        let state = fields.next()?;
+        // `state` is field 3; `starttime` is field 22, i.e. `nth(18)` of the
+        // fields that follow `state` (field 4 is `nth(0)`).
+        let start: u64 = fields.nth(18)?.parse().ok()?;
+        let state = if state.starts_with('Z') || state.starts_with('X') {
+            ProcessState::Zombie
+        } else {
+            ProcessState::Live
+        };
+        Some((state, start))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn probe_process(_pid: u32) -> Option<(ProcessState, u64)> {
+        compile_error!("the process oracle is implemented for Linux and macOS only");
+    }
+
+    /// The bounded poll shared by the oracles: `true` once the pid names
+    /// nothing, a ZOMBIE, or a process whose start token differs (the pid was
+    /// recycled and the tracked process is gone); `false` only while the SAME
+    /// live process is still there when the budget expires.
+    fn wait_until<F>(pid: u32, budget: Duration, gone: F) -> bool
+    where
+        F: Fn(ProcessState, u64) -> bool,
+    {
+        let deadline = Instant::now() + budget;
+        loop {
+            match probe_process(pid) {
+                None => return true,
+                Some((state, start)) if gone(state, start) => return true,
+                Some(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    impl ProcessId {
+        /// Record `pid`'s identity while it is known to be the tracked
+        /// process. `None` only when the pid already names nothing; a zombie
+        /// still yields its token, so a child that exited before the observer
+        /// ran is still captured.
+        fn capture(pid: u32) -> Option<Self> {
+            probe_process(pid).map(|(_, start)| ProcessId { pid, start })
+        }
+
+        /// Bounded wait for THIS process to be GONE by the runner's own
+        /// definition of alive: `live_group_members` excludes zombies, so a
+        /// zombie is dead, and a recycled pid carries a different start token
+        /// so it is a different process. `false` means the same live process
+        /// outlived the budget — a genuine leftover, which must fail the test.
+        fn wait_until_gone(self, budget: Duration) -> bool {
+            wait_until(self.pid, budget, |state, start| {
+                state == ProcessState::Zombie || start != self.start
+            })
+        }
+    }
+
+    /// The token-less fallback, used only where an identity could not be
+    /// captured before the kill (a starved capture poll): gone means the pid
+    /// names nothing or a ZOMBIE. A live process still fails, so a genuine
+    /// leftover is never missed — only the pid-reuse guard is unavailable.
+    fn wait_until_not_live(pid: u32, budget: Duration) -> bool {
+        wait_until(pid, budget, |state, _| state == ProcessState::Zombie)
+    }
+
+    /// Poll `marker` for the pid the shell writes, then capture that process's
+    /// identity WHILE IT IS STILL THE ORIGINAL — before the runner's timeout
+    /// kill re-parents it and launchd reaps it, when the pid could be
+    /// recycled. `None` when the marker never appeared or the pid was already
+    /// reaped; the caller then falls back to the token-less check.
+    fn capture_grandchild(marker: &std::path::Path, budget: Duration) -> Option<ProcessId> {
+        let deadline = Instant::now() + budget;
+        loop {
+            // Require the trailing newline `echo` writes: a marker seen
+            // without it is a PARTIAL write, and parsing a truncated pid would
+            // track an unrelated process.
+            if let Ok(text) = std::fs::read_to_string(marker)
+                && text.ends_with('\n')
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return ProcessId::capture(pid);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn fixture_runner(cwd: &std::path::Path, config: RunnerConfig) -> ChildRunner {
@@ -304,12 +476,12 @@ mod tests {
     /// gone after the call.
     #[test]
     fn quick_child_is_reaped_and_output_captured() {
-        let pid_slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let pid_slot: Arc<Mutex<Option<ProcessId>>> = Arc::new(Mutex::new(None));
         let reaped = Arc::new(AtomicBool::new(false));
         let config = RunnerConfig {
             spawn_observer: Some({
                 let slot = pid_slot.clone();
-                Arc::new(move |pid: u32| *slot.lock().unwrap() = Some(pid))
+                Arc::new(move |pid: u32| *slot.lock().unwrap() = ProcessId::capture(pid))
             }),
             reap_observer: Some({
                 let reaped = reaped.clone();
@@ -337,7 +509,11 @@ mod tests {
             .lock()
             .unwrap()
             .expect("the spawn observer must record the pid at spawn time");
-        assert!(!pid_alive(pid), "child {pid} must be reaped");
+        assert!(
+            pid.wait_until_gone(GONE_BUDGET),
+            "child {} must be reaped, not signalled-and-left",
+            pid.pid
+        );
         assert!(
             reaped.load(Ordering::SeqCst),
             "the reap observer must fire exactly once"
@@ -361,25 +537,43 @@ mod tests {
         };
         let runner = fixture_runner(dir.path(), config);
         let script = format!("sleep 30 & echo $! > {}; wait", marker.display());
-        let out = runner
-            .exec(
-                &["sh".into(), "-c".into(), script],
-                Duration::from_millis(500),
-            )
-            .expect("the timeout path must terminate and reap the group");
-        assert!(
-            matches!(out, RunOutcome::TimedOut { .. }),
-            "expected TimedOut, got {out:?}"
-        );
+        // Capture the grandchild's identity CONCURRENTLY with the run, while
+        // it is still the original process: after the group kill it is
+        // re-parented and launchd reaps it asynchronously, and only a token
+        // taken before that can tell it apart from a recycled pid.
+        let captured = {
+            let marker = marker.clone();
+            let reader = std::thread::spawn(move || capture_grandchild(&marker, GONE_BUDGET));
+            let out = runner
+                .exec(
+                    &["sh".into(), "-c".into(), script],
+                    Duration::from_millis(500),
+                )
+                .expect("the timeout path must terminate and reap the group");
+            assert!(
+                matches!(out, RunOutcome::TimedOut { .. }),
+                "expected TimedOut, got {out:?}"
+            );
+            reader
+                .join()
+                .expect("the identity-capture thread must not panic")
+        };
         let grandchild: u32 = std::fs::read_to_string(&marker)
             .expect("the child writes the grandchild pid immediately")
             .trim()
             .parse()
             .expect("pid");
-        assert!(
-            !pid_alive(grandchild),
-            "the grandchild {grandchild} must die with the group"
-        );
+        match captured {
+            Some(id) => assert!(
+                id.wait_until_gone(GONE_BUDGET),
+                "the grandchild {} must die with the group (not merely be signalled, and not linger as a zombie)",
+                id.pid
+            ),
+            None => assert!(
+                wait_until_not_live(grandchild, GONE_BUDGET),
+                "the grandchild {grandchild} must die with the group"
+            ),
+        }
     }
 
     /// The foreground-only contract: a child that exits but leaves a live
@@ -399,35 +593,51 @@ mod tests {
         };
         let runner = fixture_runner(dir.path(), config);
         let script = format!("sleep 30 & echo $! > {}; exit 0", marker.display());
-        let err = runner
-            .exec(&["sh".into(), "-c".into(), script], Duration::from_secs(5))
-            .expect_err("a command that leaves background processes must error");
-        assert!(
-            matches!(err, RunError::Background(_)),
-            "expected Background, got {err:?}"
-        );
+        // Same concurrent identity capture as the timeout test: the leftover
+        // is killed by the foreground-only check and reaped asynchronously.
+        let captured = {
+            let marker = marker.clone();
+            let reader = std::thread::spawn(move || capture_grandchild(&marker, GONE_BUDGET));
+            let err = runner
+                .exec(&["sh".into(), "-c".into(), script], Duration::from_secs(5))
+                .expect_err("a command that leaves background processes must error");
+            assert!(
+                matches!(err, RunError::Background(_)),
+                "expected Background, got {err:?}"
+            );
+            reader
+                .join()
+                .expect("the identity-capture thread must not panic")
+        };
         let leftover: u32 = std::fs::read_to_string(&marker)
             .expect("the child writes the leftover pid immediately")
             .trim()
             .parse()
             .expect("pid");
-        assert!(
-            !pid_alive(leftover),
-            "the leftover {leftover} must be terminated"
-        );
+        match captured {
+            Some(id) => assert!(
+                id.wait_until_gone(GONE_BUDGET),
+                "the leftover {} must be terminated, not merely signalled and left",
+                id.pid
+            ),
+            None => assert!(
+                wait_until_not_live(leftover, GONE_BUDGET),
+                "the leftover {leftover} must be terminated"
+            ),
+        }
     }
 
     /// Every returned outcome happens only after the child was reaped: a
     /// timeout kill failure is an error, and no live child survives the call.
     #[test]
     fn timed_out_child_is_never_left_live() {
-        let pid_slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let pid_slot: Arc<Mutex<Option<ProcessId>>> = Arc::new(Mutex::new(None));
         let config = RunnerConfig {
             term_to_kill_grace: Duration::from_millis(50),
             reap_bound: Duration::from_secs(5),
             spawn_observer: Some({
                 let slot = pid_slot.clone();
-                Arc::new(move |pid: u32| *slot.lock().unwrap() = Some(pid))
+                Arc::new(move |pid: u32| *slot.lock().unwrap() = ProcessId::capture(pid))
             }),
             ..RunnerConfig::production()
         };
@@ -440,6 +650,81 @@ mod tests {
             .expect("the timeout path must terminate and reap");
         assert!(matches!(out, RunOutcome::TimedOut { .. }));
         let pid = pid_slot.lock().unwrap().expect("spawn observer");
-        assert!(!pid_alive(pid), "child {pid} must be reaped");
+        assert!(
+            pid.wait_until_gone(GONE_BUDGET),
+            "child {} must be reaped, not left live",
+            pid.pid
+        );
+    }
+
+    /// The oracle's own semantics, pinned so it can never silently become
+    /// vacuous: a LIVE process is not gone, a ZOMBIE is gone (the runner
+    /// excludes zombies from "live" — the exact case `kill(pid, 0)` got
+    /// wrong), and a pid whose start token moved is a DIFFERENT process, so
+    /// the tracked one is gone even though the number still answers.
+    #[test]
+    fn process_oracle_matches_the_live_definition() {
+        // A live child is NOT gone, even after the budget elapses.
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a live child");
+        let live_id = ProcessId::capture(live.id()).expect("a live child is capturable");
+        assert!(
+            !live_id.wait_until_gone(Duration::from_millis(50)),
+            "a live process must not read as gone: the oracle would be vacuous"
+        );
+        live.kill().expect("kill the live child");
+        live.wait().expect("reap the live child");
+        assert!(
+            live_id.wait_until_gone(GONE_BUDGET),
+            "a killed-and-reaped child must read as gone"
+        );
+
+        // A child left as an un-reaped ZOMBIE is gone: it still holds its pid,
+        // so `kill(pid, 0)` succeeds, but the runner's `live_group_members`
+        // excludes zombies — the exact definition the oracle must share.
+        let mut zombie = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a promptly-exiting child");
+        let zombie_id = {
+            let deadline = Instant::now() + GONE_BUDGET;
+            loop {
+                match probe_process(zombie.id()) {
+                    Some((ProcessState::Zombie, start)) => {
+                        break ProcessId {
+                            pid: zombie.id(),
+                            start,
+                        };
+                    }
+                    Some((ProcessState::Live, _)) => {}
+                    None => panic!("the child vanished before it could be observed as a zombie"),
+                }
+                assert!(Instant::now() < deadline, "the child never became a zombie");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert!(
+            zombie_id.wait_until_gone(GONE_BUDGET),
+            "an un-reaped zombie must read as gone (the runner counts only live members)"
+        );
+        zombie.wait().expect("reap the zombie");
+
+        // PID REUSE: the same pid with a moved start token is a different
+        // process, so the tracked process is gone.
+        let self_id = ProcessId::capture(std::process::id()).expect("this test process is live");
+        let forged = ProcessId {
+            start: self_id.start.wrapping_add(1),
+            ..self_id
+        };
+        assert!(
+            forged.wait_until_gone(Duration::from_millis(50)),
+            "a pid whose start token moved must read as the tracked process being gone"
+        );
     }
 }

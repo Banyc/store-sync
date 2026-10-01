@@ -338,7 +338,7 @@ mod runner_property_tests {
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Instant;
 
     /// The stall point each generated operation must exhibit.
@@ -416,13 +416,18 @@ mod runner_property_tests {
         /// An order of magnitude under the deadline: a scheduling
         /// perturbation, not a deadline crossing.
         Tiny,
-        /// Past the deadline by a small margin: the wait is guaranteed to
-        /// outlive the deadline.
+        /// Past the deadline, made DETERMINISTIC: instead of racing a
+        /// wall-clock margin that a loaded scheduler can overshoot, the wait
+        /// blocks until the runner's deadline path arms the per-child
+        /// [`DeadlineSignal`], so the delayed value is sent only once the
+        /// deadline has demonstrably fired (see [`ChildCtl::injected_delay`]).
         Past,
     }
 
     impl DelaySize {
-        /// The wall-clock delay for a runner deadline of `deadline`.
+        /// The wall-clock delay for a runner deadline of `deadline`. Only the
+        /// `Spawn` and `Kill` stages sleep it; at the `Wait`/`AfterReap`
+        /// stages a `Past` delay is realised by the deadline latch instead.
         fn delay_for(self, deadline: Duration) -> Duration {
             match self {
                 DelaySize::None => Duration::ZERO,
@@ -431,6 +436,14 @@ mod runner_property_tests {
             }
         }
     }
+
+    /// The backstop on a `Past` wait delay that the runner never releases (a
+    /// runner whose deadline logic is broken never requests the kill that
+    /// arms the latch): the value is then sent anyway and the test fails
+    /// loudly on the outcome instead of hanging. FAR longer than any
+    /// plausible scheduler overshoot, so it can never itself race the
+    /// deadline of a correct runner.
+    const PAST_DELAY_FALLBACK: Duration = Duration::from_secs(5);
 
     struct FakeState {
         log: Mutex<Vec<LogEntry>>,
@@ -501,6 +514,54 @@ mod runner_property_tests {
         }
     }
 
+    /// A one-shot latch armed by the runner's deadline path (through the
+    /// seam's kill request) and awaited by a `Past` wait delay. This replaces
+    /// the former wall-clock margin with a DETERMINISTIC premise: the runner
+    /// requests a kill ONLY after `recv_timeout` reported the deadline, so
+    /// once the latch is armed the deadline has provably passed and any value
+    /// sent afterwards can never win the race — however the scheduler
+    /// interleaves the threads.
+    struct DeadlineSignal {
+        fired: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl DeadlineSignal {
+        fn new() -> Self {
+            DeadlineSignal {
+                fired: Mutex::new(false),
+                cv: Condvar::new(),
+            }
+        }
+
+        /// Arm the latch. Called FIRST in the kill closure — before the
+        /// reaped/no-op check — because the dead-handle case (join-before-kill)
+        /// must arm it too.
+        fn arm(&self) {
+            *self.fired.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+
+        /// Block until armed, or until `budget` elapses (a broken runner never
+        /// arms it). Latch semantics: an already-armed call returns at once.
+        fn wait(&self, budget: Duration) -> bool {
+            let deadline = Instant::now() + budget;
+            let mut fired = self.fired.lock().unwrap();
+            while !*fired {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                fired = self
+                    .cv
+                    .wait_timeout(fired, remaining)
+                    .expect("the deadline latch mutex must not be poisoned")
+                    .0;
+            }
+            true
+        }
+    }
+
     /// Per-child control block: the fake wait polls `killed`; the runner's
     /// deadline path calls [`FakeSeam::kill`], which sets it, so the blocked
     /// wait unblocks and records the reap — reproducing exactly the real
@@ -529,6 +590,12 @@ mod runner_property_tests {
         /// of the scheduler-delay property. `Duration::ZERO` disables it.
         delay_at: DelayAt,
         delay: Duration,
+        /// The magnitude of the injected delay: only `Past` is gated on the
+        /// deadline latch (see [`ChildCtl::injected_delay`]).
+        size: DelaySize,
+        /// The per-child deadline latch the kill closure arms and a `Past`
+        /// wait delay awaits.
+        deadline: Arc<DeadlineSignal>,
         state: Arc<FakeState>,
     }
 
@@ -544,7 +611,7 @@ mod runner_property_tests {
             // deadline leaves the completion first (join-before-kill), a
             // delay past it leaves the kill first (kill-before-join).
             if self.delay_at == DelayAt::Wait {
-                std::thread::sleep(self.delay);
+                self.injected_delay();
             }
             let res = self.wait_inner();
             // The child is fully reaped now — and the reaped flag is armed
@@ -561,13 +628,30 @@ mod runner_property_tests {
             // consumed handle (join-before-kill), the delay-probe mirror of
             // the pid-reuse barrier.
             if self.delay_at == DelayAt::AfterReap {
-                std::thread::sleep(self.delay);
+                self.injected_delay();
             }
             self.state.live_waiters.fetch_sub(1, Ordering::SeqCst);
             if let Some(barrier) = &self.after_reap_barrier {
                 barrier.wait();
             }
             res
+        }
+
+        /// Inject the configured scheduler delay. `Tiny`/`None` sleep their
+        /// real duration; a `Past` delay waits on the per-child
+        /// [`DeadlineSignal`] instead, so the completion cannot be delivered
+        /// before the runner has demonstrably timed out and requested the
+        /// kill. The value is only sent once the deadline has passed — a
+        /// correct runner therefore always reports `Timeout`, and a runner
+        /// that never reaches its deadline path leaves the latch unarmed, so
+        /// the fallback sends the value and the assertion fails.
+        fn injected_delay(&self) {
+            match self.size {
+                DelaySize::Past => {
+                    let _ = self.deadline.wait(PAST_DELAY_FALLBACK);
+                }
+                DelaySize::None | DelaySize::Tiny => std::thread::sleep(self.delay),
+            }
         }
 
         fn wait_inner(&self) -> std::result::Result<std::process::Output, RunError> {
@@ -654,11 +738,19 @@ mod runner_property_tests {
         /// scheduler-delay property.
         delay_at: DelayAt,
         delay: Duration,
+        /// The magnitude of the injected delay (see [`ChildCtl::injected_delay`]).
+        size: DelaySize,
     }
 
     impl FakeSeam {
         fn new(stall: Stall, keyscan_line: Option<String>) -> (Arc<Self>, Arc<FakeState>) {
-            Self::with_delays(stall, keyscan_line, DelayAt::Wait, Duration::ZERO)
+            Self::with_delays(
+                stall,
+                keyscan_line,
+                DelayAt::Wait,
+                DelaySize::None,
+                Duration::ZERO,
+            )
         }
 
         /// The fake seam with an injected scheduler delay: every spawned
@@ -670,6 +762,7 @@ mod runner_property_tests {
             stall: Stall,
             keyscan_line: Option<String>,
             at: DelayAt,
+            size: DelaySize,
             delay: Duration,
         ) -> (Arc<Self>, Arc<FakeState>) {
             let state = Arc::new(FakeState::new());
@@ -681,6 +774,7 @@ mod runner_property_tests {
                 after_reap_barrier: None,
                 delay_at: at,
                 delay,
+                size,
             };
             (Arc::new(seam), state)
         }
@@ -708,6 +802,8 @@ mod runner_property_tests {
                 after_reap_barrier: None,
                 delay_at: DelayAt::Wait,
                 delay: Duration::ZERO,
+                size: DelaySize::None,
+                deadline: Arc::new(DeadlineSignal::new()),
                 state: self.state.clone(),
             })
         }
@@ -745,6 +841,8 @@ mod runner_property_tests {
                 after_reap_barrier: self.after_reap_barrier.clone(),
                 delay_at: self.delay_at,
                 delay: self.delay,
+                size: self.size,
+                deadline: Arc::new(DeadlineSignal::new()),
                 state: self.state.clone(),
             });
             // The kill handle: the runner's deadline path requests the kill
@@ -755,6 +853,12 @@ mod runner_property_tests {
             // reaped child is never killed.
             let kill_ctl = ctl.clone();
             let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
+                // The runner requests a kill ONLY after its `recv_timeout`
+                // reported the deadline, so arming the latch here proves the
+                // deadline has passed. It is armed BEFORE the reaped/no-op
+                // check: the dead-handle (join-before-kill) case must arm it
+                // too, and the fake records no kill for it.
+                kill_ctl.deadline.arm();
                 if kill_ctl.reaped.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -1392,7 +1496,7 @@ mod runner_property_tests {
         // around the kill/wait boundary.
         let deadline = Duration::from_millis(2);
         let delay = size.delay_for(deadline);
-        let (seam, state) = FakeSeam::with_delays(stall, None, at, delay);
+        let (seam, state) = FakeSeam::with_delays(stall, None, at, size, delay);
         let runner = SshRunner::with_seam(seam, deadline, deadline);
         let argv = vec!["ssh".to_string(), "runner-delay.test".to_string()];
         let stdin = (kind == OpKind::Upload).then(|| vec![0x5A; 4096]);
@@ -1504,6 +1608,7 @@ mod runner_property_tests {
             after_reap_barrier: Some(barrier.clone()),
             delay_at: DelayAt::Wait,
             delay: Duration::ZERO,
+            size: DelaySize::None,
         });
         let argv = vec!["ssh".to_string(), "true".to_string()];
         let child = seam
