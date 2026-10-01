@@ -78,4 +78,32 @@ impl Error {
     pub fn conflict(msg: impl Into<String>) -> Self {
         Error::Conflict(msg.into())
     }
+
+    /// Append `context` to this error's message, PRESERVING its class.
+    ///
+    /// Used where a best-effort cleanup fails while an earlier failure is
+    /// already being reported: the caller must see BOTH failures, and must
+    /// still be able to tell the class of the underlying failure (a store
+    /// I/O error stays [`Error::Store`], a conflicting CAS stays
+    /// [`Error::Conflict`], and so on). The two variants that wrap a foreign
+    /// error ([`Error::Io`], [`Error::Json`]) keep their class by rebuilding
+    /// the inner error with the augmented message.
+    pub fn with_context(self, context: impl std::fmt::Display) -> Self {
+        let context = context.to_string();
+        match self {
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), format!("{e}; {context}"))),
+            Error::Json(e) => Error::Json(<serde_json::Error as serde::de::Error>::custom(
+                format!("{e}; {context}"),
+            )),
+            Error::Path(m) => Error::Path(format!("{m}; {context}")),
+            Error::Materialization(m) => Error::Materialization(format!("{m}; {context}")),
+            Error::Integrity(m) => Error::Integrity(format!("{m}; {context}")),
+            Error::Store(m) => Error::Store(format!("{m}; {context}")),
+            Error::Transport(m) => Error::Transport(format!("{m}; {context}")),
+            Error::Preflight(m) => Error::Preflight(format!("{m}; {context}")),
+            Error::NotFound(m) => Error::NotFound(format!("{m}; {context}")),
+            Error::Ref(m) => Error::Ref(format!("{m}; {context}")),
+            Error::Conflict(m) => Error::Conflict(format!("{m}; {context}")),
+        }
+    }
 }

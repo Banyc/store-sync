@@ -10,7 +10,11 @@
 //! content becomes VISIBLE under its final name), and the PARENT-DIRECTORY
 //! FSYNC is commit point 2 (the rename becomes DURABLE across power loss).
 //! A failure before the rename is an `Err` — the OLD content is still
-//! visible. A failure of the parent-directory open/fsync AFTER the rename
+//! visible, and the temp file the replace wrote is UNLINKED before the call
+//! returns, so a failed replace leaves the directory exactly as it found it
+//! (no stray temp entry). The best-effort unlink is never silent: if it
+//! itself fails, the error carries both the original failure and the cleanup
+//! failure. A failure of the parent-directory open/fsync AFTER the rename
 //! is [`ReplaceOutcome::ReplacedDurabilityUnknown`] — the NEW content IS
 //! visible but its durability is UNCONFIRMED — never a bare `Err` (a bare
 //! `Err` would conflate "the rename never happened" with "the rename
@@ -165,6 +169,29 @@ pub fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
     ))
 }
 
+/// Best-effort removal of a FAILED atomic replace's temp file.
+///
+/// `original` is the failure that triggered the cleanup. The unlink is
+/// best-effort — the caller is already receiving a failure — but it is NEVER
+/// silent: when the unlink itself fails, the returned error carries BOTH the
+/// original failure and the cleanup failure, so the caller can see that a
+/// stray temp entry may remain. On success the original error is returned
+/// unchanged (same class, same message).
+///
+/// NEVER called after a successful rename: the temp name no longer exists (it
+/// IS the destination), so an unlink would remove the committed content. The
+/// post-rename parent-fsync failure ([`ReplaceOutcome::ReplacedDurabilityUnknown`])
+/// is therefore NOT a cleanup point.
+fn discard_temp(original: Error, tmp: &Path) -> Error {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => original,
+        Err(e) => original.with_context(format!(
+            "additionally failed to unlink the failed replace's temp {}: {e}",
+            tmp.display()
+        )),
+    }
+}
+
 /// The explicit outcome of an atomic replace: the two commit points
 /// (the rename — new content VISIBLE — and the parent-directory fsync —
 /// new content DURABLE) are reported distinctly, so a caller can always
@@ -194,9 +221,10 @@ pub enum ReplaceStage {
     /// The temp-file CREATE/WRITE stage (before any I/O on the temp): the
     /// visible target is wholly OLD; a fault here is an `Err`.
     Write,
-    /// The temp-file FSYNC stage (after the write, before the chmod): an
-    /// invisible dot-prefixed temp exists; the visible target is wholly
-    /// OLD; a fault here is an `Err`.
+    /// The temp-file FSYNC stage (after the write, before the chmod): a
+    /// dot-prefixed temp exists and is unlinked before the `Err` is
+    /// returned; the visible target is wholly OLD; a fault here is an
+    /// `Err`.
     Sync,
     /// The RENAME stage (after the chmod, before the atomic rename): the
     /// visible target is wholly OLD; a fault here is an `Err`.

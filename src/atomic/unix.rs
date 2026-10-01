@@ -53,8 +53,13 @@ pub fn set_private(path: &Path) -> Result<()> {
     std::fs::set_permissions(path, perms)
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
 }
-/// Unique temp-file name for an atomic replace of `path`: same directory,
-/// hidden dot-prefixed name carrying the process id and a process-scoped
+/// The path-based durable atomic replace: write a UNIQUE hidden temp in the
+/// target's directory, fsync it, chmod it 0o600, rename it into place
+/// (COMMIT POINT 1), then fsync the parent directory (COMMIT POINT 2). A
+/// failure BEFORE the rename is an `Err`, leaves the OLD content visible, and
+/// UNLINKS the temp (best-effort — a cleanup failure is reported together
+/// with the original failure, never swallowed); see [`ReplaceOutcome`] for
+/// the two commit points.
 pub fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
@@ -71,38 +76,67 @@ pub fn write_atomic_replace(
     if let Some(e) = fault(ReplaceStage::Write) {
         return Err(e);
     }
+    let mut tmp_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
-        f.write_all(bytes)
-            .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+        Ok(f) => f,
+        // A failed CREATE means the temp was never created (or the name
+        // belongs to another writer): nothing to clean up.
+        Err(e) => return Err(Error::store(format!("create {}: {e}", tmp.display()))),
+    };
+    if let Err(e) = tmp_file.write_all(bytes) {
+        // Close the temp before unlinking (Windows cannot delete an open
+        // file) and remove the stray the failed write left behind.
+        drop(tmp_file);
+        return Err(discard_temp(
+            Error::store(format!("write {}: {e}", tmp.display())),
+            &tmp,
+        ));
     }
+    drop(tmp_file);
     // Stage 2: the temp fsync. A failure (or an injected
-    // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: only an
-    // invisible dot-prefixed temp exists.
+    // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
+    // temp the replace wrote is unlinked before the `Err` returns, so no
+    // stray entry survives.
     if let Some(e) = fault(ReplaceStage::Sync) {
-        return Err(e);
+        return Err(discard_temp(e, &tmp));
     }
-    {
-        let f = std::fs::File::open(&tmp)
-            .map_err(|e| Error::store(format!("open {}: {e}", tmp.display())))?;
-        f.sync_all()
-            .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
+    let tmp_file = match std::fs::File::open(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(discard_temp(
+                Error::store(format!("open {}: {e}", tmp.display())),
+                &tmp,
+            ));
+        }
+    };
+    if let Err(e) = tmp_file.sync_all() {
+        drop(tmp_file);
+        return Err(discard_temp(
+            Error::store(format!("fsync {}: {e}", tmp.display())),
+            &tmp,
+        ));
     }
+    drop(tmp_file);
     // Private BEFORE visible: the temp carries 0o600 before the rename, so
     // no reader ever observes the marker with default permissions.
-    set_private(&tmp)?;
+    if let Err(e) = set_private(&tmp) {
+        return Err(discard_temp(e, &tmp));
+    }
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
     // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
-    // visible target is wholly OLD.
+    // visible target is wholly OLD and the temp is unlinked.
     if let Some(e) = fault(ReplaceStage::Rename) {
-        return Err(e);
+        return Err(discard_temp(e, &tmp));
     }
-    std::fs::rename(&tmp, path)
-        .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        return Err(discard_temp(
+            Error::store(format!("rename {}: {e}", path.display())),
+            &tmp,
+        ));
+    }
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
     // the rename. FAIL-CLOSED but EXPLICIT: a failed open, a failed sync,
     // or an injected [`ReplaceStage::DirSync`] fault means the NEW content
@@ -528,6 +562,22 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
     Ok(())
 }
 
+/// Best-effort unlink of a FAILED descriptor-relative atomic replace's temp
+/// (the [`discard_temp`] contract, expressed with `unlinkat` against the
+/// parent fd): on success the original error is returned unchanged; when the
+/// unlink itself fails the returned error carries BOTH failures, never a
+/// swallowed cleanup failure. NEVER called after a successful rename (the
+/// temp name no longer exists).
+fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Error {
+    match unlinkat_fd(parent_fd, tmp_name) {
+        Ok(()) => original,
+        Err(e) => original.with_context(format!(
+            "additionally failed to unlink the failed replace's temp {}: {e}",
+            tmp_name.to_string_lossy()
+        )),
+    }
+}
+
 /// The descriptor-relative atomic replace: the same four-stage protocol as
 /// [`write_atomic_replace`], but the path resolves COMPONENT-WISE relative
 /// to `root` with `openat(O_NOFOLLOW)`. Every PARENT component is refused
@@ -540,7 +590,11 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 /// REFUSE a foreign final entry instead of overwriting it uses one of the
 /// open/create-new primitives — [`openat_no_follow`], [`write_file_fd`],
 /// [`write_atomic_cas_fd`], [`read_fd`], or [`path_state_fd`]. The parent
-/// directory is created via [`ensure_private_dir_fd`] if missing.
+/// directory is created via [`ensure_private_dir_fd`] if missing. A failure
+/// BEFORE the rename UNLINKS the temp before the `Err` returns (best-effort,
+/// the cleanup failure carried with the original one), so a failed replace
+/// leaves no stray temp; the post-rename parent-fsync failure is NOT a
+/// cleanup point (the temp name no longer exists).
 pub fn write_atomic_replace_fd(
     root: &RootDir,
     rel: &Path,
@@ -563,52 +617,68 @@ pub fn write_atomic_replace_fd(
     if let Some(e) = fault(ReplaceStage::Write) {
         return Err(e);
     }
-    {
-        let tmp_fd = openat_no_follow(
+    // A failed CREATE means the temp was never created (or the name belongs
+    // to another writer): nothing to clean up, so the error propagates as-is.
+    let tmp_fd = openat_no_follow(
+        &parent_fd,
+        Path::new(&tmp_name),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    let mut f = std::fs::File::from(tmp_fd);
+    if let Err(e) = f.write_all(bytes) {
+        drop(f);
+        return Err(discard_temp_fd(
+            Error::store(format!("write {}: {e}", rel.display())),
             &parent_fd,
-            Path::new(&tmp_name),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            0o600,
-        )?;
-        let mut f = std::fs::File::from(tmp_fd);
-        f.write_all(bytes)
-            .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))?;
+            &tmp_name,
+        ));
     }
+    drop(f);
     // Stage 2: the temp fsync. A failure (or an injected
-    // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: only an
-    // invisible dot-prefixed temp exists.
+    // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
+    // temp the replace wrote is unlinked before the `Err` returns, so no
+    // stray entry survives.
     if let Some(e) = fault(ReplaceStage::Sync) {
-        return Err(e);
+        return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
-    {
-        let f = std::fs::File::from(openat_no_follow(
+    let f = match openat_no_follow(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
+    };
+    if let Err(e) = f.sync_all() {
+        drop(f);
+        return Err(discard_temp_fd(
+            Error::store(format!("fsync {}: {e}", rel.display())),
             &parent_fd,
-            Path::new(&tmp_name),
-            libc::O_RDONLY,
-            0,
-        )?);
-        f.sync_all()
-            .map_err(|e| Error::store(format!("fsync {}: {e}", rel.display())))?;
+            &tmp_name,
+        ));
     }
+    drop(f);
     // Private BEFORE visible: the temp carries 0o600 before the rename, so
     // no reader ever observes the marker with default permissions.
-    {
-        let f = std::fs::File::from(openat_no_follow(
+    let f = match openat_no_follow(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
+    };
+    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        drop(f);
+        return Err(discard_temp_fd(
+            Error::store(format!("chmod {}: {e}", rel.display())),
             &parent_fd,
-            Path::new(&tmp_name),
-            libc::O_RDONLY,
-            0,
-        )?);
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))?;
+            &tmp_name,
+        ));
     }
+    drop(f);
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
     // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
-    // visible target is wholly OLD.
+    // visible target is wholly OLD and the temp is unlinked.
     if let Some(e) = fault(ReplaceStage::Rename) {
-        return Err(e);
+        return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
-    renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name)?;
+    if let Err(e) = renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name) {
+        return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
+    }
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
     // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace`]).
     if let Some(e) = fault(ReplaceStage::DirSync) {
@@ -651,27 +721,46 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
     // and no reader ever sees a torn record), unlink the temp name, then
     // fsync the parent directory.
     let tmp_name = temp_file_name(file_name);
-    {
-        let tmp_fd = openat_no_follow(
+    // A failed CREATE means the temp was never created (or the name belongs
+    // to another writer): nothing to clean up, so the error propagates as-is.
+    let tmp_fd = openat_no_follow(
+        &parent_fd,
+        Path::new(&tmp_name),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    let mut f = std::fs::File::from(tmp_fd);
+    if let Err(e) = f.write_all(bytes) {
+        drop(f);
+        return Err(discard_temp_fd(
+            Error::store(format!("write {}: {e}", rel.display())),
             &parent_fd,
-            Path::new(&tmp_name),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            0o600,
-        )?;
-        let mut f = std::fs::File::from(tmp_fd);
-        f.write_all(bytes)
-            .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))?;
-        f.sync_all()
-            .map_err(|e| Error::store(format!("fsync {}: {e}", rel.display())))?;
+            &tmp_name,
+        ));
     }
+    if let Err(e) = f.sync_all() {
+        drop(f);
+        return Err(discard_temp_fd(
+            Error::store(format!("fsync {}: {e}", rel.display())),
+            &parent_fd,
+            &tmp_name,
+        ));
+    }
+    drop(f);
     let installed = match linkat_fd(&parent_fd, &tmp_name, &parent_fd, file_name) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(e) => {
-            let _ = unlinkat_fd(&parent_fd, &tmp_name);
-            return Err(Error::store(format!("install {}: {e}", rel.display())));
+            return Err(discard_temp_fd(
+                Error::store(format!("install {}: {e}", rel.display())),
+                &parent_fd,
+                &tmp_name,
+            ));
         }
     };
+    // The install is done (our content, or the racing winner's): removing the
+    // temp name is the protocol's own bookkeeping, so a failure there must NOT
+    // turn a committed CAS into an error — best-effort, as before.
     let _ = unlinkat_fd(&parent_fd, &tmp_name);
     if !installed {
         // Lost the race: the winner's content must match ours or refuse.
@@ -1277,9 +1366,39 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, PathKind, RootDir, path_kind_fd, read_fd, read_link_fd};
+    use super::{
+        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, path_kind_fd, read_dir_fd, read_fd,
+        read_link_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
+    };
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+
+    /// The entry names DIRECTLY under the path-based directory `dir`, sorted:
+    /// a failed replace must leave NOTHING but the names the test seeded.
+    fn entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The entry names directly under the descriptor-relative directory `rel`
+    /// (through the module's own walk), sorted.
+    fn dir_names_fd(root: &RootDir, rel: &Path) -> Vec<String> {
+        let mut names: Vec<String> = read_dir_fd(root, rel)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn only(path: &str) -> Vec<String> {
+        vec![path.to_string()]
+    }
 
     fn owned_root() -> (tempfile::TempDir, RootDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1587,5 +1706,264 @@ mod tests {
             b"OUTSIDE-SECRET",
             "the outside file must be untouched and its bytes never returned"
         );
+    }
+
+    // =================================================================
+    // TEMP CLEANUP ON A FAILED ATOMIC REPLACE
+    // ----------------------------------------------------------------
+    // Every pre-rename failure (and even a COMPLETED rename) must leave no
+    // stray dot-prefixed temp behind, while the two commit points keep the
+    // OLD content visible before the rename and the NEW content after it.
+    // =================================================================
+
+    /// A fault at EACH PRE-RENAME stage leaves the OLD content visible and the
+    /// directory holding ONLY the seeded destination — the failed replace's
+    /// temp is unlinked before the `Err` is returned.
+    #[test]
+    fn failed_path_replace_at_each_pre_rename_stage_leaves_no_temp_and_old_content() {
+        for stage in [
+            ReplaceStage::Write,
+            ReplaceStage::Sync,
+            ReplaceStage::Rename,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("marker.json");
+            std::fs::write(&path, b"OLD").unwrap();
+            let err = write_atomic_replace(&path, b"NEW", &mut |s| {
+                (s == stage).then(|| Error::store(format!("injected {stage:?} fault")))
+            })
+            .unwrap_err();
+            assert!(matches!(err, Error::Store(_)), "{stage:?}: got {err:?}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"OLD".to_vec(),
+                "{stage:?}: the OLD content must stay visible"
+            );
+            assert_eq!(
+                entry_names(dir.path()),
+                only("marker.json"),
+                "{stage:?}: a failed replace must leave no stray temp"
+            );
+        }
+    }
+
+    /// The descriptor-relative replace obeys the same cleanup contract: a
+    /// fault at each pre-rename stage leaves the OLD content visible and NO
+    /// temp entry in the parent directory.
+    #[test]
+    fn failed_fd_replace_at_each_pre_rename_stage_leaves_no_temp_and_old_content() {
+        let rel = Path::new("sub/marker.json");
+        for stage in [
+            ReplaceStage::Write,
+            ReplaceStage::Sync,
+            ReplaceStage::Rename,
+        ] {
+            let (dir, root) = owned_root();
+            std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+            std::fs::write(dir.path().join("sub/marker.json"), b"OLD").unwrap();
+            let err = write_atomic_replace_fd(&root, rel, b"NEW", &mut |s| {
+                (s == stage).then(|| Error::store(format!("injected {stage:?} fault")))
+            })
+            .unwrap_err();
+            assert!(matches!(err, Error::Store(_)), "{stage:?}: got {err:?}");
+            assert_eq!(
+                read_fd(&root, rel).unwrap(),
+                b"OLD".to_vec(),
+                "{stage:?}: the OLD content must stay visible"
+            );
+            assert_eq!(
+                dir_names_fd(&root, Path::new("sub")),
+                only("marker.json"),
+                "{stage:?}: a failed replace must leave no stray temp"
+            );
+        }
+    }
+
+    /// A REAL failure of COMMIT POINT 1 (no fault hook): the destination is an
+    /// existing DIRECTORY, so the rename fails. The temp is unlinked and the
+    /// directory the rename could not replace is untouched.
+    #[test]
+    fn real_rename_failure_onto_a_directory_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        std::fs::create_dir(&path).unwrap();
+        let err = write_atomic_replace(&path, b"NEW", &mut |_| None).unwrap_err();
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("rename"),
+            "the failure must be the rename, got: {err}"
+        );
+        assert_eq!(
+            entry_names(dir.path()),
+            only("marker.json"),
+            "a real rename failure must leave no stray temp"
+        );
+        assert!(path.is_dir(), "the un-replaced directory must be untouched");
+    }
+
+    /// A REAL failure of the descriptor-relative COMMIT POINT 1: `renameat`
+    /// onto an existing directory fails and the temp is unlinked.
+    #[test]
+    fn real_fd_rename_failure_onto_a_directory_leaves_no_temp() {
+        let (dir, root) = owned_root();
+        std::fs::create_dir_all(dir.path().join("sub/marker.json")).unwrap();
+        let err =
+            write_atomic_replace_fd(&root, Path::new("sub/marker.json"), b"NEW", &mut |_| None)
+                .unwrap_err();
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        assert_eq!(
+            dir_names_fd(&root, Path::new("sub")),
+            only("marker.json"),
+            "a real renameat failure must leave no stray temp"
+        );
+    }
+
+    /// COMMIT POINT 2 (path-based): a post-rename parent-fsync fault leaves the
+    /// NEW content in place, reports `ReplacedDurabilityUnknown`, and does NOT
+    /// unlink the destination (there is no temp left to remove).
+    #[test]
+    fn post_rename_fsync_fault_leaves_new_content_and_no_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        std::fs::write(&path, b"OLD").unwrap();
+        let outcome = write_atomic_replace(&path, b"NEW", &mut |s| {
+            (s == ReplaceStage::DirSync).then(|| Error::store("injected dir fsync fault"))
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ReplaceOutcome::ReplacedDurabilityUnknown {
+                error: Error::Store(_)
+            }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEW".to_vec());
+        assert_eq!(entry_names(dir.path()), only("marker.json"));
+    }
+
+    /// COMMIT POINT 2 (descriptor-relative): same post-rename contract — the
+    /// NEW content survives and nothing is unlinked.
+    #[test]
+    fn post_rename_fsync_fault_leaves_new_content_and_no_temp_fd() {
+        let (dir, root) = owned_root();
+        let rel = Path::new("marker.json");
+        std::fs::write(dir.path().join("marker.json"), b"OLD").unwrap();
+        let outcome = write_atomic_replace_fd(&root, rel, b"NEW", &mut |s| {
+            (s == ReplaceStage::DirSync).then(|| Error::store("injected dir fsync fault"))
+        })
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ReplaceOutcome::ReplacedDurabilityUnknown {
+                error: Error::Store(_)
+            }
+        ));
+        assert_eq!(read_fd(&root, rel).unwrap(), b"NEW".to_vec());
+        assert_eq!(entry_names(dir.path()), only("marker.json"));
+    }
+
+    /// A SUCCESSFUL replace leaves exactly the destination (no temp) and still
+    /// reports `ReplacedDurable`, for both the path-based and the
+    /// descriptor-relative writers.
+    #[test]
+    fn successful_replace_leaves_only_the_destination_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        std::fs::write(&path, b"OLD").unwrap();
+        let outcome = write_atomic_replace(&path, b"NEW", &mut |_| None).unwrap();
+        assert!(matches!(outcome, ReplaceOutcome::ReplacedDurable));
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEW".to_vec());
+        assert_eq!(entry_names(dir.path()), only("marker.json"));
+
+        let (_dir, root) = owned_root();
+        let rel = Path::new("nested/marker.json");
+        let outcome = write_atomic_replace_fd(&root, rel, b"NEW", &mut |_| None).unwrap();
+        assert!(matches!(outcome, ReplaceOutcome::ReplacedDurable));
+        assert_eq!(read_fd(&root, rel).unwrap(), b"NEW".to_vec());
+        assert_eq!(
+            dir_names_fd(&root, Path::new("nested")),
+            only("marker.json")
+        );
+    }
+
+    /// The cleanup is best-effort but NOT silent: when the temp cannot be
+    /// unlinked, the returned error carries BOTH the original failure and the
+    /// cleanup failure. The fault hook swaps the just-written temp for a
+    /// DIRECTORY, so the writer's `remove_file` cleanup must fail.
+    #[test]
+    fn failed_path_replace_reports_a_failed_cleanup_with_both_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        std::fs::write(&path, b"OLD").unwrap();
+        let mut swapped: Option<PathBuf> = None;
+        let err = write_atomic_replace(&path, b"NEW", &mut |stage| {
+            if stage != ReplaceStage::Rename {
+                return None;
+            }
+            let temp = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".marker.json.tmp.")
+                })
+                .expect("the temp exists at the rename stage");
+            std::fs::remove_file(&temp).unwrap();
+            std::fs::create_dir(&temp).unwrap();
+            swapped = Some(temp);
+            Some(Error::store("injected rename fault"))
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("injected rename fault"),
+            "the ORIGINAL failure must be reported, got: {text}"
+        );
+        assert!(
+            text.contains("failed to unlink"),
+            "the CLEANUP failure must be reported, got: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"OLD".to_vec(),
+            "the destination must still hold the OLD content"
+        );
+        // Remove the deliberate stray directory so the tempdir tears down.
+        std::fs::remove_dir(swapped.expect("the hook recorded the temp")).unwrap();
+    }
+
+    /// The descriptor-relative REPLACE and the CAS both leave no temp on a
+    /// committed success — the temp name is consumed (replace) or unlinked
+    /// (CAS) once the entry is installed.
+    #[test]
+    fn committed_replace_and_cas_leave_no_temp() {
+        let (dir, root) = owned_root();
+        let rel = Path::new("marker.json");
+        write_atomic_replace_fd(&root, rel, b"NEW", &mut |_| None).unwrap();
+        assert_eq!(entry_names(dir.path()), only("marker.json"));
+        assert_eq!(read_fd(&root, rel).unwrap(), b"NEW".to_vec());
+
+        let (dir, root) = owned_root();
+        let rel = Path::new("cas.json");
+        write_atomic_cas_fd(&root, rel, b"FIRST").unwrap();
+        assert_eq!(entry_names(dir.path()), only("cas.json"));
+        write_atomic_cas_fd(&root, rel, b"FIRST").unwrap();
+        assert_eq!(entry_names(dir.path()), only("cas.json"));
+        assert_eq!(read_fd(&root, rel).unwrap(), b"FIRST".to_vec());
+    }
+
+    /// A CAS that refuses different content returns an `Err` and leaves only
+    /// the existing destination (no temp is created on the refusal path).
+    #[test]
+    fn refusing_cas_leaves_only_the_destination() {
+        let (dir, root) = owned_root();
+        let rel = Path::new("cas.json");
+        std::fs::write(dir.path().join("cas.json"), b"OLD").unwrap();
+        let err = write_atomic_cas_fd(&root, rel, b"NEW").unwrap_err();
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        assert_eq!(entry_names(dir.path()), only("cas.json"));
+        assert_eq!(read_fd(&root, rel).unwrap(), b"OLD".to_vec());
     }
 }
