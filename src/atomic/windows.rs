@@ -194,49 +194,60 @@ pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
 /// The walk queues each directory on an explicit heap `Vec` instead of
 /// recursing one Rust frame per level, so a deep tree fails cleanly (or
 /// succeeds) rather than exhausting the C stack and aborting the host
-/// process.
+/// process. It descends into a subdirectory the moment it is encountered, so
+/// its visit order matches the pre-rewrite recursion's depth-first
+/// pre-order (files and subdirectories interleaved in `readdir` order).
 #[cfg(test)]
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    struct Job {
-        src: PathBuf,
+    struct Frame {
         dst: PathBuf,
+        entries: std::vec::IntoIter<std::fs::DirEntry>,
     }
-    let mut stack: Vec<Job> = vec![Job {
-        src: src.to_path_buf(),
-        dst: dst.to_path_buf(),
-    }];
-    while let Some(job) = stack.pop() {
-        std::fs::create_dir_all(&job.dst)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", job.dst.display())))?;
-        let mut subdirs: Vec<Job> = Vec::new();
-        for entry in std::fs::read_dir(&job.src)
-            .map_err(|e| Error::store(format!("read_dir {}: {e}", job.src.display())))?
-        {
-            let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
+
+    fn open_frame(src: &Path, dst: &Path) -> Result<Frame> {
+        std::fs::create_dir_all(dst)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
+        let entries = std::fs::read_dir(src)
+            .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| Error::store(format!("entry: {e}")))?;
+        Ok(Frame {
+            dst: dst.to_path_buf(),
+            entries: entries.into_iter(),
+        })
+    }
+
+    let mut stack: Vec<Frame> = vec![open_frame(src, dst)?];
+    while let Some(top) = stack.last_mut() {
+        let next = top.entries.next();
+        let Some(entry) = next else {
+            stack.pop();
+            continue;
+        };
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
             let path = entry.path();
             let ft = entry
                 .file_type()
                 .map_err(|e| Error::store(format!("file_type: {e}")))?;
-            let target = job.dst.join(entry.file_name());
+            let target = top.dst.join(entry.file_name());
             if ft.is_dir() {
-                subdirs.push(Job {
-                    src: path,
-                    dst: target,
-                });
+                Some(open_frame(&path, &target)?)
             } else if ft.is_symlink() {
                 let link = std::fs::read_link(&path)
                     .map_err(|e| Error::store(format!("readlink {}: {e}", path.display())))?;
                 let _ = std::fs::remove_file(&target);
                 std::fs::copy(&link, &target)
                     .map_err(|e| Error::store(format!("copy {}: {e}", target.display())))?;
+                None
             } else {
                 std::fs::copy(&path, &target)
                     .map_err(|e| Error::store(format!("copy {}: {e}", target.display())))?;
+                None
             }
-        }
-        // Reverse-push so subdirectories are visited in `readdir` order.
-        while let Some(job) = subdirs.pop() {
-            stack.push(job);
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
         }
     }
     Ok(())
@@ -347,69 +358,17 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
     })
 }
 
-/// Path-based recursive removal of a directory tree.
+/// Path-based recursive removal of a directory tree. On Windows this
+/// delegates to `std::fs::remove_dir_all`, which is ITERATIVE on the
+/// installed toolchain: `library/std/src/sys/fs/windows.rs:1382` opens the
+/// directory and calls `remove_dir_all_iterative`
+/// (`library/std/src/sys/fs/windows/remove_dir_all.rs:173`), so a deep tree
+/// fails cleanly rather than aborting the host — the same guarantee the Unix
+/// path gets from its own walk. (Windows is type-checked only, never run
+/// here.)
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
     std::fs::remove_dir_all(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
-}
-
-/// Path-based recursive tree copy: the destination resolves under the root
-/// path; symlinks are copied as their target's content (Windows symlinks
-/// require admin/developer mode) — the documented weaker guarantee of the
-/// Windows port. Like the Unix port, the walk queues each directory on an
-/// explicit heap `Vec`, so a deep tree cannot overflow the C stack and abort
-/// the host process.
-pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
-    struct Job {
-        src: PathBuf,
-        dst_rel: PathBuf,
-    }
-    let mut stack: Vec<Job> = vec![Job {
-        src: src.to_path_buf(),
-        dst_rel: dst_rel.to_path_buf(),
-    }];
-    while let Some(job) = stack.pop() {
-        let dst = rel_join(root, &job.dst_rel)?;
-        std::fs::create_dir_all(&dst)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
-        let mut subdirs: Vec<Job> = Vec::new();
-        for entry in std::fs::read_dir(&job.src)
-            .map_err(|e| Error::store(format!("read_dir {}: {e}", job.src.display())))?
-        {
-            let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
-            let ft = entry
-                .file_type()
-                .map_err(|e| Error::store(format!("file_type: {e}")))?;
-            let target = dst.join(entry.file_name());
-            if ft.is_dir() {
-                subdirs.push(Job {
-                    src: entry.path(),
-                    dst_rel: job.dst_rel.join(entry.file_name()),
-                });
-            } else if ft.is_symlink() {
-                let link = std::fs::read_link(entry.path()).map_err(|e| {
-                    Error::store(format!("readlink {}: {e}", entry.path().display()))
-                })?;
-                let _ = std::fs::remove_file(&target);
-                std::fs::copy(&link, &target)
-                    .map_err(|e| Error::store(format!("copy {}: {e}", target.display())))?;
-            } else {
-                std::fs::copy(entry.path(), &target)
-                    .map_err(|e| Error::store(format!("copy {}: {e}", target.display())))?;
-            }
-        }
-        // Reverse-push so subdirectories are visited in `readdir` order.
-        while let Some(job) = subdirs.pop() {
-            stack.push(job);
-        }
-    }
-    Ok(())
-}
-
-/// Windows has no directory fsync: a no-op (documented weaker durability
-/// guarantee of the Windows port).
-pub fn fsync_tree_recursive_fd(_root: &RootDir, _rel: &Path) -> Result<()> {
-    Ok(())
 }
 
 /// Path-based plain file write (create-or-truncate).

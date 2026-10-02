@@ -264,59 +264,71 @@ pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// TEST-ONLY path-based recursive tree copy: the store's OWN object staging
-/// now uses the descriptor-relative [`copy_dir_recursive_fd`]; this path
-/// variant survives for the retention checkpoint's test-only store clone
-/// (which copies a whole store base to a fresh path and holds no root
-/// descriptor).
+/// TEST-ONLY path-based recursive tree copy: a path-based walk that must not
+/// recurse one Rust frame per level (a deep test-only store clone would
+/// otherwise exhaust the C stack and abort the test process). It copies a
+/// whole tree to a fresh path and holds no root descriptor; the store's own
+/// fd-confined copy is the generic [`crate::transport::Remote::copy_tree`]
+/// walk (`copy_tree_walk`).
+///
+/// The traversal descends into a subdirectory the moment it is encountered,
+/// so its visit order is EXACTLY the pre-rewrite recursion's depth-first
+/// pre-order (files and subdirectories interleaved in `readdir` order) —
+/// not "every file at a level, then every subdirectory" — which keeps the
+/// partial-failure state and the error ordering identical to the
+/// recursion's. The `copy_dir_recursive_visits_in_recursive_preorder` test
+/// pins this order.
 #[cfg(test)]
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    // Same explicit-stack shape as [`copy_dir_recursive_fd`]: a path-based
-    // walk must not recurse per level either (a deep test-only store clone
-    // would otherwise abort the test process). A directory's non-directory
-    // entries are copied immediately and its subdirectories are queued, so
-    // the heap `Vec` — not the C stack — holds the frontier.
-    struct Job {
-        src: PathBuf,
+    struct Frame {
         dst: PathBuf,
+        entries: std::vec::IntoIter<std::fs::DirEntry>,
     }
 
-    let mut stack: Vec<Job> = vec![Job {
-        src: src.to_path_buf(),
-        dst: dst.to_path_buf(),
-    }];
-    while let Some(job) = stack.pop() {
-        std::fs::create_dir_all(&job.dst)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", job.dst.display())))?;
-        let mut subdirs: Vec<Job> = Vec::new();
-        for entry in std::fs::read_dir(&job.src)
-            .map_err(|e| Error::store(format!("read_dir {}: {e}", job.src.display())))?
-        {
-            let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
+    fn open_frame(src: &Path, dst: &Path) -> Result<Frame> {
+        std::fs::create_dir_all(dst)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
+        let entries = std::fs::read_dir(src)
+            .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| Error::store(format!("entry: {e}")))?;
+        Ok(Frame {
+            dst: dst.to_path_buf(),
+            entries: entries.into_iter(),
+        })
+    }
+
+    let mut stack: Vec<Frame> = vec![open_frame(src, dst)?];
+    while let Some(top) = stack.last_mut() {
+        let next = top.entries.next();
+        let Some(entry) = next else {
+            stack.pop();
+            continue;
+        };
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
             let path = entry.path();
             let ft = entry
                 .file_type()
                 .map_err(|e| Error::store(format!("file_type: {e}")))?;
-            let target = job.dst.join(entry.file_name());
+            let target = top.dst.join(entry.file_name());
             if ft.is_dir() {
-                subdirs.push(Job {
-                    src: path,
-                    dst: target,
-                });
+                Some(open_frame(&path, &target)?)
             } else if ft.is_symlink() {
                 let link = std::fs::read_link(&path)
                     .map_err(|e| Error::store(format!("readlink {}: {e}", path.display())))?;
                 let _ = std::fs::remove_file(&target);
                 std::os::unix::fs::symlink(&link, &target)
                     .map_err(|e| Error::store(format!("symlink {}: {e}", target.display())))?;
+                None
             } else {
                 std::fs::copy(&path, &target)
                     .map_err(|e| Error::store(format!("copy {}: {e}", path.display())))?;
+                None
             }
-        }
-        // Push in reverse so subdirectories are visited in `readdir` order.
-        while let Some(job) = subdirs.pop() {
-            stack.push(job);
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
         }
     }
     Ok(())
@@ -621,48 +633,6 @@ fn fstatat_mode_io(dir_fd: &OwnedFd, name: &[u8]) -> std::io::Result<libc::mode_
         return Err(std::io::Error::last_os_error());
     }
     Ok(st.st_mode)
-}
-
-/// Normalize a `mode_t` to the `u32` the mode-taking primitives expect.
-/// `mode_t` is 16-bit on some Unixes (macOS) and 32-bit on others (Linux),
-/// so the widening cast is necessary on the former and lint-spurious on the
-/// latter; the local `allow` keeps `-D warnings` clean on both.
-fn mode_u32(mode: libc::mode_t) -> u32 {
-    #[allow(clippy::unnecessary_cast)]
-    {
-        mode as u32
-    }
-}
-
-/// `readlinkat` on `name` relative to `dir_fd` (a symlink's target is read
-/// as the entry itself, never followed), growing the buffer until the target
-/// fits. Used by the fd-relative copy walk: reading the source through an
-/// open descriptor keeps a source tree deeper than `PATH_MAX` addressable.
-fn readlinkat_fd(dir_fd: &OwnedFd, name: &[u8]) -> std::io::Result<PathBuf> {
-    let c = CString::new(name).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component with NUL")
-    })?;
-    let mut cap = 256usize;
-    loop {
-        let mut buf = vec![0u8; cap];
-        let n = unsafe {
-            libc::readlinkat(
-                dir_fd.as_raw_fd(),
-                c.as_ptr(),
-                buf.as_mut_ptr().cast::<libc::c_char>(),
-                cap,
-            )
-        };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let n = n as usize;
-        if n < cap {
-            buf.truncate(n);
-            return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
-        }
-        cap = cap.saturating_mul(2);
-    }
 }
 
 /// Best-effort unlink of a FAILED descriptor-relative atomic replace's temp
@@ -1179,16 +1149,19 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 }
 
 /// The iterative, descriptor-relative removal of a directory NAME (a PATH,
-/// not a root-relative spelling). The transport removes a directory that is
-/// not necessarily under a descriptor it already holds; its previous
-/// delegation, `std::fs::remove_dir_all`, recurses one Rust frame per
-/// directory level, so a deep tree there could also exhaust the C stack and
-/// abort the host. This walk reuses [`remove_dir_contents_fd`]'s explicit
-/// heap frame stack and is bounded by the descriptor limit — a clean `Err`
-/// (or success), never an abort. Semantics follow the Unix
-/// `std::fs::remove_dir_all` the transport relied on: a MISSING `path` is a
-/// successful no-op (idempotent removal), and a symlink at `path` is
-/// unlinked as the entry itself, never followed.
+/// not a root-relative spelling). On Unix the local transport routes here;
+/// on Windows it delegates to `std::fs::remove_dir_all`, whose WINDOWS
+/// implementation is itself iterative on the installed toolchain
+/// (`library/std/src/sys/fs/windows.rs:1382` opens the directory and calls
+/// `remove_dir_all_iterative`,
+/// `library/std/src/sys/fs/windows/remove_dir_all.rs:173`), so the
+/// deep-tree-abort guarantee holds on BOTH platforms — this walk is the
+/// Unix realization of it, not the only one. This walk reuses
+/// [`remove_dir_contents_fd`]'s explicit heap frame stack and is bounded by
+/// the descriptor limit — a clean `Err` (or success), never an abort.
+/// Semantics follow the Unix `std::fs::remove_dir_all` the transport relied
+/// on: a MISSING `path` is a successful no-op (idempotent removal), and a
+/// symlink at `path` is unlinked as the entry itself, never followed.
 pub fn remove_dir_all_path(path: &Path) -> Result<()> {
     let md = match std::fs::symlink_metadata(path) {
         Ok(md) => md,
@@ -1227,245 +1200,16 @@ pub fn remove_dir_all_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The descriptor-relative iterative tree copy. The DESTINATION resolves
-/// component-wise relative to `root` with `O_NOFOLLOW` (a symlink injected
-/// into a destination component is refused); below the root each level is
-/// created and entered relative to its PARENT's descriptor, so the walk
-/// costs one `openat` per level instead of re-resolving the whole path from
-/// the root. The SOURCE ROOT is opened once (that single open follows a
-/// symlink exactly as `std::fs::read_dir(src)` did); every entry below it is
-/// classified with `fstatat`/`readlinkat`/`openat` relative to the source
-/// descriptor, so an entry is never followed AND the SOURCE PATH'S LENGTH no
-/// longer bounds the walk. Directory and file modes are copied EXACTLY from
-/// the source (the tree digest includes modes — a mode-shifted copy would
-/// fail the staged-object verification).
-///
-/// The traversal uses an explicit heap `Vec` of frames instead of the call
-/// stack: a tree deeper than the C stack must fail cleanly (or succeed),
-/// never overflow the stack and ABORT the host process.
-pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
-    struct Frame {
-        src_fd: OwnedFd,
-        dst_fd: OwnedFd,
-        rel: PathBuf,
-        names: std::vec::IntoIter<Vec<u8>>,
-    }
-
-    let src_file = std::fs::File::open(src)
-        .map_err(|e| Error::store(format!("open source {}: {e}", src.display())))?;
-    // Create the destination directory with the SOURCE directory's mode (the
-    // digest includes modes; the copy must preserve them exactly).
-    let src_mode = src_file
-        .metadata()
-        .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?
-        .permissions()
-        .mode();
-    let src_fd: OwnedFd = src_file.into();
-    create_dir_chain_fd(root.as_fd(), dst_rel, src_mode)?;
-    let dst_fd = openat_no_follow(root.as_fd(), dst_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    let names = dir_entry_names(&src_fd)?;
-    let mut stack: Vec<Frame> = vec![Frame {
-        src_fd,
-        dst_fd,
-        rel: dst_rel.to_path_buf(),
-        names: names.into_iter(),
-    }];
-
-    while let Some(top) = stack.last_mut() {
-        let next = top.names.next();
-        let Some(name) = next else {
-            stack.pop();
-            continue;
-        };
-        let child_name = std::ffi::OsStr::from_bytes(&name);
-        let descend: Option<Frame> = {
-            let top = stack.last().expect("the frame just examined");
-            let child_rel = top.rel.join(Path::new(child_name));
-            let mode = fstatat_mode_io(&top.src_fd, &name)
-                .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
-            if (mode & libc::S_IFMT) == libc::S_IFDIR {
-                let child_src_fd = openat_no_follow_io(
-                    &top.src_fd,
-                    Path::new(child_name),
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                    0,
-                )
-                .map_err(|e| Error::store(format!("openat {}: {e}", child_rel.display())))?;
-                // Create the destination child relative to the PARENT
-                // descriptor (the component-wise O_NOFOLLOW discipline is
-                // preserved), then open it the same way.
-                create_dir_chain_fd(&top.dst_fd, Path::new(child_name), mode_u32(mode))?;
-                let child_dst_fd = openat_no_follow_io(
-                    &top.dst_fd,
-                    Path::new(child_name),
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                    0,
-                )
-                .map_err(|e| Error::store(format!("openat {}: {e}", child_rel.display())))?;
-                let names = dir_entry_names(&child_src_fd)?;
-                Some(Frame {
-                    src_fd: child_src_fd,
-                    dst_fd: child_dst_fd,
-                    rel: child_rel,
-                    names: names.into_iter(),
-                })
-            } else if (mode & libc::S_IFMT) == libc::S_IFLNK {
-                let link = readlinkat_fd(&top.src_fd, &name)
-                    .map_err(|e| Error::store(format!("readlink {}: {e}", child_rel.display())))?;
-                // Remove any existing entry at the target (the original
-                // removes the target before symlinking), then symlinkat.
-                let _ = unlinkat_fd(&top.dst_fd, child_name);
-                let name_c = CString::new(name.clone())
-                    .map_err(|_| Error::store("symlink name with NUL"))?;
-                let target_c = CString::new(link.as_os_str().as_bytes())
-                    .map_err(|_| Error::store("symlink target with NUL"))?;
-                let r = unsafe {
-                    libc::symlinkat(target_c.as_ptr(), top.dst_fd.as_raw_fd(), name_c.as_ptr())
-                };
-                if r < 0 {
-                    return Err(Error::store(format!(
-                        "symlinkat {}: {}",
-                        child_rel.display(),
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                None
-            } else {
-                let src_f = std::fs::File::from(
-                    openat_no_follow_io(
-                        &top.src_fd,
-                        Path::new(child_name),
-                        libc::O_RDONLY | libc::O_NOFOLLOW,
-                        0,
-                    )
-                    .map_err(|e| Error::store(format!("open {}: {e}", child_rel.display())))?,
-                );
-                let dst_f = openat_no_follow_io(
-                    &top.dst_fd,
-                    Path::new(child_name),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                    mode_u32(mode),
-                )
-                .map_err(|e| Error::store(format!("openat {}: {e}", child_rel.display())))?;
-                let mut dst_f = std::fs::File::from(dst_f);
-                std::io::copy(&mut &src_f, &mut dst_f)
-                    .map_err(|e| Error::store(format!("copy {}: {e}", child_rel.display())))?;
-                dst_f
-                    .set_permissions(std::fs::Permissions::from_mode(mode_u32(mode)))
-                    .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
-                None
-            }
-        };
-        if let Some(frame) = descend {
-            stack.push(frame);
-        }
-    }
-    Ok(())
-}
-
-/// Create the directory chain `rel` relative to `root` component-wise with
-/// O_NOFOLLOW, chmodding the FINAL directory to `mode` (the intermediate
-/// components are outside the tree root, so their modes do not affect the
-/// tree digest).
-fn create_dir_chain_fd(root: &OwnedFd, rel: &Path, mode: u32) -> Result<()> {
-    let comps = rel_components(rel)
-        .map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
-    let mut cur: OwnedFd = root
-        .try_clone()
-        .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
-    for (i, comp) in comps.iter().enumerate() {
-        let is_last = i == comps.len() - 1;
-        let dir = open_or_create_dir(&cur, comp)?;
-        if is_last {
-            let f = std::fs::File::from(
-                dir.try_clone()
-                    .map_err(|e| Error::store(format!("dup dir: {e}")))?,
-            );
-            f.set_permissions(std::fs::Permissions::from_mode(mode))
-                .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))?;
-        }
-        cur = dir;
-    }
-    Ok(())
-}
-
-/// The descriptor-relative recursive tree fsync: the same deepest-first
-/// protocol as [`fsync_tree_recursive`], but every entry is classified with
-/// `fstatat(AT_SYMLINK_NOFOLLOW)` and opened relative to the root's
-/// descriptor — a symlink injected into any component is refused (ELOOP),
-/// never followed. Symlinks are SKIPPED (their durability is their
-/// directory entry, covered by the parent-dir fsync).
-pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    struct Frame {
-        fd: OwnedFd,
-        rel: PathBuf,
-        names: std::vec::IntoIter<Vec<u8>>,
-    }
-
-    let dir_fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    let names = dir_entry_names(&dir_fd)?;
-    let mut stack: Vec<Frame> = vec![Frame {
-        fd: dir_fd,
-        rel: rel.to_path_buf(),
-        names: names.into_iter(),
-    }];
-
-    while let Some(top) = stack.last_mut() {
-        let next = top.names.next();
-        let Some(name) = next else {
-            // Deepest-first: every child has been fsynced before its parent's
-            // own directory descriptor, exactly as the recursion fsynced on
-            // unwind.
-            let done = stack.pop().expect("the frame just examined");
-            fsync_dir_fd(&done.fd)?;
-            continue;
-        };
-
-        let child_name = std::ffi::OsStr::from_bytes(&name);
-        let descend: Option<Frame> = {
-            let top = stack.last().expect("the frame just examined");
-            let child_rel = top.rel.join(Path::new(child_name));
-            let mode = fstatat_mode_io(&top.fd, &name)
-                .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
-            if (mode & libc::S_IFMT) == libc::S_IFDIR {
-                let sub = openat_no_follow(
-                    &top.fd,
-                    Path::new(child_name),
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                    0,
-                )?;
-                let names = dir_entry_names(&sub)?;
-                Some(Frame {
-                    fd: sub,
-                    rel: child_rel,
-                    names: names.into_iter(),
-                })
-            } else if (mode & libc::S_IFMT) == libc::S_IFREG {
-                let f = std::fs::File::from(openat_no_follow(
-                    &top.fd,
-                    Path::new(child_name),
-                    libc::O_RDONLY | libc::O_NOFOLLOW,
-                    0,
-                )?);
-                f.sync_all()
-                    .map_err(|e| Error::store(format!("fsync {}: {e}", child_rel.display())))?;
-                None
-            } else {
-                // Symlinks and other entries are SKIPPED (their durability is
-                // their directory entry, covered by the parent-dir fsync).
-                None
-            }
-        };
-        if let Some(frame) = descend {
-            stack.push(frame);
-        }
-    }
-    Ok(())
-}
-
 /// The descriptor-relative plain file write (create-or-truncate, 0o600):
-/// used for the staged object's `tree.json` metadata (the staged tree is
-/// fsynced as a whole by [`fsync_tree_recursive_fd`] before the publish).
+/// used for the staged object's `tree.json` metadata.
+///
+/// This does NOT fsync the file, and it does NOT fsync the staged tree as a
+/// whole: no function in this crate fsyncs a staged tree before a publish
+/// (there is no in-crate caller of
+/// [`Remote::fsync_tree`](crate::transport::Remote::fsync_tree) either), so
+/// a caller that needs the tree durable before an install rename must
+/// arrange that itself. See the crate's fidelity-scope section in
+/// [`crate::manifest`] for the tree-durability limitation.
 pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = openat_no_follow(
@@ -2259,5 +2003,92 @@ mod tests {
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
         assert_eq!(entry_names(dir.path()), only("cas.json"));
         assert_eq!(read_fd(&root, rel).unwrap(), b"OLD".to_vec());
+    }
+
+    /// The iterative path-based copy must visit entries in the SAME order as
+    /// the recursion it replaced: depth-first pre-order, descending into a
+    /// subdirectory the moment it is encountered — NOT "every file first,
+    /// then every subdirectory". The final tree is identical either way, so
+    /// this pins the observable consequence: on a mid-copy failure the
+    /// partial state follows the recursive order. The subdirectory/file names
+    /// are CHOSEN from a probe of this filesystem's own enumeration order, and
+    /// BOTH creation orders are tried, so the subdirectory precedes the
+    /// failing file on a name-hash filesystem (APFS), a creation-order
+    /// filesystem, and a reverse-creation-order filesystem (tmpfs); the
+    /// `any_non_vacuous` guard then fails the test loudly if no iteration
+    /// could observe the order at all.
+    #[test]
+    fn copy_dir_recursive_visits_in_recursive_preorder() {
+        let (sub_name, file_name) = probe_sub_before_file_names();
+        let mut any_non_vacuous = false;
+        for sub_created_first in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            let dst = tmp.path().join("dst");
+            std::fs::create_dir_all(&src).unwrap();
+            if sub_created_first {
+                std::fs::create_dir(src.join(&sub_name)).unwrap();
+                std::fs::write(src.join(&sub_name).join("inner"), b"inner").unwrap();
+                std::fs::write(src.join(&file_name), b"boom").unwrap();
+            } else {
+                std::fs::write(src.join(&file_name), b"boom").unwrap();
+                std::fs::create_dir(src.join(&sub_name)).unwrap();
+                std::fs::write(src.join(&sub_name).join("inner"), b"inner").unwrap();
+            }
+
+            let order: Vec<String> = std::fs::read_dir(&src)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            let sub_before_file = order
+                .iter()
+                .position(|n| n == &sub_name)
+                .zip(order.iter().position(|n| n == &file_name))
+                .is_some_and(|(s, f)| s < f);
+            any_non_vacuous |= sub_before_file;
+
+            // Make the file's copy fail: a regular file cannot overwrite a
+            // directory, so `std::fs::copy` fails once the walk reaches it.
+            std::fs::create_dir_all(dst.join(&file_name)).unwrap();
+
+            let res = super::copy_dir_recursive(&src, &dst);
+            assert!(res.is_err(), "a mid-copy failure must surface as an Err");
+
+            // Recursive order copies the subdirectory whenever it precedes
+            // the failing file; the buggy "files first" order never descends
+            // a subdirectory before the failing file, so this would be false
+            // under it.
+            assert_eq!(
+                dst.join(&sub_name).join("inner").is_file(),
+                sub_before_file,
+                "the partial-failure state must follow the recursion's depth-first \
+                 pre-order (sub_created_first={sub_created_first}, readdir order {order:?})"
+            );
+        }
+        assert!(
+            any_non_vacuous,
+            "this filesystem's enumeration order never placed the subdirectory before the \
+             failing file, so the test could not observe the visit order"
+        );
+    }
+
+    /// Choose a directory name and a file name such that the directory is
+    /// enumerated FIRST on THIS filesystem. A name-hash filesystem (APFS) has
+    /// a fixed per-name order, so probing in a scratch directory and reusing
+    /// the two names reproduces that order; on a creation-order or
+    /// reverse-creation-order filesystem the caller also tries both creation
+    /// orders.
+    fn probe_sub_before_file_names() -> (String, String) {
+        let tmp = tempfile::tempdir().expect("probe tempdir");
+        let names: Vec<String> = (0..16).map(|i| format!("c{i:02}")).collect();
+        for name in &names {
+            std::fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        let order: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(order.len(), names.len(), "the probe must list every name");
+        (order[0].clone(), order[order.len() - 1].clone())
     }
 }

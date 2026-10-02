@@ -78,7 +78,14 @@
 //! * **POSIX access and default ACLs**;
 //! * **timestamps** (`mtime`/`atime`);
 //! * **file flags** (`chattr +i`, `chflags uchg`);
-//! * **sparseness** — a sparse file is written out fully allocated.
+//! * **sparseness** — a sparse file is written out fully allocated;
+//! * **memory** — a sync reads each file WHOLE: the local canonicalizer
+//!   ([`canonicalize_tree`]'s `std::fs::read`) and the far-side perl
+//!   manifest script both slurp the entire file in one allocation, so peak
+//!   resident memory is proportional to the LARGEST SINGLE FILE, not to the
+//!   tree's total size. This is a PER-FILE bound, not a total-tree bound,
+//!   and no streaming path exists. (Measured: a 512 MiB file → ~515 MiB RSS;
+//!   a 2 GiB file → ~2.00 GiB RSS.)
 //!
 //! The loss of xattrs, `security.capability`, and ACLs is INVISIBLE TO THE
 //! DIFFER: a second sync compares only the manifest model, sees the entry as

@@ -2,13 +2,15 @@
 //! host process.
 //!
 //! The tree walks used to recurse one Rust frame per directory level
-//! (`atomic::unix::remove_dir_contents_fd`, `copy_dir_recursive_fd`, the
-//! default `Remote::copy_tree`, and the path-based `remove_dir_all` the
-//! transport delegated to). A tree deeper than the caller's stack exhausted
-//! it, and Rust's stack-overflow handler ABORTS the whole process (SIGABRT)
-//! — a library call killing its host is never acceptable. The walks are now
-//! explicit heap `Vec` stacks; the only remaining bound is the descriptor
-//! limit, which surfaces as a clean `Err`, never an abort.
+//! (`atomic::unix::remove_dir_contents_fd`, the default `Remote::copy_tree`
+//! walk, and the path-based `remove_dir_all` the UNIX transport delegates
+//! to). A tree deeper than the caller's stack exhausted it, and Rust's
+//! stack-overflow handler ABORTS the whole process (SIGABRT) — a library
+//! call killing its host is never acceptable. The walks are now explicit
+//! heap `Vec` stacks; the only remaining bound is the descriptor limit,
+//! which surfaces as a clean `Err`, never an abort. (The Windows transport
+//! delegates removal to `std::fs::remove_dir_all`, which is itself iterative
+//! on the installed toolchain — see `atomic::unix::remove_dir_all_path`.)
 //!
 //! The pre-fix failure is a PROCESS abort, so an in-process assertion cannot
 //! observe it (the test process would die with the child). These tests
@@ -38,6 +40,15 @@ const CHILD_TEST: &str = "deep_tree_regression::deep_tree_child";
 /// Printed by the child only once its small-stack walk COMPLETES; the parent
 /// requires it so a child that ran no test can never pass this suite.
 const DONE_MARKER: &str = "STORE_SYNC_DEEP_TREE_CHILD_DONE";
+/// The child's descriptor-exhaustion mode: lower `RLIMIT_NOFILE` before the
+/// removal walk so its one-descriptor-per-level frontier hits `EMFILE`.
+const EMFILE_MODE: &str = "remove_emfile";
+/// The soft `RLIMIT_NOFILE` the child lowers to. The observed threshold is
+/// `limit - 8`, so this is reached long before `DEPTH` levels.
+const EMFILE_NOFILE: u64 = 64;
+/// Printed by the child once the descriptor-exhaustion case has run and its
+/// in-child assertions held; the parent requires it (non-vacuity).
+const EMFILE_MARKER: &str = "STORE_SYNC_DEEP_TREE_EMFILE";
 
 /// Directory levels the child nests. Calibrated against the PRE-fix
 /// one-frame-per-level walk: at [`CHILD_STACK`] it overflows between depth 96
@@ -66,6 +77,18 @@ fn deep_tree_copy_does_not_abort_the_process() {
     assert_child_succeeds("copy");
 }
 
+/// A deep removal with `RLIMIT_NOFILE` lowered surfaces a CLEAN
+/// descriptor-exhaustion `Err` (never an abort, never a panic, never a
+/// silent partial success), leaks no descriptor, and leaves the tree in a
+/// defined, retryable state. The pre-rewrite recursive form held the same
+/// one-descriptor-per-level frontier and failed the same way, so this is a
+/// COVERAGE-ONLY pin of the documented "bounded by the descriptor limit, a
+/// clean `Err`" contract rather than a regression the rewrite fixed.
+#[test]
+fn deep_tree_removal_surfaces_a_clean_descriptor_exhaustion() {
+    assert_emfile_child();
+}
+
 /// The child worker. It does nothing unless the parent set [`MODE_ENV`], so
 /// the ordinary `cargo test` run only lists it as ignored; the parent
 /// re-execs the binary with `--ignored --exact` and the env switch.
@@ -80,6 +103,11 @@ fn deep_tree_child() {
         .expect("DEPTH_ENV is set by the parent")
         .parse()
         .expect("DEPTH_ENV is a number");
+    if mode == EMFILE_MODE {
+        run_emfile_case(&root, depth);
+        println!("{DONE_MARKER} mode={mode} depth={depth}");
+        return;
+    }
     std::thread::Builder::new()
         .stack_size(CHILD_STACK)
         .spawn(move || {
@@ -226,6 +254,119 @@ fn assert_child_succeeds(mode: &str) {
         stdout.contains(&done_marker),
         "the {mode} child exited 0 but never reached the end of the walk, so it ran no \
          test and this regression assertion would pass vacuously:\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+    );
+}
+
+/// Run the descriptor-exhaustion case in the child: build the deep tree, lower
+/// `RLIMIT_NOFILE`, remove it, and assert the contract. Panics (so the child
+/// exits nonzero) on any violation; the parent then sees a failed child.
+fn run_emfile_case(root: &Path, depth: usize) {
+    build_deep_tree(root, depth).unwrap_or_else(|e| panic!("build: {e}"));
+    let env = SysEnv::from_process();
+    let transport = LocalTransport::new(&env, root.to_path_buf(), Layout::empty())
+        .unwrap_or_else(|e| panic!("local transport: {e}"));
+    let src = RootedRelativePath::parse(Path::new(TOP)).expect("src path");
+    let before = open_fd_count().unwrap_or_else(|e| panic!("fd count before: {e}"));
+    let saved = set_nofile_soft(EMFILE_NOFILE).unwrap_or_else(|e| panic!("lower nofile: {e}"));
+    let first = transport.remove_dir_all(&src);
+    let after = open_fd_count().unwrap_or_else(|e| panic!("fd count after: {e}"));
+    restore_nofile(saved).unwrap_or_else(|e| panic!("restore nofile: {e}"));
+
+    let err = first.expect_err("the walk must surface a clean Err, never a silent success");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Too many open files") || msg.contains("EMFILE"),
+        "the error must name the descriptor exhaustion, got: {msg}"
+    );
+    assert_eq!(
+        before, after,
+        "the failed walk must not leak a descriptor (before={before}, after={after})"
+    );
+    assert!(
+        root.join(TOP).exists(),
+        "post-order removal deletes a directory only after its contents, so the \
+         partially removed tree root must still exist"
+    );
+    transport
+        .remove_dir_all(&src)
+        .expect("a retry with the limit restored must finish the removal");
+    assert!(
+        !root.join(TOP).exists(),
+        "the retry must remove the tree root, proving the partial state was defined"
+    );
+    println!("{EMFILE_MARKER} fds_before={before} fds_after={after} err={msg}");
+}
+
+/// Count this process's open descriptors via `/proc/self/fd` (Linux) or
+/// `/dev/fd` (macOS). Both include the directory handle this read opens, so
+/// the two calls are comparable.
+fn open_fd_count() -> Result<usize, String> {
+    for dir in ["/proc/self/fd", "/dev/fd"] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            return Ok(rd.count());
+        }
+    }
+    Err("no descriptor directory (/proc/self/fd or /dev/fd)".to_string())
+}
+
+/// Save the current `RLIMIT_NOFILE` and lower its SOFT limit. The hard limit
+/// is left untouched so [`restore_nofile`] can put the soft limit back.
+fn set_nofile_soft(soft: u64) -> Result<libc::rlimit, String> {
+    let mut cur: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) } != 0 {
+        return Err(format!("getrlimit: {}", std::io::Error::last_os_error()));
+    }
+    let mut lowered = cur;
+    lowered.rlim_cur = soft.min(cur.rlim_max);
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) } != 0 {
+        return Err(format!("setrlimit: {}", std::io::Error::last_os_error()));
+    }
+    Ok(cur)
+}
+
+/// Restore the soft `RLIMIT_NOFILE` saved by [`set_nofile_soft`].
+fn restore_nofile(saved: libc::rlimit) -> Result<(), String> {
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) } != 0 {
+        return Err(format!(
+            "restore setrlimit: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Spawn the child in [`EMFILE_MODE`], clean up, and require that it exited
+/// successfully AND printed [`EMFILE_MARKER`] (so a child that ran no test
+/// cannot pass vacuously).
+fn assert_emfile_child() {
+    let env = SysEnv::from_process();
+    let tmp = crate::test_support::fixture_tmpdir(&env).expect("tempdir for the emfile tree");
+    let root = tmp.path().to_path_buf();
+    let exe = std::env::current_exe().expect("the running test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .env(MODE_ENV, EMFILE_MODE)
+        .env(ROOT_ENV, &root)
+        .env(DEPTH_ENV, DEPTH.to_string())
+        .output()
+        .expect("spawn the emfile child test binary");
+
+    let _ = std::fs::remove_dir_all(root.join(TOP));
+    let _ = std::fs::remove_dir_all(root.join(COPY));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the descriptor-exhaustion child did not exit successfully: status={:?}\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        out.status,
+    );
+    assert!(
+        stdout.contains(EMFILE_MARKER),
+        "the child exited 0 but never reached the descriptor-exhaustion case, so this \
+         assertion would pass vacuously:\n\
          --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
     );
 }
