@@ -132,14 +132,14 @@ fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
     // `proc_listpgrppids(3)`: the pids of every process in the group —
     // ZOMBIES INCLUDED (a killed descendant that launchd has not yet reaped
     // is still listed). A zombie is NOT live, so every member's state is
-    // read via `proc_pidinfo(PROC_PIDTBSDINFO)` (the `pbi_status` field at
-    // byte offset 4; `SZOMB` = 5) and zombies are excluded — otherwise a
-    // command whose descendants were killed would be falsely reported as
-    // having left background processes. Our own zombie child is excluded by
-    // pid (it is the group leader, still waitable until we reap it). A
-    // member whose state cannot be read has vanished (reaped) in the window
-    // between the enumeration and the read — it is not live, so it is
-    // excluded too.
+    // read via `macos_is_not_live` (which reads the `pbi_status` field at
+    // byte offset 4 through `proc_pidinfo(PROC_PIDTBSDINFO)`) and zombies
+    // are excluded — otherwise a command whose descendants were killed would
+    // be falsely reported as having left background processes. Our own
+    // zombie child is excluded by pid (it is the group leader, still
+    // waitable until we reap it). A member whose state cannot be read has
+    // vanished (reaped) in the window between the enumeration and the read —
+    // it is not live, so it is excluded too.
     let mut buf = [0i32; 4096]; // room for up to 4096 group members
     let n = unsafe { proc_listpgrppids(pgid, buf.as_mut_ptr().cast(), (buf.len() * 4) as i32) };
     if n <= 0 {
@@ -153,21 +153,42 @@ fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
         .collect()
 }
 
-/// Whether the member is NOT live — a zombie (`SZOMB` = 5) or already
-/// vanished (reaped in the window between the enumeration and the read,
-/// which makes `proc_pidinfo` fail): either way it must be EXCLUDED from
-/// the live-members list, or a command whose descendants were killed would
-/// be falsely reported as having left background processes.
+/// THE ONE macOS "is this BSD process status NOT live?" decision, shared by
+/// production's group-member enumeration (`macos_is_not_live`, which reads
+/// `pbi_status` through `proc_pidinfo(PROC_PIDTBSDINFO)`) and the test
+/// oracle (which reads `p_stat` through `sysctl(KERN_PROC_PID)`), so a future
+/// change to the rule cannot update one arm and miss the other. The two
+/// ACCESSORS legitimately differ — the oracle needs the start-time token, and
+/// `proc_pidinfo` reports nothing for a zombie — but the DECISION is this
+/// one comparison.
+///
+/// Only `SZOMB` (= 5 from `sys/proc.h`) is not live: a zombie holds no live
+/// resources. Every other status (`SIDL` idle, `SRUN` running, `SSLEEP`
+/// sleeping, `SSTOP` stopped, and any value a future kernel adds) counts as
+/// LIVE, so an unfamiliar status can never let a leftover escape the
+/// foreground-only check.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_status_is_not_live(status: u32) -> bool {
+    const SZOMB: u32 = 5;
+    status == SZOMB
+}
+
+/// Whether the member is NOT live — a zombie (`SZOMB` = 5, judged by the
+/// shared `macos_status_is_not_live`) or already vanished (reaped in the
+/// window between the enumeration and the read, which makes `proc_pidinfo`
+/// fail): either way it must be EXCLUDED from the live-members list, or a
+/// command whose descendants were killed would be falsely reported as having
+/// left background processes.
 #[cfg(target_os = "macos")]
 fn macos_is_not_live(pid: i32) -> bool {
     // The first 8 bytes of `struct proc_bsdinfo` are `pbi_flags` (offset 0)
     // and `pbi_status` (offset 4, a uint32 copy of the process state); the
     // full struct (with rusage) is ~136 bytes on modern macOS, so the buffer
-    // must be at least that large for `proc_pidinfo` to write anything. A
-    // zombie (`SZOMB` = 5 from sys/proc.h) is not live. A failed read means
-    // the process has vanished — not live either.
+    // must be at least that large for `proc_pidinfo` to write anything. The
+    // live/not-live DECISION is `macos_status_is_not_live`, never a second
+    // copy of the `SZOMB` comparison here. A failed read means the process
+    // has vanished — not live either.
     const PROC_PIDTBSDINFO: i32 = 3;
-    const SZOMB: u32 = 5;
     let mut bsd = [0u8; 256];
     let n = unsafe {
         proc_pidinfo(
@@ -181,7 +202,7 @@ fn macos_is_not_live(pid: i32) -> bool {
     if n < 8 {
         return true; // gone (or unreadable) — not a live member
     }
-    u32::from_le_bytes([bsd[4], bsd[5], bsd[6], bsd[7]]) == SZOMB
+    macos_status_is_not_live(u32::from_le_bytes([bsd[4], bsd[5], bsd[6], bsd[7]]))
 }
 
 #[cfg(target_os = "macos")]
@@ -636,5 +657,33 @@ where
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::macos_status_is_not_live;
+
+    /// The macOS liveness decision, pinned so the ONE shared rule cannot
+    /// silently change: only `SZOMB` (= 5) is not live; a running (`SRUN` =
+    /// 2), sleeping (`SSLEEP` = 3), idle (`SIDL` = 0) or stopped (`SSTOP` =
+    /// 4) process is live; and an unknown status conservatively counts as
+    /// LIVE, so a leftover can never hide behind a status this crate does
+    /// not recognise. This is the macOS side of the guarantee that
+    /// production's enumeration and the oracle agree.
+    #[test]
+    fn macos_status_classifies_bsd_process_states() {
+        assert!(
+            macos_status_is_not_live(5),
+            "SZOMB (= 5) is the ONE not-live status"
+        );
+        assert!(!macos_status_is_not_live(2), "SRUN (running) is live");
+        assert!(!macos_status_is_not_live(3), "SSLEEP (sleeping) is live");
+        assert!(!macos_status_is_not_live(0), "SIDL (idle) is live");
+        assert!(!macos_status_is_not_live(4), "SSTOP (stopped) is live");
+        assert!(
+            !macos_status_is_not_live(99),
+            "an unknown status defaults to LIVE, so a leftover cannot escape"
+        );
     }
 }

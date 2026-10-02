@@ -84,6 +84,27 @@
 //! threads) — lives in the [`unix`] / [`windows`] submodules, selected by
 //! the TWO `mod` declarations below. The rest of the crate calls the
 //! re-exported surface and never sees the switch.
+//!
+//! # The shared liveness decision (single-sourced PER PLATFORM)
+//!
+//! "Is this process a LIVE member of the group?" must have exactly ONE
+//! answer within a platform, or production's enumeration and the test oracle
+//! drift (the bug that motivated this rule: an oracle that counted
+//! `EXIT_DEAD` as live while production did not). The decision is
+//! single-sourced per platform — NOT by one cross-platform predicate,
+//! because the two kernels report a process's state in incompatible shapes:
+//!
+//! * Linux — `is_live_state` over the `/proc/<pid>/stat` state CHARACTER:
+//!   `X` (`EXIT_DEAD`) and `Z` (`EXIT_ZOMBIE`) are not live; every other
+//!   state, including an unknown one, is live. Production's
+//!   `live_group_members` and the oracle's `probe_process` both call it.
+//! * macOS — `unix::macos_status_is_not_live` over the BSD process STATUS
+//!   (a number): `SZOMB` (= 5) is not live; every other status is live.
+//!   Production reads the status as `pbi_status` through
+//!   `proc_pidinfo(PROC_PIDTBSDINFO)`; the oracle reads it as `p_stat`
+//!   through `sysctl(KERN_PROC_PID)` (it also needs the start-time token,
+//!   and `proc_pidinfo` describes no zombie). The accessors differ; the
+//!   decision is the one function.
 
 use crate::env::SysEnv;
 use std::path::PathBuf;
@@ -119,10 +140,13 @@ pub(crate) const TERM_TO_KILL_GRACE: Duration = Duration::from_millis(200);
 /// and tiny in tests (see [`RunnerConfig::reap_bound`]).
 pub(crate) const KILL_REAP_BOUND: Duration = Duration::from_secs(2);
 
-/// THE single definition of "this `/proc/<pid>/stat` state field names a LIVE
-/// process", shared by production's group-member enumeration (the Linux arm
-/// of `live_group_members`) and the test oracle's classification
-/// (`probe_process`), so the two can never drift apart again.
+/// THE single LINUX definition of "this `/proc/<pid>/stat` state field names
+/// a LIVE process", shared by production's group-member enumeration (the
+/// Linux arm of `live_group_members`) and the test oracle's classification
+/// (`probe_process`), so the two can never drift apart again. macOS has its
+/// own single definition, `unix::macos_status_is_not_live`; the two
+/// platforms do NOT share one predicate, because their state encodings are
+/// incompatible (a state character vs a numeric BSD status).
 ///
 /// The kernel emits exactly the state characters in `fs/proc/array.c`'s
 /// `task_state_array`, selected by `task_index_to_char` in
@@ -341,10 +365,11 @@ mod tests {
     }
 
     impl ProcessState {
-        /// Classify a `/proc/<pid>/stat` state field through the SAME
-        /// [`is_live_state`] predicate production uses. The oracle does not
-        /// re-derive the live/gone rule, so an oracle/production divergence
-        /// is impossible by construction.
+        /// Classify a `/proc/<pid>/stat` state field through the SAME Linux
+        /// [`is_live_state`] predicate production's Linux arm uses. The
+        /// oracle does not re-derive the live/gone rule, so an
+        /// oracle/production divergence is impossible by construction. (The
+        /// macOS arm shares `unix::macos_status_is_not_live` the same way.)
         fn of_proc_state(state: &str) -> Self {
             if is_live_state(state) {
                 ProcessState::Live
@@ -358,11 +383,12 @@ mod tests {
     /// pid names no process at all (reaped, or never existed). A ZOMBIE is
     /// reported with the start token it had while alive — which is what lets
     /// [`ProcessId::capture`] record a child that exited before the observer
-    /// ran — but is never reported as live: the runner's `live_group_members`
-    /// excludes every non-live state (zombie AND `X`/`EXIT_DEAD`) from "live",
-    /// and this oracle shares that ONE definition through `is_live_state`
-    /// rather than agreeing with `kill(pid, 0)` (which a zombie still
-    /// answers).
+    /// ran — but is never reported as live. Both arms share production's ONE
+    /// liveness decision for their platform rather than agreeing with
+    /// `kill(pid, 0)` (which a zombie still answers): on Linux,
+    /// [`is_live_state`] over the `/proc` state character (with `X` =
+    /// `EXIT_DEAD` also not live); on macOS, `macos_status_is_not_live` over
+    /// the `p_stat` status this accessor reads.
     #[cfg(target_os = "macos")]
     fn probe_process(pid: u32) -> Option<(ProcessState, u64)> {
         // `KERN_PROC_PID` fills a `struct kinfo_proc`: `p_starttime` is two
@@ -374,7 +400,6 @@ mod tests {
         // growth still returns a readable entry rather than a short write. A
         // reaped pid yields a zero-length result (rc == 0, len == 0).
         const P_STAT_OFFSET: usize = 36;
-        const SZOMB: u8 = 5;
         let mut buf = [0u8; 1024];
         let mut len = buf.len();
         let mut mib = [
@@ -401,7 +426,7 @@ mod tests {
         }
         let sec = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
         let usec = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
-        let state = if buf[P_STAT_OFFSET] == SZOMB {
+        let state = if unix::macos_status_is_not_live(u32::from(buf[P_STAT_OFFSET])) {
             ProcessState::Zombie
         } else {
             ProcessState::Live
@@ -697,10 +722,10 @@ mod tests {
         );
     }
 
-    /// The shared predicate's mapping over every state the kernel can emit,
-    /// plus the defensive lowercase and unknown cases. Pinned so the ONE
-    /// definition cannot drift: production's enumeration and the oracle both
-    /// read this mapping.
+    /// The shared LINUX predicate's mapping over every state the kernel can
+    /// emit, plus the defensive lowercase and unknown cases. Pinned so the
+    /// ONE Linux definition cannot drift: production's Linux enumeration and
+    /// the oracle both read this mapping.
     #[test]
     fn is_live_state_classifies_kernel_states() {
         // LIVE: the non-exit states `task_state_array` can report.
@@ -723,19 +748,25 @@ mod tests {
     }
 
     /// The oracle's own semantics, pinned against the kernel's state table so
-    /// it can never silently diverge from production: the oracle classifies
-    /// through the SAME `is_live_state` predicate production uses, and this
-    /// test pins that predicate's mapping — so a regression that counts `X`
-    /// (EXIT_DEAD) as live again, the exact bug this definition exists to
-    /// catch, fails here. On top of the table: a LIVE process is not gone, a
-    /// ZOMBIE is gone, and a pid whose start token moved is a DIFFERENT
-    /// process, so the tracked one is gone even though the number still
-    /// answers.
+    /// it can never silently diverge from production. The shared rule is PER
+    /// PLATFORM: on Linux the oracle classifies a `/proc` state character
+    /// through the SAME `is_live_state` predicate production uses, and the
+    /// state-table loop below pins that mapping — so a regression that counts
+    /// `X` (EXIT_DEAD) as live again, the exact bug this definition exists to
+    /// catch, fails here. On macOS the oracle classifies the BSD status
+    /// through the SAME `unix::macos_status_is_not_live` production uses
+    /// (pinned by `macos_status_classifies_bsd_process_states` in `unix`),
+    /// and the live-child and un-reaped-zombie probes below exercise that
+    /// shared decision end to end. On top of the table: a LIVE process is not
+    /// gone, a ZOMBIE is gone, and a pid whose start token moved is a
+    /// DIFFERENT process, so the tracked one is gone even though the number
+    /// still answers.
     #[test]
     fn process_oracle_matches_the_live_definition() {
-        // The kernel state table, checked through the shared predicate AND
-        // the oracle's derivation from it. Pinning the shared rule pins both
-        // sides at once (the oracle does not re-derive it).
+        // The Linux kernel state table, checked through the shared
+        // `is_live_state` predicate AND the oracle's derivation from it.
+        // Pinning the shared rule pins both sides at once (the oracle does
+        // not re-derive it).
         for state in ["R", "S", "D", "T", "t", "P", "I"] {
             assert!(
                 is_live_state(state),
