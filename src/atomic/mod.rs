@@ -65,9 +65,9 @@
 //! durability). That component confinement covers the `_fd` surface only:
 //! [`unix`]'s PATH-BASED free functions (`set_private`,
 //! `write_atomic_replace`, `sync_parent_dir`, `ensure_private_dir`,
-//! `ensure_private_dir_durable`, `remove_dir_all_path`) take an ordinary
-//! path and are NOT covered — see [`unix`]'s module docs for the exact
-//! split.
+//! `ensure_private_dir_durable`, `copy_dir_recursive`, `remove_dir_all_path`)
+//! take an ordinary path and are NOT covered — see [`unix`]'s module docs for
+//! the exact split.
 //! [`windows`] is the path-based implementation with documented weaker
 //! guarantees: no directory descriptors (the root is a path), no
 //! parent-directory fsync durability, a non-atomic replace (Windows
@@ -100,10 +100,15 @@ pub use windows::*;
 /// `windows`, so the claim is stated once and cannot drift from the
 /// implementations it describes:
 ///
-/// * `true` on Unix: the `unix` module resolves every parent component with
-///   component-wise `openat(O_NOFOLLOW)` and raises `ELOOP` on a symlink
-///   there for EVERY primitive, reads included. That is the confinement an
-///   operation can rely on INSTEAD of a live path check.
+/// * `true` on Unix: on the `_fd` surface the `unix` module resolves every
+///   parent component with component-wise `openat(O_NOFOLLOW)` and raises
+///   `ELOOP` on a symlink there for EVERY primitive of that surface, reads
+///   included. That is the confinement an operation can rely on INSTEAD of a
+///   live path check. The property does NOT extend to [`unix`]'s PATH-BASED
+///   free functions (`set_private`, `write_atomic_replace`, `sync_parent_dir`,
+///   `ensure_private_dir`, `ensure_private_dir_durable`, `copy_dir_recursive`,
+///   `remove_dir_all_path`): those take an ordinary path, so an intermediate
+///   symlink in it IS followed — see [`unix`]'s module docs for the split.
 /// * `false` on Windows: the `windows` module is path-based (`Path::join`
 ///   plus `std::fs`), and `Path::join` has no component-wise `O_NOFOLLOW`,
 ///   so a symlink in a path component is followed. A caller must not treat a

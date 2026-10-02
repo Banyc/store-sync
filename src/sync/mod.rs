@@ -47,6 +47,16 @@
 //!
 //! # The contract, and how the crate enforces it
 //!
+//! * **The transport's host identity is prepared before the first remote
+//!   request of a run.** The entry points call
+//!   [`crate::transport::Remote::prepare_identity`] themselves — before the
+//!   destination lock record is created — rather than asking the caller for an
+//!   undocumented extra call. The default is a no-op (and
+//!   [`crate::transport::LocalTransport`] does not override it), so a local
+//!   destination is unaffected; for [`crate::transport::SshTransport`] it
+//!   creates the control-socket directory and pins the verified host key. The
+//!   caller still supplies the identity MATERIAL at construction; the crate
+//!   does not trust-on-first-use.
 //! * **The destination is exclusively owned, and the source is quiescent.**
 //!   These are CONDITIONS THE CALLER MUST UPHOLD for the run to be
 //!   well-defined, and the crate ENFORCES as much of them as it can rather than
@@ -56,7 +66,10 @@
 //!   TAKES the destination's operation lock (a [`crate::lock::FileLock`] on the
 //!   record named by [`apply::destination_lock_path`]) before reading the
 //!   destination manifest and holds it for the WHOLE run, so a cooperating
-//!   writer that tries to acquire the same record is refused at acquisition. A
+//!   writer that tries to acquire the same record is refused at acquisition.
+//!   That record is a SIBLING of the destination root and is a DIFFERENT file
+//!   from the in-root [`crate::transport::Layout::lock`], so the two locks do
+//!   NOT exclude each other (see [`apply::destination_lock_path`]). A
 //!   destination whose lock the crate CANNOT take — a REMOTE (far-side) one, or
 //!   a root with no sibling record location — is REFUSED by [`apply::sync`],
 //!   [`apply::push`], and [`apply::pull`] rather than run unowned; the

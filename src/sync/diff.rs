@@ -25,7 +25,7 @@ use crate::manifest::{
     TreeEntry, TreeMetadata, canonicalize_remote_entries, canonicalize_tree,
     remote_tree_verify_script,
 };
-use crate::transport::Remote;
+use crate::transport::{ExecOutcome, Remote};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
@@ -156,6 +156,13 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// reason an ABSENT or non-directory root is an error on BOTH branches: a
 /// caller pushing to a fresh destination creates the destination root (or
 /// provisions the layout) first; it is never silently described as empty.
+///
+/// A non-zero exit is classified by LAYER ([`remote_manifest_failure`]): the
+/// remote command is `ssh … exec -- perl -e <script> <root>`, and an `ssh`
+/// failure (its reserved exit status 255, or a control-socket/connection
+/// diagnostic) is reported as a TRANSPORT failure, not blamed on a missing
+/// `perl`. Only the shell's "could not start perl" statuses (126/127) suggest
+/// that `perl` may be absent.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     let root = remote.root();
     if remote.is_local() {
@@ -184,14 +191,113 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     ];
     let out = remote.exec(&argv, REMOTE_MANIFEST_TIMEOUT)?;
     if !out.success() {
-        return Err(Error::transport(format!(
-            "remote tree verification at {} failed (exit {}): {} (is perl installed on the remote host?)",
-            root.display(),
-            out.exit_code,
-            out.stderr.trim()
-        )));
+        return Err(remote_manifest_failure(root, &out));
     }
     canonicalize_remote_entries(&out.stdout, root)
+}
+
+/// The error for a NON-ZERO exit of the far-side manifest command, classified
+/// by the LAYER that failed.
+///
+/// The command is `ssh … exec -- perl -e <script> <root>`, so a non-zero exit
+/// can come from any of three layers, and they are not interchangeable:
+///
+/// * the TRANSPORT failed before the command ran — `ssh` reserves exit status
+///   255 for its own failures (connection refused/timed out, authentication,
+///   host-key verification, the `ControlMaster` control socket) and the runner
+///   reports `-1` when it killed the child at the deadline;
+/// * the far-side `perl` could not be STARTED — the remote shell's 126/127
+///   ("found but not executable" / "not found"), which is the only layer that
+///   is actually a statement about `perl`;
+/// * `perl` ran and the script exited non-zero (a missing root, an unreadable
+///   directory, a name that cannot cross the wire, ...).
+///
+/// Pre-fix every non-zero exit appended "(is perl installed on the remote
+/// host?)", so an `ssh` exit 255 — including the `unix_listener:` control-
+/// socket bind failure — was mislabeled as a missing interpreter.
+fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
+    let stderr = out.stderr.trim();
+    let stderr = if stderr.is_empty() {
+        "(no stderr)"
+    } else {
+        stderr
+    };
+    if perl_could_not_start(out) {
+        return Error::transport(format!(
+            "remote tree verification at {} could not start the far-side `perl` (exit {}): {} \
+             (is perl installed on the remote host?)",
+            root.display(),
+            out.exit_code,
+            stderr
+        ));
+    }
+    if transport_failed_before_the_command(out) {
+        return Error::transport(format!(
+            "remote tree verification at {} could not run: the transport failed before the \
+             far-side command started (exit {}): {} (this is a transport-level failure — \
+             connection, authentication, host key, or the ssh control socket)",
+            root.display(),
+            out.exit_code,
+            stderr
+        ));
+    }
+    Error::transport(format!(
+        "remote tree verification at {} failed inside the far-side manifest script (exit {}): {}",
+        root.display(),
+        out.exit_code,
+        stderr
+    ))
+}
+
+/// Whether `out` reports that the far-side `perl` program itself could not be
+/// started (as opposed to running and exiting non-zero).
+fn perl_could_not_start(out: &ExecOutcome) -> bool {
+    // 126 = found but not executable; 127 = not found. The remote command is
+    // `exec -- perl -e …`, so both statuses name the `perl` program.
+    if out.exit_code == 126 || out.exit_code == 127 {
+        return true;
+    }
+    // A shell that reports the not-found status through a wrapper prints the
+    // diagnostic instead; accept that spelling as the same stage.
+    out.stderr.contains("perl: command not found")
+        || out.stderr.contains("perl: not found")
+        || out.stderr.contains("perl: No such file")
+}
+
+/// Whether `out` reports a failure of the TRANSPORT layer, before the far-side
+/// command could run at all.
+fn transport_failed_before_the_command(out: &ExecOutcome) -> bool {
+    // The runner's timeout/no-status sentinel: the child was killed at the
+    // deadline, so no remote command produced this outcome.
+    if out.exit_code == -1 {
+        return true;
+    }
+    // `ssh` exits 255 for its OWN failures (connection refused/timed out,
+    // authentication, host-key verification, the control socket). A far-side
+    // perl `die` CAN also propagate 255, but the stderr is preserved verbatim
+    // in the message, and not suggesting a missing `perl` is the conservative
+    // direction: this never blames the interpreter for a transport fault.
+    if out.exit_code == 255 {
+        return true;
+    }
+    // A few ssh diagnostics do not carry the `ssh:` prefix, so accept the
+    // well-known spellings too. `unix_listener:` is the `ControlMaster`
+    // socket-bind failure (the crate's mux directory disappeared).
+    const TRANSPORT_MARKERS: &[&str] = &[
+        "ssh: ",
+        "kex_exchange_identification",
+        "Permission denied",
+        "Host key verification failed",
+        "Connection closed by",
+        "Connection refused",
+        "Connection timed out",
+        "No route to host",
+        "Network is unreachable",
+        "unix_listener:",
+    ];
+    TRANSPORT_MARKERS
+        .iter()
+        .any(|marker| out.stderr.contains(marker))
 }
 
 /// Classify every path in the union of `source` and `dest`, sorted by path.
@@ -407,5 +513,68 @@ mod tests {
             matches!(remote_manifest(&tf), Err(Error::Transport(_))),
             "a non-directory local remote root must be a transport error"
         );
+    }
+
+    /// F3: an `ssh`-level failure (exit 255, no far-side command) is reported
+    /// as a TRANSPORT failure and is NOT blamed on a missing `perl`. Pre-fix
+    /// every non-zero exit appended "(is perl installed on the remote host?)".
+    #[test]
+    fn an_ssh_level_failure_is_not_blamed_on_perl() {
+        let out = ExecOutcome {
+            exit_code: 255,
+            stdout: String::new(),
+            stderr:
+                "unix_listener: cannot bind to path /tmp/dmux/mux-123: No such file or directory"
+                    .to_string(),
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("transport-level failure"),
+            "an ssh 255 must be reported as a transport failure: {msg}"
+        );
+        assert!(
+            !msg.contains("is perl installed"),
+            "an ssh 255 must not suggest perl is missing: {msg}"
+        );
+        assert!(msg.contains("/srv/store"), "the far side is named: {msg}");
+        assert!(
+            msg.contains("unix_listener"),
+            "the ssh diagnostic is preserved: {msg}"
+        );
+    }
+
+    /// F3: the perl-missing suggestion is reserved for the shell's "could not
+    /// start perl" status (126/127).
+    #[test]
+    fn a_missing_perl_is_reported_as_the_perl_stage() {
+        let out = ExecOutcome {
+            exit_code: 127,
+            stdout: String::new(),
+            stderr: "perl: command not found".to_string(),
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("is perl installed on the remote host?"),
+            "a 127 must suggest perl may be absent: {msg}"
+        );
+    }
+
+    /// F3: a script-level failure (perl ran and exited non-zero) is reported as
+    /// the far-side script failure — neither a transport fault nor a missing
+    /// interpreter.
+    #[test]
+    fn a_script_level_failure_is_reported_as_the_far_side_script() {
+        let out = ExecOutcome {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: "not a directory: /srv/store".to_string(),
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("failed inside the far-side manifest script"),
+            "a script exit must be reported as the script failure: {msg}"
+        );
+        assert!(!msg.contains("is perl installed"), "{msg}");
+        assert!(!msg.contains("transport-level failure"), "{msg}");
     }
 }

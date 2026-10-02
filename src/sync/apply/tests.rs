@@ -950,6 +950,16 @@ struct RecordingRemote {
     rename_targets: Mutex<Vec<String>>,
     set_mode_calls: AtomicUsize,
     exec_failure: Option<ExecOutcome>,
+    /// `prepare_identity` calls seen, and the remote-request counter at the
+    /// moment of each call: the F1 ordering instrument. A call that ran after
+    /// the first remote request records a non-zero index.
+    identity_calls: AtomicUsize,
+    identity_op_index: Mutex<Vec<usize>>,
+    /// A message to fail `prepare_identity` with: the F1 failure instrument.
+    identity_failure: Option<String>,
+    /// Every remote request (ANY trait operation, read or mutating), in order.
+    /// `prepare_identity` is NOT a remote request: it PREPARES the transport.
+    remote_requests: AtomicUsize,
     /// A crafted FAR-SIDE manifest, returned instead of running the perl
     /// verification script when `is_local` is false. It lets a test describe a
     /// source tree THIS host's filesystem cannot hold (a case-SENSITIVE source
@@ -1057,6 +1067,10 @@ impl RecordingRemote {
             rename_targets: Mutex::new(Vec::new()),
             set_mode_calls: AtomicUsize::new(0),
             exec_failure: None,
+            identity_calls: AtomicUsize::new(0),
+            identity_op_index: Mutex::new(Vec::new()),
+            identity_failure: None,
+            remote_requests: AtomicUsize::new(0),
             manifest_output: None,
             after_write: None,
             after_rename: None,
@@ -1099,6 +1113,7 @@ impl RecordingRemote {
     /// Fire the one-shot swap, at most once per transport.
     #[cfg(unix)]
     fn maybe_swap_before_first_op(&self) {
+        self.note_remote_request();
         if self.first_op_fired.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -1112,6 +1127,7 @@ impl RecordingRemote {
     }
     #[cfg(not(unix))]
     fn maybe_swap_before_first_op(&self) {
+        self.note_remote_request();
         if self.first_op_fired.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -1138,6 +1154,28 @@ impl RecordingRemote {
     /// destination) this run performed.
     fn metadata_probes(&self) -> usize {
         self.metadata_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `prepare_identity` calls this transport saw (F1).
+    fn identity_calls(&self) -> usize {
+        self.identity_calls.load(Ordering::SeqCst)
+    }
+
+    /// The remote-request count observed at each `prepare_identity` call (F1):
+    /// `[0]` means the identity was prepared before ANY remote request.
+    fn identity_op_index(&self) -> Vec<usize> {
+        self.identity_op_index.lock().unwrap().clone()
+    }
+
+    /// The number of remote requests (ANY trait operation) this transport saw.
+    fn remote_requests(&self) -> usize {
+        self.remote_requests.load(Ordering::SeqCst)
+    }
+
+    /// Count one remote request. Every trait operation that reaches the wire
+    /// calls this; `prepare_identity` deliberately does NOT.
+    fn note_remote_request(&self) {
+        self.remote_requests.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Run the failed-write writer, if this is the write it targets.
@@ -1200,6 +1238,17 @@ impl Remote for RecordingRemote {
     }
     fn is_local(&self) -> bool {
         self.is_local
+    }
+    fn prepare_identity(&self) -> Result<()> {
+        self.identity_calls.fetch_add(1, Ordering::SeqCst);
+        self.identity_op_index
+            .lock()
+            .unwrap()
+            .push(self.remote_requests.load(Ordering::SeqCst));
+        if let Some(message) = &self.identity_failure {
+            return Err(Error::transport(message.clone()));
+        }
+        Ok(())
     }
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.maybe_swap_before_first_op();
@@ -1267,10 +1316,12 @@ impl Remote for RecordingRemote {
         Ok(())
     }
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        self.note_remote_request();
         self.record("try_write_new", rel);
         self.inner.try_write_new(rel, data)
     }
     fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.note_remote_request();
         self.record("create_dir", rel);
         self.inner.create_dir(rel)
     }
@@ -1369,6 +1420,7 @@ impl Remote for RecordingRemote {
         self.inner.symlink(target, link)
     }
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        self.note_remote_request();
         self.inner.read_link(rel)
     }
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
@@ -1451,6 +1503,7 @@ impl Remote for RecordingRemote {
         self.inner.metadata(rel)
     }
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        self.note_remote_request();
         if let Some(out) = &self.exec_failure {
             return Ok(out.clone());
         }
@@ -1466,6 +1519,7 @@ impl Remote for RecordingRemote {
         self.inner.exec(argv, timeout)
     }
     fn filesystem_bytes(&self) -> Result<FsBytes> {
+        self.note_remote_request();
         self.inner.filesystem_bytes()
     }
 }
@@ -10608,6 +10662,178 @@ fn sync_unowned_runs_against_a_remote_destination_and_still_verifies() {
         canonicalize_tree(&src).unwrap(),
         canonicalize_tree(&dst).unwrap()
     );
+}
+
+// ---------------------------------------------------------------------------
+// F1: the sync entry points prepare the transport's host identity.
+// ---------------------------------------------------------------------------
+
+/// F1: every sync entry point that reaches the transport runs
+/// [`Remote::prepare_identity`] BEFORE its first remote request.
+///
+/// A real `sshd` is not available to the suite, so this pins the CONTRACT with
+/// a [`Remote`] double that records WHEN `prepare_identity` was called
+/// relative to the first remote request. It does NOT prove real-SSH behaviour
+/// (no control socket is created, no host key is pinned): it proves the run
+/// calls the transport's own preparation at the right point. See
+/// `a_transport_preparation_failure_leaves_nothing_behind` for the failure
+/// contract.
+#[test]
+fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let local = dir.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    let remote_root = dir.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+
+    // A non-local double: `remote_manifest` must go through `exec`, so the
+    // FIRST remote request is observable. The far-side command fails, so the
+    // run ends there — but the identity must already be prepared.
+    let broken_exec = || ExecOutcome {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: "far-side boom".to_string(),
+    };
+
+    let mut owned = RecordingRemote::over(transport(&remote_root), false);
+    owned.exec_failure = Some(broken_exec());
+    let err = sync(Direction::Pull, &local, &owned, &ReplaceAll, Keep)
+        .expect_err("the far-side manifest command failed");
+    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert_eq!(
+        owned.identity_calls(),
+        1,
+        "the owned entry point must prepare the transport identity exactly once"
+    );
+    assert_eq!(
+        owned.identity_op_index(),
+        vec![0],
+        "prepare_identity must run before the FIRST remote request"
+    );
+    assert!(
+        owned.remote_requests() > 0,
+        "the run must have reached the transport"
+    );
+
+    // The explicitly-unowned entry point (the only way to reach a remote
+    // destination) prepares too.
+    let mut unowned = RecordingRemote::over(transport(&remote_root), false);
+    unowned.exec_failure = Some(broken_exec());
+    let _ = sync_unowned(Direction::Pull, &local, &unowned, &ReplaceAll, Keep)
+        .expect_err("the far-side manifest command failed");
+    assert_eq!(unowned.identity_calls(), 1);
+    assert_eq!(unowned.identity_op_index(), vec![0]);
+    assert!(unowned.remote_requests() > 0);
+}
+
+/// F1: a failure from the transport's identity preparation surfaces as THAT
+/// failure and leaves no mutation, no residue, and no held lock.
+///
+/// Preparation runs before the destination lock record is created, so a
+/// destination the entry point WOULD have locked is left with no lock record at
+/// all — strictly stronger than "the lock is released". The double is
+/// non-local so the failure is observed before any remote request.
+#[test]
+fn a_transport_preparation_failure_leaves_nothing_behind() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let dst = dir.path().join("dst");
+    write(&dst.join("f"), b"payload");
+    let before = canonicalize_tree(&dst).unwrap();
+
+    let mut remote = RecordingRemote::over(transport(&dst), false);
+    remote.identity_failure = Some("injected identity preparation failure".to_string());
+    // The run would fail later anyway; the assertion is that the diagnostic
+    // names the PREPARATION failure, not a downstream "identity is not
+    // configured" or a far-side failure.
+    remote.exec_failure = Some(ExecOutcome {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: "downstream far-side failure".to_string(),
+    });
+
+    // A PULL puts the LOCAL tree on the destination side, so the owned entry
+    // point would have taken the destination lock had preparation succeeded.
+    let err = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Delete)
+        .expect_err("the injected identity preparation failure must fail the run");
+    let msg = err.error().to_string();
+    assert!(
+        msg.contains("injected identity preparation failure"),
+        "the underlying preparation failure is reported: {msg}"
+    );
+    assert!(
+        msg.contains("host-identity preparation failed"),
+        "the diagnostic names the preparation stage: {msg}"
+    );
+    assert_eq!(remote.ops(), 0, "no mutation was attempted");
+    assert_eq!(
+        remote.remote_requests(),
+        0,
+        "the failure is before every remote request"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap(),
+        before,
+        "the destination is untouched"
+    );
+    let lock = destination_lock_path(&dst).expect("a sibling record location");
+    assert!(
+        !lock.exists(),
+        "a run refused before preparation leaves no lock record at {lock:?}"
+    );
+}
+
+/// F2: the sibling destination record and the in-root `Layout::lock` are
+/// DIFFERENT files and do NOT exclude each other. A caller holding a
+/// [`crate::lock::FileLock`] on `<dst>/state/operation.lock` (the
+/// `Layout::lock` path) does not stop an owned `sync` from running against
+/// `<dst>`, and while a `sync` holds the sibling record the in-root lock is
+/// still free. The module docs state this precisely; this test pins it so the
+/// old "SAME record" claim cannot come back silently.
+#[test]
+fn the_sibling_record_does_not_compose_with_the_in_root_layout_lock() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"payload");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+
+    // `Layout::empty().lock` is the CONVENTIONAL in-root record.
+    let in_root = dst.join(Layout::empty().lock.as_path());
+    let sibling = destination_lock_path(&dst).expect("a sibling record location");
+    assert_ne!(
+        sibling, in_root,
+        "the sibling record and the in-root Layout::lock are different files"
+    );
+
+    // Direction 1: holding the in-root lock does not exclude an owned `sync`.
+    let in_root_guard = crate::lock::FileLock::acquire(&in_root, "in-root-holder")
+        .expect("take the in-root layout lock");
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+        .expect("the in-root layout lock must not exclude a sync");
+    assert!(report.applied.contains(&"f".to_string()), "{report:?}");
+    drop(in_root_guard);
+
+    // Direction 2: while the sync holds the sibling record, the in-root lock is
+    // still free. A NEW source entry forces the policy probe to run INSIDE the
+    // run, at which point the sibling record is held.
+    write(&src.join("g"), b"second");
+    let probe_path = in_root.clone();
+    let probe_fired = std::sync::Arc::new(AtomicBool::new(false));
+    let fired = probe_fired.clone();
+    let probe = move |_rel: &str, _kind: EntryKind| {
+        let guard = crate::lock::FileLock::acquire(&probe_path, "in-root-probe")
+            .expect("a sync holding the sibling record must not exclude the in-root lock");
+        drop(guard);
+        fired.store(true, Ordering::SeqCst);
+        EntryPolicy::Replace
+    };
+    let report = sync(Direction::Push, &src, &transport(&dst), &probe, Keep)
+        .expect("the run must succeed with the in-run probe");
+    assert!(
+        probe_fired.load(Ordering::SeqCst),
+        "the in-run probe must have observed the held sibling record"
+    );
+    assert!(report.applied.contains(&"g".to_string()), "{report:?}");
 }
 
 /// THE SOURCE-QUIESCENCE PRECONDITION, enforced rather than trusted. A source

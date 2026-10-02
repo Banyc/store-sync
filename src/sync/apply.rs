@@ -374,14 +374,31 @@
 //! `SIGKILL`ed holder releases it too, because the kernel closes the process's
 //! descriptors. There is ONE authority for how a lock is taken —
 //! [`crate::lock::FileLock`], the same primitive the crate documents for its
-//! push and checkpoint pipelines — and the record name reuses the crate's
-//! reserved `operation.lock` spelling (see [`destination_lock_path`]).
+//! push and checkpoint pipelines — and the record reuses the crate's reserved
+//! `operation.lock` FILE NAME. That is a NAME, not the same file: the sibling
+//! record does NOT compose with the in-root
+//! [`crate::transport::Layout::lock`] (see [`destination_lock_path`] and
+//! "Why the lock record is a SIBLING of the destination root").
 //!
 //! ### The conditions the crate ENFORCES (and what a caller still owes)
 //!
 //! The crate does not trust these conditions to documentation; it builds them
 //! into the entry points and into the run itself.
 //!
+//! 0. **The transport has prepared its own host identity.** Every entry point
+//!    calls [`Remote::prepare_identity`] BEFORE the first remote request of
+//!    the run and BEFORE the destination lock record is created. For
+//!    [`crate::transport::SshTransport`] that creates the local
+//!    control-socket directory and pins the verified host key; without it the
+//!    documented API was unusable and the first remote request failed with a
+//!    misleading "host identity is not configured" (the identity WAS
+//!    configured, it had simply not been prepared). The default is a no-op and
+//!    [`crate::transport::LocalTransport`] does not override it, so a local
+//!    destination is unaffected. The crate discharges the PREPARATION; the
+//!    caller still owes the identity MATERIAL — a `known_hosts` path or a
+//!    pre-verified `host_key_fingerprint` supplied at construction — because a
+//!    crate that invented one would be trusting on first use, which this
+//!    crate refuses.
 //! 1. **The destination is exclusively owned. The crate enforces this for a
 //!    LOCAL destination by TAKING the lock itself.** The owned entry points —
 //!    [`sync`], [`push`], and [`pull`] — acquire the destination's operation
@@ -453,9 +470,40 @@
 //! creates NOTHING, not even the root" and "two empty trees are a no-op"
 //! contracts (both pinned by tests). [`destination_lock_path`] therefore
 //! derives a dot-prefixed sibling record in the destination root's parent:
-//! taking the lock never creates or enters the tree the run is judging, and
-//! the record reuses the reserved `operation.lock` spelling
-//! ([`crate::transport::Layout::lock`]) rather than inventing a mechanism.
+//! taking the lock never creates or enters the tree the run is judging. The
+//! record reuses the reserved `operation.lock` FILE NAME, not the PATH of
+//! [`crate::transport::Layout::lock`].
+//!
+//! ### The sibling record does NOT compose with the in-root `Layout::lock`
+//!
+//! [`crate::transport::Layout::empty`]'s `lock` is the IN-ROOT
+//! `state/operation.lock` (inside the destination root); this record is
+//! `<parent>/.<name>.operation.lock` (outside it). They are DIFFERENT files,
+//! so the two locks are INDEPENDENT and do NOT exclude each other in either
+//! direction:
+//!
+//! * a caller holding [`crate::lock::FileLock`] on the in-root layout lock
+//!   does NOT stop a [`sync`] from taking the sibling record and running;
+//! * a [`sync`] holding the sibling record does NOT stop a caller from taking
+//!   the in-root layout lock.
+//!
+//! A caller that needs one lock to exclude the other must take BOTH (or
+//! serialize at a higher level); a non-cooperating writer that takes neither
+//! is still only DETECTED, never excluded (see "The lock discipline").
+//!
+//! Composing the two here is NOT done, and cannot be done from this side:
+//!
+//! * [`Remote`] exposes no accessor for its [`crate::transport::Layout`], so
+//!   the applier cannot learn the caller's in-root lock path from a
+//!   `&dyn Remote`; assuming the conventional `state/operation.lock` would be
+//!   wrong for a custom layout.
+//! * Taking the in-root record would OPEN (and, when absent, CREATE) a file
+//!   INSIDE the destination root, creating the root and its `state` directory
+//!   for a run that must create nothing, entering them in the destination
+//!   manifest, and creating them at the store-private `0o700` mode the lock
+//!   helper uses — the exact three things the sibling location exists to
+//!   avoid. Taking it only "when it already exists" is a check-then-act race
+//!   and still leaves the fresh-destination case uncovered.
 //!
 //! Because the record is a SIBLING, placing it can touch a directory OUTSIDE
 //! the destination root that the CALLER owns — the root's parent, and any
@@ -1223,10 +1271,19 @@ impl From<Error> for SyncError {
 /// deliberately outside the tree the run judges, because taking a lock inside
 /// the tree would create the destination root for a run that must create
 /// nothing and would enter the destination manifest — see the module docs
-/// ("Why the lock record is a SIBLING of the destination root"). The spelling
-/// reuses the crate's reserved `operation.lock` name
-/// ([`crate::transport::Layout::lock`]), so it is the SAME record name a push
-/// or checkpoint pass would use, not a new lock mechanism.
+/// ("Why the lock record is a SIBLING of the destination root").
+///
+/// The record reuses the crate's reserved `operation.lock` FILE NAME, not the
+/// path of [`crate::transport::Layout::lock`]. Those are DIFFERENT files:
+/// [`crate::transport::Layout::empty`]'s `lock` is the IN-ROOT
+/// `state/operation.lock`, while this record is
+/// `<parent>/.<name>.operation.lock`. The two locks are therefore INDEPENDENT
+/// and do NOT exclude each other: a caller holding [`crate::lock::FileLock`]
+/// on the in-root `Layout::lock` does not exclude a [`sync`], and a [`sync`]
+/// holding this record does not exclude a caller that takes the in-root layout
+/// lock. They are not composed here and cannot be composed from this side; the
+/// module docs ("Why the lock record is a SIBLING of the destination root")
+/// state exactly why.
 ///
 /// `None` when no sibling location can be derived: a filesystem root (`/`) has
 /// no parent, and a path with no final component names no record. [`sync`],
@@ -1311,24 +1368,16 @@ fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
     )
 }
 
-/// Acquire the destination's operation lock for a run that REQUIRES it, or
-/// refuse; this is the enforcement behind [`sync`]'s owned-by-default
-/// contract.
+/// The destination lock record the owned entry points must take, or a REFUSAL
+/// when the crate cannot hold the destination.
 ///
-/// A destination the crate cannot lock — a REMOTE one (`is_local()` false), for
-/// which no local descriptor lock exists, or one with no sibling record
-/// location ([`destination_lock_path`] is `None`) — is an ERROR here rather
-/// than a silent unowned run: the caller who wants the run must name
-/// [`sync_unowned`]. The [`FileLock`] is returned inside the token so it lives
-/// exactly as long as the run: the drop runs on the success path, on every
-/// error return, and on a panic that unwinds, and the kernel releases the flock
-/// when the descriptor closes even if the drop never runs (a `SIGKILL`ed
-/// holder).
-fn lock_destination(
-    direction: Direction,
-    dest_is_local: bool,
-    dest_root: &Path,
-) -> Result<DestinationOwnership> {
+/// PURE by construction: it derives the sibling record path and validates that
+/// the record has a real parent directory, but creates nothing and takes no
+/// lock. It exists so [`run_entry`] can refuse a destination the crate cannot
+/// hold BEFORE it prepares a transport identity or creates any file — a
+/// refusal must leave no residue. [`lock_destination`] runs the same check and
+/// then performs the acquisition.
+fn destination_lock_record(dest_is_local: bool, dest_root: &Path) -> Result<PathBuf> {
     if !dest_is_local {
         return Err(Error::preflight(format!(
             "refusing to sync into the REMOTE destination {} without its operation lock: the crate cannot hold a far-side lock for the whole run, so this call cannot own the destination. If the caller holds the destination for the run, call `sync_unowned` (the explicitly weaker entry point); otherwise sync into a LOCAL destination.",
@@ -1359,9 +1408,35 @@ fn lock_destination(
             path.display()
         )));
     }
-    // Create a MISSING parent chain at the platform default mode BEFORE the
-    // lock helper sees it, so the helper never narrows a caller-owned directory
-    // to store-private `0o700` (see [`create_lock_parent`]).
+    Ok(path)
+}
+
+/// Acquire the destination's operation lock for a run that REQUIRES it, or
+/// refuse; this is the enforcement behind [`sync`]'s owned-by-default
+/// contract.
+///
+/// A destination the crate cannot lock — a REMOTE one (`is_local()` false), for
+/// which no local descriptor lock exists, or one with no sibling record
+/// location ([`destination_lock_path`] is `None`) — is an ERROR here rather
+/// than a silent unowned run: the caller who wants the run must name
+/// [`sync_unowned`]. The refusal check is [`destination_lock_record`]. The
+/// [`FileLock`] is returned inside the token so it lives exactly as long as
+/// the run: the drop runs on the success path, on every error return, and on a
+/// panic that unwinds, and the kernel releases the flock when the descriptor
+/// closes even if the drop never runs (a `SIGKILL`ed holder).
+fn lock_destination(
+    direction: Direction,
+    dest_is_local: bool,
+    dest_root: &Path,
+) -> Result<DestinationOwnership> {
+    let path = destination_lock_record(dest_is_local, dest_root)?;
+    // The record's parent exists and is non-empty (validated above). Create a
+    // MISSING parent chain at the platform default mode BEFORE the lock helper
+    // sees it, so the helper never narrows a caller-owned directory to
+    // store-private `0o700` (see [`create_lock_parent`]).
+    let parent = path
+        .parent()
+        .expect("destination_lock_record validated a non-empty parent");
     create_lock_parent(parent)?;
     let op_id = destination_op_id(direction, dest_root);
     Ok(DestinationOwnership::Locked(FileLock::acquire(
@@ -1419,6 +1494,16 @@ enum DestinationOwnership {
 ///
 /// # What the crate enforces, and what a caller still owes
 ///
+/// 0. **The transport's host identity is prepared, and `sync` ENFORCES it** by
+///    calling [`Remote::prepare_identity`] itself before the first remote
+///    request and before the destination lock record is created. The default
+///    is a no-op and [`crate::transport::LocalTransport`] does not override
+///    it, so a local destination is unaffected; for
+///    [`crate::transport::SshTransport`] this is what creates the
+///    control-socket directory and pins the verified host key. The caller
+///    still supplies the identity MATERIAL (`known_hosts` or
+///    `host_key_fingerprint`) at construction: the crate will not
+///    trust-on-first-use.
 /// 1. **The destination is exclusively owned, and `sync` ENFORCES it by
 ///    TAKING the lock itself** ([`crate::lock::FileLock`] on the record named
 ///    by [`destination_lock_path`]), before the destination manifest is read
@@ -1559,6 +1644,32 @@ fn run_entry(
         Direction::Push => remote.is_local(),
         Direction::Pull => true,
     };
+    // (1) REFUSE an unlockable destination BEFORE preparing a transport
+    // identity or creating a lock record: a refusal must leave no residue, and
+    // the refusal is a pure decision that needs no transport. The same check
+    // runs again inside `lock_destination`, which then acquires.
+    if matches!(requested, RequestedOwnership::Locked) {
+        destination_lock_record(dest_is_local, &dest_root).map_err(SyncError::from)?;
+    }
+    // (2) Prepare the TRANSPORT's OWN identity before the first remote request
+    // of the run and before the destination lock record is created. This is
+    // what the documented API omitted: the SSH transport's `prepare_identity`
+    // creates its control-socket directory and pins the verified host key, and
+    // without it the first remote request failed with a misleading "host
+    // identity is not configured" (the identity WAS configured; it had not
+    // been prepared). `Remote::prepare_identity`'s default is a no-op and
+    // `LocalTransport` does not override it, so a local destination is
+    // unaffected. The failure is annotated so the diagnostic names the
+    // PREPARATION stage rather than a bare transport error. A failure here has
+    // created no lock record and no destination entry, and made no remote
+    // request.
+    if let Err(error) = remote.prepare_identity() {
+        return Err(SyncError::from(error.with_context(
+            "the transport's host-identity preparation failed before the run made any \
+             remote request or took the destination lock",
+        )));
+    }
+    // (3) Now establish ownership, holding it for the whole run.
     let ownership = match requested {
         RequestedOwnership::Locked => {
             lock_destination(direction, dest_is_local, &dest_root).map_err(SyncError::from)?
