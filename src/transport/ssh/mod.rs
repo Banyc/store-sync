@@ -38,8 +38,8 @@ use runner::{
 /// outcome, because an exit code carries no errno):
 ///
 /// * `P\t<size>\t<rawmode_hex>` — the entry EXISTS (`lstat` succeeded);
-///   `<size>` is decimal and `<rawmode>` is hex, the `stat -c '%s %f'`-
-///   equivalent format, so the [`RemoteMeta`] parse is unchanged.
+///   `<size>` is decimal and `<rawmode>` is hex, the `lstat`-equivalent
+///   format, so the [`RemoteMeta`] parse is unchanged.
 /// * `A\t<errno>` — `lstat` FAILED with a CONFIRMED-ABSENCE errno: ENOENT
 ///   or ENOTDIR (the ONLY errnos that mean "no such entry").
 /// * `E\t<errno>` — `lstat` FAILED with any OTHER errno (EACCES, EIO,
@@ -71,7 +71,7 @@ pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 /// The exit code the remote `write_new_cmd` script uses for a PRE-INSTALL
 /// failure — any failure BEFORE the no-clobber publish: the parent `mkdir`,
 /// the `mktemp` allocation, the payload write, the final `chmod`, the file
-/// `sync`, or a non-EEXIST `link(2)` failure. Such a failure means the
+/// fsync, or a non-EEXIST `link(2)` failure. Such a failure means the
 /// operation never reached the publish
 /// decision point, so it is a propagated Error, NEVER a verdict — the
 /// transport refuses to guess the destination's state. Deliberately distinct
@@ -86,6 +86,28 @@ pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
 /// even if the system clock jumps.
 const SIDECAR_FLOCK_DEADLINE_SECS: f64 = 2.0;
 const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
+
+/// The portable far-side FSYNC primitive: a `perl` one-liner that opens
+/// `$ARGV[0]` and calls `IO::Handle::sync` (i.e. `fsync(2)`) on the opened
+/// handle. Perl already ships with every reasonable Linux/macOS remote and the
+/// crate REQUIRES it for the framed `lstat` helper, `verify_open`, and the
+/// sidecars, so this is the ONE durability primitive with identical GNU and
+/// BSD semantics.
+///
+/// `sync <path>` is NOT portable: GNU coreutils >= 8.24 fsyncs the named path,
+/// but BSD/macOS `sync` accepts NO operand and silently no-ops —
+/// `sync /nonexistent/xyz` exits 0 — so a durability protocol built on
+/// `sync <path>` is a protocol that does NOTHING on macOS, a remote this crate
+/// documents as supported. `die` makes a failed open/fsync LOUD (nonzero exit)
+/// instead of a swallowed success, and the path arrives after `--` as a
+/// positional argument, so a leading `-` is an operand, never an option.
+///
+/// The two trailing COMMENT tokens are the stable hooks a test's fake `perl`
+/// on `PATH` matches to fault-inject or record the file fsync and the
+/// directory fsync independently; being comments they change nothing about the
+/// executed script.
+const PERL_FSYNC_FILE: &str = "use IO::Handle; open my $fh, \"<\", $ARGV[0] or die \"fsync-open $ARGV[0]: $!\"; $fh->sync or die \"fsync $ARGV[0]: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_FILE";
+const PERL_FSYNC_DIR: &str = "use IO::Handle; open my $fh, \"<\", $ARGV[0] or die \"fsync-open $ARGV[0]: $!\"; $fh->sync or die \"fsync $ARGV[0]: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_DIR";
 
 /// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
 /// `crate::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
@@ -430,7 +452,7 @@ impl SshTransport {
     /// Build the `ssh <args> -- <command>` argv, forcing the remote command to
     /// run under `bash` regardless of the deployment account's login shell.
     /// The remote scripts (globs, the `[ -e ] || [ -L ] || continue`
-    /// existence guard, `stat -c`, ...) are
+    /// existence guard, ...) are
     /// written for POSIX sh/bash semantics; a login shell like zsh aborts on
     /// an unmatched glob (`no matches found`) instead of passing the pattern
     /// through, which breaks e.g. the first `list` of an empty object store.
@@ -445,16 +467,32 @@ impl SshTransport {
         Ok(argv)
     }
 
-    /// Build a remote shell command string from an `argv`, quoting every
-    /// argument so the remote shell re-tokenizes it back into exactly `argv`.
-    /// Build the remote `mv` command for an atomic path replacement.
+    /// Build the remote command for an atomic path replacement.
     ///
-    /// `-T` (no-target-directory) is REQUIRED: without it GNU mv treats a
-    /// destination that is a symlink to a directory as the directory itself
-    /// and moves `from` INTO it instead of replacing the symlink. The
-    /// `current` swap depends on replacing a symlink-to-directory in place
-    /// (the atomic per-slot commit point), and a bare `mv` silently pollutes
-    /// the object store with the temp link.
+    /// The primitive is perl's `rename(2)` — the ONE operation with POSIX
+    /// rename semantics, using the same interpreter the framed `lstat` helper
+    /// and `verify_open` already require on the far side. It has exactly the
+    /// three properties the transport depends on, on EVERY userland:
+    ///
+    /// * it is ATOMIC and it atomically REPLACES an existing non-directory
+    ///   target (a regular file, a live or DANGLING symlink, a self-loop
+    ///   symlink), which is the per-slot commit point;
+    /// * it NEVER moves the source INTO a directory target — the failure mode
+    ///   of a bare `mv src dst` when `dst` is a symlink to a directory
+    ///   (`mv` dereferences the destination and moves `src` inside it,
+    ///   silently polluting the store); and
+    /// * it REFUSES, loudly (nonzero, `die` on stderr), when the target is a
+    ///   directory and the source is not (`EISDIR`/`ENOTDIR`), so a
+    ///   kind-changing replacement that the applier did not stage is an error
+    ///   rather than a surprise.
+    ///
+    /// GNU `mv -T` provided the first two points on GNU only. It is an
+    /// ILLEGAL option on BSD/macOS (`mv: illegal option -- T`, exit 64), so on
+    /// a supported macOS/BSD remote EVERY kind-changing replacement — the
+    /// symlink-to-directory `current` swap, a symlink retarget, dir-over-nondir
+    /// — failed with a transport error. `rename(2)` is portable and has no
+    /// option parsing at all: both operands are shell-quoted and passed after
+    /// `--`, so a leading `-` is an operand, never an option.
     fn rename_cmd(root: &Path, from: &Path, to: &Path) -> String {
         let f = root.join(from).to_string_lossy().into_owned();
         let t = root.join(to).to_string_lossy().into_owned();
@@ -463,13 +501,50 @@ impl SshTransport {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
         format!(
-            "mkdir -p {parent} && mv -T {f} {t}",
+            "mkdir -p {parent} && perl -e 'rename($ARGV[0], $ARGV[1]) or die \"rename $ARGV[0] -> $ARGV[1]: $!\";' -- {f} {t}",
             parent = shell_quote(&parent),
             f = shell_quote(&f),
             t = shell_quote(&t),
         )
     }
 
+    /// Build the remote command that fsyncs `root.join(rel)` and every entry
+    /// BELOW it, deepest-first, so a staged bundle is durable before the atomic
+    /// install rename. `find -depth -exec ... {} ;` is portable (POSIX `find`);
+    /// the fsync PROGRAM is the portable perl primitive ([`PERL_FSYNC_DIR`])
+    /// because `sync <path>` is GNU-only and a silent no-op on BSD/macOS.
+    fn fsync_tree_cmd(root: &Path, rel: &Path) -> String {
+        let p = root.join(rel).to_string_lossy().into_owned();
+        Self::argv_cmd(&[
+            "find".into(),
+            p,
+            "-depth".into(),
+            "-exec".into(),
+            "perl".into(),
+            "-e".into(),
+            PERL_FSYNC_DIR.into(),
+            "{}".into(),
+            ";".into(),
+        ])
+    }
+
+    /// Build the remote command that fsyncs the PARENT directory of
+    /// `root.join(rel)` — the directory whose entry the mutation just changed.
+    /// See [`PERL_FSYNC_DIR`] for why `sync <dir>` cannot be used.
+    fn fsync_parent_cmd(root: &Path, rel: &Path) -> String {
+        let p = root.join(rel).to_string_lossy().into_owned();
+        let parent = Path::new(&p)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        format!(
+            "perl -e '{PERL_FSYNC_DIR}' -- {parent}",
+            parent = shell_quote(&parent)
+        )
+    }
+
+    /// Build a remote shell command string from an `argv`, quoting every
+    /// argument so the remote shell re-tokenizes it back into exactly `argv`.
     fn argv_cmd(argv: &[String]) -> String {
         argv.iter()
             .map(|a| shell_quote(a))
@@ -777,7 +852,9 @@ impl SshTransport {
     ///    this is the byte-preservation contract of [`Remote::try_write_new`].
     /// 3. Apply the FINAL MODE with `chmod` BEFORE the file fsync — the
     ///    published inode carries the caller's mode, never the remote umask.
-    /// 4. `sync "$tmp"` — the file is durable.
+    /// 4. A perl `fsync(2)` of the temp file — the file is durable. (See
+    ///    [`PERL_FSYNC_FILE`]: `sync "$tmp"` is GNU-only and a NO-OP on
+    ///    BSD/macOS, so it cannot carry a durability guarantee.)
     /// 5. Install atomically WITHOUT replacement via perl's raw `link(2)`
     ///    (the same interpreter the framed `lstat` helper relies on) — it
     ///    FAILS if the destination exists in ANY form (a regular file, a
@@ -788,7 +865,9 @@ impl SshTransport {
     /// 6. Remove only the temporary file THIS invocation created (the
     ///    cleanup runs on the conflict path too — the `rc` capture keeps it
     ///    outside the `&&` chain).
-    /// 7. `sync <parent>` — the PARENT-DIRECTORY fsync whose failure
+    /// 7. A perl `fsync(2)` of the PARENT directory — the rename that publishes
+    ///    the record is durable, and its failure PROPAGATES (a failed fsync is a
+    ///    failed install, never a silent success).
     ///    PROPAGATES (the old script swallowed it with `2>/dev/null`): a
     ///    failed sync is a failed install, never a silent success.
     ///
@@ -813,17 +892,17 @@ impl SshTransport {
     /// nonzero publish exit with the destination ABSENT is a real publish
     /// failure, again the pre-install exit (an error). The final `sync
     /// <parent>` runs ONLY on the install-success path, and its exit status
-    /// is the command's exit status — a real `sync <dir>`/fsync, never a
-    /// best-effort swallow. (The
+    /// is the command's exit status — a real `fsync(2)` (perl `IO::Handle::sync`),
+    /// never a best-effort swallow. (The
     /// AlreadyPresent retry's parent sync runs in the TRANSPORT — see
     /// [`SshTransport::try_write_new`] — mirroring the local primitive's
     /// "parent fsync on Created AND AlreadyPresent, never on Conflict".)
     //
     // Portability notes: `mktemp TEMPLATE` accepts a template argument on
     // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
-    // (kept here), and `sync FILE` fsyncs the path on Linux (coreutils
-    // >= 8.24) and macOS (forces pending writes); the parent-dir sync is the
-    // real `sync <dir>` whose failure propagates. The payload write is a
+    // (kept here). Durability is the perl `fsync(2)` primitive
+    // ([`PERL_FSYNC_FILE`] / [`PERL_FSYNC_DIR`]) because `sync <path>` is
+    // GNU-only and a silent no-op on BSD/macOS. The payload write is a
     // bare `cat > "$tmp"`: `cat` is POSIX, reads stdin to EOF, and the
     // redirect opens the temp — no quoting of data anywhere.
     fn write_new_cmd(root: &Path, rel: &Path, mode: u32) -> String {
@@ -871,7 +950,7 @@ impl SshTransport {
         // identical to the reserved [`SSH_TWRITE_CONFLICT_EXIT`]; any other
         // link failure is the pre-install exit (a real publish error).
         format!(
-            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then perl -e '{fsync_dir}' -- {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
             p = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
             mode = mode_str,
@@ -879,6 +958,8 @@ impl SshTransport {
             conflict = SSH_TWRITE_CONFLICT_EXIT,
             preinst = SSH_TWRITE_PREINSTALL_EXIT,
             parent = shell_quote(&parent),
+            fsync_file = PERL_FSYNC_FILE,
+            fsync_dir = PERL_FSYNC_DIR,
         )
     }
 
@@ -932,35 +1013,48 @@ impl SshTransport {
         )
     }
 
-    /// Build the remote `list` script for `rel`. The glob intentionally covers
-    /// hidden entries but excludes the `.` and `..` self/parent directories,
-    /// and each entry's real mode is fetched with `stat -c '%f'` (raw mode in
-    /// hex) so the caller can faithfully reconstruct permissions and types.
+    /// Build the remote `list` script for `rel`. It is ONE perl one-liner —
+    /// perl is already REQUIRED on the far side by the framed `lstat` helper,
+    /// `verify_open`, and the sidecars — that `opendir`s the directory,
+    /// `lstat`s each entry, and prints the frame. The mode comes from
+    /// `lstat`'s `st_mode` (`$s[2] & 0xffff`, the same raw-mode value the
+    /// `lstat` protocol uses), NOT from `stat -c '%f'`: BSD/macOS `stat`
+    /// rejects `-c`, so the old script produced an EMPTY mode on a supported
+    /// macOS remote and the parser silently defaulted every entry to mode 0.
     ///
-    /// The FRAME is one NUL-terminated record per entry, `type<TAB>mode<TAB>name`.
-    /// NUL is the only byte a POSIX file name cannot contain, so it is the only
-    /// unambiguous delimiter: a tab- or newline-delimited frame silently
-    /// truncates a name containing that byte, and `sync`'s listing check is
-    /// BYTE-EXACT — two distinct on-disk names must never collapse into one
-    /// compared spelling. The name is taken with the `${e##*/}` parameter
-    /// expansion, never `$(basename ...)`: command substitution strips EVERY
-    /// trailing newline, so a name ending in `\n` (legal on every POSIX
-    /// filesystem) would lose that byte before it ever reached the frame.
+    /// The FRAME is one NUL-terminated record per entry, `type<TAB>mode<TAB>name`
+    /// — unchanged by the portability fix. NUL is the only byte a POSIX file
+    /// name cannot contain, so it is the only unambiguous delimiter: a tab- or
+    /// newline-delimited frame silently truncates a name containing that byte,
+    /// and `sync`'s listing check is BYTE-EXACT — two distinct on-disk names
+    /// must never collapse into one compared spelling. The name is the
+    /// `readdir` entry printed VERBATIM (no `basename`/parameter expansion, so
+    /// neither a trailing newline nor an embedded TAB/LF is ever stripped) and
+    /// is the LAST field, so the Rust parser can `splitn(3, '\t')` and keep
+    /// every remaining byte as the name.
     ///
-    /// The existence guard is `[ -e "$e" ] || [ -L "$e" ]`: it exists ONLY to
-    /// filter the unmatched globs (an empty directory expands each pattern to
-    /// its own literal text, which is not an entry). It must not be a bare
-    /// `[ -e ]`, because POSIX `-e` FOLLOWS a symlink and would therefore omit
-    /// a DANGLING symlink — an entry the far-side manifest walk, which uses
-    /// `lstat`, INCLUDES. The two views of one directory must agree: the
-    /// omission made `sync` report a legitimately installed dangling link as a
-    /// `NameNotFaithful` conflict, refuse to replace an existing one, and (with
-    /// `delete_extraneous`) hide a reserved dangling child from the residue
-    /// gate so the sanctioned recursive removal destroyed the caller's copy.
+    /// The classification is `lstat`-based (not `-e`/`-d`, which FOLLOW a
+    /// symlink), so a DANGLING symlink is INCLUDED — an entry the far-side
+    /// manifest walk (also `lstat`) includes. The two views of one directory
+    /// must agree: the old omission made `sync` report a legitimately installed
+    /// dangling link as a `NameNotFaithful` conflict, refuse to replace an
+    /// existing one, and (with `delete_extraneous`) hide a reserved dangling
+    /// child from the residue gate so the sanctioned recursive removal
+    /// destroyed the caller's copy. `.`/`..` are skipped explicitly.
+    ///
+    /// A directory that cannot be opened (ENOENT, EACCES, a non-directory) makes
+    /// the script `die` — nonzero, on stderr — rather than silently listing
+    /// nothing, so [`Remote::list`] agrees with `LocalTransport::list`'s
+    /// `read_dir` failure on an entry that is not a readable directory. Names
+    /// are printed as RAW BYTES (`binmode STDOUT`); a non-UTF-8 name is refused
+    /// by the Rust decoder, never lossily decoded.
     fn list_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
         format!(
-            "for e in {p}/* {p}/.[!.]* {p}/..?*; do case \"$e\" in {p}/.|{p}/..) continue;; esac; [ -e \"$e\" ] || [ -L \"$e\" ] || continue; n=${{e##*/}}; if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; m=$(stat -c '%f' \"$e\"); printf '%s\\t%s\\t%s\\0' \"$t\" \"$m\" \"$n\"; done"
+            "perl -e 'binmode STDOUT; my $dir = $ARGV[0]; opendir(my $dh, $dir) or die \"list: opendir $dir: $!\"; \
+for my $n (readdir($dh)) {{ next if $n eq \".\" || $n eq \"..\"; my @s = lstat(\"$dir/$n\"); next unless @s; \
+my $mt = $s[2] & 0170000; my $t = ($mt == 0120000) ? \"l\" : (($mt == 0040000) ? \"d\" : \"f\"); \
+printf \"%s\\t%x\\t%s\\0\", $t, $s[2] & 0xffff, $n; }}' -- {p}"
         )
     }
 
@@ -968,11 +1062,11 @@ impl SshTransport {
     /// delete (the ssh mirror of `LocalTransport::remove_file_if`): CLAIM the
     /// entry with `mv` to a mktemp-allocated same-directory name (the lock is
     /// always a regular file, so plain `mv` — portable GNU and BSD — moves it
-    /// without the `-T` the symlink-to-directory `current` swap needs; only
-    /// ONE contender can win the claim; a failed mv with the destination
-    /// still present is a Mismatch verdict, with the destination absent an
-    /// Absent verdict), VERIFY with `cmp`, then either DELETE the claim
-    /// (match → frame `R`) or RESTORE it no-replace with `ln` (mismatch →
+    /// without the perl `rename(2)` the symlink-to-directory `current` swap
+    /// needs; only ONE contender can win the claim; a failed mv with the
+    /// destination still present is a Mismatch verdict, with the destination
+    /// absent an Absent verdict), VERIFY with `cmp`, then either DELETE the
+    /// claim (match → frame `R`) or RESTORE it no-replace with `ln` (mismatch →
     /// frame `M`; a concurrent install makes `ln` fail — the winner is never
     /// replaced and the claim is discarded). The single stdout frame is
     /// parsed strictly; a malformed frame is an error, never a silent
@@ -1071,9 +1165,10 @@ impl SshTransport {
         )
     }
 
-    /// Classify a raw mode (`stat -c '%f'`-equivalent, the `S_IFMT` type
-    /// bits) into a [`RemoteMeta`] — the shared classification of the framed
-    /// lstat protocol AND the descriptor-bound verify-open protocol.
+    /// Classify a raw mode (the raw `st_mode` value the `lstat`/`verify_open`
+    /// helpers print, whose `S_IFMT` bits and permission bits are POSIX on
+    /// GNU and BSD alike) into a [`RemoteMeta`] — the shared classification of
+    /// the framed lstat protocol AND the descriptor-bound verify-open protocol.
     fn meta_from_raw_mode(raw: u32) -> RemoteMeta {
         let mode = raw & 0o7777;
         let is_symlink = (raw & 0o170000) == 0o120000;
@@ -1321,11 +1416,14 @@ impl SshTransport {
 
     /// Parse the NUL-framed records produced by [`SshTransport::list_script`].
     /// `.` and `..` are never emitted by the script, but are skipped here
-    /// defensively. A structurally malformed record (fewer than three TAB
-    /// fields) is refused rather than defaulted, so a mangled frame can never
-    /// be read as a shorter or bogus name. The mode field is defaulted to 0
-    /// when it does not parse (a BSD `stat` does not accept `-c`, and a
-    /// name/type comparison never consumes the mode).
+    /// defensively. The parse is STRICT on every field: a structurally
+    /// malformed record (fewer than three TAB fields) is refused, and a mode
+    /// field that is not hex is an ERROR rather than a silent 0. The old
+    /// `unwrap_or(0)` default was exactly how a BSD/macOS `stat -c` failure
+    /// turned every entry's mode into 0 without a single error — a public field
+    /// that was silently wrong on a supported platform. The producer is now
+    /// portable, so an unparseable mode means a mangled frame, never a
+    /// userland we do not support.
     fn parse_list_output(text: &str) -> Result<Vec<RemoteEntry>> {
         let mut entries = Vec::new();
         for record in text.split('\0') {
@@ -1343,7 +1441,11 @@ impl SshTransport {
             if name.is_empty() || name == "." || name == ".." {
                 continue;
             }
-            let mode = u32::from_str_radix(raw, 16).unwrap_or(0) & 0o7777;
+            let mode = u32::from_str_radix(raw, 16).map_err(|_| {
+                Error::transport(format!(
+                    "ssh list: malformed mode field (expected hex, got {raw:?}) in record {record:?}"
+                ))
+            })? & 0o7777;
             entries.push(RemoteEntry {
                 name: name.to_string(),
                 is_dir: t == "d",
@@ -1486,37 +1588,22 @@ impl Remote for SshTransport {
     }
 
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
-        let p = self.root.join(rel).to_string_lossy().into_owned();
         // `find -depth` visits entries DEEPEST-FIRST (children before
-        // parents), so `-exec sync {} \;` fsyncs every file and directory
-        // in the right order — the whole staged bundle is durable before the
-        // atomic install rename. `sync FILE` fsyncs the path on Linux
-        // (coreutils >= 8.24) and macOS (forces pending writes), the same
-        // primitive `write_new_cmd` already relies on.
-        let cmd = Self::argv_cmd(&[
-            "find".into(),
-            p,
-            "-depth".into(),
-            "-exec".into(),
-            "sync".into(),
-            "{}".into(),
-            ";".into(),
-        ]);
+        // parents), so each entry is fsynced before its parent — the whole
+        // staged bundle is durable before the atomic install rename. The fsync
+        // itself is the portable perl primitive (see [`PERL_FSYNC_DIR`]);
+        // `sync <path>` is GNU-only and a NO-OP on BSD/macOS, so the old
+        // command silently made this method a no-op on a supported remote.
+        let cmd = Self::fsync_tree_cmd(&self.root, rel.as_path());
         self.run_remote_ok(&cmd)
     }
 
     fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
-        let p = self.root.join(rel).to_string_lossy().into_owned();
-        let parent = Path::new(&p)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
-        // `sync <dir>` fsyncs the directory on Linux (coreutils >= 8.24) and
-        // macOS (forces pending writes) — the same primitive `write_new_cmd`
-        // already relies on for its parent-dir sync. FAIL-CLOSED: a failed
-        // sync is a propagated error (the mutation's durability is
-        // unconfirmed).
-        let cmd = Self::argv_cmd(&["sync".into(), parent]);
+        // FAIL-CLOSED: the parent-directory fsync is the portable perl
+        // primitive (see [`PERL_FSYNC_DIR`]) and a failed fsync is a propagated
+        // error (the mutation's durability is unconfirmed). `sync <dir>` would
+        // have been a silent no-op here on BSD/macOS.
+        let cmd = Self::fsync_parent_cmd(&self.root, rel.as_path());
         self.run_remote_ok(&cmd)
     }
 
@@ -1822,12 +1909,11 @@ impl Remote for SshTransport {
         )?;
         let verdict = verified_to_verdict(verified);
         if let CreateNewVerdict::AlreadyPresent = &verdict {
-            let remote_path_str = self.root.join(rel).to_string_lossy().into_owned();
-            let parent = Path::new(&remote_path_str)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".to_string());
-            self.run_remote_ok(&format!("sync {}", shell_quote(&parent)))?;
+            // The convergent retry must return with a DURABLE entry, exactly as
+            // a fresh Created install does: fsync the parent directory with the
+            // SAME portable perl primitive the script uses ([`PERL_FSYNC_DIR`]).
+            // A bare `sync <dir>` here would be a silent no-op on BSD/macOS.
+            self.run_remote_ok(&SshTransport::fsync_parent_cmd(&self.root, rel.as_path()))?;
             return Ok(CreateNewVerdict::AlreadyPresent);
         }
         Ok(verdict)
@@ -2142,16 +2228,57 @@ mod tests_ssh {
         assert!(hidden.is_symlink, "symlink type preserved");
     }
 
-    // Finding 3: the list script covers hidden files/executables/symlinks and
-    // never emits `.`/`..`.
+    /// F2: the LITERAL `list_script` must report the REAL mode on a BSD
+    /// userland. Pre-fix it ran `stat -c '%f'`, which BSD/macOS `stat` rejects;
+    /// the mode column came out empty and the parser silently defaulted every
+    /// entry to 0, so this test FAILED on macOS with `left: 0` for each entry.
+    /// The script is now one perl `lstat` one-liner (perl is already required
+    /// far side), and the mode is `st_mode & 0xffff` in hex — POSIX on GNU and
+    /// BSD alike. It also pins that hidden entries are covered and `.`/`..` are
+    /// never emitted, which the previous shape-only test asserted by string
+    /// matching.
     #[test]
-    fn list_script_excludes_self_and_parent() {
-        let t = transport();
-        let script = t.list_script(Path::new("objects/sha256/abc/root"));
-        assert!(script.contains(".[!.]*"), "hidden entries covered");
-        assert!(script.contains("..?*"), "dot-dot-prefixed entries covered");
-        // The self/parent directors are explicitly skipped.
-        assert!(script.contains("continue"), "skip guard present");
+    fn list_script_reports_the_real_mode_on_bsd_userland() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("exec.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            tree.join("exec.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(tree.join(".hidden"), b"h").unwrap();
+        std::fs::set_permissions(
+            tree.join(".hidden"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::set_permissions(
+            tree.join("sub"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        let entries = run_list_script(&transport_at(dir.path()), Path::new("tree"));
+        let get = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("entry {n} missing from {entries:?}"))
+        };
+        assert_eq!(
+            get("exec.sh").mode,
+            0o755,
+            "the executable mode must be real on a BSD userland, never silently 0"
+        );
+        assert_eq!(get(".hidden").mode, 0o600, "the hidden file's real mode");
+        assert_eq!(get("sub").mode, 0o700, "the directory's real mode");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".hidden"), "hidden entries are covered");
+        assert!(!names.contains(&"."), ". must never be emitted");
+        assert!(!names.contains(&".."), ".. must never be emitted");
     }
 
     /// A transport rooted at a caller-supplied directory, so the LITERAL
@@ -2175,9 +2302,10 @@ mod tests_ssh {
     }
 
     /// Run the LITERAL `list_script` for `rel` under `/bin/sh` and return the
-    /// parsed entries. `stat -c` is GNU-only, so on a BSD `stat` the mode
-    /// column is empty (the entry parses with mode 0) — callers must assert on
-    /// NAMES and TYPES here, never on the mode.
+    /// parsed entries. The mode is now obtained through the portable perl
+    /// `lstat` path (NOT GNU-only `stat -c`), so these tests assert on the mode
+    /// too; the old "callers must never assert on the mode" caveat is gone
+    /// because the underlying defect is fixed.
     fn run_list_script(t: &SshTransport, rel: &Path) -> Vec<RemoteEntry> {
         let script = t.list_script(rel);
         let out = run_sh_stdin(&script, &[]);
@@ -2538,25 +2666,77 @@ mod tests_ssh {
         );
     }
 
-    // The `current` swap replaces a symlink-to-directory in place; GNU mv
-    // would otherwise treat that destination as the directory itself and move
-    // the temp link INTO it (silently polluting the object store). `-T` is
-    // mandatory.
+    /// F1, BEHAVIOUR: the LITERAL `rename_cmd` runs under `sh` against a real
+    /// root, and a symlink-to-directory destination is REPLACED IN PLACE. This
+    /// replaces the old `rename_uses_no_target_directory_flag`, which asserted
+    /// `cmd.contains("mv -T")` — a shape assertion that could not tell whether
+    /// the command RUNS.
+    ///
+    /// Pre-fix `rename_cmd` emitted `mv -T`; on this host (macOS/BSD userland)
+    /// `mv` rejects it and the command exits 64, so this test FAILED with
+    /// `mv: illegal option -- T` + usage. On Linux/GNU it passed, which is
+    /// exactly the silent platform divergence this pins.
     #[test]
-    fn rename_uses_no_target_directory_flag() {
-        let t = transport();
-        let cmd = SshTransport::rename_cmd(
-            t.root(),
-            Path::new(".current.tmp.op-x"),
-            Path::new("current"),
+    fn rename_replaces_a_symlink_to_a_directory() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().join("remote");
+        std::fs::create_dir_all(root.join("objects/app-v1")).unwrap();
+        std::fs::create_dir_all(root.join("objects/app-v2")).unwrap();
+        std::os::unix::fs::symlink("objects/app-v1", root.join("current")).unwrap();
+        std::os::unix::fs::symlink("objects/app-v2", root.join(".current.tmp.op-x")).unwrap();
+
+        let cmd =
+            SshTransport::rename_cmd(&root, Path::new(".current.tmp.op-x"), Path::new("current"));
+        let out = run_sh_stdin(&cmd, &[]);
+        assert!(
+            out.status.success(),
+            "rename must succeed on every userland; stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            Path::new("objects/app-v2"),
+            "the `current` link must be REPLACED, not moved INTO objects/app-v1"
         );
         assert!(
-            cmd.contains("mv -T"),
-            "rename must use mv -T (no-target-directory) so a symlink-to-dir destination is replaced, got: {cmd}"
+            !root.join("objects/app-v1/.current.tmp.op-x").exists(),
+            "the source must NEVER be moved INTO the destination directory"
+        );
+    }
+
+    /// F1, GUARD: the property `-T` existed to provide — a regular file must
+    /// not be moved INTO a directory target — must survive the portable
+    /// primitive. The `rename(2)` refusal (`EISDIR`/`ENOTDIR`) is loud (nonzero)
+    /// and leaves both operands untouched. This pins the guard; it passes
+    /// pre-fix too (pre-fix `mv -T` also refused, just for the wrong reason on
+    /// BSD), but without it a "fix" that dropped the guard would regress
+    /// silently.
+    #[test]
+    fn rename_refuses_a_file_onto_a_directory_target() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().join("remote");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("source"), b"must-not-move").unwrap();
+
+        let cmd = SshTransport::rename_cmd(&root, Path::new("source"), Path::new("target"));
+        let out = run_sh_stdin(&cmd, &[]);
+        assert!(
+            !out.status.success(),
+            "a file onto a directory must be refused, got status {:?}",
+            out.status.code()
         );
         assert!(
-            cmd.ends_with("'/srv/app/current'"),
-            "destination is the deployment root's `current` symlink, got: {cmd}"
+            root.join("source").is_file(),
+            "the source must stay in place"
+        );
+        assert!(
+            root.join("target").is_dir(),
+            "the target must stay a directory"
+        );
+        assert!(
+            !root.join("target/source").exists(),
+            "the source must NEVER be moved INTO the directory target"
         );
     }
 
@@ -3265,6 +3445,47 @@ mod tests_ssh {
         child.wait_with_output().expect("wait sh -c")
     }
 
+    /// Resolve the REAL `perl` from the test process's own `PATH`, before a
+    /// fake one is prepended.
+    fn real_perl() -> std::path::PathBuf {
+        for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+            let cand = Path::new(dir).join("perl");
+            if cand.is_file() {
+                return cand;
+            }
+        }
+        panic!("no `perl` on PATH; the far-side scripts require perl");
+    }
+
+    /// The literal hook tokens embedded as comments in [`PERL_FSYNC_FILE`] and
+    /// [`PERL_FSYNC_DIR`]. A fake `perl` matches these to fault-inject or
+    /// record exactly one fsync kind without disturbing the script's other perl
+    /// calls (notably the perl `link(2)` publish).
+    const FSYNC_FILE_HOOK: &str = "STORE_SYNC_TEST_FSYNC_FILE";
+    const FSYNC_DIR_HOOK: &str = "STORE_SYNC_TEST_FSYNC_DIR";
+
+    /// The body of a fake `perl` that exits `code` when its `-e` program
+    /// contains `needle` and otherwise delegates VERBATIM to the real perl.
+    fn fake_perl_body(needle: &str, code: i32) -> String {
+        let real = real_perl();
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *{needle}*) echo 'fake perl: faulted {needle}' >&2; exit {code} ;;\n  *) exec {real} \"$@\" ;;\nesac\n",
+            needle = needle,
+            code = code,
+            real = shell_quote(&real.to_string_lossy()),
+        )
+    }
+
+    /// Install a fake `perl` on `bin` that faults on `needle` (see
+    /// [`fake_perl_body`]).
+    fn install_fake_perl(bin: &Path, needle: &str, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let p = bin.join("perl");
+        std::fs::write(&p, fake_perl_body(needle, code)).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     // The old temp name derived from the LOCAL pid + a per-process counter, so
     // two controllers on different hosts could share a pid and collide on the
     // same remote temp name; `printf ... > tmp` then truncated the collided
@@ -3435,38 +3656,56 @@ mod tests_ssh {
         );
     }
 
-    /// The remote script implements the canonical seven-step sequence: the
-    /// FINAL MODE is chmod'd onto the temp BEFORE the file fsync and the
-    /// no-clobber install, and the PARENT-DIRECTORY sync is a real
-    /// `sync <dir>` whose failure is never swallowed (`2>/dev/null` is gone).
+    /// F3, ORDER: the remote script implements the canonical seven-step
+    /// sequence — the FINAL MODE is chmod'd onto the temp BEFORE the portable
+    /// FILE fsync, which is before the no-clobber install, and the
+    /// PARENT-DIRECTORY fsync (also the portable perl primitive) runs after the
+    /// install and is never swallowed (`2>/dev/null` is gone).
+    ///
+    /// Pre-fix the script used `sync "$tmp"` / `sync <dir>`; the fix uses the
+    /// perl `fsync(2)` the [`PERL_FSYNC_FILE`]/[`PERL_FSYNC_DIR`] hooks are
+    /// named for. This test therefore FAILED pre-fix at
+    /// "the file fsync step must be present".
     #[test]
-    fn try_write_new_cmd_final_chmod_and_real_parent_sync() {
+    fn try_write_new_cmd_final_chmod_and_portable_fsyncs() {
         let t = transport();
         let cmd = SshTransport::write_new_cmd(t.root(), Path::new("state/operation.lock"), 0o640);
         // Step 3 (final chmod) BEFORE step 4 (file fsync) BEFORE step 5
-        // (no-replace install): the published inode carries the caller's
-        // mode, never the remote umask.
+        // (no-replace install) BEFORE step 7 (parent-dir fsync): the published
+        // inode carries the caller's mode, never the remote umask, and the
+        // durability steps are the PORTABLE perl `fsync(2)`, never the
+        // GNU-only `sync <operand>` that is a silent no-op on BSD/macOS.
         let chmod_pos = cmd
             .find("chmod 640 \"$tmp\"")
             .expect("the final chmod step must be present");
-        let fsync_pos = cmd
-            .find("sync \"$tmp\"")
-            .expect("the file fsync step must be present");
+        let file_fsync_pos = cmd
+            .find(PERL_FSYNC_FILE)
+            .expect("the portable FILE fsync step must be present");
         let publish_pos = cmd
             .find("link($ARGV[0], $ARGV[1])")
             .expect("the no-replace install must be present");
+        let dir_fsync_pos = cmd
+            .find(PERL_FSYNC_DIR)
+            .expect("the portable PARENT-DIRECTORY fsync step must be present");
         assert!(
-            chmod_pos < fsync_pos && fsync_pos < publish_pos,
-            "step order must be chmod -> file fsync -> install, got: {cmd}"
+            chmod_pos < file_fsync_pos
+                && file_fsync_pos < publish_pos
+                && publish_pos < dir_fsync_pos,
+            "step order must be chmod -> file fsync -> install -> parent fsync, got: {cmd}"
         );
-        // Step 7: a real `sync <dir>` — and no `2>/dev/null` swallow.
+        // The GNU-only operand-taking `sync` is GONE, and the parent fsync is
+        // never swallowed.
         assert!(
-            cmd.contains("sync '/srv/app/state'"),
-            "the parent-dir sync must be a real sync <dir>, got: {cmd}"
+            !cmd.contains("sync \"$tmp\""),
+            "the GNU-only `sync <file>` must be gone, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("sync '/srv/app/state'"),
+            "the GNU-only `sync <dir>` must be gone, got: {cmd}"
         );
         assert!(
             !cmd.contains("2>/dev/null"),
-            "the parent-dir sync failure must never be swallowed, got: {cmd}"
+            "the parent fsync failure must never be swallowed, got: {cmd}"
         );
     }
 
@@ -3498,27 +3737,24 @@ mod tests_ssh {
         assert_eq!(std::fs::read(root.join(rel)).unwrap(), b"payload-data");
     }
 
-    /// The parent-directory sync failure PROPAGATES: a fake `sync` on PATH
-    /// that fsyncs regular files but fails on directories lets the file fsync
-    /// (step 4) pass, then the parent-dir sync (step 7) fails — the command
-    /// exits with the fake sync's status, never a swallowed success. The old
-    /// `sync 2>/dev/null` was exactly this bug.
+    /// F3, PROPAGATION: a FAILED parent-directory fsync is a propagated error,
+    /// never a swallowed success. The fake perl exits 9 on the
+    /// [`PERL_FSYNC_DIR`] hook; the FILE fsync and the perl `link(2)` publish
+    /// still run (the fake delegates them to the real perl), so the record is
+    /// fully installed and the command's exit status is EXACTLY the failed
+    /// durability step.
+    ///
+    /// Pre-fix there was no perl dir-fsync hook: the parent durability step was
+    /// the operand-taking `sync <dir>`, which the fake perl never saw, so the
+    /// command exited 0 and this test FAILED with `Some(0)` instead of `Some(9)`.
     #[test]
-    fn try_write_new_parent_sync_failure_propagates() {
+    fn try_write_new_dir_fsync_failure_propagates() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
         let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
         let fakebin = dir.path().join("fakebin");
-        std::fs::create_dir_all(&fakebin).unwrap();
-        std::fs::write(
-            fakebin.join("sync"),
-            "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(fakebin.join("sync"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        install_fake_perl(&fakebin, FSYNC_DIR_HOOK, 9);
         let out = run_sh_stdin(
             &format!(
                 "PATH={fake}:$PATH; {cmd}",
@@ -3529,14 +3765,68 @@ mod tests_ssh {
         assert_eq!(
             out.status.code(),
             Some(9),
-            "the parent-dir sync failure must propagate (never swallowed)"
+            "the parent-directory fsync failure must propagate (never swallowed)"
         );
-        // The install itself succeeded (ln ran) — the propagated failure is
-        // EXACTLY the final durability step, and the record is complete.
+        // The install itself succeeded (the perl link ran) — the propagated
+        // failure is EXACTLY the final durability step, and the record is
+        // complete.
         assert_eq!(
             std::fs::read(root.join(rel)).unwrap(),
             b"payload-data",
-            "the record must be fully installed before the parent-dir sync"
+            "the record must be fully installed before the parent-directory fsync"
+        );
+    }
+
+    /// F3, FAIL-CLOSED: a failure of the FILE fsync (step 4) aborts BEFORE the
+    /// publish — the command exits [`SSH_TWRITE_PREINSTALL_EXIT`] and NOTHING is
+    /// installed, because the record's bytes were never made durable.
+    ///
+    /// Pre-fix there was no perl file-fsync hook: the GNU-only `sync "$tmp"`
+    /// succeeded (or silently no-opped), the publish ran, and this test FAILED
+    /// with `Some(0)` instead of `Some(1)`.
+    #[test]
+    fn try_write_new_file_fsync_failure_aborts_before_publish() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let fakebin = dir.path().join("fakebin");
+        install_fake_perl(&fakebin, FSYNC_FILE_HOOK, 9);
+        let out = run_sh_stdin(
+            &format!(
+                "PATH={fake}:$PATH; {cmd}",
+                fake = shell_quote(&fakebin.to_string_lossy())
+            ),
+            b"payload-data",
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(SSH_TWRITE_PREINSTALL_EXIT),
+            "a failed file fsync is a pre-install failure, never a verdict"
+        );
+        assert!(
+            !root.join(rel).exists(),
+            "nothing may be published when the file fsync failed"
+        );
+    }
+
+    /// The fault-injection hooks the tests key on are actually carried by the
+    /// fsync snippets, and the two snippets are DISTINCT (a fake perl must be
+    /// able to fault the file fsync without touching the directory fsync and
+    /// vice versa).
+    #[test]
+    fn perl_fsync_snippets_carry_their_distinct_hooks() {
+        assert!(
+            PERL_FSYNC_FILE.contains(FSYNC_FILE_HOOK),
+            "PERL_FSYNC_FILE must carry {FSYNC_FILE_HOOK}"
+        );
+        assert!(
+            PERL_FSYNC_DIR.contains(FSYNC_DIR_HOOK),
+            "PERL_FSYNC_DIR must carry {FSYNC_DIR_HOOK}"
+        );
+        assert!(
+            !PERL_FSYNC_FILE.contains(FSYNC_DIR_HOOK) && !PERL_FSYNC_DIR.contains(FSYNC_FILE_HOOK),
+            "the two fsync snippets must be distinguishable by their hooks"
         );
     }
 
@@ -3588,15 +3878,17 @@ mod tests_ssh {
         Write,
         /// `chmod` fails (step 3).
         Chmod,
-        /// `sync "$tmp"` fails (step 4).
+        /// The FILE fsync fails (step 4) — the portable perl `fsync(2)`, faulted
+        /// by a fake `perl` that exits 1 on the [`FSYNC_FILE_HOOK`] token.
         FileFsync,
         /// `ln` fails for a reason OTHER than EEXIST (step 5) — with the
         /// destination ABSENT, so the script must NOT call it a verdict. The
         /// publish is perl `link(2)`, so the stage is faulted by a fake
         /// `perl` that exits 1.
         Publish,
-        /// `sync <dir>` fails (step 7) — the file sync passes, the
-        /// parent-dir sync is the propagated failure.
+        /// The PARENT-DIRECTORY fsync fails (step 7) — the file fsync passes, the
+        /// parent-dir fsync is the propagated failure. Faulted by a fake `perl`
+        /// that exits 9 on the [`FSYNC_DIR_HOOK`] token.
         ParentFsync,
     }
 
@@ -3631,18 +3923,21 @@ mod tests_ssh {
             std::fs::create_dir_all(&fakebin).unwrap();
 
             let (name, body) = match stage {
-                SshStageFailure::CreateTemp => ("mktemp", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::CreateTemp => ("mktemp", "#!/bin/sh\nexit 1\n".to_string()),
                 SshStageFailure::Write => (
                     "mktemp",
-                    "#!/bin/sh\nprintf '%s\\n' '/definitely/unwritable/.op.json.tmp.XXXXXX'\n",
+                    "#!/bin/sh\nprintf '%s\\n' '/definitely/unwritable/.op.json.tmp.XXXXXX'\n"
+                        .to_string(),
                 ),
-                SshStageFailure::Chmod => ("chmod", "#!/bin/sh\nexit 1\n"),
-                SshStageFailure::FileFsync => ("sync", "#!/bin/sh\nexit 1\n"),
-                SshStageFailure::Publish => ("perl", "#!/bin/sh\nexit 1\n"),
-                SshStageFailure::ParentFsync => (
-                    "sync",
-                    "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
-                )};
+                SshStageFailure::Chmod => ("chmod", "#!/bin/sh\nexit 1\n".to_string()),
+                SshStageFailure::FileFsync => {
+                    ("perl", fake_perl_body(FSYNC_FILE_HOOK, 1))
+                }
+                SshStageFailure::Publish => ("perl", fake_perl_body("link(", 1)),
+                SshStageFailure::ParentFsync => {
+                    ("perl", fake_perl_body(FSYNC_DIR_HOOK, 9))
+                }
+            };
             let p = fakebin.join(name);
             std::fs::write(&p, body).unwrap();
             use std::os::unix::fs::PermissionsExt;
