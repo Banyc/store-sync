@@ -13,6 +13,12 @@
 //! caller pipeline that touches both, a push or a checkpoint pass alike, runs
 //! under the same lock discipline.
 //!
+//! [`crate::sync`] is deliberately OUTSIDE that discipline: it locks the
+//! SIBLING record `<parent>/.<name>.operation.lock`
+//! ([`crate::sync::destination_lock_path`]), not this in-root `operation.lock`,
+//! so a `sync` and a push/checkpoint pass do NOT exclude each other in either
+//! direction.
+//!
 //! # The STABLE-INODE discipline (why the lock file is never deleted)
 //!
 //! POSIX `flock` locks are attached to an INODE, not a path. The lock file is

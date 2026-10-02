@@ -520,10 +520,17 @@
 //!   sidecar locks where the private mode IS required.)
 //! * **The DESTINATION TREE is still created lazily and only by a mutation.**
 //!   "A fully-refused pull creates NOTHING" holds for the root and everything
-//!   under it: the record location is outside the root, so a refused run may
-//!   still leave the root's PARENT chain present at the platform default mode,
-//!   but it never creates the root itself. This is the honest limit of the
-//!   contract; it is stated here rather than implied.
+//!   under it: the record location is outside the root, so the run never
+//!   creates the ROOT itself. Two pieces of residue OUTSIDE the root can
+//!   outlive a refused or blocked run, and both are named rather than implied:
+//!   (1) the root's PARENT chain, created at the platform default mode by
+//!   `create_lock_parent`; and (2) the persistent sibling record file
+//!   `<parent>/.<name>.operation.lock` itself, which
+//!   [`crate::lock::FileLock`] creates on first acquisition and NEVER removes
+//!   (the STABLE-INODE discipline in [`crate::lock`]) — the same path the suite
+//!   pins after a missing-source error
+//!   (`an_error_exit_releases_the_destination_lock`). This is the honest limit
+//!   of the contract; it is stated here rather than implied.
 //!
 //! A single-component RELATIVE root resolves through the current directory
 //! ([`destination_lock_path`] maps an empty `Path::parent` to `.`), exactly as

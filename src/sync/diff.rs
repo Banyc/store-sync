@@ -158,11 +158,15 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// provisions the layout) first; it is never silently described as empty.
 ///
 /// A non-zero exit is classified by LAYER ([`remote_manifest_failure`]): the
-/// remote command is `ssh … exec -- perl -e <script> <root>`, and an `ssh`
-/// failure (its reserved exit status 255, or a control-socket/connection
-/// diagnostic) is reported as a TRANSPORT failure, not blamed on a missing
-/// `perl`. Only the shell's "could not start perl" statuses (126/127) suggest
-/// that `perl` may be absent.
+/// remote command is `ssh … exec -- perl -e <script> <root>`. `ssh` reserves
+/// exit status 255 for its OWN failures, but a far-side `perl` `die` ALSO
+/// exits 255 (perl exits 255 when `$!` is 0, which is exactly what the
+/// crate's own script does for a non-directory root or a non-NFC name), so
+/// exit 255 ALONE establishes nothing: a positive transport diagnostic in
+/// stderr is required before the failure is named as transport, and otherwise
+/// the command is reported as a far-side script failure. Only the shell's
+/// "could not start perl" statuses (126/127) suggest that `perl` may be
+/// absent.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     let root = remote.root();
     if remote.is_local() {
@@ -202,10 +206,14 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 /// The command is `ssh … exec -- perl -e <script> <root>`, so a non-zero exit
 /// can come from any of three layers, and they are not interchangeable:
 ///
-/// * the TRANSPORT failed before the command ran — `ssh` reserves exit status
-///   255 for its own failures (connection refused/timed out, authentication,
-///   host-key verification, the `ControlMaster` control socket) and the runner
-///   reports `-1` when it killed the child at the deadline;
+/// * the TRANSPORT failed before the command ran — the runner reports `-1`
+///   when it killed the child at the deadline (no far-side exit status can be
+///   negative, so `-1` is conclusive on its own); `ssh` also reserves exit
+///   status 255 for its own failures (connection refused/timed out,
+///   authentication, host-key verification, the `ControlMaster` control
+///   socket), but a far-side `perl` `die` propagates 255 too, so 255 selects
+///   this branch ONLY with a positive transport diagnostic in stderr. Exit
+///   255 alone names no layer and is never reported as transport;
 /// * the far-side `perl` could not be STARTED — the remote shell's 126/127
 ///   ("found but not executable" / "not found"), which is the only layer that
 ///   is actually a statement about `perl`;
@@ -214,7 +222,12 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 ///
 /// Pre-fix every non-zero exit appended "(is perl installed on the remote
 /// host?)", so an `ssh` exit 255 — including the `unix_listener:` control-
-/// socket bind failure — was mislabeled as a missing interpreter.
+/// socket bind failure — was mislabeled as a missing interpreter; the fix
+/// after that made every exit 255 transport, which mislabeled the script's
+/// own `die`-at-255 refusals. This version attributes the layer from the
+/// EVIDENCE in stderr and, when the layer cannot be established, reports what
+/// is known (the exit status and preserved stderr) instead of asserting ssh,
+/// connection, or authentication.
 fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     let stderr = out.stderr.trim();
     let stderr = if stderr.is_empty() {
@@ -266,27 +279,36 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
 
 /// Whether `out` reports a failure of the TRANSPORT layer, before the far-side
 /// command could run at all.
+///
+/// Evidence, not a guess from the exit status: the runner's own timeout
+/// sentinel is conclusive on its own, but `ssh` exit status 255 is NOT,
+/// because a far-side `perl` `die` propagates the same status (perl exits 255
+/// when `$!` is 0) — the crate's own manifest script refuses a non-directory
+/// root and a non-NFC name exactly that way. Exit 255 therefore selects this
+/// branch only with a positive transport diagnostic in stderr.
 fn transport_failed_before_the_command(out: &ExecOutcome) -> bool {
-    // The runner's timeout/no-status sentinel: the child was killed at the
-    // deadline, so no remote command produced this outcome.
+    // The runner's timeout/no-status sentinel: THIS process killed the child
+    // at the deadline, so no far-side command produced the outcome. No
+    // far-side process can exit with a negative status, so -1 is conclusive
+    // by construction and needs no textual corroboration.
     if out.exit_code == -1 {
         return true;
     }
-    // `ssh` exits 255 for its OWN failures (connection refused/timed out,
-    // authentication, host-key verification, the control socket). A far-side
-    // perl `die` CAN also propagate 255, but the stderr is preserved verbatim
-    // in the message, and not suggesting a missing `perl` is the conservative
-    // direction: this never blames the interpreter for a transport fault.
-    if out.exit_code == 255 {
-        return true;
+    // `ssh` exits 255 for its own failures, but the far-side perl `die` does
+    // too, so 255 alone proves nothing. Require a positive transport marker.
+    if out.exit_code != 255 {
+        return false;
     }
-    // A few ssh diagnostics do not carry the `ssh:` prefix, so accept the
-    // well-known spellings too. `unix_listener:` is the `ControlMaster`
-    // socket-bind failure (the crate's mux directory disappeared).
+    // The markers below were each observed from a real `ssh` (OpenSSH) or from
+    // the crate's own script; `Permission denied` is deliberately ABSENT — it
+    // is ambiguous, because the crate's own script prints it (from `opendir
+    // $dir: $!`, exit 13) for an unreadable far-side directory. The connect-
+    // stage spellings (`Connection refused`, `Connection timed out`, `No
+    // route to host`, `Network is unreachable`) are additionally subsumed by
+    // the `ssh: ` prefix in real output and are kept as belt-and-braces.
     const TRANSPORT_MARKERS: &[&str] = &[
         "ssh: ",
         "kex_exchange_identification",
-        "Permission denied",
         "Host key verification failed",
         "Connection closed by",
         "Connection refused",
@@ -557,6 +579,149 @@ mod tests {
             msg.contains("is perl installed on the remote host?"),
             "a 127 must suggest perl may be absent: {msg}"
         );
+    }
+
+    /// F1: `perl`'s `die` exits 255 when `$! == 0` (perl's documented rule),
+    /// and the crate's OWN far-side script refuses a non-directory root and a
+    /// non-NFC name exactly that way. Exit 255 ALONE therefore establishes no
+    /// layer: with the script's own stderr the failure must stay a far-side
+    /// script failure, naming the exit status and preserved stderr.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): both inputs returned
+    /// "the transport failed before the far-side command started (exit 255): …
+    /// (this is a transport-level failure — connection, authentication, host
+    /// key, or the ssh control socket)".
+    #[test]
+    fn a_far_side_perl_die_at_255_is_not_a_transport_failure() {
+        for stderr in [
+            "not a directory: /srv/store",
+            "entry name under /srv/store is not NFC-normalized: e\u{301}",
+            // The real script's diagnostic for a far-side name `a<TAB>b`:
+            // the name is hex-encoded, so it carries no transport marker.
+            "entry name under /srv/store contains a tab, newline, carriage return, or NUL \
+             (the manifest wire refuses NUL/LF/CR/TAB): 610962",
+        ] {
+            let out = ExecOutcome {
+                exit_code: 255,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("failed inside the far-side manifest script"),
+                "a perl `die` at 255 with script stderr must be a far-side script \
+                 failure, got: {msg}"
+            );
+            assert!(
+                !msg.contains("transport-level failure"),
+                "exit 255 with no transport marker must not name the transport layer: {msg}"
+            );
+            assert!(
+                !msg.contains("is perl installed"),
+                "exit 255 is not the `perl` not-started stage: {msg}"
+            );
+            assert!(
+                msg.contains("exit 255") && msg.contains(stderr),
+                "the message must report what is known — the exit status and the preserved \
+                 stderr: {msg}"
+            );
+        }
+    }
+
+    /// F1: the crate's own script prints `opendir <dir>: $!` and exits 13 for an
+    /// unreadable far-side directory, so `Permission denied` in stderr is NOT
+    /// transport evidence (it is ambiguous — ssh authentication failures say it
+    /// too, but those still exit 255). Exit 13 with this stderr is a far-side
+    /// script failure.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the input returned
+    /// "the transport failed before the far-side command started (exit 13):
+    /// opendir /srv/store/sub: Permission denied (this is a transport-level
+    /// failure — connection, authentication, host key, or the ssh control
+    /// socket)".
+    #[test]
+    fn a_script_eacces_with_permission_denied_is_not_a_transport_failure() {
+        let out = ExecOutcome {
+            exit_code: 13,
+            stdout: String::new(),
+            stderr: "opendir /srv/store/sub: Permission denied".to_string(),
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("failed inside the far-side manifest script"),
+            "an EACCES script refusal must be a far-side script failure, got: {msg}"
+        );
+        assert!(
+            !msg.contains("transport-level failure"),
+            "`Permission denied` must not select the transport branch: {msg}"
+        );
+        assert!(
+            msg.contains("exit 13") && msg.contains("Permission denied"),
+            "the exit status and preserved stderr must survive: {msg}"
+        );
+    }
+
+    /// F1: the transport branch is retained for exit 255 that DOES carry a
+    /// strong, unambiguous transport diagnostic. This guards against
+    /// overcorrecting the "255 alone is not transport" rule into "255 is never
+    /// transport". (This assertion also holds pre-fix, which is the point: the
+    /// fix must not lose the genuine case.)
+    #[test]
+    fn an_exit_255_with_a_strong_transport_marker_is_transport() {
+        for stderr in [
+            "kex_exchange_identification: read: Connection reset by peer",
+            // The reviewer's real-sshd ground truth for a genuinely closed
+            // port: exit 255 AND this exact ssh diagnostic, which must still
+            // route to transport.
+            "ssh: connect to host 127.0.0.1 port 22: Connection refused",
+        ] {
+            let out = ExecOutcome {
+                exit_code: 255,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("transport-level failure"),
+                "an exit 255 with a strong ssh marker is transport: {msg}"
+            );
+            assert!(
+                msg.contains(stderr.trim()),
+                "the ssh diagnostic is preserved: {msg}"
+            );
+        }
+    }
+
+    /// F1: the only branch that is a statement about `perl` itself is the
+    /// remote shell's 126/127 ("found but not executable" / "not found"), with
+    /// or without the wrapper's not-found diagnostic.
+    ///
+    /// PRE-FIX BEHAVIOUR: this already classified correctly (the pre-fix
+    /// classifier reached the `perl` stage for 126/127 and for the diagnostic
+    /// spellings); the test pins that the fix did not move it.
+    #[test]
+    fn perl_could_not_start_is_the_perl_stage() {
+        for (code, stderr) in [
+            (126, ""),
+            (127, ""),
+            (127, "perl: command not found"),
+            (126, "bash: perl: No such file or directory"),
+        ] {
+            let out = ExecOutcome {
+                exit_code: code,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("is perl installed on the remote host?"),
+                "exit {code} with {stderr:?} must be the perl stage: {msg}"
+            );
+            assert!(
+                !msg.contains("transport-level failure"),
+                "the perl stage is not a transport failure: {msg}"
+            );
+        }
     }
 
     /// F3: a script-level failure (perl ran and exited non-zero) is reported as

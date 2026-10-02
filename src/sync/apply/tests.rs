@@ -10598,6 +10598,20 @@ fn a_killed_holder_releases_the_destination_lock() {
 /// nothing, and names the entry point that states the weaker guarantee. An
 /// agentic caller therefore cannot reach an unowned run by reaching for
 /// `sync`; it has to type `sync_unowned`.
+///
+/// This also pins the ORDERING the refusal depends on: the refusal is a PURE
+/// decision taken BEFORE [`Remote::prepare_identity`], so a refused run leaves
+/// no transport residue. A real `SshTransport::prepare_identity` creates the
+/// local `ControlMaster` mux directory (0700) and pins the verified host key;
+/// the [`RecordingRemote`] double cannot observe those real filesystem
+/// effects, so this pins the strongest consequence it CAN observe — that
+/// `prepare_identity` was never CALLED (`identity_calls() == 0`). Mutation
+/// proof: deleting the early `destination_lock_record` check leaves every
+/// other assertion in this test green (the later `lock_destination` still
+/// refuses with the same message) but calls `prepare_identity` first, so this
+/// assertion is what fails. What remains unobservable in-crate is the mux
+/// directory and pin cache themselves: only the real-SSH reproduction can see
+/// them, and it recovers the gap at this same ordering point.
 #[test]
 fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
     let dir = fixture_tmpdir(&env()).unwrap();
@@ -10619,6 +10633,15 @@ fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
         error.report().transfers,
         0,
         "the refusal is before every mutation"
+    );
+    assert_eq!(
+        remote.identity_calls(),
+        0,
+        "the refusal must precede prepare_identity: preparing the transport \
+         creates its mux directory and pins its host key, so a refused run \
+         must not prepare it (a real SshTransport's prepare_identity creates \
+         the control-socket directory and pins the verified host key; the \
+         double observes the call, which is the strongest in-crate proof)"
     );
     let text = error.to_string();
     assert!(
