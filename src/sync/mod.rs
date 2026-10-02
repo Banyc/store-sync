@@ -47,6 +47,23 @@
 //!
 //! # Two contracts a caller must know
 //!
+//! * **The destination is exclusively owned for the run, and the source must be
+//!   quiescent.** [`apply::sync`] TAKES the destination's operation lock (a
+//!   [`crate::lock::FileLock`] on the record named by
+//!   [`apply::destination_lock_path`]) and holds it for the WHOLE run, from
+//!   before the destination manifest is read until after the final
+//!   verification pass and any removal phase. Two preconditions follow: (a) the
+//!   destination is exclusively owned for the duration — cooperating writers
+//!   must hold the SAME lock, which the crate takes for you; (b) the SOURCE is
+//!   quiescent — the crate cannot lock the source (a remote tree for a PULL, the
+//!   caller's tree for a PUSH), so a concurrent source write is OUTSIDE the
+//!   contract. A COOPERATING writer is refused at acquisition; a
+//!   NON-cooperating writer is still caught by the existing post-transfer
+//!   verification, which is retained unchanged as a best-effort tripwire that
+//!   fails closed. The crate takes NO lock for a REMOTE destination (a far-side
+//!   lock cannot be held across the run with the existing machinery); see
+//!   [`apply`]'s "The lock discipline" section for that gap and the exact
+//!   failure mode.
 //! * **The two roots must be disjoint.** Neither the local root nor the remote
 //!   root may be an ancestor of the other; [`apply::sync`] refuses a strict
 //!   nesting before any mutation because a nested destination makes the run
@@ -60,21 +77,13 @@
 //!   from this host, so no refusal is computed — and none is implied; a caller
 //!   co-locating the two roots must ensure disjointness itself. See
 //!   [`apply`]'s "the two roots must be disjoint" section.
-//! * **`sync` takes NO lock.** Its concurrency posture is detection and
-//!   fail-closed (post-transfer verification reads every written entry and
-//!   touched directory back, and an `Ok` run is not a claim that the
-//!   destination is clean), NOT serialisation. A caller that needs to
-//!   serialise against a concurrent push or checkpoint must hold the crate's
-//!   push lock itself ([`crate::lock::FileLock`] on the operation-lock record
-//!   named by [`crate::transport::Layout::lock`]). See [`apply`]'s "the lock
-//!   discipline" section.
 
 pub mod apply;
 pub mod diff;
 
 pub use apply::{
     Conflict, ConflictReason, Direction, EntryPolicy, Policy, ReplaceAll, SyncError, SyncReport,
-    SyncResult, pull, push, sync,
+    SyncResult, destination_lock_path, pull, push, sync,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, diff_trees, local_manifest,

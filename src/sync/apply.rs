@@ -362,28 +362,79 @@
 //! enforce disjointness itself. This is stated rather than papered over: the
 //! guarantee this module computes is exactly the one it can see from here.
 //!
-//! ## The lock discipline: sync takes NO lock
+//! ## The lock discipline: the destination is exclusively owned
 //!
-//! [`sync`] takes NO lock and calls neither [`provision_layout`](crate::transport::Remote::provision_layout)
-//! nor [`crate::lock::FileLock`]. Its concurrency posture is DETECTION AND
-//! FAIL-CLOSED, not serialisation: a concurrent writer's effect is caught by
-//! the post-transfer verification (which reads every written entry, the
+//! [`sync`] TAKES the destination's operation lock and holds it for the WHOLE
+//! run — acquired before the destination manifest is read and released only
+//! after the transfers, the post-transfer verification, and any removal
+//! phase. The lock is a [`crate::lock::FileLock`]: an advisory `flock`
+//! (`LockFileEx` on Windows) held by an open descriptor, which the kernel
+//! releases when the descriptor drops. The guard is therefore released on the
+//! success path, on EVERY error return, and on a panic that unwinds; a
+//! `SIGKILL`ed holder releases it too, because the kernel closes the process's
+//! descriptors. There is ONE authority for how a lock is taken —
+//! [`crate::lock::FileLock`], the same primitive the crate documents for its
+//! push and checkpoint pipelines — and the record name reuses the crate's
+//! reserved `operation.lock` spelling (see [`destination_lock_path`]).
+//!
+//! ### The two preconditions
+//!
+//! 1. **The destination is exclusively owned for the duration of the run.**
+//!    Every cooperating writer of the destination tree must hold the SAME
+//!    lock. For a LOCAL destination the crate takes it for you; a cooperating
+//!    writer that tries to acquire it while the run holds it is refused at
+//!    acquisition (`FileLock::acquire` is non-blocking: it fails with the
+//!    "held by" diagnostic rather than interleaving), and the run's own
+//!    writes and reads therefore cannot be interleaved by such a writer.
+//! 2. **The SOURCE is quiescent for the duration.** The crate cannot lock the
+//!    source: for a PULL the source is a remote tree it does not own, and for
+//!    a PUSH the source is the caller's local tree, which the crate is not
+//!    given a lock record for. A concurrent SOURCE write is OUTSIDE the
+//!    contract, and the destination cannot be made to agree with a source
+//!    that changes underneath the run.
+//!
+//! ### What happens when a precondition is violated
+//!
+//! A COOPERATING writer cannot interleave: the crate holds the lock, so the
+//! writer is refused when it tries to take the same record. A NON-cooperating
+//! writer — one that does not take the lock — still can, and the existing
+//! detection is retained UNCHANGED as a best-effort tripwire that fails
+//! closed: the post-transfer verification reads every written entry, the
 //! touched directories' live listings, and the entries the run claims to have
-//! left alone) and surfaced as a conflict, a [`SyncReport::verify_failures`]
-//! entry, or a hard error naming the unplanned path; an `Ok` run that a writer
-//! raced is not a claim that the destination is clean. Nothing here serialises
-//! two syncs, and nothing here is claimed to.
+//! left alone, and surfaces a violation as a conflict, a
+//! [`SyncReport::verify_failures`] entry, or a hard error naming the unplanned
+//! path. Taking the lock does not narrow that detection and no check is
+//! removed here; an `Ok` run that a non-cooperating writer raced is still not
+//! a claim that the destination is clean. A SOURCE write cannot be detected at
+//! all: the destination is compared against the source manifest the run read,
+//! and no third party holds the source still.
 //!
-//! If a caller needs serialisation against a concurrent push or checkpoint, it
-//! MUST hold the crate's push lock itself: a [`crate::lock::FileLock`] acquired
-//! on the operation-lock record named by
-//! [`crate::transport::Layout::lock`], in the fixed local-then-target order the
-//! [`crate::lock`] module documents — the SAME discipline every push and
-//! checkpoint pass uses. That module's "every caller pipeline that touches both
-//! ... runs under the same lock discipline" describes the pipelines that
-//! acquire it; [`sync`] is deliberately NOT one of them (taking it would
-//! require creating the destination's lock record, so even an all-refused sync
-//! would mutate the destination, and a remote `flock` is not portable).
+//! ### The far-side (remote destination) limitation
+//!
+//! [`destination_lock_path`] is a path on THIS host and [`crate::lock::FileLock`]
+//! is a LOCAL descriptor lock. A destination whose [`Remote::is_local`] is
+//! `false` names a far-side tree, and the existing machinery cannot hold a
+//! far-side lock across the run: the transport's sidecar `flock` is taken
+//! INSIDE a single remote command and dies when that command exits, so it
+//! serializes one lock-record mutation, not a whole run. The crate therefore
+//! takes NO lock when the destination is remote. This is stated rather than
+//! papered over — for such a destination NEITHER precondition above is
+//! enforced by the crate, a cooperating far-side writer is not excluded, and
+//! the caller that needs serialisation must provide it. Closing the gap needs
+//! a persistent far-side session, which does not exist here.
+//!
+//! ### Why the lock record is a SIBLING of the destination root
+//!
+//! The lock record is deliberately NOT placed inside the destination tree.
+//! Creating `<root>/state/operation.lock` would create the destination ROOT
+//! itself for a run that must create nothing, and it would enter the
+//! destination manifest the run reads, destroying the "a fully-refused pull
+//! creates NOTHING, not even the root" and "two empty trees are a no-op"
+//! contracts (both pinned by tests). [`destination_lock_path`] therefore
+//! derives a dot-prefixed sibling record in the destination root's parent:
+//! taking the lock never creates or enters the tree the run is judging, and
+//! the record reuses the reserved `operation.lock` spelling
+//! ([`crate::transport::Layout::lock`]) rather than inventing a mechanism.
 //!
 //! ## Root pinning, and the race that remains
 //!
@@ -644,6 +695,7 @@
 
 use crate::atomic::ReplaceOutcome;
 use crate::error::{Error, Result};
+use crate::lock::FileLock;
 use crate::manifest::{
     TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata, canonicalize_tree, compute_tree_digest,
 };
@@ -1086,6 +1138,74 @@ impl From<Error> for SyncError {
     }
 }
 
+/// The operation-lock record path for a LOCAL destination root.
+///
+/// The record is a dot-prefixed SIBLING of the destination root, in that
+/// root's parent directory: `<parent>/.<name>.operation.lock`. It is
+/// deliberately outside the tree the run judges, because taking a lock inside
+/// the tree would create the destination root for a run that must create
+/// nothing and would enter the destination manifest — see the module docs
+/// ("Why the lock record is a SIBLING of the destination root"). The spelling
+/// reuses the crate's reserved `operation.lock` name
+/// ([`crate::transport::Layout::lock`]), so it is the SAME record name a push
+/// or checkpoint pass would use, not a new lock mechanism.
+///
+/// `None` when no sibling location can be derived: a filesystem root (`/`) has
+/// no parent, and a path with no final component names no record. Such a
+/// destination is synced WITHOUT a lock (the crate cannot place the record),
+/// and the caller must serialize — the preconditions are not enforced for it.
+///
+/// Two runs of [`sync`] against the same destination root derive the same path
+/// and so exclude each other; a caller that wants to cooperate with a `sync`
+/// can acquire the same record with [`crate::lock::FileLock::acquire`].
+pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
+    let root = normalize_root(dest_root);
+    let parent = root.parent()?;
+    let base = root.file_name()?;
+    let mut record = OsString::from(".");
+    record.push(base);
+    record.push(".operation.lock");
+    Some(parent.join(record))
+}
+
+/// A human-readable holder identity recorded in the lock record, so a refused
+/// contender's "held by ..." diagnostic names the run that holds it.
+fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
+    format!(
+        "store-sync {direction:?} of {} (pid {})",
+        dest_root.display(),
+        std::process::id()
+    )
+}
+
+/// Acquire the destination's operation lock and return the guard that holds it
+/// for the whole run, or `None` when the crate cannot take one.
+///
+/// A guard is returned (rather than the lock being taken inside a closure) so
+/// the caller's single `let _guard = ...` binds it across the ENTIRE run: the
+/// `FileLock` drop runs on the success path, on every error return, and on a
+/// panic that unwinds, and the kernel releases the flock when the descriptor
+/// closes even if the drop never runs (a `SIGKILL`ed holder).
+///
+/// The crate takes NO lock when the destination is REMOTE (`is_local()` false),
+/// or when no sibling record location can be derived ([`destination_lock_path`]
+/// is `None`); both cases are documented gaps, not silent interleaving. See the
+/// module's "The far-side (remote destination) limitation".
+fn acquire_destination_lock(
+    direction: Direction,
+    dest_is_local: bool,
+    dest_root: &Path,
+) -> Result<Option<FileLock>> {
+    if !dest_is_local {
+        return Ok(None);
+    }
+    let Some(path) = destination_lock_path(dest_root) else {
+        return Ok(None);
+    };
+    let op_id = destination_op_id(direction, dest_root);
+    Ok(Some(FileLock::acquire(&path, &op_id)?))
+}
+
 /// Sync `local_root` and `remote` in `direction` under `policy`, reporting
 /// every action and conflict. `delete_extraneous` defaults to false in
 /// [`push`]/[`pull`]; when true, destination-only entries are removed after
@@ -1107,6 +1227,29 @@ impl From<Error> for SyncError {
 /// entry the run claimed to leave untouched whose content a concurrent writer
 /// changed), and [`SyncReport::conflicts`] names every path left for the caller
 /// to resolve.
+///
+/// # The destination lock and the two preconditions
+///
+/// `sync` TAKES the destination's operation lock ([`crate::lock::FileLock`] on
+/// the record named by [`destination_lock_path`]) and holds it for the WHOLE
+/// run — from before the
+/// destination manifest is read until after the transfers, the post-transfer
+/// verification, and any removal phase — so a cooperating writer of the
+/// destination is refused at acquisition instead of interleaving. Two
+/// preconditions follow:
+///
+/// 1. **The destination is exclusively owned for the duration of the run.**
+///    Cooperating writers must hold the SAME lock, which the crate takes for
+///    you (for a LOCAL destination).
+/// 2. **The SOURCE is quiescent for the duration.** The crate cannot lock the
+///    source; a concurrent source write is outside the contract.
+///
+/// A NON-cooperating destination writer is still possible, and the existing
+/// post-transfer verification is retained unchanged as a best-effort tripwire
+/// that fails closed. The crate takes NO lock for a REMOTE destination and
+/// none when no sibling record location can be derived; those gaps and the
+/// exact failure mode are stated in the module docs (the "The lock
+/// discipline" section).
 ///
 /// # The two roots must be disjoint
 ///
@@ -1153,6 +1296,23 @@ pub fn sync(
         Direction::Push => (Side::Local(&local), Side::Remote(remote)),
         Direction::Pull => (Side::Remote(remote), Side::Local(&local)),
     };
+    // Take the destination's operation lock and hold it for the WHOLE run.
+    // Acquired BEFORE `run` reads the destination manifest, and released only
+    // when the guard drops after `run` returns — on success, on every error
+    // return, and on a panic (the guard is a `FileLock`, so the flock is
+    // released when the descriptor drops; a `SIGKILL`ed holder releases it by
+    // process death). See the module's "The lock discipline" section for the
+    // two preconditions and the remote-destination gap.
+    let dest_root = match direction {
+        Direction::Push => normalize_root(remote.root()),
+        Direction::Pull => local.root_path.clone(),
+    };
+    let dest_is_local = match direction {
+        Direction::Push => remote.is_local(),
+        Direction::Pull => true,
+    };
+    let _dest_lock =
+        acquire_destination_lock(direction, dest_is_local, &dest_root).map_err(SyncError::from)?;
     run(&source, &dest, policy, delete_extraneous)
 }
 

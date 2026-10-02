@@ -9714,3 +9714,327 @@ fn a_deep_destination_tree_is_removed_without_aborting_the_process() {
         "the replacement must have completed once the child exited cleanly"
     );
 }
+
+// ===========================================================================
+// THE DESTINATION OPERATION LOCK
+// ===========================================================================
+//
+// `sync` TAKES the destination's operation lock for the whole run. These tests
+// pin, in order: the lock is actually HELD during a run; two REAL processes
+// cannot interleave on one destination; the guard is released on an ERROR
+// exit; and the flock is released when the holder is KILLED.
+//
+// Determinism: no assertion depends on timing luck. Where the prose says "a
+// probe must fail WHILE the run holds the lock", the probe runs from INSIDE
+// the run (a caller-supplied `Policy`, which the applier invokes on its real
+// code path) or from the parent while a CHILD signals readiness through a
+// file. The only waits are BOUNDED by a hard deadline, so a wedged lock test
+// fails the suite instead of hanging it.
+
+/// The hard deadline for every blocking wait in the real-process lock tests.
+#[cfg(unix)]
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Env var that turns the test binary into the CHILD holding the destination
+/// lock.
+#[cfg(unix)]
+const LOCK_CHILD: &str = "STORE_SYNC_LOCK_CHILD";
+#[cfg(unix)]
+const LOCK_CHILD_SRC: &str = "STORE_SYNC_LOCK_CHILD_SRC";
+#[cfg(unix)]
+const LOCK_CHILD_DST: &str = "STORE_SYNC_LOCK_CHILD_DST";
+#[cfg(unix)]
+const LOCK_CHILD_HELD: &str = "STORE_SYNC_LOCK_CHILD_HELD";
+#[cfg(unix)]
+const LOCK_CHILD_RELEASE: &str = "STORE_SYNC_LOCK_CHILD_RELEASE";
+
+/// Wait (BOUNDED) for `path` to appear. Returns whether it did.
+#[cfg(unix)]
+fn wait_for_file(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// A spawned lock holder that CANNOT outlive its test: on drop it tells the
+/// child to finish, and kills and reaps it if it does not within a bound — so
+/// a failed assertion can never leave a process holding the lock, or block the
+/// suite, forever.
+#[cfg(unix)]
+struct LockHolder {
+    child: Option<std::process::Child>,
+    release: PathBuf,
+}
+
+#[cfg(unix)]
+impl LockHolder {
+    fn spawn(src: &Path, dst: &Path, held: &Path, release: &Path) -> LockHolder {
+        // The libtest name of the CHILD test: `module_path!()` carries the
+        // crate prefix while libtest registers the in-crate path, so the name
+        // is spelled out (the deep-tree child does the same).
+        let name = "sync::apply::tests::destination_lock_child_holder";
+        let child =
+            std::process::Command::new(std::env::current_exe().expect("the test binary's path"))
+                .args(["--exact", name, "--nocapture"])
+                .env(LOCK_CHILD, "hold")
+                .env(LOCK_CHILD_SRC, src)
+                .env(LOCK_CHILD_DST, dst)
+                .env(LOCK_CHILD_HELD, held)
+                .env(LOCK_CHILD_RELEASE, release)
+                .spawn()
+                .expect("spawn the lock-holder child");
+        LockHolder {
+            child: Some(child),
+            release: release.to_path_buf(),
+        }
+    }
+
+    /// Tell the holder to finish and return its exit status.
+    fn finish(mut self) -> std::process::ExitStatus {
+        let _ = std::fs::write(&self.release, b"go");
+        self.child.take().unwrap().wait().unwrap()
+    }
+
+    /// Kill the holder (SIGKILL on Unix) and reap it.
+    fn kill(mut self) -> std::process::ExitStatus {
+        let mut child = self.child.take().unwrap();
+        child.kill().expect("kill the lock holder");
+        child.wait().unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = std::fs::write(&self.release, b"go");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// The CHILD side of the real-process lock tests: hold the destination's lock
+/// open until the parent releases or kills us. Readiness is signalled by
+/// creating `LOCK_CHILD_HELD` from INSIDE the run (the policy runs only after
+/// the lock has been acquired), and the child then blocks in the policy until
+/// `LOCK_CHILD_RELEASE` appears — a real synchronising hook, not a sleep. The
+/// child has its OWN hard deadline, so a misbehaving parent cannot leave a
+/// blocked test binary behind. With the env var unset this test is a no-op.
+#[cfg(unix)]
+#[test]
+fn destination_lock_child_holder() {
+    if std::env::var_os(LOCK_CHILD).is_none() {
+        return;
+    }
+    let src = PathBuf::from(std::env::var_os(LOCK_CHILD_SRC).unwrap());
+    let dst = PathBuf::from(std::env::var_os(LOCK_CHILD_DST).unwrap());
+    let held = PathBuf::from(std::env::var_os(LOCK_CHILD_HELD).unwrap());
+    let release = PathBuf::from(std::env::var_os(LOCK_CHILD_RELEASE).unwrap());
+    let child_deadline = std::time::Instant::now() + LOCK_WAIT + Duration::from_secs(30);
+    let policy = move |_rel: &str, _kind: EntryKind| {
+        write(&held, b"held");
+        while !release.exists() && std::time::Instant::now() < child_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        EntryPolicy::Replace
+    };
+    let report = sync(Direction::Push, &src, &transport(&dst), &policy, false).unwrap();
+    assert!(report.applied.contains(&"f".to_string()), "{report:?}");
+}
+
+/// The lock is ACTUALLY TAKEN for the duration of the run, and released after
+/// it.
+///
+/// The probe runs from a caller-supplied `Policy`, which the applier invokes
+/// on its real code path INSIDE `run` — after the guard is bound and while it
+/// is still alive — so "the record is held" is observed at a point the
+/// implementation cannot reorder without breaking the run. After the run the
+/// same record must be immediately acquirable again.
+///
+/// PRE-FIX PROOF: before this change `sync` took no lock, so the in-run
+/// `FileLock::acquire` below would SUCCEED and the `expect_err` panics.
+#[test]
+fn the_destination_lock_is_held_during_the_run_and_released_after() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"payload");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let lock_path =
+        destination_lock_path(&dst).expect("a destination root in a parent has a lock record");
+
+    let probe_path = lock_path.clone();
+    let probe = move |_rel: &str, _kind: EntryKind| {
+        let err = match crate::lock::FileLock::acquire(&probe_path, "in-run-probe") {
+            Ok(_) => panic!("the destination lock must be held while the run is in progress"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("held by"),
+            "the refusal must name the holder: {err}"
+        );
+        EntryPolicy::Replace
+    };
+    let report = sync(Direction::Push, &src, &transport(&dst), &probe, false).unwrap();
+    assert!(report.applied.contains(&"f".to_string()), "{report:?}");
+
+    // The guard has dropped: the record is free again.
+    let after = crate::lock::FileLock::acquire(&lock_path, "after-run")
+        .expect("the destination lock must be released when the run returns");
+    drop(after);
+}
+
+/// An ERROR exit path releases the lock.
+///
+/// The run fails AFTER the lock has been taken (the source root is missing, so
+/// the SOURCE manifest read fails inside `run`), and the record must then be
+/// free: a subsequent run acquires IMMEDIATELY. A leaked guard would leave the
+/// record held and the second run would fail with "held by".
+///
+/// The first assertion fails against the PRE-CHANGE behaviour (`sync` took no
+/// lock, so the record file would not exist). The second assertion is
+/// COVERAGE-ONLY against the pre-fix prefix (it passes without a lock) but is
+/// the guard against THIS change leaking a guard.
+#[test]
+fn an_error_exit_releases_the_destination_lock() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let missing = dir.path().join("missing-source");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let lock_path = destination_lock_path(&dst).unwrap();
+
+    let err = sync(
+        Direction::Push,
+        &missing,
+        &transport(&dst),
+        &ReplaceAll,
+        false,
+    )
+    .expect_err("a missing source root must fail the run");
+    assert!(
+        matches!(err.error(), Error::Materialization(_)),
+        "got {err:?}"
+    );
+    assert!(
+        lock_path.exists(),
+        "the lock record must have been created (and held) before the source manifest failed"
+    );
+
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"ok");
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, false)
+        .expect("the lock must be released after the error exit");
+    assert!(report.applied.contains(&"f".to_string()), "{report:?}");
+}
+
+/// Two REAL processes against one destination never interleave: the second run
+/// is refused at acquisition while the first holds the lock, and the first
+/// completes correctly.
+///
+/// The holder is a CHILD PROCESS (the test binary re-entered with `--exact`)
+/// whose caller-supplied policy signals readiness and then blocks INSIDE the
+/// run, so the parent observes "the child holds the lock" from a file rather
+/// than a sleep. The parent's own run is refused by the SAME record.
+///
+/// PRE-FIX PROOF: before this change the parent's run took no lock, so it
+/// would proceed (and `expect_err` panics); the two processes would interleave
+/// on the destination.
+#[cfg(unix)]
+#[test]
+fn two_concurrent_syncs_against_one_destination_do_not_interleave() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"first");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let held = dir.path().join("held");
+    let release = dir.path().join("release");
+
+    let holder = LockHolder::spawn(&src, &dst, &held, &release);
+    assert!(
+        wait_for_file(&held),
+        "the holder never reported holding the lock"
+    );
+
+    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, false)
+        .expect_err("the second run must be refused while the holder holds the lock");
+    assert!(
+        err.error().to_string().contains("held by"),
+        "the refusal must name the holder: {err}"
+    );
+
+    let status = holder.finish();
+    assert!(status.success(), "the lock holder failed: {status:?}");
+    assert_eq!(read(&dst.join("f")), b"first");
+}
+
+/// Killing the holder releases the lock: `flock` is released by the kernel on
+/// process death, so a subsequent acquisition succeeds within a bounded time.
+///
+/// The holder is SIGKILLed (`Child::kill`) while it blocks inside the run. The
+/// parent then acquires the SAME record in a bounded loop. A mechanism that
+/// did not rest on the descriptor's lifetime (a content record, say) would
+/// leave the record held forever and this test would fail at the deadline.
+///
+/// This test is meaningful only from this change on (pre-fix `sync` took no
+/// lock, so there was no holder to kill); it is the regression guard for the
+/// SIGKILL release property.
+#[cfg(unix)]
+#[test]
+fn a_killed_holder_releases_the_destination_lock() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"payload");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let held = dir.path().join("held");
+    let release = dir.path().join("release");
+    let lock_path = destination_lock_path(&dst).unwrap();
+
+    let holder = LockHolder::spawn(&src, &dst, &held, &release);
+    assert!(
+        wait_for_file(&held),
+        "the holder never reported holding the lock"
+    );
+    assert!(
+        crate::lock::FileLock::acquire(&lock_path, "before-kill").is_err(),
+        "the record must be held before the kill"
+    );
+
+    let status = holder.kill();
+    assert!(
+        !status.success(),
+        "the holder must have been killed: {status:?}"
+    );
+
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let mut acquired = None;
+    while std::time::Instant::now() < deadline {
+        match crate::lock::FileLock::acquire(&lock_path, "after-kill") {
+            Ok(guard) => {
+                acquired = Some(guard);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    assert!(
+        acquired.is_some(),
+        "the destination lock was not released after the holder was SIGKILLed; \
+         flock must release on process death"
+    );
+}
