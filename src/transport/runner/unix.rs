@@ -78,8 +78,10 @@ fn siginfo_pid(si: &libc::siginfo_t) -> libc::pid_t {
     si.si_pid
 }
 
-/// The LIVE (non-zombie) members of the process group `pgid`, excluding the
-/// runner's own child `exclude_pid`. This is the FOREGROUND-ONLY detection:
+/// The LIVE members of the process group `pgid` — judged by the shared
+/// `is_live_state` rule, so `Z` (EXIT_ZOMBIE) AND `X` (EXIT_DEAD) are
+/// excluded — minus the runner's own child `exclude_pid`. This is the
+/// FOREGROUND-ONLY detection:
 /// after the direct child exits (held as a zombie), any remaining live member
 /// is a background descendant the command left behind. The enumeration never
 /// uses the fault-injected [`KillSeam`] — it is a pure detection primitive,
@@ -118,7 +120,7 @@ fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
         let state = fields.next().unwrap_or("");
         let _ppid = fields.next();
         let pgrp: i32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(-1);
-        if pgrp == pgid && !state.starts_with('Z') {
+        if pgrp == pgid && is_live_state(state) {
             members.push(pid);
         }
     }

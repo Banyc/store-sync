@@ -119,6 +119,35 @@ pub(crate) const TERM_TO_KILL_GRACE: Duration = Duration::from_millis(200);
 /// and tiny in tests (see [`RunnerConfig::reap_bound`]).
 pub(crate) const KILL_REAP_BOUND: Duration = Duration::from_secs(2);
 
+/// THE single definition of "this `/proc/<pid>/stat` state field names a LIVE
+/// process", shared by production's group-member enumeration (the Linux arm
+/// of `live_group_members`) and the test oracle's classification
+/// (`probe_process`), so the two can never drift apart again.
+///
+/// The kernel emits exactly the state characters in `fs/proc/array.c`'s
+/// `task_state_array`, selected by `task_index_to_char` in
+/// `include/linux/sched.h`:
+///
+/// * LIVE — `R` running, `S` sleeping, `D` disk sleep, `T` stopped,
+///   `t` tracing stop, `P` parked, `I` idle. A stopped/traced task is not
+///   exiting: it keeps its resources and can resume, so it is a live group
+///   member.
+/// * NOT live — `X` dead and `Z` zombie. `X` is `EXIT_DEAD`: the task has
+///   already finished exiting (`__task_state_index` reports `X` whenever
+///   `exit_state` holds `EXIT_DEAD`) and only awaits its final release, so
+///   it must NOT be counted as a live member; `Z` is `EXIT_ZOMBIE`: exited
+///   but held unreaped.
+///
+/// `task_index_to_char` is `"RSDTtXZPI"`: the kernel never emits a lowercase
+/// `z` or `x`, but they are accepted as the same dead states defensively. Any
+/// other string is not a state a kernel can report (a malformed `stat` line);
+/// it conservatively counts as LIVE, so a malformed entry can never let a
+/// leftover escape the foreground-only check.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) fn is_live_state(state: &str) -> bool {
+    !matches!(state, "X" | "Z" | "x" | "z")
+}
+
 /// The kill seam behind [`ChildRunner`]: the syscall-level termination
 /// surface, injectable for tests (a kill-function pointer seam). The runner
 /// reports a kill failure as an error only when the seam says the signal
@@ -311,14 +340,29 @@ mod tests {
         Zombie,
     }
 
+    impl ProcessState {
+        /// Classify a `/proc/<pid>/stat` state field through the SAME
+        /// [`is_live_state`] predicate production uses. The oracle does not
+        /// re-derive the live/gone rule, so an oracle/production divergence
+        /// is impossible by construction.
+        fn of_proc_state(state: &str) -> Self {
+            if is_live_state(state) {
+                ProcessState::Live
+            } else {
+                ProcessState::Zombie
+            }
+        }
+    }
+
     /// The kernel's `(state, start-time token)` for `pid`, or `None` when the
     /// pid names no process at all (reaped, or never existed). A ZOMBIE is
     /// reported with the start token it had while alive — which is what lets
     /// [`ProcessId::capture`] record a child that exited before the observer
     /// ran — but is never reported as live: the runner's `live_group_members`
-    /// deliberately excludes zombies from "live", and this oracle must agree
-    /// with that definition rather than with `kill(pid, 0)` (which a zombie
-    /// still answers).
+    /// excludes every non-live state (zombie AND `X`/`EXIT_DEAD`) from "live",
+    /// and this oracle shares that ONE definition through `is_live_state`
+    /// rather than agreeing with `kill(pid, 0)` (which a zombie still
+    /// answers).
     #[cfg(target_os = "macos")]
     fn probe_process(pid: u32) -> Option<(ProcessState, u64)> {
         // `KERN_PROC_PID` fills a `struct kinfo_proc`: `p_starttime` is two
@@ -379,11 +423,7 @@ mod tests {
         // `state` is field 3; `starttime` is field 22, i.e. `nth(18)` of the
         // fields that follow `state` (field 4 is `nth(0)`).
         let start: u64 = fields.nth(18)?.parse().ok()?;
-        let state = if state.starts_with('Z') || state.starts_with('X') {
-            ProcessState::Zombie
-        } else {
-            ProcessState::Live
-        };
+        let state = ProcessState::of_proc_state(state);
         Some((state, start))
     }
 
@@ -657,13 +697,69 @@ mod tests {
         );
     }
 
-    /// The oracle's own semantics, pinned so it can never silently become
-    /// vacuous: a LIVE process is not gone, a ZOMBIE is gone (the runner
-    /// excludes zombies from "live" — the exact case `kill(pid, 0)` got
-    /// wrong), and a pid whose start token moved is a DIFFERENT process, so
-    /// the tracked one is gone even though the number still answers.
+    /// The shared predicate's mapping over every state the kernel can emit,
+    /// plus the defensive lowercase and unknown cases. Pinned so the ONE
+    /// definition cannot drift: production's enumeration and the oracle both
+    /// read this mapping.
+    #[test]
+    fn is_live_state_classifies_kernel_states() {
+        // LIVE: the non-exit states `task_state_array` can report.
+        for state in ["R", "S", "D", "T", "t", "P", "I"] {
+            assert!(is_live_state(state), "{state} is a live kernel state");
+        }
+        // DEAD: `X` (EXIT_DEAD) and `Z` (EXIT_ZOMBIE), plus the lowercase
+        // spellings a kernel never emits but a defensive reader accepts.
+        for state in ["X", "Z", "x", "z"] {
+            assert!(!is_live_state(state), "{state} is a dead kernel state");
+        }
+        // Unknown or malformed input conservatively counts as LIVE, so a
+        // leftover can never hide behind an unparsed state.
+        for state in ["", "Q", "?", "RS", " Z", "r"] {
+            assert!(
+                is_live_state(state),
+                "{state:?} is not a kernel state and must default to live"
+            );
+        }
+    }
+
+    /// The oracle's own semantics, pinned against the kernel's state table so
+    /// it can never silently diverge from production: the oracle classifies
+    /// through the SAME `is_live_state` predicate production uses, and this
+    /// test pins that predicate's mapping — so a regression that counts `X`
+    /// (EXIT_DEAD) as live again, the exact bug this definition exists to
+    /// catch, fails here. On top of the table: a LIVE process is not gone, a
+    /// ZOMBIE is gone, and a pid whose start token moved is a DIFFERENT
+    /// process, so the tracked one is gone even though the number still
+    /// answers.
     #[test]
     fn process_oracle_matches_the_live_definition() {
+        // The kernel state table, checked through the shared predicate AND
+        // the oracle's derivation from it. Pinning the shared rule pins both
+        // sides at once (the oracle does not re-derive it).
+        for state in ["R", "S", "D", "T", "t", "P", "I"] {
+            assert!(
+                is_live_state(state),
+                "{state} is a live kernel state; production and the oracle must agree it is live"
+            );
+            assert_eq!(
+                ProcessState::of_proc_state(state),
+                ProcessState::Live,
+                "the oracle must classify {state} as live, matching production"
+            );
+        }
+        for state in ["X", "Z", "x", "z"] {
+            assert!(
+                !is_live_state(state),
+                "{state} is a dead kernel state (X = EXIT_DEAD, Z = EXIT_ZOMBIE); \
+                 production must not count it as a live member"
+            );
+            assert_eq!(
+                ProcessState::of_proc_state(state),
+                ProcessState::Zombie,
+                "the oracle must classify {state} as gone, matching production"
+            );
+        }
+
         // A live child is NOT gone, even after the budget elapses.
         let mut live = std::process::Command::new("sleep")
             .arg("30")
