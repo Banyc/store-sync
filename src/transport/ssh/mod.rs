@@ -491,9 +491,23 @@ impl SshTransport {
     pub(crate) fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
         let remote_path = self.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
+        // The parent is computed HERE and single-quoted, never via an unquoted
+        // `$(dirname ...)`: command-substitution output is subject to word
+        // splitting and pathname expansion, so a destination whose parent
+        // contains a space, a tab, a newline, or a glob metacharacter would
+        // create stray entries and — for a split word — an object relative to
+        // the remote working directory, OUTSIDE the destination root. A
+        // command substitution also strips a trailing newline from `dirname`'s
+        // output, silently truncating a parent that ends in one. `--` keeps a
+        // component that starts with `-` from being read as an option.
+        let parent = Path::new(&remote_path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
         let script = format!(
-            "mkdir -p $(dirname {p}) && cat > {p}",
-            p = shell_quote(&remote_path_str)
+            "mkdir -p -- {parent} && cat > {p}",
+            parent = shell_quote(&parent),
+            p = shell_quote(&remote_path_str),
         );
         let argv = self.ssh_command_argv(&script)?;
         // Size-aware deadline: a large upload over a slow link must not be
@@ -1522,8 +1536,11 @@ impl Remote for SshTransport {
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
+        // `--` before the link target: `target` is a plain relative link
+        // target and may legitimately start with `-`; without it the `ln`
+        // option parser reads it as an option cluster and refuses the link.
         let cmd = format!(
-            "mkdir -p {parent} && ln -sfn {t} {l}",
+            "mkdir -p -- {parent} && ln -sfn -- {t} {l}",
             parent = shell_quote(&parent),
             t = shell_quote(t),
             l = shell_quote(&l),
@@ -1657,7 +1674,9 @@ impl Remote for SshTransport {
         // Preserve argv boundaries: quote every argument and run them via `exec`
         // so the program receives exactly `argv` and the remote shell cannot
         // reinterpret spaces/metacharacters inside an argument.
-        let command = format!("exec {}", Self::argv_cmd(argv));
+        // `--` before the program: `argv[0]` is caller-supplied and a program
+        // name that starts with `-` must not be parsed as an `exec` option.
+        let command = format!("exec -- {}", Self::argv_cmd(argv));
         let full = self.ssh_command_argv(&command)?;
         // Runs through THE shared runner with the caller-supplied timeout: on
         // deadline the child is killed and reaped (deterministically) before the
