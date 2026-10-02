@@ -6,8 +6,8 @@
 //!
 //! * only `Missing` and `Changed` entries are eligible — `Same` entries are
 //!   skipped with no content I/O, and `Extraneous` (destination-only) entries
-//!   are REPORTED and never deleted unless the caller sets `delete_extraneous`
-//!   (default false);
+//!   are REPORTED and never deleted unless the caller passes
+//!   [`Extraneous::Delete`] (the default is [`Extraneous::Keep`]);
 //! * [`EntryPolicy::Replace`] overwrites the destination entry,
 //!   [`EntryPolicy::Refuse`] leaves it alone and reports a conflict, and
 //!   [`EntryPolicy::AppendTail`] applies the append-only prefix rule (below);
@@ -44,7 +44,7 @@
 //!   remember to insert into the set.
 //! * **Proof-carrying deletion.** [`Applier::remove_subtree`] requires a
 //!   [`Sanction`], not an ancestry question. [`Sanction::ExtraneousFlag`] is the
-//!   caller's `delete_extraneous`, and it refuses any path the conflict-derived
+//!   caller's [`Extraneous::Delete`], and it refuses any path the conflict-derived
 //!   prohibition covers; [`Sanction::OwnClaim`] carries the [`Claim`] naming the
 //!   aside this sync itself renamed away, so the sync's own cleanup cannot
 //!   strand residue under a conflicted writable ancestor — but the claim is
@@ -210,7 +210,7 @@
 //! DESTINATION reserved entry is abandoned residue: it is reduced to its topmost
 //! path in [`SyncReport::residue`], NEVER transferred (a pull must not copy a
 //! stranded aside into the other tree), and NEVER removed — not even by
-//! `delete_extraneous`: a destination-only directory that contains residue has
+//! [`Extraneous::Delete`]: a destination-only directory that contains residue has
 //! its removal refused as [`ConflictReason::ResidueBelow`], and a CLAIMED subtree
 //! that contains residue is left in place (the removal stops at the reserved
 //! child instead of handing the directory to a recursive removal, which
@@ -341,7 +341,7 @@
 //! the other, before any mutation. Nested roots put the run on both sides of an
 //! overlap: a `dst` inside `src` makes the destination manifest enumerate the
 //! source's own subtree (the run copies `sub/x` to `sub/sub/x` and, with
-//! `delete_extraneous`, destroys `sub/x`), and an `src` inside `dst` makes the
+//! [`Extraneous::Delete`], destroys `sub/x`), and an `src` inside `dst` makes the
 //! destination manifest enumerate the source (an extraneous removal destroys
 //! it). Equal roots are ALLOWED: the manifests are identical, the diff is
 //! empty, and the run is an idempotent no-op — refusing them would break a
@@ -377,37 +377,57 @@
 //! push and checkpoint pipelines — and the record name reuses the crate's
 //! reserved `operation.lock` spelling (see [`destination_lock_path`]).
 //!
-//! ### The two preconditions
+//! ### The conditions the crate ENFORCES (and what a caller still owes)
 //!
-//! 1. **The destination is exclusively owned for the duration of the run.**
-//!    Every cooperating writer of the destination tree must hold the SAME
-//!    lock. For a LOCAL destination the crate takes it for you; a cooperating
-//!    writer that tries to acquire it while the run holds it is refused at
-//!    acquisition (`FileLock::acquire` is non-blocking: it fails with the
-//!    "held by" diagnostic rather than interleaving), and the run's own
-//!    writes and reads therefore cannot be interleaved by such a writer.
-//! 2. **The SOURCE is quiescent for the duration.** The crate cannot lock the
-//!    source: for a PULL the source is a remote tree it does not own, and for
-//!    a PUSH the source is the caller's local tree, which the crate is not
-//!    given a lock record for. A concurrent SOURCE write is OUTSIDE the
-//!    contract, and the destination cannot be made to agree with a source
-//!    that changes underneath the run.
+//! The crate does not trust these conditions to documentation; it builds them
+//! into the entry points and into the run itself.
 //!
-//! ### What happens when a precondition is violated
+//! 1. **The destination is exclusively owned. The crate enforces this for a
+//!    LOCAL destination by TAKING the lock itself.** The owned entry points —
+//!    [`sync`], [`push`], and [`pull`] — acquire the destination's operation
+//!    lock (a [`crate::lock::FileLock`] on the record named by
+//!    [`destination_lock_path`]) BEFORE reading the destination manifest and
+//!    hold it for the WHOLE run. A cooperating writer that tries to acquire the
+//!    same record while the run holds it is refused at acquisition
+//!    (`FileLock::acquire` is non-blocking), so the run's writes and reads
+//!    cannot be interleaved by one. A destination the crate CANNOT lock — a
+//!    REMOTE (far-side) one, or a root with no sibling record location — is
+//!    REFUSED by those entry points rather than silently run unowned. A caller
+//!    that holds such a destination itself must say so by calling
+//!    [`sync_unowned`] (or [`push_unowned`]/[`pull_unowned`]): the NAME is the
+//!    only place the weaker choice appears, so it cannot be made by omission.
+//! 2. **The source is quiescent. The crate cannot lock the source, so it
+//!    VERIFIES it instead.** The source is a remote tree the crate does not own
+//!    (a PULL) or the caller's local tree (a PUSH), and there is no lock record
+//!    for it. The run therefore re-reads the source manifest after the transfer
+//!    and compares it to the one the plan was made against: an entry that ADDED,
+//!    DISAPPEARED, or CHANGED makes the run FAIL CLOSED and is NAMED, and a
+//!    source read that cannot be repeated is likewise a failure. What a caller still owes is honesty about
+//!    ABA: a source that changes and changes BACK between the two reads is
+//!    indistinguishable from a stable one — two samples can refute quiescence,
+//!    never prove it.
+//! 3. **A writer using a DIFFERENT version of this tool, or a different tool
+//!    sharing the store, is a NON-COOPERATING writer unless it takes the same
+//!    lock.** The ownership claim is only as strong as the ecosystem's
+//!    discipline; the crate cannot force another program to take the record.
+//!
+//! ### What happens when a non-cooperating writer violates the ownership condition
 //!
 //! A COOPERATING writer cannot interleave: the crate holds the lock, so the
 //! writer is refused when it tries to take the same record. A NON-cooperating
-//! writer — one that does not take the lock — still can, and the existing
-//! detection is retained UNCHANGED as a best-effort tripwire that fails
-//! closed: the post-transfer verification reads every written entry, the
-//! touched directories' live listings, and the entries the run claims to have
-//! left alone, and surfaces a violation as a conflict, a
-//! [`SyncReport::verify_failures`] entry, or a hard error naming the unplanned
-//! path. Taking the lock does not narrow that detection and no check is
-//! removed here; an `Ok` run that a non-cooperating writer raced is still not
-//! a claim that the destination is clean. A SOURCE write cannot be detected at
-//! all: the destination is compared against the source manifest the run read,
-//! and no third party holds the source still.
+//! writer — one that does not take the lock, which includes a writer using a
+//! different version of this tool or a different tool sharing the store —
+//! still can, and the answer is DETECTION THAT FAILS CLOSED, never permission
+//! to lose its data. The post-transfer verification is retained UNCHANGED: it
+//! reads every written entry, the touched directories' live listings, and the
+//! entries the run claims to have left alone, and surfaces a violation as a
+//! conflict, a [`SyncReport::verify_failures`] entry, or a hard error naming
+//! the unplanned path. An out-of-band write the verification OBSERVES is
+//! therefore reported and the run does not return a clean `Ok`; taking the lock
+//! did not narrow that detection and removed no check. The honest limit is
+//! COVERAGE, not intent: the verification is scoped to the paths it reads, so a
+//! writer that touches only paths the run never inspects can still escape it,
+//! and an `Ok` run is not by itself a claim that the destination is clean.
 //!
 //! ### The far-side (remote destination) limitation
 //!
@@ -416,12 +436,13 @@
 //! `false` names a far-side tree, and the existing machinery cannot hold a
 //! far-side lock across the run: the transport's sidecar `flock` is taken
 //! INSIDE a single remote command and dies when that command exits, so it
-//! serializes one lock-record mutation, not a whole run. The crate therefore
-//! takes NO lock when the destination is remote. This is stated rather than
-//! papered over — for such a destination NEITHER precondition above is
-//! enforced by the crate, a cooperating far-side writer is not excluded, and
-//! the caller that needs serialisation must provide it. Closing the gap needs
-//! a persistent far-side session, which does not exist here.
+//! serializes one lock-record mutation, not a whole run. The owned entry points
+//! therefore REFUSE a remote destination; only [`sync_unowned`] reaches it, and
+//! for that run the crate enforces NEITHER the destination lock NOR any
+//! far-side exclusion, so a cooperating far-side writer is not excluded and the
+//! caller must supply the serialisation itself. The SOURCE-quiescence re-read
+//! still runs. Closing the gap needs a persistent far-side session, which does
+//! not exist here.
 //!
 //! ### Why the lock record is a SIBLING of the destination root
 //!
@@ -503,7 +524,7 @@
 //! First, `no entry is destroyed` holds only for UNSANCTIONED entries: a
 //! top-level `Changed` or `Missing` mutation fails before it touches any entry,
 //! so nothing is mutated at all, but a top-level removal the caller SANCTIONED
-//! (`delete_extraneous` over an extraneous directory) may unlink that
+//! ([`Extraneous::Delete`] over an extraneous directory) may unlink that
 //! directory's children before the removal's own final `rmdir` fails on the
 //! read-only root — a sanctioned deletion that stops part-way, not a destroyed
 //! caller entry. Second, the sync's own residue cleanup is likewise a sanctioned
@@ -556,7 +577,7 @@
 //! (Linux/ext4) re-normalizing is exactly how a decomposed on-disk name became a
 //! stored spelling with no file behind it — a source read that failed, a second
 //! entry written beside the original (a tree that then refuses to canonicalize
-//! at all), or a `delete_extraneous` removal that silently addressed a path that
+//! at all), or an [`Extraneous::Delete`] removal that silently addressed a path that
 //! did not exist. Every bookkeeping string this module builds
 //! (`manifest_spelling`, `join_manifest_path`, `re_root_path`) is derived from an
 //! already-canonical path or from the LIVE directory listing, and the address a
@@ -573,7 +594,7 @@
 //! thinks, and two contracts would break silently: "make the destination match
 //! the source" (the on-disk name never changes, so the sync never converges)
 //! and "a path may be destroyed only under a sanction FOR THAT PATH" (the
-//! `delete_extraneous` sanction is keyed on a spelling that aliases another
+//! [`Extraneous::Delete`] sanction is keyed on a spelling that aliases another
 //! file, so the pass destroys the entry just transferred through the fold).
 //! Three rules close it, all in this module because only this module knows the
 //! destination at run time:
@@ -615,7 +636,7 @@
 //!   parent's LIVE listing AND no source entry aliases the on-disk spelling; a
 //!   spelling that is absent from the listing, or aliased, is a
 //!   [`ConflictReason::NameNotFaithful`] conflict and is left in place. This is
-//!   what stops `delete_extraneous` from destroying the entry a fold just
+//!   what stops [`Extraneous::Delete`] from destroying the entry a fold just
 //!   transferred.
 //! * **A case pair the destination cannot represent is refused up front.**
 //!   [`Applier::refuse_unrepresentable_case_aliases`] groups source entries by
@@ -728,6 +749,25 @@ pub enum Direction {
     Pull,
 }
 
+/// Whether a sync may DELETE destination-only entries.
+///
+/// This is deliberately NOT a `bool`: the choice permanently deletes
+/// destination data the source does not contain, and a positional `bool` is
+/// exactly the argument an agentic caller passes wrongly. Spelling the
+/// decision at the call site is the point — `Extraneous::Keep` and
+/// `Extraneous::Delete` say what they do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Extraneous {
+    /// Leave every destination-only entry in place and report it in
+    /// [`SyncReport::extraneous`]. The default, and the safe choice.
+    #[default]
+    Keep,
+    /// Remove every destination-only entry after the transfers and the
+    /// verification have succeeded, under the fold-aware identity checks.
+    /// This PERMANENTLY destroys destination data the source does not hold.
+    Delete,
+}
+
 /// What to do with one `Missing`/`Changed` destination entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryPolicy {
@@ -787,7 +827,7 @@ pub enum ConflictReason {
     AppendNotAFile,
     /// A destination DIRECTORY had to be removed to replace it with a file or
     /// symlink, but it still contains destination-only entries and
-    /// `delete_extraneous` is false — those entries were not sanctioned for
+    /// [`Extraneous::Keep`] is selected — those entries were not sanctioned for
     /// removal, so the replacement is refused and the tree is left intact.
     ExtraneousBelow,
     /// The entry's parent directory was NOT created or replaced by this sync
@@ -933,7 +973,7 @@ pub struct SyncReport {
     pub skipped: Vec<String>,
     /// Entries left alone for the caller to resolve, ordered by path.
     pub conflicts: Vec<Conflict>,
-    /// Every destination-only path, whether or not `delete_extraneous` removed
+    /// Every destination-only path, whether or not [`Extraneous::Delete`] removed
     /// it, EXCEPT one whose sanctioned removal a conflict blocked: that path is
     /// reported in `conflicts` (reason `ParentRefused`) instead, so the four
     /// derived lists stay mutually exclusive. Ordered by path.
@@ -977,7 +1017,7 @@ pub struct SyncReport {
     /// destroy the path, so it still EXISTS at report time and must be
     /// recovered by hand. Reserved residue is
     /// stripped from the destination manifest BEFORE the diff, so it is NEVER
-    /// transferred and NEVER removed — not even by `delete_extraneous`, whose
+    /// transferred and NEVER removed — not even by [`Extraneous::Delete`], whose
     /// removal of a destination-only directory holding residue is refused as
     /// [`ConflictReason::ResidueBelow`] — and ALWAYS reported here so the caller
     /// can recover it by hand. Every named path still EXISTS after the sync: a
@@ -1151,9 +1191,18 @@ impl From<Error> for SyncError {
 /// or checkpoint pass would use, not a new lock mechanism.
 ///
 /// `None` when no sibling location can be derived: a filesystem root (`/`) has
-/// no parent, and a path with no final component names no record. Such a
-/// destination is synced WITHOUT a lock (the crate cannot place the record),
-/// and the caller must serialize — the preconditions are not enforced for it.
+/// no parent, and a path with no final component names no record. [`sync`],
+/// [`push`], and [`pull`] REFUSE such a destination rather than run it unowned;
+/// only the explicitly-named [`sync_unowned`] reaches it, and the caller must
+/// supply the serialisation itself.
+///
+/// A writer that does not take this record is NON-COOPERATING. That includes a
+/// writer using a different version of this tool and a different tool sharing
+/// the store: the ownership claim is only as strong as the discipline of every
+/// program that can reach the tree, and the crate cannot force one to take the
+/// record. A non-cooperating write is not silently absorbed — the run's
+/// post-transfer verification still detects one it can see and fails closed
+/// (see the module docs, "The lock discipline").
 ///
 /// Two runs of [`sync`] against the same destination root derive the same path
 /// and so exclude each other; a caller that wants to cooperate with a `sync`
@@ -1178,37 +1227,71 @@ fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
     )
 }
 
-/// Acquire the destination's operation lock and return the guard that holds it
-/// for the whole run, or `None` when the crate cannot take one.
+/// Acquire the destination's operation lock for a run that REQUIRES it, or
+/// refuse; this is the enforcement behind [`sync`]'s owned-by-default
+/// contract.
 ///
-/// A guard is returned (rather than the lock being taken inside a closure) so
-/// the caller's single `let _guard = ...` binds it across the ENTIRE run: the
-/// `FileLock` drop runs on the success path, on every error return, and on a
-/// panic that unwinds, and the kernel releases the flock when the descriptor
-/// closes even if the drop never runs (a `SIGKILL`ed holder).
-///
-/// The crate takes NO lock when the destination is REMOTE (`is_local()` false),
-/// or when no sibling record location can be derived ([`destination_lock_path`]
-/// is `None`); both cases are documented gaps, not silent interleaving. See the
-/// module's "The far-side (remote destination) limitation".
-fn acquire_destination_lock(
+/// A destination the crate cannot lock — a REMOTE one (`is_local()` false), for
+/// which no local descriptor lock exists, or one with no sibling record
+/// location ([`destination_lock_path`] is `None`) — is an ERROR here rather
+/// than a silent unowned run: the caller who wants the run must name
+/// [`sync_unowned`]. The [`FileLock`] is returned inside the token so it lives
+/// exactly as long as the run: the drop runs on the success path, on every
+/// error return, and on a panic that unwinds, and the kernel releases the flock
+/// when the descriptor closes even if the drop never runs (a `SIGKILL`ed
+/// holder).
+fn lock_destination(
     direction: Direction,
     dest_is_local: bool,
     dest_root: &Path,
-) -> Result<Option<FileLock>> {
+) -> Result<DestinationOwnership> {
     if !dest_is_local {
-        return Ok(None);
+        return Err(Error::preflight(format!(
+            "refusing to sync into the REMOTE destination {} without its operation lock: the crate cannot hold a far-side lock for the whole run, so this call cannot own the destination. If the caller holds the destination for the run, call `sync_unowned` (the explicitly weaker entry point); otherwise sync into a LOCAL destination.",
+            dest_root.display()
+        )));
     }
     let Some(path) = destination_lock_path(dest_root) else {
-        return Ok(None);
+        return Err(Error::preflight(format!(
+            "refusing to sync into the destination {} without its operation lock: no lock record can be placed as a sibling of that root. If the caller holds the destination for the run, call `sync_unowned`.",
+            dest_root.display()
+        )));
     };
     let op_id = destination_op_id(direction, dest_root);
-    Ok(Some(FileLock::acquire(&path, &op_id)?))
+    Ok(DestinationOwnership::Locked(FileLock::acquire(
+        &path, &op_id,
+    )?))
+}
+
+/// The proof a mutating run holds its destination.
+///
+/// PRIVATE by design. [`DestinationOwnership::Locked`] can only be produced by
+/// [`lock_destination`], which takes the [`FileLock`] FIRST, and
+/// [`DestinationOwnership::Unowned`] only by the explicitly-named `*_unowned`
+/// entry points. [`run`] takes the token BY VALUE, so no code path — and no
+/// caller, since the type has no public constructor — can reach the mutating
+/// core without stating which ownership it established. That is what makes an
+/// unowned run reachable only through the name that says so.
+enum DestinationOwnership {
+    /// The crate TAKES the destination's operation lock and holds it for the
+    /// whole run.
+    Locked(FileLock),
+    /// The caller has taken the destination for the run out of band; the crate
+    /// holds no lock.
+    Unowned,
 }
 
 /// Sync `local_root` and `remote` in `direction` under `policy`, reporting
-/// every action and conflict. `delete_extraneous` defaults to false in
-/// [`push`]/[`pull`]; when true, destination-only entries are removed after
+/// every action and conflict.
+///
+/// THIS IS THE OWNED ENTRY POINT. It TAKES the destination's operation lock
+/// (when the destination is local) and holds it for the WHOLE run, and it
+/// REFUSES a destination whose lock the crate cannot take — a REMOTE one, or a
+/// root with no sibling record location — instead of running unowned. The
+/// explicitly-named [`sync_unowned`] is the only way to reach such a
+/// destination, so the weaker choice cannot be made by omission. `extraneous`
+/// selects whether destination-only entries are [`Extraneous::Keep`] (the
+/// default, and what [`push`]/[`pull`] pass) or [`Extraneous::Delete`]d after
 /// the transfers and the verification have succeeded.
 ///
 /// The local root descriptor is opened (pinned) BEFORE either manifest is
@@ -1224,39 +1307,39 @@ fn acquire_destination_lock(
 /// A successful `Ok(report)` is NOT by itself a clean-destination claim: the
 /// caller must consult the report's lists. In particular
 /// [`SyncReport::verify_failures`] can be non-empty on `Ok` (a destination
-/// entry the run claimed to leave untouched whose content a concurrent writer
-/// changed), and [`SyncReport::conflicts`] names every path left for the caller
-/// to resolve.
+/// entry the run claimed to leave untouched whose content changed under the
+/// run), and [`SyncReport::conflicts`] names every path left for the caller to
+/// resolve.
 ///
-/// # The destination lock and the two preconditions
+/// # What the crate enforces, and what a caller still owes
 ///
-/// `sync` TAKES the destination's operation lock ([`crate::lock::FileLock`] on
-/// the record named by [`destination_lock_path`]) and holds it for the WHOLE
-/// run — from before the
-/// destination manifest is read until after the transfers, the post-transfer
-/// verification, and any removal phase — so a cooperating writer of the
-/// destination is refused at acquisition instead of interleaving. Two
-/// preconditions follow:
+/// 1. **The destination is exclusively owned, and `sync` ENFORCES it by
+///    TAKING the lock itself** ([`crate::lock::FileLock`] on the record named
+///    by [`destination_lock_path`]), before the destination manifest is read
+///    and for the whole run, so a cooperating writer is refused at acquisition
+///    instead of interleaving. A destination the crate cannot lock is REFUSED
+///    here, not run unowned.
+/// 2. **The source is quiescent, and the crate VERIFIES it.** The source
+///    cannot be locked, so the run re-reads its manifest at the end and fails
+///    closed, naming the paths that moved, if it differs from the plan.
+/// 3. **A writer using a DIFFERENT version of this tool, or a different tool
+///    sharing the store, is a NON-COOPERATING writer unless it takes the same
+///    lock** — the ownership claim is only as strong as the ecosystem's
+///    discipline.
 ///
-/// 1. **The destination is exclusively owned for the duration of the run.**
-///    Cooperating writers must hold the SAME lock, which the crate takes for
-///    you (for a LOCAL destination).
-/// 2. **The SOURCE is quiescent for the duration.** The crate cannot lock the
-///    source; a concurrent source write is outside the contract.
-///
-/// A NON-cooperating destination writer is still possible, and the existing
-/// post-transfer verification is retained unchanged as a best-effort tripwire
-/// that fails closed. The crate takes NO lock for a REMOTE destination and
-/// none when no sibling record location can be derived; those gaps and the
-/// exact failure mode are stated in the module docs (the "The lock
-/// discipline" section).
+/// A non-cooperating writer that writes the destination anyway is still
+/// DETECTED and the run still FAILS CLOSED: the post-transfer verification is
+/// retained unchanged (detection is scoped to the paths the run reads, so its
+/// coverage is not total). For a REMOTE destination `sync` refuses outright;
+/// [`sync_unowned`] is the explicitly weaker entry point, and the module docs
+/// ("The lock discipline" and the far-side limitation) state the residual.
 ///
 /// # The two roots must be disjoint
 ///
 /// The local root and the remote root must be DISJOINT: neither may be an
 /// ANCESTOR of the other, in either direction. A destination nested inside the
 /// source makes the destination manifest enumerate the source's own subtree, so
-/// the run copies `sub/x` to `sub/sub/x` and — with `delete_extraneous` —
+/// the run copies `sub/x` to `sub/sub/x` and — with [`Extraneous::Delete`] —
 /// destroys `sub/x`; a source nested inside the destination makes the
 /// destination manifest enumerate the source, so an extraneous removal destroys
 /// the source. Either way the run is on both sides of an overlap and no report
@@ -1281,7 +1364,70 @@ pub fn sync(
     local_root: &Path,
     remote: &dyn Remote,
     policy: &dyn Policy,
-    delete_extraneous: bool,
+    extraneous: Extraneous,
+) -> SyncResult {
+    run_entry(
+        direction,
+        local_root,
+        remote,
+        policy,
+        extraneous,
+        RequestedOwnership::Locked,
+    )
+}
+
+/// [`sync`] WITHOUT holding the destination's operation lock: the caller
+/// asserts that it has taken the destination for the run itself.
+///
+/// The NAME states the weaker guarantee, deliberately: this is the ONLY way to
+/// reach a run whose destination the crate did not lock, so the weaker choice
+/// cannot be made by omission. It exists for the destinations the crate CANNOT
+/// lock — a REMOTE (far-side) destination, or a root with no sibling lock
+/// location — and for a caller whose own protocol already serialises every
+/// writer. For every other destination use [`sync`], which is the default and
+/// ENFORCES the lock.
+///
+/// Only the LOCK is weaker here. The post-transfer verification is IDENTICAL,
+/// so an out-of-band write is still DETECTED and the run still FAILS CLOSED;
+/// the SOURCE-quiescence re-read also still runs. What the caller gives up is
+/// the crate's own exclusion of a cooperating writer for the duration, and it
+/// must supply that exclusion itself.
+///
+/// `extraneous` selects whether destination-only entries are
+/// [`Extraneous::Keep`] or [`Extraneous::Delete`]d.
+pub fn sync_unowned(
+    direction: Direction,
+    local_root: &Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+    extraneous: Extraneous,
+) -> SyncResult {
+    run_entry(
+        direction,
+        local_root,
+        remote,
+        policy,
+        extraneous,
+        RequestedOwnership::Unowned,
+    )
+}
+
+/// Which ownership the caller asked the entry point to establish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestedOwnership {
+    /// The crate must take the destination's operation lock, or refuse.
+    Locked,
+    /// The caller asserts it holds the destination; the crate takes no lock.
+    Unowned,
+}
+
+fn run_entry(
+    direction: Direction,
+    local_root: &Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+    extraneous: Extraneous,
+    requested: RequestedOwnership,
 ) -> SyncResult {
     // Pin the local root BEFORE the manifests: the manifest walk and the
     // mutations must describe the same inode (checked on Unix after the walk,
@@ -1296,13 +1442,9 @@ pub fn sync(
         Direction::Push => (Side::Local(&local), Side::Remote(remote)),
         Direction::Pull => (Side::Remote(remote), Side::Local(&local)),
     };
-    // Take the destination's operation lock and hold it for the WHOLE run.
-    // Acquired BEFORE `run` reads the destination manifest, and released only
-    // when the guard drops after `run` returns — on success, on every error
-    // return, and on a panic (the guard is a `FileLock`, so the flock is
-    // released when the descriptor drops; a `SIGKILL`ed holder releases it by
-    // process death). See the module's "The lock discipline" section for the
-    // two preconditions and the remote-destination gap.
+    // Establish ownership BEFORE `run` reads the destination manifest, and
+    // hold it for the WHOLE run: `run` takes the token by value, so the lock is
+    // released only when the run returns.
     let dest_root = match direction {
         Direction::Push => normalize_root(remote.root()),
         Direction::Pull => local.root_path.clone(),
@@ -1311,19 +1453,61 @@ pub fn sync(
         Direction::Push => remote.is_local(),
         Direction::Pull => true,
     };
-    let _dest_lock =
-        acquire_destination_lock(direction, dest_is_local, &dest_root).map_err(SyncError::from)?;
-    run(&source, &dest, policy, delete_extraneous)
+    let ownership = match requested {
+        RequestedOwnership::Locked => {
+            lock_destination(direction, dest_is_local, &dest_root).map_err(SyncError::from)?
+        }
+        RequestedOwnership::Unowned => DestinationOwnership::Unowned,
+    };
+    run(&source, &dest, policy, extraneous, ownership)
 }
 
-/// [`sync`] in [`Direction::Push`], without removing extraneous entries.
+/// [`sync`] in [`Direction::Push`], without removing extraneous entries. The
+/// destination must be one whose lock the crate can take; use
+/// [`push_unowned`] for a destination it cannot lock.
 pub fn push(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> SyncResult {
-    sync(Direction::Push, local_root, remote, policy, false)
+    sync(
+        Direction::Push,
+        local_root,
+        remote,
+        policy,
+        Extraneous::Keep,
+    )
 }
 
-/// [`sync`] in [`Direction::Pull`], without removing extraneous entries.
+/// [`sync`] in [`Direction::Pull`], without removing extraneous entries. The
+/// destination must be one whose lock the crate can take; use
+/// [`pull_unowned`] for a destination it cannot lock.
 pub fn pull(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> SyncResult {
-    sync(Direction::Pull, local_root, remote, policy, false)
+    sync(
+        Direction::Pull,
+        local_root,
+        remote,
+        policy,
+        Extraneous::Keep,
+    )
+}
+
+/// [`push`] WITHOUT the destination lock; the caller owns the destination.
+pub fn push_unowned(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> SyncResult {
+    sync_unowned(
+        Direction::Push,
+        local_root,
+        remote,
+        policy,
+        Extraneous::Keep,
+    )
+}
+
+/// [`pull`] WITHOUT the destination lock; the caller owns the destination.
+pub fn pull_unowned(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> SyncResult {
+    sync_unowned(
+        Direction::Pull,
+        local_root,
+        remote,
+        policy,
+        Extraneous::Keep,
+    )
 }
 
 /// A mode kind this sync knows how to widen and restore.
@@ -1624,7 +1808,7 @@ struct UnconfirmedMove {
 /// record) nor over-block the sync's own bookkeeping.
 #[derive(Clone, Copy)]
 enum Sanction<'a> {
-    /// The caller's `delete_extraneous`. It sanctions ONLY a destination-only
+    /// The caller's [`Extraneous::Delete`]. It sanctions ONLY a destination-only
     /// entry absent from the source manifest, and it is still refused for any
     /// path the conflict-derived prohibition covers.
     ExtraneousFlag,
@@ -1780,12 +1964,25 @@ fn run(
     source: &Side<'_>,
     dest: &Side<'_>,
     policy: &dyn Policy,
-    delete_extraneous: bool,
+    extraneous: Extraneous,
+    ownership: DestinationOwnership,
 ) -> SyncResult {
+    // Hold the destination's operation lock for the WHOLE run: `_lock` lives
+    // until this function returns, so the flock is released only after the last
+    // mutation, the verification, and the source-quiescence re-read.
+    let _lock = match ownership {
+        DestinationOwnership::Locked(lock) => Some(lock),
+        DestinationOwnership::Unowned => None,
+    };
     let source_meta = match source.manifest() {
         Ok(meta) => meta,
         Err(error) => return Err(SyncError::from(error)),
     };
+    // The RAW source manifest the plan is made against, kept for the
+    // SOURCE-quiescence check at the END of the run. It must be the manifest
+    // BEFORE the reserved-namespace strip below, so a change to a reserved
+    // spelling is not hidden from the comparison.
+    let source_plan = source_meta.clone();
     let dest_meta = match dest.manifest() {
         Ok(meta) => meta,
         Err(error) => return Err(SyncError::from(error)),
@@ -1811,7 +2008,7 @@ fn run(
         source,
         dest,
         policy,
-        delete_extraneous,
+        extraneous_policy: extraneous,
         diff: &diff,
         outcomes: BTreeMap::new(),
         conflicts: BTreeMap::new(),
@@ -1839,14 +2036,87 @@ fn run(
         listings: RefCell::new(BTreeMap::new()),
         transfers: 0,
     };
-    applier.run()
+    let result = applier.run();
+    // ENFORCE THE SOURCE-QUIESCENCE PRECONDITION, as far as the crate can
+    // observe it. The caller owes a source that does not move during the run
+    // and the crate cannot lock it, so rather than trust the obligation the
+    // crate VERIFIES it: re-read the source manifest and compare it to the one
+    // the plan was made against, turning a silent plan/transfer skew into a
+    // LOUD failure that names the paths that moved. A source read that cannot
+    // be repeated is itself a failure — an unconfirmed quiescence is not
+    // quiescence.
+    match source.manifest() {
+        Ok(current) if current == source_plan => result,
+        Ok(current) => {
+            let error = source_changed_error(&source_plan, &current);
+            Err(match result {
+                Ok(report) => SyncError {
+                    error,
+                    report: Box::new(report),
+                    restore_failures: Vec::new(),
+                },
+                Err(mut failure) => {
+                    failure.restore_failures.push(error.to_string());
+                    failure
+                }
+            })
+        }
+        Err(probe) => {
+            let error = Error::integrity(format!(
+                "the run could not confirm the SOURCE was quiescent: re-reading the source manifest after the transfer failed: {probe}"
+            ));
+            Err(match result {
+                Ok(report) => SyncError {
+                    error,
+                    report: Box::new(report),
+                    restore_failures: Vec::new(),
+                },
+                Err(mut failure) => {
+                    failure.restore_failures.push(error.to_string());
+                    failure
+                }
+            })
+        }
+    }
+}
+
+/// Describe a SOURCE-quiescence violation: the source manifest re-read at the
+/// end of the run differs from the one the transfer was planned against. The
+/// paths that ADDED, DISAPPEARED, or CHANGED are named so the caller can see
+/// exactly what moved underneath the run. Only called on the failure path, so
+/// the extra comparison costs nothing on a clean run.
+fn source_changed_error(planned: &TreeMetadata, current: &TreeMetadata) -> Error {
+    let diff = diff_trees(planned, current);
+    let mut changed: Vec<String> = Vec::new();
+    for entry in &planned.entries {
+        if diff.classify(&entry.path) != Some(EntryDiff::Same) {
+            changed.push(entry.path.clone());
+        }
+    }
+    for entry in &current.entries {
+        if diff.classify(&entry.path) == Some(EntryDiff::Extraneous) {
+            changed.push(entry.path.clone());
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    Error::integrity(format!(
+        "the SOURCE changed during the run, violating the caller's quiescence precondition: the destination was planned against source digest {}, but the source now digests to {}; changed paths: {}",
+        planned.tree_sha256,
+        current.tree_sha256,
+        if changed.is_empty() {
+            "(none identifiable)".to_string()
+        } else {
+            changed.join(", ")
+        },
+    ))
 }
 
 struct Applier<'a, 'b> {
     source: &'b Side<'a>,
     dest: &'b Side<'a>,
     policy: &'b dyn Policy,
-    delete_extraneous: bool,
+    extraneous_policy: Extraneous,
     diff: &'b TreeDiff,
     /// Per-source-entry outcome, keyed by path (a `BTreeMap` so iteration and
     /// the derived report are path-ordered and a path cannot be recorded
@@ -1919,7 +2189,7 @@ struct Applier<'a, 'b> {
     /// really names. Populated by the pre-transfer alias check and by
     /// [`Applier::verify_names`]. It is what makes the removal of such a
     /// spelling — and of everything below it — a conflict instead of a
-    /// destruction: the sanctioned `delete_extraneous` removal is keyed on a
+    /// destruction: the sanctioned [`Extraneous::Delete`] removal is keyed on a
     /// spelling that aliases another file.
     aliased_dest: BTreeMap<String, String>,
     /// The destination filesystem's case sensitivity, probed at most ONCE per
@@ -2400,14 +2670,14 @@ impl Applier<'_, '_> {
     /// The diff's destination manifest is STRIPPED of the reserved namespace, so
     /// a directory whose only child is an aside would look childless; the RAW
     /// residue set is therefore consulted too, so a directory holding residue is
-    /// NOT sanctioned by the EMPTINESS test alone. `delete_extraneous` DOES
+    /// NOT sanctioned by the EMPTINESS test alone. [`Extraneous::Delete`] DOES
     /// sanction it (the early return below consults no residue set), and that is
     /// safe: the replacement claims the directory aside and then removes it
     /// through the ONE removal walk, which stops at the reserved child and
     /// leaves the holding directory in place ([`Removal::ResidueLeft`]), so the
     /// residue survives even a sanctioned replacement.
     fn dir_replace_is_sanctioned(&self, path: &str) -> bool {
-        if self.delete_extraneous {
+        if self.extraneous_policy == Extraneous::Delete {
             return true;
         }
         if self
@@ -3872,7 +4142,7 @@ impl Applier<'_, '_> {
                 // The conflict itself forbids destruction of the directory (its
                 // `forbids_destruction` is exhaustive and uniform), so its
                 // destination-only children are `ParentRefused` and survive a
-                // `delete_extraneous` pass instead of being destroyed under a
+                // [`Extraneous::Delete`] pass instead of being destroyed under a
                 // conflict that claimed to leave the path alone.
                 self.conflict(
                     &entry.path,
@@ -4371,7 +4641,7 @@ impl Applier<'_, '_> {
     /// parent through the ONE choke point; the widenings are reverted by the
     /// single settle.
     fn remove_extraneous(&mut self) -> Result<()> {
-        if !self.delete_extraneous {
+        if self.extraneous_policy == Extraneous::Keep {
             return Ok(());
         }
         let mut entries: Vec<(String, EntryKind)> = Vec::new();
@@ -4416,7 +4686,7 @@ impl Applier<'_, '_> {
                 self.conflict(&path, kind, policy, ConflictReason::ParentRefused);
                 continue;
             }
-            // IDENTITY-AWARE REMOVAL. The caller's `delete_extraneous` sanctions
+            // IDENTITY-AWARE REMOVAL. The caller's [`Extraneous::Delete`] sanctions
             // destroying THIS destination-only path, not a spelling that aliases
             // another file. An on-disk spelling an installed (or skipped) source
             // entry aliases is off-limits: removing it would destroy the entry
@@ -5847,7 +6117,7 @@ fn refuse_overlapping_roots(local: &LocalSide, remote: &dyn Remote) -> Result<()
             (local.root_path.as_path(), remote.root())
         };
         return Err(Error::materialization(format!(
-            "refusing to sync {} and {}: the root {} is an ancestor of {}, so the run would copy a tree into its own subtree (and, with delete_extraneous, destroy the source); the two roots must be disjoint",
+            "refusing to sync {} and {}: the root {} is an ancestor of {}, so the run would copy a tree into its own subtree (and, with Extraneous::Delete, destroy the source); the two roots must be disjoint",
             local.root_path.display(),
             remote.root().display(),
             outer.display(),

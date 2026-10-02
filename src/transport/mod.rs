@@ -2488,29 +2488,20 @@ impl Remote for LocalTransport {
     #[cfg(not(unix))]
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = join(&self.base, rel);
-        #[cfg(unix)]
-        {
-            // Iterative and descriptor-relative: `std::fs::remove_dir_all`
-            // recurses one Rust frame per directory level, so a deep tree
-            // could exhaust the C stack and ABORT the host process. The walk
-            // surfaces a clean `Err` (or succeeds), never an abort, and
-            // keeps the component-wise O_NOFOLLOW discipline. A missing
-            // `p` is the old idempotent no-op.
-            crate::atomic::remove_dir_all_path(&p)
-                .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::remove_dir_all(&p)
-                .or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })
-                .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
-        }
+        // The non-Unix port uses `std::fs::remove_dir_all`, whose walk is
+        // iterative, so a deep tree cannot exhaust the thread stack. There is
+        // NO descriptor-relative primitive on this platform, which is the
+        // documented weaker guarantee of the Windows port (see the module
+        // docs). A missing `p` is the idempotent no-op it always was.
+        std::fs::remove_dir_all(&p)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
     }
 
     #[cfg(not(unix))]

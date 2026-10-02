@@ -45,25 +45,45 @@
 //! single idempotent restore on the success and failure path; a report derived
 //! from the journal and the per-entry outcome record).
 //!
-//! # Two contracts a caller must know
+//! # The contract, and how the crate enforces it
 //!
-//! * **The destination is exclusively owned for the run, and the source must be
-//!   quiescent.** [`apply::sync`] TAKES the destination's operation lock (a
-//!   [`crate::lock::FileLock`] on the record named by
-//!   [`apply::destination_lock_path`]) and holds it for the WHOLE run, from
-//!   before the destination manifest is read until after the final
-//!   verification pass and any removal phase. Two preconditions follow: (a) the
-//!   destination is exclusively owned for the duration — cooperating writers
-//!   must hold the SAME lock, which the crate takes for you; (b) the SOURCE is
-//!   quiescent — the crate cannot lock the source (a remote tree for a PULL, the
-//!   caller's tree for a PUSH), so a concurrent source write is OUTSIDE the
-//!   contract. A COOPERATING writer is refused at acquisition; a
-//!   NON-cooperating writer is still caught by the existing post-transfer
-//!   verification, which is retained unchanged as a best-effort tripwire that
-//!   fails closed. The crate takes NO lock for a REMOTE destination (a far-side
-//!   lock cannot be held across the run with the existing machinery); see
-//!   [`apply`]'s "The lock discipline" section for that gap and the exact
-//!   failure mode.
+//! * **The destination is exclusively owned, and the source is quiescent.**
+//!   These are CONDITIONS THE CALLER MUST UPHOLD for the run to be
+//!   well-defined, and the crate ENFORCES as much of them as it can rather than
+//!   asking.
+//!
+//!   (a) **The destination is exclusively owned for the run.** [`apply::sync`]
+//!   TAKES the destination's operation lock (a [`crate::lock::FileLock`] on the
+//!   record named by [`apply::destination_lock_path`]) before reading the
+//!   destination manifest and holds it for the WHOLE run, so a cooperating
+//!   writer that tries to acquire the same record is refused at acquisition. A
+//!   destination whose lock the crate CANNOT take — a REMOTE (far-side) one, or
+//!   a root with no sibling record location — is REFUSED by [`apply::sync`],
+//!   [`apply::push`], and [`apply::pull`] rather than run unowned; the
+//!   explicitly weaker [`apply::sync_unowned`] (and
+//!   `push_unowned`/`pull_unowned`) is the only way to reach it, so the weaker
+//!   choice cannot be made by omission.
+//!
+//!   (b) **The SOURCE is quiescent.** The crate cannot lock the source (a
+//!   remote tree for a PULL, the caller's tree for a PUSH), so it VERIFIES
+//!   instead: the run re-reads the source manifest at the end and FAILS CLOSED,
+//!   naming the paths that moved, if it differs from the plan. An ABA that
+//!   changes back between the two reads is beyond what two samples can catch.
+//!
+//!   (c) **A writer using a DIFFERENT version of this tool, or a different tool
+//!   sharing the store, is a NON-COOPERATING writer** unless it takes the same
+//!   lock — the ownership claim is only as strong as the ecosystem's discipline,
+//!   and the crate cannot force another program to take the record.
+//!
+//!   A non-cooperating write is NOT permission to lose data: the post-transfer
+//!   verification is retained UNCHANGED, so an out-of-band write it observes is
+//!   REPORTED (a conflict, a [`apply::SyncReport::verify_failures`] entry, or a
+//!   hard error naming the unplanned path) and the run does not return a clean
+//!   `Ok`. Its coverage is the paths the run reads, so it is not total. See
+//!   [`apply`]'s "The lock discipline" section, including the far-side
+//!   limitation: for a remote destination NEITHER the lock NOR any far-side
+//!   exclusion is available, and only the explicitly-named unowned entry point
+//!   reaches it.
 //! * **The two roots must be disjoint.** Neither the local root nor the remote
 //!   root may be an ancestor of the other; [`apply::sync`] refuses a strict
 //!   nesting before any mutation because a nested destination makes the run
@@ -82,8 +102,9 @@ pub mod apply;
 pub mod diff;
 
 pub use apply::{
-    Conflict, ConflictReason, Direction, EntryPolicy, Policy, ReplaceAll, SyncError, SyncReport,
-    SyncResult, destination_lock_path, pull, push, sync,
+    Conflict, ConflictReason, Direction, EntryPolicy, Extraneous, Policy, ReplaceAll, SyncError,
+    SyncReport, SyncResult, destination_lock_path, pull, pull_unowned, push, push_unowned, sync,
+    sync_unowned,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, diff_trees, local_manifest,
