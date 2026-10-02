@@ -1674,12 +1674,28 @@ impl Remote for LocalTransport {
         let mut out = Vec::new();
         for e in rd {
             let e = e.map_err(|e| Error::transport(format!("entry: {e}")))?;
+            // A `RemoteEntry.name` must be the on-disk name EXACTLY: the
+            // sync's listing check is BYTE-EXACT, and two distinct names that
+            // are not valid UTF-8 both decode to U+FFFD under
+            // `to_string_lossy` — the lossy listing would then report success
+            // while the destination holds an entry no caller can address (and
+            // `canonicalize_tree` would refuse the tree the run claimed to
+            // have produced). Fail closed, naming the entry, instead of
+            // handing any caller a lossy view.
+            let path = e.path();
+            let name = e.file_name().into_string().map_err(|_| {
+                Error::transport(format!(
+                    "read_dir {}: entry name is not valid UTF-8, so the listing cannot be compared byte-exactly (distinct names would both decode to U+FFFD); refusing: {}",
+                    dir.display(),
+                    path.display()
+                ))
+            })?;
             // `symlink_metadata` (not `metadata`) so a symlink is reported as a
             // symlink with its own mode rather than being followed to its target.
             let m = std::fs::symlink_metadata(e.path())
                 .map_err(|e| Error::transport(format!("meta: {e}")))?;
             out.push(RemoteEntry {
-                name: e.file_name().to_string_lossy().into_owned(),
+                name,
                 is_dir: m.is_dir(),
                 is_symlink: m.file_type().is_symlink(),
                 size: m.len(),
@@ -2025,6 +2041,99 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
+
+    /// DEFECT 1 (local half): a directory holding a name that is not valid
+    /// UTF-8 must make `list` an ERROR, never a lossy `Ok`. Pre-fix
+    /// `file_name().to_string_lossy()` mapped every non-UTF-8 name to U+FFFD,
+    /// so two distinct on-disk names became one indistinguishable
+    /// `RemoteEntry.name`; the byte-exact listing comparison then matched an
+    /// intended entry while the destination held an extra, unaddressable one
+    /// and `canonicalize_tree` refused the tree the run claimed to have
+    /// produced.
+    ///
+    /// PLATFORM: a non-UTF-8 name cannot be created on APFS, so this SKIPS on
+    /// macOS (announcing `STORE_SYNC_SKIP`); the reproduction requires a
+    /// Linux/BSD filesystem.
+    #[test]
+    fn local_list_refuses_a_non_utf8_entry_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), base, Layout::empty()).unwrap();
+        let root = RootedRelativePath::parse(Path::new("tree")).unwrap();
+
+        // Two DIFFERENT names that both decode to U+FFFD under
+        // `to_string_lossy` (0xff and 0xfe are both invalid standalone).
+        let bad_a = std::ffi::OsString::from_vec(vec![0xff]);
+        let bad_b = std::ffi::OsString::from_vec(vec![0xfe]);
+        if let Err(e) = std::fs::write(tree.join(&bad_a), b"a") {
+            crate::test_support::announce_skip(&format!(
+                "the filesystem refuses a non-UTF-8 file name ({e}), so the lossy-listing reproduction cannot run here; run it on Linux"
+            ));
+            return;
+        }
+        std::fs::write(tree.join(&bad_b), b"b").unwrap();
+
+        let err = t
+            .list(&root)
+            .expect_err("a non-UTF-8 entry name must make the listing an error, never a lossy Ok");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "the error must name the reason (not valid UTF-8), got: {msg}"
+        );
+        assert!(
+            msg.contains("tree"),
+            "the error must name the entry/directory, got: {msg}"
+        );
+    }
+
+    /// Control for the refusal above: an ordinary UTF-8 directory still lists
+    /// faithfully (the fail-closed change must not refuse valid names).
+    #[test]
+    fn local_list_still_lists_ordinary_names() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a b"), b"x").unwrap();
+        std::fs::write(tree.join(".hidden"), b"x").unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), base, Layout::empty()).unwrap();
+        let mut names: Vec<String> = t
+            .list(&RootedRelativePath::parse(Path::new("tree")).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![".hidden".to_string(), "a b".to_string()]);
+    }
+
+    /// DEFECT 2 control (local half): the LOCAL `read_link` is raw — a target
+    /// that leads and/or trails with whitespace comes back verbatim. The SSH
+    /// side must match these exact bytes (see `parse_readlink_output_strips_`
+    /// `exactly_one_newline` in the ssh suite); the pre-fix `.trim()` there
+    /// returned `"x"` for this local `"x "`.
+    #[test]
+    fn local_read_link_returns_the_target_bytes_verbatim() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), base, Layout::empty()).unwrap();
+        for (i, target) in [" x", "x ", " x ", "a b"].iter().enumerate() {
+            let name = format!("link{i}");
+            std::os::unix::fs::symlink(target, tree.join(&name)).unwrap();
+            let rel = RootedRelativePath::parse(Path::new(&format!("tree/{name}"))).unwrap();
+            assert_eq!(
+                t.read_link(&rel).unwrap(),
+                PathBuf::from(target),
+                "the local read_link must return {target:?} verbatim"
+            );
+        }
+    }
 
     /// The deploy_dir's IMMUTABLE receiver-id marker: `provision_layout`
     /// creates it ONCE (stored as `<id>\n`), a re-provisioning adopts the

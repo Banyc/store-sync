@@ -23,6 +23,37 @@ pub(crate) fn fixture_tmpdir(env: &SysEnv) -> std::io::Result<tempfile::TempDir>
     tempfile::Builder::new().tempdir_in(env.temp_dir())
 }
 
+/// Announce a SKIPPED test on the REAL console of a PLAIN `cargo test` run.
+///
+/// libtest CAPTURES `print!`/`eprintln!` per test and DISCARDS the captured
+/// output of a PASSING test, so a skip message written with those macros is
+/// invisible in the default gate: a skipped assertion is then
+/// indistinguishable from a passing one. This writes a single
+/// machine-greppable line DIRECTLY to file descriptor 1 (bypassing libtest's
+/// capture) and names the test with the harness thread's name.
+#[cfg(unix)]
+pub(crate) fn announce_skip(reason: &str) {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("<unknown test>")
+        .to_string();
+    let line = format!("STORE_SYNC_SKIP test={test} reason={reason}\n");
+    unsafe {
+        libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
+    }
+}
+
+/// Non-Unix fallback: no raw-fd bypass is needed where the reproductions that
+/// use it are `#[cfg(unix)]`.
+#[cfg(not(unix))]
+pub(crate) fn announce_skip(reason: &str) {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("<unknown test>")
+        .to_string();
+    println!("STORE_SYNC_SKIP test={test} reason={reason}");
+}
+
 /// A property-test case count, reduced unless the full suites are requested.
 pub(crate) fn proptest_cases(full: u32) -> u32 {
     if full_suites() {

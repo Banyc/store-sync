@@ -645,7 +645,7 @@ fn remove_file_if_sidecar_cmd(
     root: &Path,
     sidecar_rel: &RootedRelativePath,
     lock_rel: &RootedRelativePath,
-    expected: &[u8],
+    expected: &str,
 ) -> String {
     let sidecar = root.join(sidecar_rel).to_string_lossy().into_owned();
     let lock = root.join(lock_rel).to_string_lossy().into_owned();
@@ -656,7 +656,7 @@ fn remove_file_if_sidecar_cmd(
     let sidecar_q = shell_quote(&sidecar);
     let sidecar_parent_q = shell_quote(&sidecar_parent);
     let lock_q = shell_quote(&lock);
-    let expected_q = shell_quote(&String::from_utf8_lossy(expected));
+    let expected_q = shell_quote(expected);
     let prelude = sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
     format!(
         "mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
@@ -687,8 +687,8 @@ fn recover_sidecar_cmd(
     root: &Path,
     sidecar_rel: &RootedRelativePath,
     lock_rel: &RootedRelativePath,
-    observed: &[u8],
-    new_data: &[u8],
+    observed: &str,
+    new_data: &str,
 ) -> String {
     let sidecar = root.join(sidecar_rel).to_string_lossy().into_owned();
     let lock = root.join(lock_rel).to_string_lossy().into_owned();
@@ -699,8 +699,8 @@ fn recover_sidecar_cmd(
     let sidecar_q = shell_quote(&sidecar);
     let lock_q = shell_quote(&lock);
     let parent_q = shell_quote(&parent);
-    let observed_q = shell_quote(&String::from_utf8_lossy(observed));
-    let new_q = shell_quote(&String::from_utf8_lossy(new_data));
+    let observed_q = shell_quote(observed);
+    let new_q = shell_quote(new_data);
     let sidecar_parent = std::path::Path::new(&sidecar)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -923,6 +923,16 @@ impl SshTransport {
     /// and each entry's real mode is fetched with `stat -c '%f'` (raw mode in
     /// hex) so the caller can faithfully reconstruct permissions and types.
     ///
+    /// The FRAME is one NUL-terminated record per entry, `type<TAB>mode<TAB>name`.
+    /// NUL is the only byte a POSIX file name cannot contain, so it is the only
+    /// unambiguous delimiter: a tab- or newline-delimited frame silently
+    /// truncates a name containing that byte, and `sync`'s listing check is
+    /// BYTE-EXACT — two distinct on-disk names must never collapse into one
+    /// compared spelling. The name is taken with the `${e##*/}` parameter
+    /// expansion, never `$(basename ...)`: command substitution strips EVERY
+    /// trailing newline, so a name ending in `\n` (legal on every POSIX
+    /// filesystem) would lose that byte before it ever reached the frame.
+    ///
     /// The existence guard is `[ -e "$e" ] || [ -L "$e" ]`: it exists ONLY to
     /// filter the unmatched globs (an empty directory expands each pattern to
     /// its own literal text, which is not an entry). It must not be a bare
@@ -936,7 +946,7 @@ impl SshTransport {
     fn list_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
         format!(
-            "for e in {p}/* {p}/.[!.]* {p}/..?*; do case \"$e\" in {p}/.|{p}/..) continue;; esac; [ -e \"$e\" ] || [ -L \"$e\" ] || continue; n=$(basename \"$e\"); if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; m=$(stat -c '%f' \"$e\"); printf '%s\\t%s\\t%s\\n' \"$n\" \"$t\" \"$m\"; done"
+            "for e in {p}/* {p}/.[!.]* {p}/..?*; do case \"$e\" in {p}/.|{p}/..) continue;; esac; [ -e \"$e\" ] || [ -L \"$e\" ] || continue; n=${{e##*/}}; if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; m=$(stat -c '%f' \"$e\"); printf '%s\\t%s\\t%s\\0' \"$t\" \"$m\" \"$n\"; done"
         )
     }
 
@@ -953,7 +963,7 @@ impl SshTransport {
     /// replaced and the claim is discarded). The single stdout frame is
     /// parsed strictly; a malformed frame is an error, never a silent
     /// verdict.
-    fn remove_file_if_cmd(root: &Path, rel: &Path, expected: &[u8]) -> String {
+    fn remove_file_if_cmd(root: &Path, rel: &Path, expected: &str) -> String {
         let remote_path_str = root.join(rel).to_string_lossy().into_owned();
         let parent = Path::new(&remote_path_str)
             .parent()
@@ -970,7 +980,7 @@ impl SshTransport {
             parent.trim_end_matches('/'),
             basename
         );
-        let expected_str = String::from_utf8_lossy(expected).into_owned();
+        let expected_str = expected.to_string();
         format!(
             "mkdir -p {p} && tmp=$(mktemp {tpl}) && rm -f \"$tmp\" && if mv {d} \"$tmp\" 2>/dev/null; then if printf '%s' {exp} | cmp -s \"$tmp\" -; then rm -f \"$tmp\"; printf 'R'; else ln \"$tmp\" {d} 2>/dev/null; rm -f \"$tmp\"; printf 'M'; fi; else if [ -e {d} ] || [ -L {d} ]; then printf 'M'; else printf 'A'; fi; fi",
             p = shell_quote(&parent),
@@ -1260,37 +1270,99 @@ impl SshTransport {
         }
     }
 
-    /// Parse the tab-delimited output produced by [`SshTransport::list_script`].
-    /// Each line is `name<TAB>type<TAB>rawmode_hex`; `.` and `..` are never
-    /// emitted by the script, but are skipped here defensively.
-    fn parse_list_output(stdout: &str) -> Vec<RemoteEntry> {
+    /// Decode the RAW stdout of [`SshTransport::list_script`] into entries.
+    ///
+    /// The frame is NUL-terminated records of `type<TAB>mode<TAB>name` (see
+    /// [`SshTransport::list_script`]); the name is the FINAL field and may
+    /// contain a tab, a newline, or a carriage return, so each record is split
+    /// on TAB at most three times and the remainder is the name verbatim. The
+    /// payload must be valid UTF-8: a name that is NOT is REFUSED (fail-closed)
+    /// rather than decoded with `from_utf8_lossy`, because two distinct
+    /// non-UTF-8 names both decode to U+FFFD and would then be
+    /// indistinguishable to the byte-exact listing comparison. The error names
+    /// the offending record so the destination entry is identifiable.
+    fn decode_list_output(stdout: &[u8]) -> Result<Vec<RemoteEntry>> {
+        let text = match std::str::from_utf8(stdout) {
+            Ok(text) => text,
+            Err(e) => {
+                let at = e.valid_up_to();
+                let start = stdout[..at]
+                    .iter()
+                    .rposition(|&b| b == 0)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let end = stdout[at..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|i| at + i)
+                    .unwrap_or(stdout.len());
+                return Err(Error::transport(format!(
+                    "ssh list: an entry name is not valid UTF-8, so the listing cannot be compared byte-exactly (a lossy decode would make distinct names both U+FFFD); refusing. Offending record (lossily rendered for the message): {:?}",
+                    String::from_utf8_lossy(&stdout[start..end])
+                )));
+            }
+        };
+        Self::parse_list_output(text)
+    }
+
+    /// Parse the NUL-framed records produced by [`SshTransport::list_script`].
+    /// `.` and `..` are never emitted by the script, but are skipped here
+    /// defensively. A structurally malformed record (fewer than three TAB
+    /// fields) is refused rather than defaulted, so a mangled frame can never
+    /// be read as a shorter or bogus name. The mode field is defaulted to 0
+    /// when it does not parse (a BSD `stat` does not accept `-c`, and a
+    /// name/type comparison never consumes the mode).
+    fn parse_list_output(text: &str) -> Result<Vec<RemoteEntry>> {
         let mut entries = Vec::new();
-        for line in stdout.lines() {
-            let mut it = line.split('\t');
-            let name = match it.next() {
-                Some(n) if !n.is_empty() => n.to_string(),
-                _ => continue,
-            };
-            if name == "." || name == ".." {
+        for record in text.split('\0') {
+            if record.is_empty() {
                 continue;
             }
+            let mut it = record.splitn(3, '\t');
             let t = it.next().unwrap_or("f");
-            let raw = it
-                .next()
-                .and_then(|s| u32::from_str_radix(s, 16).ok())
-                .unwrap_or(0);
-            let mode = raw & 0o7777;
-            let is_dir = t == "d";
-            let is_symlink = t == "l";
+            let raw = it.next().unwrap_or("");
+            let name = it.next().ok_or_else(|| {
+                Error::transport(format!(
+                    "ssh list: malformed listing record (expected type<TAB>mode<TAB>name): {record:?}"
+                ))
+            })?;
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+            let mode = u32::from_str_radix(raw, 16).unwrap_or(0) & 0o7777;
             entries.push(RemoteEntry {
-                name,
-                is_dir,
-                is_symlink,
+                name: name.to_string(),
+                is_dir: t == "d",
+                is_symlink: t == "l",
                 size: 0,
                 mode,
             });
         }
-        entries
+        Ok(entries)
+    }
+
+    /// Decode the stdout of `readlink` into the symlink target.
+    ///
+    /// `readlink` prints the RAW target followed by EXACTLY ONE newline. Strip
+    /// exactly that one byte and NOTHING else: a target may legitimately begin
+    /// and/or end with whitespace (including a newline of its own — then the
+    /// output ends in two newlines and exactly one is removed), and a `.trim()`
+    /// would delete those bytes, making the SSH read a DIFFERENT value than the
+    /// raw local `read_link` for the same link. That divergence is both a false
+    /// post-transfer verification failure and a blind spot: a concurrent
+    /// `"x"` -> `"x "` change keeps the same trimmed value, so the target hash
+    /// still matches. A target that is not valid UTF-8 is refused: the manifest
+    /// already refuses a non-UTF-8 target, so a lossy read here could only
+    /// misreport one.
+    fn parse_readlink_output(stdout: &[u8], rel: &Path) -> Result<PathBuf> {
+        let target = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+        let target = std::str::from_utf8(target).map_err(|_| {
+            Error::transport(format!(
+                "ssh readlink {}: the symlink target is not valid UTF-8; the manifest refuses a non-UTF-8 target, so the read is refused rather than decoded lossily",
+                rel.display()
+            ))
+        })?;
+        Ok(PathBuf::from(target))
     }
 }
 
@@ -1388,9 +1460,7 @@ impl Remote for SshTransport {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        Ok(Self::parse_list_output(&String::from_utf8_lossy(
-            &out.stdout,
-        )))
+        Self::decode_list_output(&out.stdout)
     }
 
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
@@ -1437,7 +1507,16 @@ impl Remote for SshTransport {
     }
 
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
-        let t = target.to_string_lossy().into_owned();
+        // The target is embedded in a shell command, so a non-UTF-8 target
+        // could only be written LOSSILY — creating a link whose target differs
+        // from the caller's intent, which the post-transfer `read_link`
+        // verification would then compare against a corrupted value. The
+        // manifest already refuses a non-UTF-8 target; fail closed here too.
+        let t = target.to_str().ok_or_else(|| {
+            Error::transport(format!(
+                "ssh symlink: the link target is not valid UTF-8 and cannot be written to the remote verbatim: {target:?}"
+            ))
+        })?;
         let l = self.root.join(link).to_string_lossy().into_owned();
         let parent = Path::new(&l)
             .parent()
@@ -1446,7 +1525,7 @@ impl Remote for SshTransport {
         let cmd = format!(
             "mkdir -p {parent} && ln -sfn {t} {l}",
             parent = shell_quote(&parent),
-            t = shell_quote(&t),
+            t = shell_quote(t),
             l = shell_quote(&l),
         );
         self.run_remote_ok(&cmd)
@@ -1461,8 +1540,7 @@ impl Remote for SshTransport {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        let target = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok(PathBuf::from(target))
+        Self::parse_readlink_output(&out.stdout, &self.root.join(rel))
     }
 
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
@@ -1479,6 +1557,15 @@ impl Remote for SshTransport {
     }
 
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        // The remote compare runs a shell command carrying `expected` as an
+        // argv token: a non-UTF-8 `expected` could only be embedded LOSSILY,
+        // so the compare would be against a different byte string than the
+        // caller's. Fail closed instead of comparing a lossy rendering.
+        let expected = std::str::from_utf8(expected).map_err(|_| {
+            Error::transport(
+                "ssh remove_file_if: the expected content is not valid UTF-8 and cannot be compared byte-exactly over the remote shell; refusing rather than comparing a lossy rendering",
+            )
+        })?;
         let cmd = if rel.as_path() == self.layout.lock.as_path() {
             remove_file_if_sidecar_cmd(
                 &self.root,
@@ -1555,7 +1642,12 @@ impl Remote for SshTransport {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        Self::parse_lstat_frame(&String::from_utf8_lossy(&out.stdout))
+        Self::parse_lstat_frame(std::str::from_utf8(&out.stdout).map_err(|_| {
+            Error::transport(format!(
+                "ssh lstat: frame is not valid UTF-8: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            ))
+        })?)
     }
 
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<crate::transport::ExecOutcome> {
@@ -1732,6 +1824,20 @@ impl Remote for SshTransport {
         if rel.as_path() != self.layout.lock.as_path() {
             return Ok(None);
         }
+        // `observed` and `new_data` cross into the remote perl command as argv
+        // tokens: a non-UTF-8 value could only be embedded LOSSILY, so the
+        // compare-and-replace would act on a different byte string than the
+        // caller's. Fail closed rather than embedding a lossy rendering.
+        let observed = std::str::from_utf8(observed).map_err(|_| {
+            Error::transport(
+                "ssh atomic_recover: the observed record is not valid UTF-8 and cannot be compared byte-exactly over the remote shell; refusing rather than comparing a lossy rendering",
+            )
+        })?;
+        let new_data = std::str::from_utf8(new_data).map_err(|_| {
+            Error::transport(
+                "ssh atomic_recover: the replacement record is not valid UTF-8 and cannot be written byte-exactly over the remote shell; refusing rather than writing a lossy rendering",
+            )
+        })?;
         let cmd = recover_sidecar_cmd(
             &self.root,
             &self.layout.lock_sidecar,
@@ -1997,9 +2103,10 @@ mod tests_ssh {
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.
     #[test]
     fn list_excludes_dot_entries_and_keeps_modes() {
-        // name<TAB>type<TAB>rawmode_hex; 0o81ed = 100755 (executable), 0o81a4 = 100644.
-        let out = "app\tfff\t81ed\n.\td\t41ed\n..\td\t41ed\nhidden\tl\t41ed\nreadme\tf\t81a4\n";
-        let entries = SshTransport::parse_list_output(out);
+        // The wire frame is NUL-terminated records of `type<TAB>mode<TAB>name`;
+        // 0o81ed = 100755 (executable), 0o81a4 = 100644.
+        let out = "f\t81ed\tapp\0d\t41ed\t.\0d\t41ed\t..\0l\t41ed\thidden\0f\t81a4\treadme\0";
+        let entries = SshTransport::parse_list_output(out).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&"."), ". must be excluded");
         assert!(!names.contains(&".."), ".. must be excluded");
@@ -2061,7 +2168,7 @@ mod tests_ssh {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        SshTransport::parse_list_output(&String::from_utf8_lossy(&out.stdout))
+        SshTransport::decode_list_output(&out.stdout).unwrap()
     }
 
     /// A DANGLING symlink must be LISTED. The old guard `[ -e "$e" ] ||
@@ -2117,6 +2224,165 @@ mod tests_ssh {
             "an empty directory must list nothing, got {:?}",
             entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
         );
+    }
+
+    /// DEFECT 1 (Remote half, script): the wire frame must carry a name
+    /// containing a TAB or a NEWLINE verbatim. Pre-fix the frame was
+    /// tab/LF-delimited, so `a\tb` parsed as `a` (the tab split the fields)
+    /// and `line1\nline2` split into TWO bogus entries — the listing view used
+    /// by the byte-exact comparison silently disagreed with the directory.
+    /// The frame is now NUL-terminated (`type<TAB>mode<TAB>name`), and NUL is
+    /// the one byte a POSIX name cannot contain. Runs on any POSIX host (these
+    /// names are legal on APFS too).
+    #[test]
+    fn list_script_carries_a_tab_and_a_newline_in_a_name() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a\tb"), b"x").unwrap();
+        std::fs::write(tree.join("line1\nline2"), b"x").unwrap();
+        std::fs::write(tree.join("x "), b"x").unwrap();
+        std::fs::write(tree.join(" x"), b"x").unwrap();
+
+        let mut names: Vec<String> = run_list_script(&transport_at(dir.path()), Path::new("tree"))
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                " x".to_string(),
+                "a\tb".to_string(),
+                "line1\nline2".to_string(),
+                "x ".to_string(),
+            ]
+        );
+    }
+
+    /// DEFECT 1 (Remote half, script): a name ending in a newline is legal and
+    /// must survive the frame. Pre-fix the script derived the name with
+    /// `$(basename ...)`, and command substitution strips EVERY trailing
+    /// newline, so `n\n` became `n` — a byte-exact comparison would then match
+    /// the wrong entry (or miss the intended one entirely).
+    #[test]
+    fn list_script_carries_a_trailing_newline_in_a_name() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("n\n"), b"x").unwrap();
+        std::fs::write(tree.join("plain"), b"x").unwrap();
+
+        let mut names: Vec<String> = run_list_script(&transport_at(dir.path()), Path::new("tree"))
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["n\n".to_string(), "plain".to_string()]);
+    }
+
+    /// DEFECT 1 (Remote half, decoder): the listing payload is decoded from
+    /// RAW bytes and a non-UTF-8 name is REFUSED. Pre-fix
+    /// `String::from_utf8_lossy(&out.stdout)` mapped every such name to U+FFFD,
+    /// so two DISTINCT on-disk names became one compared spelling. This is the
+    /// byte-level reproduction of the U+FFFD conflation and needs no
+    /// filesystem that can actually hold such a name.
+    #[test]
+    fn decode_list_output_refuses_two_distinct_non_utf8_names() {
+        // 0xff and 0xfe are both invalid standalone UTF-8, so `from_utf8_lossy`
+        // renders both as U+FFFD — indistinguishable.
+        let raw = b"f\t81a4\t\xff\0f\t81a4\t\xfe\0";
+        let err = SshTransport::decode_list_output(raw)
+            .expect_err("a non-UTF-8 name must refuse the listing, never decode to U+FFFD");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "the error must name the reason, got: {msg}"
+        );
+    }
+
+    /// The decoder keeps a tab and a newline INSIDE a name (they are data,
+    /// not delimiters) and refuses a structurally malformed record rather than
+    /// defaulting it.
+    #[test]
+    fn parse_list_output_keeps_tabs_and_newlines_in_names() {
+        let text = "f\t81a4\ta\tb\0f\t81a4\tline1\nline2\0f\t81a4\tx \0";
+        let entries = SshTransport::parse_list_output(text).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a\tb", "line1\nline2", "x "]);
+
+        // A record with fewer than three TAB fields is malformed, not an
+        // empty-named entry.
+        assert!(
+            SshTransport::parse_list_output("f\t81a4").is_err(),
+            "a short record must be refused"
+        );
+    }
+
+    /// DEFECT 2: `readlink` prints the RAW target plus ONE newline. The frame
+    /// must strip exactly that one byte — the pre-fix `.trim()` also deleted a
+    /// leading/trailing whitespace byte that is PART OF THE TARGET, so the SSH
+    /// read differed from the raw local `read_link` and a concurrent `"x"` ->
+    /// `"x "` change kept the same target hash.
+    #[test]
+    fn parse_readlink_output_strips_exactly_one_newline() {
+        let rel = Path::new("link");
+        for target in ["plain", "x ", " x", " x ", "a b", "a\tb", "n\n"] {
+            let mut framed = target.as_bytes().to_vec();
+            framed.push(b'\n');
+            assert_eq!(
+                SshTransport::parse_readlink_output(&framed, rel).unwrap(),
+                PathBuf::from(target),
+                "target {target:?} must round-trip through the readlink frame"
+            );
+        }
+        // Exactly ONE newline is the framing byte: a target that itself ends in
+        // a newline arrives as two, and one must survive.
+        assert_eq!(
+            SshTransport::parse_readlink_output(b"x\n\n", rel).unwrap(),
+            PathBuf::from("x\n"),
+        );
+        // Nothing else is trimmed: a payload without a framing newline is the
+        // target verbatim.
+        assert_eq!(
+            SshTransport::parse_readlink_output(b"x ", rel).unwrap(),
+            PathBuf::from("x "),
+        );
+    }
+
+    /// Pre-fix `String::from_utf8_lossy` turned a non-UTF-8 target into U+FFFD;
+    /// the manifest refuses a non-UTF-8 target, so the read must fail closed
+    /// rather than misreport one.
+    #[test]
+    fn parse_readlink_output_refuses_a_non_utf8_target() {
+        let err = SshTransport::parse_readlink_output(b"\xff\n", Path::new("link"))
+            .expect_err("a non-UTF-8 target must be an error, never a lossy read");
+        assert!(err.to_string().contains("not valid UTF-8"), "got: {err}");
+    }
+
+    /// The two read mechanisms must AGREE on the exact bytes of a target: the
+    /// LOCAL path is raw (`std::fs::read_link`, the mechanism
+    /// `LocalTransport::read_link` uses), and the SSH frame must return the
+    /// same bytes for the same link. Pre-fix `.trim()` returned `"x"` for a
+    /// local `"x "`, so an SSH destination/source failed post-transfer
+    /// verification on a legitimate link.
+    #[test]
+    fn local_and_ssh_readlink_agree_on_whitespace_targets() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for (i, target) in ["plain", "x ", " x", " x ", "a b"].iter().enumerate() {
+            let name = format!("link{i}");
+            std::os::unix::fs::symlink(target, tree.join(&name)).unwrap();
+            let local = std::fs::read_link(tree.join(&name)).unwrap();
+            let mut framed = local.to_str().unwrap().as_bytes().to_vec();
+            framed.push(b'\n');
+            let ssh = SshTransport::parse_readlink_output(&framed, Path::new(&name)).unwrap();
+            assert_eq!(
+                ssh, local,
+                "the SSH read must equal the raw local read for target {target:?}"
+            );
+        }
     }
 
     /// The two views of one directory must AGREE on a dangling symlink:
@@ -2291,7 +2557,7 @@ mod tests_ssh {
         let payload = "{\"operation_id\":\"a\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6\"}";
 
         // Genuinely absent: the Absent frame.
-        let cmd = SshTransport::remove_file_if_cmd(&root, rel, payload.as_bytes());
+        let cmd = SshTransport::remove_file_if_cmd(&root, rel, payload);
         let out = run_sh_stdin(&cmd, &[]);
         assert!(out.status.success(), "script must exit 0: {out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "A");
@@ -2314,7 +2580,7 @@ mod tests_ssh {
         let cmd2 = SshTransport::remove_file_if_cmd(
             &root,
             rel,
-            b"{\"operation_id\":\"b\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b7\"}",
+            "{\"operation_id\":\"b\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b7\"}",
         );
         let out = run_sh_stdin(&cmd2, &[]);
         assert!(out.status.success(), "script must exit 0: {out:?}");
@@ -2519,14 +2785,14 @@ mod tests_ssh {
             Path::new("/srv/app"),
             &RootedRelativePath::parse(Path::new("state/operation.lock.mutex")).unwrap(),
             &RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap(),
-            b"exp",
+            "exp",
         );
         let recover = recover_sidecar_cmd(
             Path::new("/srv/app"),
             &RootedRelativePath::parse(Path::new("state/operation.lock.mutex")).unwrap(),
             &RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap(),
-            b"obs",
-            b"new",
+            "obs",
+            "new",
         );
         let tr = transport();
         let create =
