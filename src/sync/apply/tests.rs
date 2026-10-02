@@ -806,6 +806,11 @@ enum AfterWrite {
     /// a live entry's KIND under a manifest snapshot and plants an entry no
     /// manifest spelling addresses (the Finding-1 stale-claim-kind swap).
     ReplaceWithDirTreeAt(String, String, Vec<u8>),
+    /// (unix only) Replace the DIRECTORY at `rel` with a SYMLINK to `outside`:
+    /// a writer that turns a directory POSITION into a door out of the tree
+    /// AFTER an earlier transfer already confirmed it is a real directory.
+    #[cfg(unix)]
+    ReplaceDirWithSymlink(String, PathBuf),
 }
 
 impl AfterWrite {
@@ -857,6 +862,12 @@ impl AfterWrite {
                     Err(_) => {}
                 }
                 write(&path.join(child), bytes);
+            }
+            #[cfg(unix)]
+            AfterWrite::ReplaceDirWithSymlink(rel, outside) => {
+                let path = root.join(rel);
+                fs::remove_dir_all(&path).unwrap();
+                std::os::unix::fs::symlink(outside, &path).unwrap();
             }
         }
     }
@@ -1456,6 +1467,204 @@ impl Remote for RecordingRemote {
     }
     fn filesystem_bytes(&self) -> Result<FsBytes> {
         self.inner.filesystem_bytes()
+    }
+}
+
+/// A PATH-BASED [`Remote`] test double: every operation is the plain
+/// `root.join(rel)` form backed by `std::fs`, so a symlink in ANY component is
+/// FOLLOWED — the situation an [`SshTransport`](crate::transport::SshTransport)
+/// far side presents, where the applier's preflight is the ONLY confinement.
+/// The fd-confined [`LocalTransport`] refuses a swapped component itself, so it
+/// cannot exercise this class of defect. `is_local()` is true so the manifest is
+/// read in process.
+///
+/// `after_write` mirrors [`RecordingRemote`]'s hook: after the Nth successful
+/// `write` the given [`AfterWrite`] runs against the root, so a test can swap a
+/// directory for an out-of-tree symlink AFTER an earlier transfer already
+/// confirmed it is a real directory.
+#[cfg(unix)]
+struct PathRemote {
+    root: PathBuf,
+    writes: AtomicUsize,
+    after_write: Option<(usize, AfterWrite)>,
+}
+
+#[cfg(unix)]
+impl PathRemote {
+    fn over(root: &Path) -> PathRemote {
+        PathRemote {
+            root: root.to_path_buf(),
+            writes: AtomicUsize::new(0),
+            after_write: None,
+        }
+    }
+
+    fn after_write(mut self, nth: usize, action: AfterWrite) -> PathRemote {
+        self.after_write = Some((nth, action));
+        self
+    }
+
+    fn path(&self, rel: &RootedRelativePath) -> PathBuf {
+        self.root.join(rel.as_path())
+    }
+}
+
+#[cfg(unix)]
+impl Remote for PathRemote {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn is_local(&self) -> bool {
+        true
+    }
+
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        std::fs::read(self.path(rel))
+            .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
+    }
+
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        // PATH-BASED AND SYMLINK-FOLLOWING: exactly the far-side write the
+        // preflight exists to confine.
+        let path = self.path(rel);
+        std::fs::write(&path, data)
+            .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))?;
+        let nth = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some((target, action)) = &self.after_write
+            && nth == *target
+        {
+            action.apply(&self.root);
+        }
+        Ok(())
+    }
+
+    fn try_write_new(&self, rel: &RootedRelativePath, _data: &[u8]) -> Result<CreateNewVerdict> {
+        // The sync path never calls create-new; a test double is honest about
+        // that rather than emulating a primitive it is not exercising.
+        Err(Error::transport(format!(
+            "PathRemote::try_write_new is not exercised by the sync path ({})",
+            rel.display()
+        )))
+    }
+
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        match std::fs::create_dir(self.path(rel)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(Error::transport(format!(
+                "create_dir {}: {e}",
+                rel.display()
+            ))),
+        }
+    }
+
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::create_dir_all(self.path(rel))
+            .map_err(|e| Error::transport(format!("create_dir_all {}: {e}", rel.display())))
+    }
+
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(self.path(rel), std::fs::Permissions::from_mode(mode))
+            .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
+    }
+
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        let dir = self.path(rel);
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| Error::transport(format!("list {}: {e}", rel.display())))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| Error::transport(format!("list entry in {}: {e}", rel.display())))?;
+            let meta = std::fs::symlink_metadata(entry.path())
+                .map_err(|e| Error::transport(format!("stat {}: {e}", entry.path().display())))?;
+            out.push(RemoteEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                is_dir: meta.is_dir(),
+                is_symlink: meta.file_type().is_symlink(),
+                size: meta.len(),
+                mode: crate::platform::metadata_mode(&meta) & 0o7777,
+            });
+        }
+        Ok(out)
+    }
+
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        std::fs::rename(self.path(from), self.path(to)).map_err(|e| {
+            Error::transport(format!(
+                "rename {} -> {}: {e}",
+                from.display(),
+                to.display()
+            ))
+        })
+    }
+
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        std::os::unix::fs::symlink(target, self.path(link))
+            .map_err(|e| Error::transport(format!("symlink {}: {e}", link.display())))
+    }
+
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        std::fs::read_link(self.path(rel))
+            .map_err(|e| Error::transport(format!("read_link {}: {e}", rel.display())))
+    }
+
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        match std::fs::remove_file(self.path(rel)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::transport(format!(
+                "remove_file {}: {e}",
+                rel.display()
+            ))),
+        }
+    }
+
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::remove_dir_all(self.path(rel))
+            .map_err(|e| Error::transport(format!("remove_dir_all {}: {e}", rel.display())))
+    }
+
+    fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        std::fs::remove_dir(self.path(rel))
+            .map_err(|e| Error::transport(format!("remove_dir {}: {e}", rel.display())))
+    }
+
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
+        self.path(rel).exists()
+    }
+
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        let path = self.path(rel);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => Ok(RemoteMeta {
+                is_dir: meta.is_dir(),
+                is_symlink: meta.file_type().is_symlink(),
+                is_file: meta.is_file(),
+                size: meta.len(),
+                mode: crate::platform::metadata_mode(&meta) & 0o7777,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::NotFound(format!("{}", rel.display())))
+            }
+            Err(e) => Err(Error::transport(format!("stat {}: {e}", rel.display()))),
+        }
+    }
+
+    fn exec(&self, _argv: &[String], _timeout: Duration) -> Result<ExecOutcome> {
+        Err(Error::transport("PathRemote does not exec"))
+    }
+
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        Ok(FsBytes {
+            total: 0,
+            available: u64::MAX,
+        })
     }
 }
 
@@ -3045,11 +3254,17 @@ fn measure_deep_chain_sync(depth: usize) -> (usize, usize) {
 /// F1 DEPTH BOUND: a depth-D chain with ONE change must cost O(D) ancestry
 /// probes, not O(D^2) (and not O(D^3) `openat`: a probe resolves a path
 /// component-wise, so D probes of a depth-D prefix is D^2 `openat` and a
-/// per-ancestor re-walk of every prefix is D of those). The memo is what makes
-/// each `(path, kind)` decision at most once per run, so both assertions below
-/// fail against the pre-fix code: its depth-32 count is 669 probes and its
-/// depth-64 count is 2349 (measured), not a small multiple of the depth, and it
-/// grows QUADRATICALLY when the depth doubles.
+/// per-ancestor re-walk of every prefix is D of those). This fixture uses a
+/// PATH-BASED destination, where NO ancestry memo is allowed (the preflight is
+/// the confinement; see [`Applier::ancestry_dirs`]), so the linearity pinned
+/// here comes ENTIRELY from verifying a path's ancestry ONCE per operation: the
+/// deepest guard already walks every prefix, so `widen_ancestors` performs one
+/// ancestry walk for the whole chain and each widen re-checks nothing. Both
+/// assertions below fail against the pre-fix code: its depth-32 count is 669
+/// probes and its depth-64 count is 2349 (measured), not a small multiple of
+/// the depth, and it grows QUADRATICALLY when the depth doubles. Measured after
+/// the per-operation restructuring (no memo, path-based destination): 173 ->
+/// 333, i.e. a 5*D growth in the count, linear in the depth.
 #[cfg(unix)]
 #[test]
 fn a_deep_chain_costs_linear_ancestry_probes() {
@@ -3066,7 +3281,7 @@ fn a_deep_chain_costs_linear_ancestry_probes() {
 
     // ABSOLUTE BOUND: O(D), not O(D^2). A small constant multiple of the depth,
     // plus a constant for the manifest/verification probes that do not scale
-    // with D. Measured: pre-fix the depth-32 count is 669; post-fix it is 141.
+    // with D. Measured: pre-fix the depth-32 count is 669; post-fix it is 173.
     assert!(
         shallow <= 8 * depth + 64,
         "a depth-{depth} chain must cost O(D) ancestry probes, not O(D^2): got \
@@ -3076,7 +3291,8 @@ fn a_deep_chain_costs_linear_ancestry_probes() {
 
     // ADDITIVE GROWTH: doubling the depth must add only a LINEAR amount, so the
     // count is independent of a large multiplication of D. Measured: post-fix
-    // 141 -> 269 (adds 128 for 32 more levels); pre-fix 669 -> 2349 (adds 1680).
+    // 173 -> 333 (adds 160 for 32 more levels, exactly 5*D); pre-fix 669 -> 2349
+    // (adds 1680).
     assert!(
         deep <= shallow + 6 * depth,
         "doubling the depth must add O(D) probes, not multiply them: \
@@ -8944,6 +9160,66 @@ fn local_and_remote_destinations_agree_a_swapped_symlink_is_not_followed() {
     );
 }
 
+/// F-1 REGRESSION (destination-component confinement). On a PATH-BASED
+/// destination the preflight is the ONLY confinement, so a directory the run
+/// confirmed once must still be probed LIVE on every later operation. Here the
+/// first transfer of `a/1` confirms `a`, a writer then replaces `a` with a
+/// symlink to an OUTSIDE tree, and the second transfer into `a` must REFUSE.
+///
+/// Against the pre-fix memo the second transfer hit the cached `a` and skipped
+/// the `lstat`, and the path-based `write` followed the symlink: `outside/2` was
+/// OVERWRITTEN (and a missing one created). Post-fix the live guard refuses
+/// first and nothing is created or overwritten outside the root.
+#[cfg(unix)]
+#[test]
+fn a_path_based_destination_refuses_a_directory_swapped_for_a_symlink_after_a_transfer() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    // Source `a/1` and `a/2`; the destination holds a REAL `a/` directory with
+    // BOTH names already present (`Changed`), so listing `a` caches both names
+    // and the first transfer is a WRITE that confirms `a` and fires the swap.
+    // `outside/2` already holds bytes that a followed write would overwrite.
+    write(&src.join("a/1"), b"one");
+    write(&src.join("a/2"), b"two");
+    write(&dst.join("a/1"), b"old-one");
+    write(&dst.join("a/2"), b"old-two");
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("2"), b"PRE-EXISTING");
+
+    let remote = PathRemote::over(&dst).after_write(
+        1,
+        AfterWrite::ReplaceDirWithSymlink("a".to_string(), outside.clone()),
+    );
+    let error = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+        .expect_err("a swapped directory component must be refused, not followed");
+
+    // THE DECISIVE ASSERTION: NOTHING was created or overwritten outside the
+    // root. Pre-fix `outside/2` held the transferred `two`.
+    assert_eq!(
+        read(&outside.join("2")),
+        b"PRE-EXISTING",
+        "a pre-existing file outside the root must NOT be overwritten"
+    );
+    assert_eq!(
+        fs::read_dir(&outside).unwrap().count(),
+        1,
+        "no transfer may create anything outside the destination root"
+    );
+
+    let text = error.to_string();
+    assert!(
+        text.contains("destination path a is a symlink"),
+        "the refusal must name the swapped component distinctly: {text}"
+    );
+    assert!(
+        !error.report().applied.contains(&"a/2".to_string()),
+        "a refused path is never reported applied: {:?}",
+        error.report()
+    );
+}
+
 /// FINDING A (round 22), chmod variant: a `Skipped` path whose final
 /// verification COULD NOT RUN because its parent directory became unreadable
 /// must be a verification failure, never advertised `skipped`. The failure was
@@ -10368,8 +10644,237 @@ fn a_source_that_changes_after_the_plan_fails_closed_and_names_the_path() {
         text.contains("SOURCE changed"),
         "the failure must name the source-quiescence violation: {text}"
     );
-    assert!(text.contains("a"), "the changed path must be named: {text}");
+    // A DISTINCTIVE token, not a bare character: `contains("a")` was satisfied
+    // by the "a" in "changed" and "paths", so a message that named NO path
+    // (or the wrong one) still passed. The prose before the list is fixed, so
+    // the assertion names the list itself.
+    assert!(
+        text.contains("changed paths: a"),
+        "the changed path must be named: {text}"
+    );
     // The transfer itself landed the planned bytes: the run failed over the
     // PLAN, not over the write.
     assert_eq!(read(&local.join("a")), b"AAA");
+}
+
+// ---------------------------------------------------------------------------
+// F-2 / F-3: the lock record's sibling location.
+// ---------------------------------------------------------------------------
+
+/// Env var that turns the test binary into the CHILD that runs the owned entry
+/// point with a RELATIVE destination root from a chosen working directory.
+#[cfg(unix)]
+const RELATIVE_ROOT_CHILD: &str = "STORE_SYNC_RELATIVE_ROOT_CHILD";
+#[cfg(unix)]
+const RELATIVE_ROOT_WORK: &str = "STORE_SYNC_RELATIVE_ROOT_WORK";
+#[cfg(unix)]
+const RELATIVE_ROOT_SRC: &str = "STORE_SYNC_RELATIVE_ROOT_SRC";
+#[cfg(unix)]
+const RELATIVE_ROOT_RESULT: &str = "STORE_SYNC_RELATIVE_ROOT_RESULT";
+
+/// The CHILD side of the F-3 test: `chdir` into the work directory (the child
+/// owns its process, so the process-global cwd change cannot race other tests)
+/// and run the OWNED `sync` against a single-component RELATIVE destination
+/// root. The outcome is written to the result file so the parent reads it, and
+/// the child test passes either way. With the env var unset this is a no-op.
+#[cfg(unix)]
+#[test]
+fn destination_lock_relative_root_child() {
+    if std::env::var_os(RELATIVE_ROOT_CHILD).is_none() {
+        return;
+    }
+    let work = PathBuf::from(std::env::var_os(RELATIVE_ROOT_WORK).unwrap());
+    let src = PathBuf::from(std::env::var_os(RELATIVE_ROOT_SRC).unwrap());
+    let result = PathBuf::from(std::env::var_os(RELATIVE_ROOT_RESULT).unwrap());
+    std::env::set_current_dir(&work).expect("chdir into the work directory");
+    let outcome = match sync(
+        Direction::Pull,
+        Path::new("local"),
+        &transport(&src),
+        &ReplaceAll,
+        Keep,
+    ) {
+        Ok(_) => "ok".to_string(),
+        Err(error) => format!("err: {error}"),
+    };
+    write(&result, outcome.as_bytes());
+}
+
+/// F-3 REGRESSION: a single-component RELATIVE destination root through the
+/// OWNED entry point. `destination_lock_path("local")` derived a record whose
+/// `Path::parent` is `""`, so the lock helper ran `mkdir ""` (ENOENT) and the
+/// run failed with a message that did not name the real problem. The record
+/// must resolve to `./.local.operation.lock` — the current directory, exactly
+/// as the rest of the path handling resolves a relative root.
+///
+/// The child process does the `chdir`; the parent asserts only on the child's
+/// result and files, so the cwd change cannot race the rest of the suite.
+#[cfg(unix)]
+#[test]
+fn the_owned_entry_point_accepts_a_single_component_relative_destination_root() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"payload");
+    let work = dir.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let result = dir.path().join("result");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "sync::apply::tests::destination_lock_relative_root_child",
+            "--nocapture",
+        ])
+        .env(RELATIVE_ROOT_CHILD, "1")
+        .env(RELATIVE_ROOT_WORK, &work)
+        .env(RELATIVE_ROOT_SRC, &src)
+        .env(RELATIVE_ROOT_RESULT, &result)
+        .output()
+        .expect("spawn the relative-root child");
+    assert!(
+        child.status.success(),
+        "the child failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let outcome =
+        String::from_utf8(fs::read(&result).expect("the child writes its result")).unwrap();
+    assert_eq!(outcome, "ok", "the relative-root owned run must succeed");
+    assert_eq!(read(&work.join("local/f")), b"payload");
+    assert!(
+        work.join(".local.operation.lock").exists(),
+        "the lock record must be the sibling of the relative root"
+    );
+}
+
+/// F-2 REGRESSION: taking the destination's operation lock must NOT narrow a
+/// directory OUTSIDE the destination root to the store-private `0o700`.
+///
+/// The lock record is a SIBLING of the root, so a destination whose parent
+/// chain is missing made the lock helper's
+/// [`crate::atomic::ensure_private_dir_durable`] create that chain AND chmod it
+/// `0o700`, on every run including a fully-refused one. The owned entry point
+/// must instead create the chain at the SAME platform-default mode the run's
+/// own ancestor creation uses (the `*_unowned` path), so the lock path
+/// introduces no mode the run would not have used itself.
+///
+/// The mode is compared against BOTH the unowned path's chain and a plain
+/// `create_dir_all` under the same process umask, so the assertion is exact
+/// regardless of umask. Under a `0o077` umask the platform default IS `0o700`,
+/// so the PARITY assertions are the load-bearing ones there and this test is
+/// (correctly) not discriminating.
+#[cfg(unix)]
+#[test]
+fn taking_the_destination_lock_does_not_narrow_a_missing_parent_to_store_private() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let remote_root = dir.path().join("remote");
+    write(&remote_root.join("f"), b"new");
+
+    // OWNED: the lock's sibling record needs the missing parent chain.
+    let owned_parent = dir.path().join("owned-parent");
+    let owned_dest = owned_parent.join("local");
+    sync(
+        Direction::Pull,
+        &owned_dest,
+        &transport(&remote_root),
+        &ReplaceAll,
+        Keep,
+    )
+    .expect("an owned pull into a missing parent chain must run");
+    assert_eq!(read(&owned_dest.join("f")), b"new");
+
+    // UNOWNED: the run's own `create_dir_all` creates the same missing chain.
+    let unowned_parent = dir.path().join("unowned-parent");
+    let unowned_dest = unowned_parent.join("local");
+    sync_unowned(
+        Direction::Pull,
+        &unowned_dest,
+        &transport(&remote_root),
+        &ReplaceAll,
+        Keep,
+    )
+    .expect("an unowned pull into a missing parent chain must run");
+
+    // A plain directory created under the same process umask: the platform
+    // default.
+    let umask_probe = dir.path().join("umask-probe");
+    fs::create_dir_all(&umask_probe).unwrap();
+
+    assert_eq!(
+        mode_of(&owned_parent),
+        mode_of(&umask_probe),
+        "the owned lock path must create a missing parent at the platform \
+         default, not the store-private 0o700"
+    );
+    assert_eq!(
+        mode_of(&unowned_parent),
+        mode_of(&umask_probe),
+        "the unowned path is the reference for the platform default"
+    );
+
+    // A FULLY-REFUSED owned run: the parent chain is still created (the record
+    // is a sibling) at the platform default, but the destination ROOT and its
+    // subtree are NOT — the "creates nothing" contract holds for the root.
+    let refused_parent = dir.path().join("refused-parent");
+    let refused_dest = refused_parent.join("local");
+    let refuse = |_: &str, _: EntryKind| EntryPolicy::Refuse;
+    let report = sync(
+        Direction::Pull,
+        &refused_dest,
+        &transport(&remote_root),
+        &refuse,
+        Keep,
+    )
+    .unwrap();
+    assert_eq!(report.transfers, 0, "{report:?}");
+    assert!(
+        !refused_dest.exists(),
+        "a fully-refused owned pull still creates NOTHING, not even the root"
+    );
+    assert_eq!(
+        mode_of(&refused_parent),
+        mode_of(&umask_probe),
+        "even a refused run must not narrow the lock record's parent to 0o700"
+    );
+}
+
+/// A-F2 REGRESSION: a run that REMOVES a nested destination-only subtree must
+/// not then fail re-listing a directory it correctly removed.
+///
+/// `remove_extraneous` inserts each removed entry's PARENT into `touched_dirs`,
+/// and the post-removal `verify` pass re-lists every touched directory. For a
+/// chain that is ENTIRELY extraneous (`d/d/f`, nothing left under `d`), the run
+/// removes `d` too, so listing `d/d` finds an ABSENT ANCESTOR and the
+/// fd-confined local destination raises `openat d: ENOENT`; the run then
+/// returned `Err` naming paths it had removed correctly. The path-based remote
+/// destination maps a missing-parent path to `Ok(None)`, which is why the
+/// pre-existing PULL+Delete tests (which keep a shared non-extraneous ancestor
+/// alive) never hit this.
+#[test]
+fn removing_an_all_extraneous_nested_chain_does_not_fail_the_removal_verify() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let remote_root = dir.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+    let local = dir.path().join("local");
+    write(&local.join("d/d/f"), b"gone");
+
+    let report = sync(
+        Direction::Pull,
+        &local,
+        &transport(&remote_root),
+        &ReplaceAll,
+        Extraneous::Delete,
+    )
+    .expect("removing an all-extraneous nested chain must succeed");
+    assert_eq!(
+        report.extraneous,
+        vec!["d".to_string(), "d/d".to_string(), "d/d/f".to_string()],
+        "{report:?}"
+    );
+    assert!(
+        report.verify_failures.is_empty(),
+        "a correctly removed chain has no verification failure: {report:?}"
+    );
+    assert!(
+        !local.join("d").exists(),
+        "the extraneous chain must be fully removed: {report:?}"
+    );
 }

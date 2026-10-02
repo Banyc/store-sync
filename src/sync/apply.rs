@@ -457,6 +457,31 @@
 //! the record reuses the reserved `operation.lock` spelling
 //! ([`crate::transport::Layout::lock`]) rather than inventing a mechanism.
 //!
+//! Because the record is a SIBLING, placing it can touch a directory OUTSIDE
+//! the destination root that the CALLER owns — the root's parent, and any
+//! missing ancestor of it. Two things are true of that touch, and they are the
+//! contract:
+//!
+//! * **The parent chain is created at the PLATFORM DEFAULT mode, never the
+//!   store-private `0o700`.** The owned entry points pre-create a missing chain
+//!   with `create_dir_all` ([`create_lock_parent`]), the same mode the run's own
+//!   `root_for_mutation` gives a destination root's missing ancestors, so the
+//!   lock path introduces no mode the run would not itself have used. (This is
+//!   deliberately NOT a change to [`crate::lock::FileLock`] or
+//!   [`crate::atomic::ensure_private_dir_durable`], which serve the transport's
+//!   sidecar locks where the private mode IS required.)
+//! * **The DESTINATION TREE is still created lazily and only by a mutation.**
+//!   "A fully-refused pull creates NOTHING" holds for the root and everything
+//!   under it: the record location is outside the root, so a refused run may
+//!   still leave the root's PARENT chain present at the platform default mode,
+//!   but it never creates the root itself. This is the honest limit of the
+//!   contract; it is stated here rather than implied.
+//!
+//! A single-component RELATIVE root resolves through the current directory
+//! ([`destination_lock_path`] maps an empty `Path::parent` to `.`), exactly as
+//! the rest of the path handling resolves a relative root, so the owned entry
+//! points accept a relative destination instead of failing on `mkdir ""`.
+//!
 //! ## Root pinning, and the race that remains
 //!
 //! [`sync`] opens the local root descriptor BEFORE it reads either manifest
@@ -498,7 +523,8 @@
 //! symlink where the manifest says `Dir` is never treated as an intact
 //! directory. The preflight duplicates a window the fd-confined local
 //! destination already closes in `crate::atomic`; for a
-//! [`LocalTransport`](crate::transport::LocalTransport) the transport itself
+//! [`LocalTransport`](crate::transport::LocalTransport) used as the applier's
+//! [`Side::Local`] the transport itself
 //! resolves every non-root path component-wise with `O_NOFOLLOW` (no window) —
 //! mutations AND the reads this applier verifies against (`read`, `read_link`,
 //! `metadata_opt`, `exists`), so a verification verdict cannot be sourced from
@@ -507,6 +533,14 @@
 //! be changed, so the preflight is the guarantee and a component SWAPPED
 //! between the check and the operation is a residual race — the same class as
 //! the root-swap race above, not a guarantee this module claims to close.
+//!
+//! The applier sees only [`Side::is_confined_local`], a property of the SIDE it
+//! was handed, not of a concrete transport: a [`Side::Remote`] destination may
+//! be backed by a [`LocalTransport`](crate::transport::LocalTransport) whose
+//! own primitives happen to be fd-confined, but the applier cannot know that.
+//! It therefore treats EVERY [`Side::Remote`] destination as path-based, where
+//! the preflight IS the confinement, and caches nothing that would let a
+//! repeated probe be skipped (see [`Applier::ancestry_dirs`]).
 //!
 //! ## The destination root's mode is NOT journalled
 //!
@@ -1214,7 +1248,53 @@ pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
     let mut record = OsString::from(".");
     record.push(base);
     record.push(".operation.lock");
+    // A single-component RELATIVE root (`foo`) has `Path::parent() == Some("")`:
+    // the directory the record must be placed in is the CURRENT one, and an
+    // empty parent would make the lock helper run `mkdir ""` (ENOENT). Resolve
+    // it to `.` exactly the way the rest of the path handling resolves a
+    // relative root ([`canonicalize_with_missing_tail`] joins the current
+    // directory), so the record is the SAME `.foo.operation.lock` sibling a
+    // caller reaches by name. Only a root with NO parent at all (`/`, or an
+    // empty root) still has no record location.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     Some(parent.join(record))
+}
+
+/// Create the destination lock record's PARENT chain at the platform default
+/// directory mode.
+///
+/// The lock record is a SIBLING of the destination root, so its parent is a
+/// directory OUTSIDE the destination tree that the CALLER owns. The lock helper
+/// ([`crate::lock::FileLock::acquire`]) creates a missing parent chain through
+/// [`crate::atomic::ensure_private_dir_durable`], which chmods every component
+/// it creates to the store-private `0o700`. That is correct for a directory
+/// INSIDE the store, but a caller that syncs into `<missing>/local` would find
+/// the caller-visible `<missing>` created AND narrowed to `0o700` — on a run
+/// that refuses every entry, to boot. Pre-creating the chain here with the
+/// platform default (`create_dir_all`, exactly the mode
+/// [`Applier::root_for_mutation`] gives a destination root's missing ancestors)
+/// leaves [`crate::atomic::ensure_private_dir_durable`] nothing to create or
+/// chmod.
+///
+/// This is a change LOCAL to the sync path by design: [`crate::lock::FileLock`]
+/// and the atomic helper also serve the transport's sidecar locks, where the
+/// private mode is REQUIRED, so changing them would change every caller's
+/// on-disk modes. The behaviour is stated in the module docs, "Why the lock
+/// record is a SIBLING of the destination root".
+fn create_lock_parent(parent: &Path) -> Result<()> {
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).map_err(|e| {
+        Error::preflight(format!(
+            "the destination lock record's parent directory {} cannot be created: {e}",
+            parent.display()
+        ))
+    })
 }
 
 /// A human-readable holder identity recorded in the lock record, so a refused
@@ -1257,6 +1337,28 @@ fn lock_destination(
             dest_root.display()
         )));
     };
+    // The record must be placed in a real directory. A single-component
+    // RELATIVE root resolves to `.` above; anything else that still yields an
+    // EMPTY parent is named here rather than surfacing as a bare `mkdir ""`
+    // ENOENT from the lock helper.
+    let Some(parent) = path.parent() else {
+        return Err(Error::preflight(format!(
+            "refusing to sync into the destination {}: the operation lock record {} has no directory to be placed in",
+            dest_root.display(),
+            path.display()
+        )));
+    };
+    if parent.as_os_str().is_empty() {
+        return Err(Error::preflight(format!(
+            "refusing to sync into the destination {}: the operation lock record {} has no directory to be placed in",
+            dest_root.display(),
+            path.display()
+        )));
+    }
+    // Create a MISSING parent chain at the platform default mode BEFORE the
+    // lock helper sees it, so the helper never narrows a caller-owned directory
+    // to store-private `0o700` (see [`create_lock_parent`]).
+    create_lock_parent(parent)?;
     let op_id = destination_op_id(direction, dest_root);
     Ok(DestinationOwnership::Locked(FileLock::acquire(
         &path, &op_id,
@@ -2232,7 +2334,13 @@ struct Applier<'a, 'b> {
     /// this set keeps an all-`Same` sync from paying for a full-tree listing.
     /// [`Applier::verify`] reads each one's LIVE listing and compares it
     /// BYTE-IDENTICALLY against the names the run expected there, and verifies
-    /// the content and KIND of the entries it claims to have left alone.
+    /// the content and KIND of the entries it claims to have left alone. A
+    /// directory this run REMOVED stays in the set (the removal pass inserts a
+    /// removed entry's parent), but every consumer SKIPS a path for which
+    /// [`Applier::is_already_gone`] holds: re-listing an absent directory would
+    /// otherwise raise a missing-ancestor error for a correctly deleted
+    /// subtree. The `touched_dirs` set is therefore "every directory the
+    /// verification MUST still find", not "every directory it may probe".
     touched_dirs: BTreeSet<String>,
     /// THE run-scoped listing cache: for every destination directory this run
     /// has enumerated (keyed by its manifest path, `""` for the root), the
@@ -2263,14 +2371,29 @@ struct Applier<'a, 'b> {
     /// `Some(EntryKind::Dir)` arm of the guard's per-component probe, so it
     /// replaces that one `kind_opt` with a set lookup.
     ///
-    /// WHY IT IS SOUND. The guard re-walks EVERY prefix of a path on every
-    /// call, and `widen_ancestors` calls it once per ancestor, so a depth-D
-    /// chain costs O(D^2) probes at this seam (and O(D^3) `openat` once each
-    /// probe resolves its components) with no reuse. A destination path that is
-    /// a real directory is a fact the run owns: under the exclusive ownership
-    /// this crate establishes, nothing but the run itself can turn it into a
-    /// non-directory. The run converts a directory ONLY by (a) renaming it aside
-    /// in [`Applier::claim_aside`]/[`Applier::rename_back`] and installing a
+    /// SCOPED TO CONFINED DESTINATIONS — A PROPERTY OF THE SIDE, ENFORCED AT
+    /// THE USE SITE. The memo is populated and consulted ONLY while
+    /// [`Side::is_confined_local`] holds: a [`Side::Local`] destination, whose
+    /// every mutation and probe is resolved component-wise with `O_NOFOLLOW`
+    /// through `crate::atomic`. On a PATH-BASED [`Side::Remote`] destination the
+    /// preflight is the confinement (see "Destination-component confinement" on
+    /// the module), so the applier caches NOTHING there and probes live on every
+    /// operation. The condition is structural — the destination KIND, checked at
+    /// the point of use — never a comment assuming a guarantee that only holds
+    /// on some of the paths the applier serves.
+    ///
+    /// WHY IT IS SOUND ON A CONFINED DESTINATION. A memo hit can skip only a
+    /// REDUNDANT preflight; it can never skip the confinement. Even if a
+    /// non-cooperating writer turns a memoized directory into a symlink, the
+    /// mutation itself goes through the component-wise `O_NOFOLLOW` primitive in
+    /// `crate::atomic`, which refuses the swapped component — so the memo widens
+    /// no window through which a mutation could land outside the root.
+    ///
+    /// WHAT IT RESTS ON, STATED AT THE POINT OF USE. The memo additionally rests
+    /// on the exclusive-ownership PRECONDITION the lock establishes: under it,
+    /// the run itself is the only writer, so a confirmed `Dir` fact stays true
+    /// and the run converts a directory ONLY by (a) renaming it aside in
+    /// [`Applier::claim_aside`]/[`Applier::rename_back`] and installing a
     /// different kind at the same manifest spelling, or (b) removing it in
     /// [`Applier::remove_subtree`]. Both are CONTENT mutations, and
     /// [`Applier::begin_mutation`] DROPS the memo entry for the mutated path, so
@@ -2281,21 +2404,10 @@ struct Applier<'a, 'b> {
     /// `MayCreate` pass) exact after a create; only the positive `Dir` fact is
     /// stable enough to reuse. A stale entry for a DESCENDANT of a converted
     /// directory is masked by its converted ancestor, which the top-down prefix
-    /// walk re-probes first.
-    ///
-    /// FRESHNESS, stated precisely: a memoized decision can be invalidated ONLY
-    /// by a mutation the run itself performs on that directory (or an ancestor
-    /// of it) — a rename that replaces its kind, or its removal — never by a
-    /// mode change and never by the passage of time. Both are Content mutations
-    /// and both funnel through [`Applier::begin_mutation`], which removes the
-    /// mutated spelling; nothing else in the run changes a kind. A
-    /// non-cooperating writer is OUTSIDE the exclusive-ownership precondition
-    /// the memo rests on, and the run still fails closed on one: on Unix every
-    /// destination mutation and probe goes through the component-wise
-    /// `O_NOFOLLOW` confinement in `crate::atomic` (the guard is an additional
-    /// preflight, never the only confinement), and every `verify_*` pass
-    /// re-reads LIVE listings and re-probes kinds, so a swapped component is
-    /// DETECTED and the run is failed rather than silently applied.
+    /// walk re-probes first. A writer that VIOLATES the precondition is still
+    /// handled: every `verify_*` pass re-reads LIVE listings and re-probes kinds,
+    /// so a swapped component it leaves behind is DETECTED and the run FAILS
+    /// CLOSED rather than silently applied.
     ancestry_dirs: RefCell<BTreeSet<String>>,
     transfers: usize,
 }
@@ -2509,7 +2621,9 @@ impl Applier<'_, '_> {
         // real directory" fact is therefore no longer trustworthy AT this
         // spelling, so it is dropped here (the ONE mutation choke point) and the
         // next guard re-probes the LIVE object. A MODE mutation leaves the kind
-        // untouched and keeps the fact.
+        // untouched and keeps the fact. The memo exists only for a confined
+        // destination (see [`Applier::ancestry_dirs`]); on a path-based one the
+        // set is never filled, so this drop is a harmless no-op there.
         if kind == MutationKind::Content {
             self.ancestry_dirs.borrow_mut().remove(path);
         }
@@ -2781,8 +2895,11 @@ impl Applier<'_, '_> {
     fn widen_ancestors(&mut self, path: &str, need: ParentNeed) -> Result<()> {
         let ancestors = ancestor_paths(path);
         let last = ancestors.len().checked_sub(1);
+        // The directories this operation may widen: manifest entries that exist
+        // as directories. `dest_entry_at` reads the SNAPSHOT; whether each is
+        // LIVE is established by the ONE ancestry verification below.
+        let mut candidates: Vec<(usize, String, RootedRelativePath)> = Vec::new();
         for (index, dir) in ancestors.iter().enumerate() {
-            let immediate = last == Some(index);
             // A path whose OWN entry a conflict forbids must never be widened
             // (its mode is left exactly as it was found).
             if self.is_directly_prohibited(dir) {
@@ -2799,8 +2916,22 @@ impl Applier<'_, '_> {
             if existing_kind != EntryKind::Dir {
                 continue;
             }
-            let rel = rooted(dir)?;
-            self.widen_dir(dir, &rel, need, immediate)?;
+            candidates.push((index, dir.clone(), rooted(dir)?));
+        }
+        // ONE live ancestry verification for the WHOLE widen. The DEEPEST
+        // candidate's strict ancestors are exactly this path's strict ancestors
+        // (top-down), so guarding it once checks every prefix — and, because it
+        // demands a final DIRECTORY, the deepest candidate itself. The loop
+        // below performs no ancestry walk of its own, which is what removes the
+        // per-ancestor x per-prefix multiplication (a depth-D widen used to cost
+        // O(D^2) probes, and O(D^3) `openat`). Nothing is remembered across
+        // operations: this fact lives for exactly this call.
+        if let Some((_, _, deepest)) = candidates.last() {
+            self.guard_destination(deepest, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
+        }
+        for (index, dir, rel) in candidates {
+            let immediate = last == Some(index);
+            self.widen_dir_verified(&dir, &rel, need, immediate)?;
         }
         Ok(())
     }
@@ -2847,6 +2978,13 @@ impl Applier<'_, '_> {
         // Strict ancestors TOP-DOWN (nearest to the root first), so the
         // nearest-to-root refusal is named and a symlink is never resolved by a
         // deeper check.
+        //
+        // The ancestry memo is consulted ONLY where the destination's own
+        // primitives enforce component-wise confinement
+        // ([`Side::is_confined_local`]); on a path-based destination the
+        // preflight IS the confinement, so every operation probes live and
+        // nothing is cached (see [`Applier::ancestry_dirs`]).
+        let memo_ancestry = self.dest.is_confined_local();
         let mut prefixes: Vec<RootedRelativePath> = Vec::new();
         let mut current = rel.parent();
         while let Some(ancestor) = current {
@@ -2856,14 +2994,16 @@ impl Applier<'_, '_> {
         for ancestor in prefixes.into_iter().rev() {
             let spelling = manifest_spelling(&ancestor);
             // A prefix the run already CONFIRMED as a real directory is a
-            // reusable fact (see [`Applier::ancestry_dirs`]); only a MISS
-            // reaches the live probe below.
-            if self.ancestry_dirs.borrow().contains(&spelling) {
+            // reusable fact on a confined destination (see
+            // [`Applier::ancestry_dirs`]); only a MISS reaches the live probe.
+            if memo_ancestry && self.ancestry_dirs.borrow().contains(&spelling) {
                 continue;
             }
             match self.dest.kind_opt(&ancestor)? {
                 Some(EntryKind::Dir) => {
-                    self.ancestry_dirs.borrow_mut().insert(spelling);
+                    if memo_ancestry {
+                        self.ancestry_dirs.borrow_mut().insert(spelling);
+                    }
                 }
                 Some(other) => {
                     return Err(non_directory_destination_error(&spelling, other));
@@ -2880,15 +3020,17 @@ impl Applier<'_, '_> {
                 // A confirmed directory satisfies EVERY `FinalPolicy` (it is not
                 // a symlink and, where the policy demands a directory, it is
                 // one), so a hit skips the probe; a `File`/`Symlink`/absence is
-                // never memoized.
+                // never memoized. Only a confined destination may reuse the hit.
                 let spelling = manifest_spelling(rel);
-                if self.ancestry_dirs.borrow().contains(&spelling) {
+                if memo_ancestry && self.ancestry_dirs.borrow().contains(&spelling) {
                     return Ok(());
                 }
                 match self.dest.kind_opt(rel)? {
                     None => {}
                     Some(EntryKind::Dir) => {
-                        self.ancestry_dirs.borrow_mut().insert(spelling);
+                        if memo_ancestry {
+                            self.ancestry_dirs.borrow_mut().insert(spelling);
+                        }
                     }
                     Some(EntryKind::Symlink) => {
                         return Err(non_directory_destination_error(
@@ -2967,7 +3109,16 @@ impl Applier<'_, '_> {
     /// widen of the same directory in the same state is a no-op. The journal
     /// records the original ONCE per identity, so a widen after a `finalize`
     /// still restores the true original.
-    fn widen_dir(
+    ///
+    /// NO ANCESTRY WALK OF ITS OWN. The caller has ALREADY verified, in this
+    /// SAME operation, that `rel` is a live real directory and that every strict
+    /// ancestor of it is a real directory — [`Applier::widen_ancestors`] does it
+    /// once for the whole ancestor chain, and [`Applier::remove_subtree`] does
+    /// it immediately before widening the directory it is about to empty.
+    /// Re-walking the prefixes here would multiply the work by the prefix
+    /// length; the verified fact lives for exactly one operation and is never
+    /// cached across one.
+    fn widen_dir_verified(
         &mut self,
         path: &str,
         rel: &RootedRelativePath,
@@ -2977,7 +3128,6 @@ impl Applier<'_, '_> {
         if self.is_directly_prohibited(path) {
             return Ok(());
         }
-        self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
         let current = self.dest.mode(rel, EntryKind::Dir)?;
         let target = widen_target(current, immediate, need, self.dest.is_confined_local());
         if target == current {
@@ -3104,7 +3254,12 @@ impl Applier<'_, '_> {
                             // A read-only directory cannot have its children
                             // unlinked; widen it first (journaled, so a failed
                             // removal is restorable).
-                            self.widen_dir(&entry_path, &entry_rel, ParentNeed::Writable, true)?;
+                            self.widen_dir_verified(
+                                &entry_path,
+                                &entry_rel,
+                                ParentNeed::Writable,
+                                true,
+                            )?;
                             let children = self.dest.list(&entry_rel)?;
                             stack.push(DirFrame {
                                 path: entry_path,
@@ -5077,6 +5232,17 @@ impl Applier<'_, '_> {
     ) {
         let dirs: Vec<String> = self.touched_dirs.iter().cloned().collect();
         for dir in dirs {
+            // A directory the RUN REMOVED (or that lies UNDER one it removed) no
+            // longer exists, so re-listing it would be a false failure: on a
+            // confined destination an absent ANCESTOR raises `openat ENOENT`
+            // for a directory the removal walk already verified and deleted
+            // (the `Remove`/`Delete` pass of an all-extraneous nested chain,
+            // e.g. `d/d/f`). The fail-closed behaviour below is untouched for a
+            // directory that EXISTS but cannot be enumerated: this skips only a
+            // path this run itself removed.
+            if self.is_already_gone(&dir) {
+                continue;
+            }
             let live = match self.listing(&dir) {
                 Ok(entries) => entries,
                 // A directory the run cannot enumerate faithfully: it cannot
@@ -5250,6 +5416,14 @@ impl Applier<'_, '_> {
         for entry in &self.diff.dest.entries {
             let dir = parent_manifest(&entry.path);
             if !self.touched_dirs.contains(&dir) || is_reserved_path(&entry.path) {
+                continue;
+            }
+            // A path the run REMOVED (or that lies under a removed ancestor) is
+            // gone BY DESIGN; it is not a "left alone" claim, so it is not
+            // listed here. Re-probing it would raise a missing-ancestor error
+            // on a confined destination for an entry the run correctly
+            // deleted (see [`Applier::verify_directory_listings`]).
+            if self.is_already_gone(&entry.path) {
                 continue;
             }
             let claimed = match self.outcomes.get(&entry.path) {
