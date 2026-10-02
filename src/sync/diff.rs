@@ -160,13 +160,20 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// A non-zero exit is classified by LAYER ([`remote_manifest_failure`]): the
 /// remote command is `ssh … exec -- perl -e <script> <root>`. `ssh` reserves
 /// exit status 255 for its OWN failures, but a far-side `perl` `die` ALSO
-/// exits 255 (perl exits 255 when `$!` is 0, which is exactly what the
-/// crate's own script does for a non-directory root or a non-NFC name), so
-/// exit 255 ALONE establishes nothing: a positive transport diagnostic in
-/// stderr is required before the failure is named as transport, and otherwise
-/// the command is reported as a far-side script failure. Only the shell's
-/// "could not start perl" statuses (126/127) suggest that `perl` may be
-/// absent.
+/// exits 255: perl exits 255 when `$!` is 0, and the crate's own script
+/// measures exactly that for a NON-NFC entry name and for a name (or symlink
+/// target) whose diagnostic is hex-encoded (measured on macOS perl 5.34.1 and
+/// Linux perl 5.40.1, invoked exactly as the crate invokes it). A root that
+/// is not a directory exits 2 instead: `perl -e`'s module loading leaves
+/// `$!` = ENOENT, so the script's `not a directory:` `die` propagates 2.
+/// Exit 255 alone therefore establishes nothing. The layer is
+/// attributed only from a POSITIVE diagnostic at the START of a stderr line
+/// ([`transport_failed_before_the_command`], [`far_side_script_failed`]);
+/// when neither the transport's markers nor the script's own closed `die`
+/// vocabulary is present, the exit status and preserved stderr are reported
+/// as an UNDETERMINED failure rather than being blamed on any layer. Only the
+/// shell's "could not start perl" statuses (126/127) suggest that `perl` may
+/// be absent.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     let root = remote.root();
     if remote.is_local() {
@@ -204,7 +211,7 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 /// by the LAYER that failed.
 ///
 /// The command is `ssh … exec -- perl -e <script> <root>`, so a non-zero exit
-/// can come from any of three layers, and they are not interchangeable:
+/// can come from any of several layers, and they are not interchangeable:
 ///
 /// * the TRANSPORT failed before the command ran — the runner reports `-1`
 ///   when it killed the child at the deadline (no far-side exit status can be
@@ -212,22 +219,33 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 ///   status 255 for its own failures (connection refused/timed out,
 ///   authentication, host-key verification, the `ControlMaster` control
 ///   socket), but a far-side `perl` `die` propagates 255 too, so 255 selects
-///   this branch ONLY with a positive transport diagnostic in stderr. Exit
-///   255 alone names no layer and is never reported as transport;
+///   this branch ONLY with an EVIDENCE-BACKED transport diagnostic at the
+///   start of a stderr line. Exit 255 alone names no layer and is never
+///   reported as transport;
 /// * the far-side `perl` could not be STARTED — the remote shell's 126/127
 ///   ("found but not executable" / "not found"), which is the only layer that
 ///   is actually a statement about `perl`;
-/// * `perl` ran and the script exited non-zero (a missing root, an unreadable
-///   directory, a name that cannot cross the wire, ...).
+/// * `perl` ran and the script exited non-zero — recognised by the script's
+///   OWN closed `die` prefix at the start of a stderr line (a missing root,
+///   an unreadable directory, a name that cannot cross the wire, ...);
+/// * NONE of the above is established — the exit status and preserved stderr
+///   are reported as UNDETERMINED, naming no layer. This is the honest
+///   outcome for a status no rule covers (200, a signal-killed `137` with
+///   empty stderr, a locally-generated outlier): an earlier version asserted
+///   the far-side script here, which is a layer it cannot establish.
 ///
 /// Pre-fix every non-zero exit appended "(is perl installed on the remote
 /// host?)", so an `ssh` exit 255 — including the `unix_listener:` control-
 /// socket bind failure — was mislabeled as a missing interpreter; the fix
 /// after that made every exit 255 transport, which mislabeled the script's
-/// own `die`-at-255 refusals. This version attributes the layer from the
-/// EVIDENCE in stderr and, when the layer cannot be established, reports what
-/// is known (the exit status and preserved stderr) instead of asserting ssh,
-/// connection, or authentication.
+/// own `die`-at-255 refusals; the fix after that DELETED `Permission denied`
+/// from the transport markers on the stated grounds that the script prints it,
+/// which mislabeled a real ssh authentication failure at 255 (the script's
+/// own `Permission denied` path exits 13, so inside the 255 gate the phrase is
+/// NOT the script). This version restores authentication recognition inside
+/// the 255 gate and attributes the layer from EVIDENCE in stderr — anchored at
+/// a line start — reporting an undetermined failure rather than asserting ssh,
+/// connection, authentication, or the script.
 fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     let stderr = out.stderr.trim();
     let stderr = if stderr.is_empty() {
@@ -254,8 +272,22 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
             stderr
         ));
     }
+    if far_side_script_failed(out) {
+        return Error::transport(format!(
+            "remote tree verification at {} failed inside the far-side manifest script (exit {}): {}",
+            root.display(),
+            out.exit_code,
+            stderr
+        ));
+    }
+    // No rule establishes the layer: report only what is KNOWN. Naming the
+    // transport, the shell, or the script here would assert a layer the
+    // evidence does not support — the defect this branch replaces.
     Error::transport(format!(
-        "remote tree verification at {} failed inside the far-side manifest script (exit {}): {}",
+        "remote tree verification at {} failed: the remote manifest command exited {} with {} \
+         (the exit status and stderr are preserved verbatim; the available evidence does not \
+         establish which layer produced this failure, so it is reported as undetermined rather \
+         than attributed to one)",
         root.display(),
         out.exit_code,
         stderr
@@ -265,16 +297,28 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
 /// Whether `out` reports that the far-side `perl` program itself could not be
 /// started (as opposed to running and exiting non-zero).
 fn perl_could_not_start(out: &ExecOutcome) -> bool {
-    // 126 = found but not executable; 127 = not found. The remote command is
-    // `exec -- perl -e …`, so both statuses name the `perl` program.
+    // EVIDENCE-BACKED (POSIX shells; measured on macOS and Linux): 126 = found
+    // but not executable, 127 = not found. The remote command is
+    // `exec -- perl -e …`, so both statuses name the `perl` program. The
+    // STATUS is the primary signal — a real shell that cannot find `perl`
+    // exits 127 (`bash: perl: command not found`), which the anchored
+    // diagnostic below deliberately does NOT match, because `bash: perl:` is
+    // not the start of a line.
     if out.exit_code == 126 || out.exit_code == 127 {
         return true;
     }
-    // A shell that reports the not-found status through a wrapper prints the
-    // diagnostic instead; accept that spelling as the same stage.
-    out.stderr.contains("perl: command not found")
-        || out.stderr.contains("perl: not found")
-        || out.stderr.contains("perl: No such file")
+    // Plausible-but-unverified secondary signal, ANCHORED at a line start: a
+    // wrapper that prints the diagnostic but exits with a status of its own
+    // (not 126/127). Anchoring is load-bearing: the far-side script echoes a
+    // non-NFC name RAW, so a bare `contains` let a name `perl: command not
+    // found` route a script failure to this branch.
+    [
+        "perl: command not found",
+        "perl: not found",
+        "perl: No such file",
+    ]
+    .iter()
+    .any(|marker| stderr_line_starts_with(&out.stderr, marker))
 }
 
 /// Whether `out` reports a failure of the TRANSPORT layer, before the far-side
@@ -283,9 +327,22 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
 /// Evidence, not a guess from the exit status: the runner's own timeout
 /// sentinel is conclusive on its own, but `ssh` exit status 255 is NOT,
 /// because a far-side `perl` `die` propagates the same status (perl exits 255
-/// when `$!` is 0) — the crate's own manifest script refuses a non-directory
-/// root and a non-NFC name exactly that way. Exit 255 therefore selects this
-/// branch only with a positive transport diagnostic in stderr.
+/// when `$!` is 0) — the crate's own manifest script does exactly that for a
+/// non-NFC name and for a hex-encoded name/target refusal. Exit 255
+/// therefore selects this branch only with a positive transport diagnostic at
+/// the START of a stderr line.
+///
+/// ANCHORING BOUND (measured with the real script): line-anchoring closes the
+/// far-side-text spoof COMPLETELY. The script can echo arbitrary name text
+/// raw (only a non-NFC name WITHOUT LF/CR/TAB is echoed raw; a name with any
+/// of those is hex-encoded instead), and it always echoes it AFTER its own
+/// closed `die` prefix (`entry name under …`), so a crafted name — or a ROOT
+/// DIRECTORY named `Host key verification failed store` — cannot place a
+/// marker at a line start. The one residual is NOT far-side text: the script
+/// echoes the root ARGUMENT raw in `not a directory: $root`, so a
+/// CALLER-SUPPLIED root path containing a raw LF could start a marker line.
+/// That path is chosen by the local caller, never by the far side, so it is
+/// not a spoofing channel from the tree being described.
 fn transport_failed_before_the_command(out: &ExecOutcome) -> bool {
     // The runner's timeout/no-status sentinel: THIS process killed the child
     // at the deadline, so no far-side command produced the outcome. No
@@ -295,31 +352,115 @@ fn transport_failed_before_the_command(out: &ExecOutcome) -> bool {
         return true;
     }
     // `ssh` exits 255 for its own failures, but the far-side perl `die` does
-    // too, so 255 alone proves nothing. Require a positive transport marker.
+    // too, so 255 alone proves nothing. Require positive transport evidence.
     if out.exit_code != 255 {
         return false;
     }
-    // The markers below were each observed from a real `ssh` (OpenSSH) or from
-    // the crate's own script; `Permission denied` is deliberately ABSENT — it
-    // is ambiguous, because the crate's own script prints it (from `opendir
-    // $dir: $!`, exit 13) for an unreadable far-side directory. The connect-
-    // stage spellings (`Connection refused`, `Connection timed out`, `No
-    // route to host`, `Network is unreachable`) are additionally subsumed by
-    // the `ssh: ` prefix in real output and are kept as belt-and-braces.
+    stderr_is_auth_failure(&out.stderr) || transport_marker_at_line_start(&out.stderr)
+}
+
+/// Whether any line of `stderr` begins with `marker`.
+///
+/// Line ANCHORING is deliberate and load-bearing. The far-side script echoes
+/// a non-NFC entry NAME raw, and that name is far-side-chosen text; a bare
+/// `contains` match let a name `ssh: connect to host …` (or a root directory
+/// named `Host key verification failed store`) route a script failure to the
+/// TRANSPORT branch. Requiring the marker at offset 0 or immediately after a
+/// `\n` removes every such spoof: the script's raw-name line always begins
+/// with the closed `die` prefix (`entry name under …`), never with an ssh
+/// marker, and a name containing LF/CR/TAB is hex-encoded rather than echoed,
+/// so it cannot start a line. See the residual bound on
+/// [`transport_failed_before_the_command`].
+fn stderr_line_starts_with(stderr: &str, marker: &str) -> bool {
+    stderr.split('\n').any(|line| line.starts_with(marker))
+}
+
+/// Whether `stderr` carries an OpenSSH authentication failure at the start of
+/// a line.
+///
+/// EVIDENCE-BACKED (OpenSSH 10.2p1, macOS and Linux): a rejected public-key
+/// authentication prints `<user>@<host>: Permission denied (publickey).`,
+/// whose line START is the `user@host` shape, so it cannot be matched by the
+/// bare marker `Permission denied` at line start. The pattern is anchored
+/// exactly as the real output is: a whitespace-free `something@something:`
+/// target followed by `: Permission denied`, OR `Permission denied` alone at
+/// the start of a line (PLAUSIBLE-BUT-UNVERIFIED as a bare spelling, kept
+/// because at a 255 status the script cannot produce it: every script `die`
+/// line starts with the closed vocabulary below). `Permission denied` is
+/// accepted here ONLY inside the 255 gate: the crate's own unreadable-directory
+/// path prints `opendir …: Permission denied` but exits 13, so at a non-255
+/// status the phrase says nothing about the transport.
+fn stderr_is_auth_failure(stderr: &str) -> bool {
+    stderr.split('\n').any(|line| {
+        line.starts_with("Permission denied")
+            || line
+                .split_once(": Permission denied")
+                .is_some_and(|(who, _)| {
+                    !who.is_empty() && who.contains('@') && !who.contains(char::is_whitespace)
+                })
+    })
+}
+
+/// EVIDENCE-BACKED OpenSSH diagnostics for a failure BEFORE the far-side
+/// command ran, each at the START of a stderr line. Observed from real
+/// OpenSSH 10.2p1 on macOS and Linux; the authentication shape is handled
+/// separately by [`stderr_is_auth_failure`]. `unix_listener:` is the
+/// `ControlMaster` control-socket bind failure; `kex_exchange_identification`
+/// is a pre-auth key-exchange failure.
+///
+/// The four connect-stage spellings at the end are PLAUSIBLE-BUT-UNVERIFIED
+/// as line starts: real OpenSSH prints them behind the `ssh: ` prefix
+/// (`ssh: connect to host … port …: Connection refused`), which is already
+/// matched, so they add no coverage today; they are kept, anchored, as
+/// belt-and-braces for a wrapper or a build that drops the prefix.
+fn transport_marker_at_line_start(stderr: &str) -> bool {
     const TRANSPORT_MARKERS: &[&str] = &[
         "ssh: ",
         "kex_exchange_identification",
         "Host key verification failed",
         "Connection closed by",
+        "Received disconnect from",
+        "Timeout, server ",
+        "Too many authentication failures",
+        "unix_listener:",
         "Connection refused",
         "Connection timed out",
         "No route to host",
         "Network is unreachable",
-        "unix_listener:",
     ];
     TRANSPORT_MARKERS
         .iter()
-        .any(|marker| out.stderr.contains(marker))
+        .any(|marker| stderr_line_starts_with(stderr, marker))
+}
+
+/// The far-side manifest script's own closed `die` vocabulary. Every entry is
+/// the literal start of a stderr line the script writes before exiting
+/// non-zero (see [`crate::manifest::remote_tree_verify_script`]); the
+/// vocabulary is closed because the script has exactly one `die` per
+/// condition and nothing else writes its stderr.
+const SCRIPT_DIE_PREFIXES: &[&str] = &[
+    "not a directory: ",
+    "entry name under ",
+    "symlink target of ",
+    "lstat ",
+    "open ",
+    "readlink ",
+    "opendir ",
+    "readdir ",
+    "closedir ",
+];
+
+/// Whether the far-side `perl` RAN and its script exited non-zero, i.e. the
+/// failure is inside the manifest script rather than the transport or the
+/// shell. Recognised by the script's OWN closed `die` prefix at the start of
+/// a stderr line — the only writer that can produce those lines. The exit
+/// status alone is NOT used: the same statuses can come from a shell or a
+/// signal (`137`, `200`), which is exactly the case the undetermined branch
+/// exists for.
+fn far_side_script_failed(out: &ExecOutcome) -> bool {
+    SCRIPT_DIE_PREFIXES
+        .iter()
+        .any(|prefix| stderr_line_starts_with(&out.stderr, prefix))
 }
 
 /// Classify every path in the union of `source` and `dest`, sorted by path.
@@ -375,7 +516,7 @@ fn manifest_entry_equal(a: &TreeEntry, b: &TreeEntry) -> bool {
 mod tests {
     use super::*;
     use crate::env::SysEnv;
-    use crate::test_support::fixture_tmpdir;
+    use crate::test_support::{announce_skip, fixture_tmpdir};
     use crate::transport::{Layout, LocalTransport};
     use std::fs;
 
@@ -581,13 +722,30 @@ mod tests {
         );
     }
 
-    /// F1: `perl`'s `die` exits 255 when `$! == 0` (perl's documented rule),
-    /// and the crate's OWN far-side script refuses a non-directory root and a
-    /// non-NFC name exactly that way. Exit 255 ALONE therefore establishes no
-    /// layer: with the script's own stderr the failure must stay a far-side
-    /// script failure, naming the exit status and preserved stderr.
+    /// F4: `perl`'s `die` exits 255 when `$! == 0` (perl's documented rule),
+    /// and the crate's OWN far-side script reaches that arm for a NON-NFC name
+    /// and for a root that EXISTS but is not a directory. Exit 255 therefore
+    /// establishes no layer: with the script's own stderr the failure must
+    /// stay a far-side script failure, naming the exit status and preserved
+    /// stderr.
     ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): both inputs returned
+    /// The three inputs are REAL script output, measured identically on macOS
+    /// perl 5.34.1 and Linux perl 5.40.1 (see
+    /// `real_script_statuses_classify_as_the_far_side_script`, which produces
+    /// them from the script itself):
+    /// * the non-NFC and LF/TAB inputs are the script's NFC and
+    ///   hex-encoding refusals, both confirmed at 255;
+    /// * `not a directory: <root>` at 255 is SYNTHESIZED. The shape is real,
+    ///   but the crate's invocation (`perl -e <script> <root>`) exits 2 for
+    ///   ANY non-directory root — existing or absent — because `use
+    ///   Digest::SHA` / `use Unicode::Normalize` leave `$!` = ENOENT and
+    ///   `-d`'s successful `stat` does not clear it. The synthesized 255 keeps
+    ///   the branch independent of the exit status (a `die` with `$!` = 0 also
+    ///   exits 255, exactly as the non-NFC input does), and the real 2 is
+    ///   pinned by `a_script_level_failure_is_reported_as_the_far_side_script`
+    ///   and by the real-script test.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the inputs returned
     /// "the transport failed before the far-side command started (exit 255): …
     /// (this is a transport-level failure — connection, authentication, host
     /// key, or the ssh control socket)".
@@ -741,5 +899,468 @@ mod tests {
         );
         assert!(!msg.contains("is perl installed"), "{msg}");
         assert!(!msg.contains("transport-level failure"), "{msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // F1: real OpenSSH transport evidence, and the undetermined fallback.
+    // -----------------------------------------------------------------------
+
+    /// F1: the REAL OpenSSH authentication/transport shapes observed on this
+    /// fleet, each at the START of a stderr line, must be attributed to the
+    /// TRANSPORT — not to the far-side script (the regression this change
+    /// fixes) and not to `perl`.
+    ///
+    /// EVIDENCE: OpenSSH 10.2p1 on macOS and Linux (`ssh -o BatchMode=yes …
+    /// nonexistentuser@localhost true`) prints the first shape; the others are
+    /// OpenSSH's spellings for a disconnect, an unresponsive server, and too
+    /// many authentication attempts. The leading `Warning:` line in the second
+    /// case proves the auth match is LINE-ANCHORED rather than a substring of
+    /// the first line.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the first shape
+    /// returned "remote tree verification at /srv/store failed inside the
+    /// far-side manifest script (exit 255): nonexistentuser@localhost:
+    /// Permission denied (publickey)." — a transport failure blamed on the
+    /// script.
+    #[test]
+    fn real_ssh_auth_failure_shapes_are_transport() {
+        for stderr in [
+            "nonexistentuser@localhost: Permission denied (publickey).",
+            "Warning: Permanently added 'localhost' (ED25519) to the list of known hosts.\n\
+             nonexistentuser@localhost: Permission denied (publickey).",
+            "Received disconnect from 127.0.0.1 port 22:2: disconnected by user",
+            "Timeout, server 127.0.0.1 not responding.",
+            "Too many authentication failures",
+        ] {
+            let out = ExecOutcome {
+                exit_code: 255,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("transport-level failure"),
+                "a real ssh 255 ({stderr:?}) is transport, got: {msg}"
+            );
+            assert!(
+                !msg.contains("failed inside the far-side manifest script"),
+                "a transport failure must not be blamed on the script: {msg}"
+            );
+            assert!(
+                !msg.contains("is perl installed") && msg.contains("exit 255"),
+                "the transport branch names neither perl nor a lost status: {msg}"
+            );
+        }
+    }
+
+    /// F1: a genuine ssh failure produced by the REAL `ssh` binary on this
+    /// host is classified as TRANSPORT. This is the end-to-end ground-truth
+    /// probe: macOS (no local sshd) prints `ssh: connect to host localhost
+    /// port 22: Connection refused`; Linux (sshd running) prints
+    /// `nonexistentuser@localhost: Permission denied (publickey).` — both at
+    /// 255, so both must be transport.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_ssh_failure_is_transport() {
+        if !ssh_on_path() {
+            announce_skip("ssh is not on PATH, so the real-ssh transport probe cannot run");
+            return;
+        }
+        let Some(out) = bounded_ssh_failure(std::time::Duration::from_secs(30)) else {
+            announce_skip("the real ssh probe could not be spawned or produced no status");
+            return;
+        };
+        if out.exit_code == 0 {
+            announce_skip(
+                "the probe target unexpectedly authenticated, so no real ssh failure was produced",
+            );
+            return;
+        }
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("transport-level failure"),
+            "a REAL ssh failure (exit {}, stderr {:?}) must be transport, got: {msg}",
+            out.exit_code,
+            out.stderr
+        );
+        assert!(
+            !msg.contains("failed inside the far-side manifest script")
+                && !msg.contains("is perl installed"),
+            "a real ssh failure must not be blamed on the script or perl: {msg}"
+        );
+    }
+
+    /// F1: a status no rule classifies must NOT be blamed on any layer — the
+    /// message reports the KNOWN exit status and stderr and says the layer is
+    /// undetermined. The previous fallback asserted "failed inside the
+    /// far-side manifest script" for exactly these inputs, which is a layer it
+    /// cannot establish.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): every input returned
+    /// "… failed inside the far-side manifest script (exit N): …" — a
+    /// confident wrong layer.
+    #[test]
+    fn an_unclassified_exit_names_no_layer() {
+        for (code, stderr) in [
+            (200, ""),
+            (137, ""),
+            (1, "some unrelated wrapper diagnostic"),
+            (137, "Killed"),
+            // 255 alone establishes no layer: without a transport marker it is
+            // not transport, and without the script's `die` vocabulary it is
+            // not the script either.
+            (255, ""),
+        ] {
+            let out = ExecOutcome {
+                exit_code: code,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("undetermined") && msg.contains(&format!("exited {code}")),
+                "an unclassified exit {code} must report the known status and say the layer \
+                 is undetermined: {msg}"
+            );
+            for forbidden in [
+                "transport-level failure",
+                "failed inside the far-side manifest script",
+                "is perl installed",
+                "ssh",
+                "connection",
+                "authentication",
+            ] {
+                assert!(
+                    !msg.contains(forbidden),
+                    "an unclassified exit must not name {forbidden:?}: {msg}"
+                );
+            }
+            let expected = if stderr.is_empty() {
+                "(no stderr)"
+            } else {
+                stderr
+            };
+            assert!(
+                msg.contains(expected),
+                "the stderr (or its absence) survives: {msg}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F2: line anchoring closes the far-side-text spoof.
+    // -----------------------------------------------------------------------
+
+    /// F2: marker and `perl`-not-found matches are LINE-ANCHORED, so a raw
+    /// non-NFC entry name cannot spoof a layer. Each name below is exactly the
+    /// text the script would echo raw after its own `die` prefix; before
+    /// anchoring, every one of them routed the failure to the transport (or
+    /// the perl) branch.
+    ///
+    /// EVIDENCE: the script's `entry name under $dir is not NFC-normalized:
+    /// $n` line, with `$n` measured echoed raw on both platforms (see
+    /// `real_script_raw_non_nfc_name_does_not_spoof_transport`, which feeds
+    /// the script's OWN output).
+    #[test]
+    fn a_raw_non_nfc_name_cannot_spoof_a_marker() {
+        for name in [
+            "e\u{301} ssh: connect to host 127.0.0.1 port 22: Connection refused",
+            "e\u{301} Host key verification failed.",
+            "e\u{301} kex_exchange_identification: boom",
+            "e\u{301} unix_listener: cannot bind to path /tmp/dmux/mux-123",
+            "e\u{301} Received disconnect from 127.0.0.1 port 22:2: bye",
+            "e\u{301} Timeout, server 127.0.0.1 not responding.",
+            "e\u{301} Too many authentication failures",
+            "e\u{301} Connection closed by 127.0.0.1 port 22",
+            "e\u{301} Permission denied (publickey).",
+            "e\u{301} x@y: Permission denied (publickey).",
+            "e\u{301} perl: command not found",
+        ] {
+            let stderr = format!("entry name under /srv/store is not NFC-normalized: {name}");
+            let out = ExecOutcome {
+                exit_code: 255,
+                stdout: String::new(),
+                stderr,
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("failed inside the far-side manifest script"),
+                "a raw non-NFC name ({name:?}) must stay a script failure: {msg}"
+            );
+            assert!(
+                !msg.contains("transport-level failure") && !msg.contains("is perl installed"),
+                "a raw non-NFC name must not spoof transport or perl: {msg}"
+            );
+        }
+    }
+
+    /// F2: a marker-shaped string appearing in a path the script PRINTS (here
+    /// the root directory's own name) is not at a line start, so it cannot
+    /// spoof the transport branch even with no crafted entry name at all.
+    #[test]
+    fn a_marker_named_root_directory_cannot_spoof_transport() {
+        let stderr = "entry name under /tmp/Host key verification failed store is not \
+                      NFC-normalized: e\u{301}";
+        let out = ExecOutcome {
+            exit_code: 255,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        };
+        let msg =
+            remote_manifest_failure(Path::new("/tmp/Host key verification failed store"), &out)
+                .to_string();
+        assert!(
+            msg.contains("failed inside the far-side manifest script"),
+            "a marker inside the printed root must not select transport: {msg}"
+        );
+        assert!(!msg.contains("transport-level failure"), "{msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // F4: the classifier pinned to the REAL script's own emissions.
+    // -----------------------------------------------------------------------
+
+    /// Whether `perl` can run at all (the real-script probes need it).
+    fn perl_on_path() -> bool {
+        std::process::Command::new("perl")
+            .args(["-e", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Whether `ssh` can be spawned (the real-ssh probe needs it).
+    fn ssh_on_path() -> bool {
+        std::process::Command::new("ssh")
+            .arg("-V")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    /// Run a real `ssh` against a target that cannot authenticate and return
+    /// its bounded outcome, or `None` when it could not be spawned / did not
+    /// finish before `deadline`.
+    ///
+    /// The child's stdout/stderr are redirected to FILES rather than pipes so
+    /// the wait loop can poll `try_wait` and kill at the deadline without any
+    /// pipe-buffer deadlock. The target is `nonexistentuser@localhost`: macOS
+    /// (no sshd) fails at connect, Linux (sshd) fails at authentication — both
+    /// transport-layer outcomes at exit 255.
+    #[cfg(unix)]
+    fn bounded_ssh_failure(deadline: std::time::Duration) -> Option<ExecOutcome> {
+        use std::process::{Command, Stdio};
+        let dir = fixture_tmpdir(&SysEnv::from_process()).ok()?;
+        let out_path = dir.path().join("stdout");
+        let err_path = dir.path().join("stderr");
+        let out_file = std::fs::File::create(&out_path).ok()?;
+        let err_file = std::fs::File::create(&err_path).ok()?;
+        let mut child = Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=5",
+                "nonexistentuser@localhost",
+                "true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file))
+            .spawn()
+            .ok()?;
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if start.elapsed() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break None,
+            }
+        }?;
+        Some(ExecOutcome {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: std::fs::read_to_string(&out_path).unwrap_or_default(),
+            stderr: std::fs::read_to_string(&err_path).unwrap_or_default(),
+        })
+    }
+
+    /// Run the REAL far-side script on `root` and return its raw outcome.
+    fn real_script_outcome(root: &Path) -> Option<ExecOutcome> {
+        let out = std::process::Command::new("perl")
+            .args(["-e", remote_tree_verify_script()])
+            .arg(root)
+            .output()
+            .ok()?;
+        Some(ExecOutcome {
+            exit_code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    /// Assert that `out` — the REAL script's own output — classifies as the
+    /// far-side script layer and neither transport nor perl.
+    fn assert_script_layer(out: &ExecOutcome) {
+        let msg = remote_manifest_failure(Path::new("/srv/store"), out).to_string();
+        assert!(
+            msg.contains("failed inside the far-side manifest script"),
+            "real script output {out:?} must be the script layer, got: {msg}"
+        );
+        assert!(
+            !msg.contains("transport-level failure") && !msg.contains("is perl installed"),
+            "real script output must not be transport or perl: {msg}"
+        );
+    }
+
+    /// F4: the classifier is pinned to the [status, stderr] the REAL far-side
+    /// script emits, measured identically on macOS perl 5.34.1 and Linux perl
+    /// 5.40.1 under the crate's own `perl -e <script> <root>` invocation:
+    ///
+    /// * root EXISTS but is not a directory -> 2 (`not a directory: …`);
+    /// * root is ABSENT                    -> 2 (`not a directory: …`);
+    /// * a directory the walk cannot open  -> 13  (`opendir …: Permission
+    ///   denied`), when this filesystem actually refuses the read;
+    /// * a non-NFC entry name              -> 255 (name echoed RAW);
+    /// * an entry name with LF             -> 255 (name HEX-encoded);
+    /// * an empty directory                -> 0   (the empty manifest).
+    ///
+    /// This corrects the module's earlier claim that the script's
+    /// non-directory-root refusal "exits 255": under the invocation the crate
+    /// actually uses it exits 2 (`perl -e`'s module loading leaves `$!` =
+    /// ENOENT). Only a `perl <file>` invocation (never used here) exits 255 for
+    /// that refusal — the source of the original mistake.
+    #[test]
+    fn real_script_statuses_classify_as_the_far_side_script() {
+        if !perl_on_path() {
+            announce_skip("perl is not on PATH, so the remote verification script cannot run");
+            return;
+        }
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+
+        // An EXISTING regular file as the root: measured 2, NOT 255. `perl -e`
+        // loads Digest::SHA/Unicode::Normalize first, leaving `$!` = ENOENT;
+        // `-d`'s successful `stat` does not clear it, so `die` propagates 2.
+        let file = dir.path().join("plain.txt");
+        write(&file, b"content");
+        let out = real_script_outcome(&file).unwrap();
+        assert_eq!(
+            out.exit_code, 2,
+            "an existing non-directory root exits 2 under `perl -e`: {out:?}"
+        );
+        assert!(
+            out.stderr.starts_with("not a directory: "),
+            "the script names the rule: {out:?}"
+        );
+        assert_script_layer(&out);
+
+        // An ABSENT root: measured 2 (`-d` sets ENOENT).
+        let absent = dir.path().join("absent");
+        let out = real_script_outcome(&absent).unwrap();
+        assert_eq!(out.exit_code, 2, "an absent root exits 2: {out:?}");
+        assert!(out.stderr.starts_with("not a directory: "), "{out:?}");
+        assert_script_layer(&out);
+
+        // An existing EMPTY directory: measured 0 with empty stdout — the empty
+        // manifest, not a refusal.
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let out = real_script_outcome(&empty).unwrap();
+        assert_eq!(out.exit_code, 0, "an empty directory exits 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "an empty directory prints an empty listing: {out:?}"
+        );
+
+        // A non-NFC entry name: measured 255 with the name echoed RAW.
+        let nfc = dir.path().join("nfc");
+        fs::create_dir_all(&nfc).unwrap();
+        fs::create_dir(nfc.join("e\u{301}")).unwrap();
+        let out = real_script_outcome(&nfc).unwrap();
+        assert_eq!(out.exit_code, 255, "a non-NFC name exits 255: {out:?}");
+        assert!(
+            out.stderr.contains("is not NFC-normalized: e\u{301}"),
+            "the non-NFC name is echoed RAW: {out:?}"
+        );
+        assert_script_layer(&out);
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::PermissionsExt;
+
+            // An LF entry name: measured 255 with the name HEX-encoded.
+            let lf = dir.path().join("lf");
+            fs::create_dir_all(&lf).unwrap();
+            fs::create_dir(lf.join(OsStr::from_bytes(b"a\nb"))).unwrap();
+            let out = real_script_outcome(&lf).unwrap();
+            assert_eq!(out.exit_code, 255, "an LF name exits 255: {out:?}");
+            assert!(
+                out.stderr.contains("610a62"),
+                "the LF name is hex-encoded (`a\\nb` = 61 0a 62): {out:?}"
+            );
+            assert_script_layer(&out);
+
+            // A directory the walk cannot open: measured 13 (`opendir`
+            // EACCES), when this process/filesystem really refuses the read.
+            let unread = dir.path().join("unread");
+            fs::create_dir_all(unread.join("sub")).unwrap();
+            write(&unread.join("sub/inside"), b"x");
+            fs::set_permissions(unread.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+            let refused = fs::read_dir(unread.join("sub")).is_err();
+            if refused {
+                let out = real_script_outcome(&unread).unwrap();
+                fs::set_permissions(unread.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(out.exit_code, 13, "an unreadable dir exits 13: {out:?}");
+                assert!(out.stderr.starts_with("opendir "), "{out:?}");
+                assert_script_layer(&out);
+            } else {
+                fs::set_permissions(unread.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+                announce_skip(
+                    "this process can still enumerate a mode-0o000 directory, so the EACCES \
+                     premise is untestable here",
+                );
+            }
+        }
+    }
+
+    /// F2 end-to-end: the REAL script's output for a non-NFC entry whose name
+    /// is a transport marker must still classify as the far-side script. This
+    /// feeds the script's OWN bytes, not a reconstructed string, so it is the
+    /// strongest available measurement that anchoring closes the spoof.
+    #[test]
+    fn real_script_raw_non_nfc_name_does_not_spoof_transport() {
+        if !perl_on_path() {
+            announce_skip("perl is not on PATH, so the remote verification script cannot run");
+            return;
+        }
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+        let root = dir.path().join("spoof");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(
+            root.join("e\u{301} ssh: connect to host 127.0.0.1 port 22: Connection refused"),
+        )
+        .unwrap();
+        let out = real_script_outcome(&root).unwrap();
+        assert_eq!(out.exit_code, 255, "{out:?}");
+        assert!(
+            out.stderr.contains("Connection refused"),
+            "the raw name is echoed verbatim: {out:?}"
+        );
+        assert_script_layer(&out);
     }
 }

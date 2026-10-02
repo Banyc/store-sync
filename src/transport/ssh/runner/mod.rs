@@ -1058,6 +1058,131 @@ mod runner_property_tests {
         assert_pair(kind, stall, deadline, &state, outcome);
     }
 
+    /// F3: `prepare_identity` creates the transport's OUTSIDE-THE-ROOT residue
+    /// and leaves it behind — the third residue the `sync` module doc omitted.
+    /// With a hermetic `TMPDIR` and the fake runner's keyscan seam, this
+    /// measures exactly what a run BLOCKED on the destination lock (or failing
+    /// after preparation) has already created:
+    ///
+    /// * `<TMPDIR>/dmux` (0700), created on EVERY `prepare_identity`; and
+    /// * the pin cache dir (0700) plus `knownhosts-<hash>.txt` (0600), created
+    ///   only when the transport was given a fingerprint and no `known_hosts`.
+    ///
+    /// Both are asserted to PERSIST after the transport is dropped (the crate
+    /// has no `Drop` cleanup for them).
+    #[test]
+    fn prepare_identity_creates_and_keeps_the_residue_outside_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        // A hermetic snapshot whose TMPDIR is the fixture dir: `mux_socket_dir`
+        // is `<temp_dir>/dmux`, and the pin cache is resolved by the caller, so
+        // both residue roots live inside `dir` and nothing touches the real
+        // /tmp.
+        let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("TMPDIR"),
+            dir.path().as_os_str().to_os_string(),
+        )]));
+        let cache = dir.path().join("deploy-ssh-knownhosts");
+
+        // A real ed25519 key so the fake keyscan line verifies with the real
+        // `ssh-keygen` (the same seam the pin property test uses).
+        let (pubkey, fingerprint) = host_key();
+        let (seam, _state) = FakeSeam::new(Stall::Complete, Some(pubkey));
+        let runner =
+            SshRunner::with_seam(seam, Duration::from_millis(50), Duration::from_millis(50));
+        let transport = SshTransport::with_runner(
+            "deploy",
+            "residue.test",
+            2222,
+            Path::new("/srv/app"),
+            None, // no explicit known_hosts: take the fingerprint/pin path
+            Some(&fingerprint),
+            &cache,
+            &env,
+            runner,
+        )
+        .unwrap();
+
+        transport.prepare_identity().unwrap();
+
+        let mux = dir.path().join("dmux");
+        let meta = std::fs::metadata(&mux).expect("prepare_identity must create the mux dir");
+        assert!(meta.is_dir(), "the mux path must be a directory: {mux:?}");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "the mux dir must be 0700"
+        );
+
+        let cache_meta = std::fs::metadata(&cache).expect("the pin path must create the cache dir");
+        assert!(cache_meta.is_dir(), "the pin cache must be a directory");
+        assert_eq!(
+            cache_meta.permissions().mode() & 0o777,
+            0o700,
+            "the pin cache dir must be 0700"
+        );
+
+        let pin = std::fs::read_dir(&cache)
+            .expect("the pin cache must be readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("knownhosts-") && name.ends_with(".txt"))
+            })
+            .expect("the pin file must exist");
+        let pin_meta = std::fs::metadata(&pin).expect("the pin file must exist");
+        assert!(pin_meta.is_file(), "the pinned file must be a regular file");
+        assert_eq!(
+            pin_meta.permissions().mode() & 0o777,
+            0o600,
+            "the pinned known-hosts file must be 0600"
+        );
+
+        // No cleanup on drop: the residue outlives the transport.
+        drop(transport);
+        assert!(
+            mux.is_dir(),
+            "the mux dir must persist after the transport drops"
+        );
+        assert!(
+            pin.is_file(),
+            "the pin file must persist after the transport drops"
+        );
+
+        // With an explicit `known_hosts` file the pin path is SKIPPED, so the
+        // known-hosts residue is CONDITIONAL while the mux dir is not.
+        let other_cache = dir.path().join("other-cache");
+        let kh = dir.path().join("known_hosts");
+        std::fs::write(&kh, b"placeholder\n").unwrap();
+        let (seam, _state) = FakeSeam::new(Stall::Complete, None);
+        let runner =
+            SshRunner::with_seam(seam, Duration::from_millis(50), Duration::from_millis(50));
+        let transport = SshTransport::with_runner(
+            "deploy",
+            "residue.test",
+            2222,
+            Path::new("/srv/app"),
+            Some(&kh),
+            None,
+            &other_cache,
+            &env,
+            runner,
+        )
+        .unwrap();
+        transport.prepare_identity().unwrap();
+        assert!(
+            mux.is_dir(),
+            "the mux dir is created on EVERY prepare_identity"
+        );
+        assert!(
+            !other_cache.exists(),
+            "the pin cache is NOT created without a fingerprint"
+        );
+    }
+
     /// The property's assertions for one pair. `state` is the fake's full call
     /// log + live-waiter count.
     fn assert_pair(

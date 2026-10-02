@@ -10609,9 +10609,13 @@ fn a_killed_holder_releases_the_destination_lock() {
 /// proof: deleting the early `destination_lock_record` check leaves every
 /// other assertion in this test green (the later `lock_destination` still
 /// refuses with the same message) but calls `prepare_identity` first, so this
-/// assertion is what fails. What remains unobservable in-crate is the mux
-/// directory and pin cache themselves: only the real-SSH reproduction can see
-/// them, and it recovers the gap at this same ordering point.
+/// assertion is what fails. The residue the double cannot observe — the
+/// `ControlMaster` mux directory (0700) and the pinned host key — is now
+/// enumerated in the module doc and measured in-crate with a hermetic `TMPDIR`,
+/// the real `prepare_identity`, and the fake keyscan seam by
+/// `transport::ssh::runner::runner_property_tests::prepare_identity_creates_and_keeps_the_residue_outside_the_root`,
+/// so this call-count assertion is no longer the only cover for the ordering
+/// gap.
 #[test]
 fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
     let dir = fixture_tmpdir(&env()).unwrap();

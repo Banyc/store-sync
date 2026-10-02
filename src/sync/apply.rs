@@ -521,16 +521,37 @@
 //! * **The DESTINATION TREE is still created lazily and only by a mutation.**
 //!   "A fully-refused pull creates NOTHING" holds for the root and everything
 //!   under it: the record location is outside the root, so the run never
-//!   creates the ROOT itself. Two pieces of residue OUTSIDE the root can
-//!   outlive a refused or blocked run, and both are named rather than implied:
-//!   (1) the root's PARENT chain, created at the platform default mode by
-//!   `create_lock_parent`; and (2) the persistent sibling record file
-//!   `<parent>/.<name>.operation.lock` itself, which
-//!   [`crate::lock::FileLock`] creates on first acquisition and NEVER removes
-//!   (the STABLE-INODE discipline in [`crate::lock`]) — the same path the suite
-//!   pins after a missing-source error
-//!   (`an_error_exit_releases_the_destination_lock`). This is the honest limit
-//!   of the contract; it is stated here rather than implied.
+//!   creates the ROOT itself. Three pieces of residue OUTSIDE the root can
+//!   outlive a blocked or later-failed run, and all three are named rather
+//!   than implied. The first two are created by the lock acquisition itself,
+//!   the third strictly earlier; a run refused by the OWNERSHIP check BEFORE
+//!   preparation (a remote destination reached through [`sync`]) still creates
+//!   nothing at all. This is the honest limit of the contract; it is stated
+//!   here rather than implied. The three are:
+//!     * the root's PARENT chain, created at the platform default mode by
+//!       `create_lock_parent`;
+//!     * the persistent sibling record file
+//!       `<parent>/.<name>.operation.lock` itself, which
+//!       [`crate::lock::FileLock`] creates on first acquisition and NEVER
+//!       removes (the STABLE-INODE discipline in [`crate::lock`]) — the same
+//!       path the suite pins after a missing-source error
+//!       (`an_error_exit_releases_the_destination_lock`); and
+//!     * the transport's own PREPARATION residue, created by
+//!       [`Remote::prepare_identity`] BEFORE the lock is taken
+//!       ([`run_entry`]'s refusal -> `prepare_identity` -> lock -> run order),
+//!       so a run BLOCKED on the lock, or failing after preparation, has
+//!       already created it. There is no cleanup on drop. It comprises the SSH
+//!       `ControlMaster` mux directory `<temp_dir>/dmux` (0700), created on
+//!       EVERY [`crate::transport::SshTransport`] `prepare_identity` call,
+//!       plus the `mux-<hash>` control sockets ssh later creates inside it
+//!       (`ControlPath=<temp_dir>/dmux/mux-<hash>`, `ControlMaster=auto`,
+//!       `ControlPersist=120`), which the crate never removes; and, only when
+//!       the transport was configured with a `host_key_fingerprint` and NO
+//!       explicit `known_hosts`, the managed known-hosts pin — the pin cache
+//!       directory (0700, resolved at the transport boundary as
+//!       `DEPLOY_SSH_KNOWNHOSTS_DIR` else `<temp_dir>/deploy-ssh-knownhosts`)
+//!       and the pinned `knownhosts-<hash>.txt` file (0600), likewise never
+//!       removed.
 //!
 //! A single-component RELATIVE root resolves through the current directory
 //! ([`destination_lock_path`] maps an empty `Path::parent` to `.`), exactly as
