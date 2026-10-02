@@ -9,6 +9,21 @@
 //! exactly these bytes on upload. Any module that serializes or transfers tree
 //! bytes diverging from this format silently breaks digest equality for every
 //! other verifier.
+//!
+//! # Names are on-disk names: NFC UTF-8, or the tree is refused
+//!
+//! The manifest's paths are the entries' ON-DISK names, so an entry path is
+//! stored exactly as the filesystem spells it (joined with `/`): valid UTF-8
+//! and already NFC. Canonicalization therefore REFUSES a tree containing a
+//! name that is not valid UTF-8 or not already NFC, with an error that names
+//! the offending entry, instead of converting or normalizing it. This is
+//! deliberate: the stored path is used to ADDRESS the file downstream, and
+//! storing a normalized spelling names a path that does not exist on a
+//! normalization-sensitive filesystem (Linux/ext4) — the sync would either
+//! fail to find the file or, worse, report success while leaving the
+//! destination holding both spellings. The two canonicalizers (the local walk
+//! and the remote wire assembler) apply the same rule, so they accept exactly
+//! the same trees.
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
@@ -21,11 +36,13 @@ use walkdir::WalkDir;
 /// One entry in a canonical tree object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
-    /// NFC-normalized, UTF-8, `/`-separated path relative to the artifact
-    /// root. The spelling is host-independent: nested entries are `a/b` on
-    /// every platform. A literal `\` inside one component is an ordinary
-    /// name character (legal on Unix) and is preserved verbatim, so readers
-    /// must split on `/` only.
+    /// The entry's ON-DISK name, in NFC over UTF-8, `/`-separated relative
+    /// to the artifact root. Canonicalization stores the exact on-disk
+    /// spelling (never a re-spelled form) because this string is what
+    /// downstream code uses to ADDRESS the file. The spelling is
+    /// host-independent: nested entries are `a/b` on every platform. A
+    /// literal `\` inside one component is an ordinary name character (legal
+    /// on Unix) and is preserved verbatim, so readers must split on `/` only.
     pub path: String,
     /// `file`, `dir`, or `symlink`.
     #[serde(rename = "type")]
@@ -79,7 +96,7 @@ fn normalize_lexical(base: &Path, rel: &Path) -> Option<PathBuf> {
 }
 
 /// The manifest's canonical spelling for an artifact-relative path: every
-/// [`Component::Normal`] name joined with `/`.
+/// valid-UTF-8 [`Component::Normal`] name joined with `/`.
 ///
 /// This is a COMPONENT join, never a `\` -> `/` string replacement, because
 /// `\` is an ordinary character in a Unix file name: rewriting it would
@@ -87,26 +104,41 @@ fn normalize_lexical(base: &Path, rel: &Path) -> Option<PathBuf> {
 /// instead makes the spelling host-independent — on Windows `a\b` is two
 /// components and becomes the portable `a/b`, while on Unix the same bytes
 /// are one component and stay `a\b`, exactly as the remote (POSIX) script
-/// already spells it. Any non-`Normal` component (a root or prefix, or a
-/// `.`/`..` component) means the path is not a portable artifact-relative
-/// path, so such a path yields `None`; an empty path (no components) yields
-/// `None` too.
-fn canonical_entry_path(rel: &Path) -> Option<String> {
+/// already spells it. The spelling is stored VERBATIM, so a name it cannot
+/// address is refused rather than converted: a non-`Normal` component (a root
+/// or prefix, or a `.`/`..` component) is an error, a name that is not valid
+/// UTF-8 is an error (never a lossy conversion), and an empty path (no
+/// components) is an error too.
+fn canonical_entry_path(rel: &Path) -> Result<String> {
     let mut out = String::new();
     let mut count = 0usize;
     for comp in rel.components() {
         match comp {
             Component::Normal(name) => {
+                let Some(name) = name.to_str() else {
+                    return Err(Error::materialization(format!(
+                        "manifest requires NFC/UTF-8 names, but this entry's name is not valid UTF-8: {rel:?}"
+                    )));
+                };
                 if count > 0 {
                     out.push('/');
                 }
-                out.push_str(&name.to_string_lossy());
+                out.push_str(name);
                 count += 1;
             }
-            _ => return None,
+            _ => {
+                return Err(Error::materialization(format!(
+                    "path has a non-normal component: {rel:?}"
+                )));
+            }
         }
     }
-    (count > 0).then_some(out)
+    if count == 0 {
+        return Err(Error::materialization(format!(
+            "path has no components: {rel:?}"
+        )));
+    }
+    Ok(out)
 }
 
 /// Whether every `/`-separated component of a wire path is a normal name:
@@ -120,14 +152,19 @@ fn has_only_normal_components(path: &str) -> bool {
         .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
-/// Validate the WIRE spelling of an entry path and return its
-/// NFC-normalized form. Both canonicalizers funnel through this so they
-/// accept exactly the same set of trees.
+/// Validate an entry path (the local spelling built by
+/// [`canonical_entry_path`], or the raw WIRE spelling the remote script
+/// printed) and return it UNCHANGED. Both canonicalizers funnel through this
+/// so they accept exactly the same set of trees.
 ///
 /// Rejects NUL bytes and newline/tab characters (the remote script's output
 /// is line- and tab-separated, so such a name would mangle the wire format
 /// and make a tree unverifiable on a remote), rejects absolute paths and any
-/// empty or traversal (`.`/`..`) component, and NFC-normalizes the result.
+/// empty or traversal (`.`/`..`) component, and — because the manifest stores
+/// on-disk names — REQUIRES the spelling to be already NFC instead of
+/// normalizing it. A non-NFC name is refused, naming the entry: storing a
+/// normalized spelling would address a path that does not exist on a
+/// normalization-sensitive filesystem.
 fn validate_entry_path(path: &str) -> Result<String> {
     if path.contains('\0') {
         return Err(Error::materialization(format!(
@@ -149,16 +186,13 @@ fn validate_entry_path(path: &str) -> Result<String> {
             "path contains a traversal or empty component: {path}"
         )));
     }
-    let normalized: String = path.nfc().collect();
-    // NFC never changes `/`, `.`, or `..`, so this re-check can only fire if
-    // the normalization rule above grew an exotic mapping; keep it explicit
-    // so the guarantee is tied to the STORED spelling.
-    if normalized.starts_with('/') || !has_only_normal_components(&normalized) {
+    let nfc: String = path.nfc().collect();
+    if nfc != path {
         return Err(Error::materialization(format!(
-            "path contains a traversal or empty component: {normalized}"
+            "manifest requires NFC/UTF-8 names, but this entry path is not NFC-normalized: {path}"
         )));
     }
-    Ok(normalized)
+    Ok(path.to_string())
 }
 
 /// Canonicalize a directory into a [`TreeMetadata`] and compute its digest.
@@ -171,9 +205,10 @@ fn validate_entry_path(path: &str) -> Result<String> {
 ///
 /// Rejects absolute paths, `..`, NUL bytes, newline/tab filenames (the
 /// remote verification wire format is line- and tab-separated, so the two
-/// verification paths must agree), duplicate normalized paths,
-/// escaping/absolute symbolic links, devices, sockets, FIFOs, and hard
-/// links.
+/// verification paths must agree), names that are not valid UTF-8 or not
+/// already NFC (the stored path IS the on-disk name, never a normalized
+/// re-spelling), duplicate paths, escaping/absolute symbolic links, devices,
+/// sockets, FIFOs, and hard links.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -196,27 +231,26 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             .map_err(|e| Error::materialization(format!("{e}")))?;
 
         // Build the canonical spelling from the path's COMPONENTS, never by
-        // rewriting separators in a string. Every component must be
-        // `Component::Normal`: a root/prefix, `.`, or `..` component is not a
-        // portable artifact-relative path and is refused. On Windows a
-        // nested path (`a\b`) has two components and becomes the portable
+        // rewriting separators in a string. Every component must be a valid
+        // UTF-8 `Component::Normal`: a root/prefix, `.`, or `..` component is
+        // not a portable artifact-relative path and is refused, and a
+        // non-UTF-8 name is refused rather than lossily converted. On Windows
+        // a nested path (`a\b`) has two components and becomes the portable
         // `a/b`; on Unix those same bytes are ONE component, so a literal
-        // `\` inside a file name is preserved verbatim rather than
-        // corrupted into a separator.
-        let joined = canonical_entry_path(rel_os).ok_or_else(|| {
-            Error::materialization(format!(
-                "path has a non-normal component: {}",
-                path.display()
-            ))
-        })?;
-        // Validate the NORMALIZED spelling, because that spelling is what the
-        // remote assembler sees: NUL bytes, newline/tab, absolute paths, and
-        // empty/traversal components are refused here exactly as they are
-        // there, and NFC normalization is applied to the stored form.
-        let normalized = validate_entry_path(&joined)?;
-        if !seen.insert(normalized.clone()) {
+        // `\` inside a file name is preserved verbatim rather than corrupted
+        // into a separator.
+        let joined = canonical_entry_path(rel_os)?;
+        // Validate the spelling the manifest will store — the ON-DISK name —
+        // because that is exactly what the remote assembler sees too: NUL
+        // bytes, newline/tab, absolute paths, empty/traversal components, and
+        // names that are not already NFC are refused here exactly as they are
+        // there. The accepted spelling is stored UNCHANGED; a normalized
+        // spelling would name a different file on a normalization-sensitive
+        // filesystem.
+        let entry_path = validate_entry_path(&joined)?;
+        if !seen.insert(entry_path.clone()) {
             return Err(Error::materialization(format!(
-                "duplicate normalized path: {normalized}"
+                "duplicate normalized path: {entry_path}"
             )));
         }
 
@@ -286,7 +320,7 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
         }
 
         entries.push(TreeEntry {
-            path: normalized,
+            path: entry_path,
             entry_type: entry_type.to_string(),
             mode,
             content_sha256,
@@ -333,7 +367,8 @@ pub fn remote_tree_verify_script() -> &'static str {
 
 /// Assemble canonical tree metadata from the remote verification script's
 /// output ([`remote_tree_verify_script`]), applying the SAME validations the
-/// local canonicalizer applies ([`canonicalize_tree`]): NFC normalization,
+/// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
+/// names (a non-NFC name is refused, never normalized),
 /// NUL/traversal/absolute/duplicate path rejection, hardlink rejection, and
 /// in-root symlink targets. The per-file content hashes come from the remote
 /// (sha256sum); the digest is computed from the assembled metadata, so a
@@ -365,23 +400,24 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
         // Path validation — mirror canonicalize_tree exactly by running the
         // SAME validator on the wire spelling. Newline/tab are the
         // wire-format breakers (the script's output is line- and
-        // tab-separated), and absolute/empty/traversal components are
-        // refused, so the two verification paths accept exactly the same
+        // tab-separated), absolute/empty/traversal components are refused,
+        // and a name that is not already NFC is refused rather than
+        // normalized, so the two verification paths accept exactly the same
         // trees.
-        let normalized = validate_entry_path(path)?;
-        if !seen.insert(normalized.clone()) {
+        let entry_path = validate_entry_path(path)?;
+        if !seen.insert(entry_path.clone()) {
             return Err(Error::materialization(format!(
-                "duplicate normalized path: {normalized}"
+                "duplicate normalized path: {entry_path}"
             )));
         }
 
         let mode = u32::from_str_radix(mode_hex, 16).map_err(|_| {
-            Error::materialization(format!("invalid mode {mode_hex:?} for {normalized}"))
+            Error::materialization(format!("invalid mode {mode_hex:?} for {entry_path}"))
         })?;
 
         let entry = match entry_type {
             "d" => TreeEntry {
-                path: normalized,
+                path: entry_path,
                 entry_type: "dir".to_string(),
                 mode: fmt_mode(mode),
                 content_sha256: None,
@@ -389,16 +425,16 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
             },
             "f" => {
                 let n: u64 = nlink.parse().map_err(|_| {
-                    Error::materialization(format!("invalid nlink {nlink:?} for {normalized}"))
+                    Error::materialization(format!("invalid nlink {nlink:?} for {entry_path}"))
                 })?;
                 if n > 1 {
                     return Err(Error::materialization(format!(
-                        "hard links not allowed: {normalized}"
+                        "hard links not allowed: {entry_path}"
                     )));
                 }
                 if content_hash.is_empty() {
                     return Err(Error::materialization(format!(
-                        "missing content hash for {normalized}"
+                        "missing content hash for {entry_path}"
                     )));
                 }
                 // The remote script emits lowercase hex (Digest::SHA's
@@ -413,11 +449,11 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                         .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
                 {
                     return Err(Error::materialization(format!(
-                        "invalid content hash {content_hash:?} for {normalized}"
+                        "invalid content hash {content_hash:?} for {entry_path}"
                     )));
                 }
                 TreeEntry {
-                    path: normalized,
+                    path: entry_path,
                     entry_type: "file".to_string(),
                     mode: fmt_mode(mode),
                     content_sha256: Some(content_hash.to_string()),
@@ -427,13 +463,13 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
             "l" => {
                 if symlink_target.is_empty() {
                     return Err(Error::materialization(format!(
-                        "missing symlink target for {normalized}"
+                        "missing symlink target for {entry_path}"
                     )));
                 }
                 let target = PathBuf::from(symlink_target);
                 if target.is_absolute() {
                     return Err(Error::materialization(format!(
-                        "absolute symlink not allowed: {normalized}"
+                        "absolute symlink not allowed: {entry_path}"
                     )));
                 }
                 let resolved = normalize_lexical(root, &target);
@@ -441,13 +477,13 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                     Some(r) if r.starts_with(root) => {}
                     _ => {
                         return Err(Error::materialization(format!(
-                            "escaping symlink not allowed: {normalized}"
+                            "escaping symlink not allowed: {entry_path}"
                         )));
                     }
                 }
                 let target_bytes = symlink_target.as_bytes();
                 TreeEntry {
-                    path: normalized,
+                    path: entry_path,
                     entry_type: "symlink".to_string(),
                     mode: "0777".to_string(),
                     content_sha256: Some(sha256_bytes(target_bytes)),
@@ -456,7 +492,7 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
             }
             other => {
                 return Err(Error::materialization(format!(
-                    "unsupported file type at {normalized}: {other:?}"
+                    "unsupported file type at {entry_path}: {other:?}"
                 )));
             }
         };
@@ -604,6 +640,65 @@ mod tests {
         std::os::unix::fs::symlink("file.txt", root.join("sub").join("link")).unwrap();
     }
 
+    /// Whether `perl` is on `PATH`. The remote verification script IS the
+    /// production wire format (it runs through `Remote::exec` as `perl -e`),
+    /// so the tests that exercise it need an interpreter. On a host without
+    /// one they SKIP with a visible reason instead of failing the suite for
+    /// an environment reason that has nothing to do with this crate.
+    fn perl_on_path() -> bool {
+        std::process::Command::new("perl")
+            .args(["-e", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Skip the current test, with a clear reason, when `perl` is not on
+    /// `PATH`. Used at the top of every test that runs the remote script.
+    macro_rules! skip_without_perl {
+        ($name:literal) => {
+            if !perl_on_path() {
+                eprintln!(
+                    "skipping {}: perl is not on PATH, so the remote verification \
+                     script cannot run",
+                    $name
+                );
+                return;
+            }
+        };
+    }
+
+    /// Whether a mode-`0o000` directory ACTUALLY refuses enumeration for THIS
+    /// process. Root and any process holding `CAP_DAC_READ_SEARCH`, and a
+    /// filesystem that ignores mode bits, can still list it, so the
+    /// unreadable-subdirectory premise is untestable there — asserting the
+    /// script's refusal would fail for a reason unrelated to the script. Probe
+    /// the premise with a REAL `read_dir` (the sync suite's pattern) rather
+    /// than `geteuid() == 0`. Returns `true` when the read FAILED (the premise
+    /// holds), and prints the skip reason otherwise so a skipped run is never
+    /// silent.
+    #[cfg(unix)]
+    fn an_unreadable_dir_really_refuses_reads() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let unreadable = dir.path().join("unreadable");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = std::fs::read_dir(&unreadable).is_err();
+        // Restore so the TempDir's recursive cleanup can remove the tree.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !refused {
+            eprintln!(
+                "skipping: this process can still enumerate a mode-0o000 directory \
+                 (effective uid 0, CAP_DAC_READ_SEARCH, or a mode-ignoring \
+                 filesystem?), so the unreadable-subdirectory premise is untestable here"
+            );
+        }
+        refused
+    }
+
     /// The remote verification script ([`remote_tree_verify_script`]) must
     /// produce the EXACT same canonical digest as the local canonicalizer
     /// ([`canonicalize_tree`]): the script walks the tree and prints per-entry
@@ -613,6 +708,7 @@ mod tests {
     /// symlink) — a divergence would falsely quarantine valid remote trees.
     #[test]
     fn remote_verify_script_digest_matches_local_canonicalization() {
+        skip_without_perl!("remote_verify_script_digest_matches_local_canonicalization");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         build_tree(&root);
@@ -743,6 +839,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn backslash_inside_a_unix_filename_is_preserved_verbatim() {
+        skip_without_perl!("backslash_inside_a_unix_filename_is_preserved_verbatim");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
@@ -766,22 +863,26 @@ mod tests {
         assert_eq!(remote.tree_sha256, meta.tree_sha256);
     }
 
-    /// A path whose components are not all `Component::Normal` is refused:
-    /// the component join returns `None` for a root/prefix, `.`, or `..`
-    /// component, and the shared wire validator refuses the same spellings
-    /// (`../x`, `/x`, `a/../b`, plus empty components) with NUL rejected too.
+    /// A path whose components are not all a valid-UTF-8
+    /// `Component::Normal` is refused: the component join errors for a
+    /// root/prefix, `.`, or `..` component, for an empty path, and (never a
+    /// lossy conversion) for a name that is not valid UTF-8. The shared wire
+    /// validator refuses the same spellings (`../x`, `/x`, `a/../b`, plus
+    /// empty components) with NUL rejected too, and — because the manifest
+    /// stores on-disk names — REQUIRES an already-NFC spelling instead of
+    /// normalizing it.
     #[test]
     fn traversal_and_absolute_components_are_refused() {
         // The local component join refuses any non-`Normal` component.
-        assert_eq!(canonical_entry_path(Path::new("../x")), None);
-        assert_eq!(canonical_entry_path(Path::new("/x")), None);
-        assert_eq!(canonical_entry_path(Path::new("a/../b")), None);
-        assert_eq!(canonical_entry_path(Path::new("./x")), None);
-        assert_eq!(canonical_entry_path(Path::new("")), None);
+        assert!(canonical_entry_path(Path::new("../x")).is_err());
+        assert!(canonical_entry_path(Path::new("/x")).is_err());
+        assert!(canonical_entry_path(Path::new("a/../b")).is_err());
+        assert!(canonical_entry_path(Path::new("./x")).is_err());
+        assert!(canonical_entry_path(Path::new("")).is_err());
         // A name containing `..` as a substring is still one normal component.
         assert_eq!(
-            canonical_entry_path(Path::new("a..b")),
-            Some("a..b".to_string())
+            canonical_entry_path(Path::new("a..b")).unwrap(),
+            "a..b".to_string()
         );
 
         // The shared validator — used by BOTH canonicalizers — refuses the
@@ -799,6 +900,24 @@ mod tests {
         );
         assert!(validate_entry_path("a\tb").is_err(), "tab must be refused");
 
+        // The NFC rule: an already-NFC non-ASCII name is accepted and
+        // returned UNCHANGED, while a decomposed spelling is refused (never
+        // normalized) with an error that names the offending entry.
+        assert_eq!(
+            validate_entry_path("caf\u{e9}.txt").unwrap(),
+            "caf\u{e9}.txt",
+            "an already-NFC non-ASCII name must be stored unchanged"
+        );
+        let nfd_err = validate_entry_path("cafe\u{301}.txt").unwrap_err();
+        assert!(
+            nfd_err.to_string().contains("NFC/UTF-8"),
+            "a non-NFC name must be refused with the rule it broke, got: {nfd_err}"
+        );
+        assert!(
+            nfd_err.to_string().contains("cafe\u{301}.txt"),
+            "the non-NFC refusal must name the offending entry, got: {nfd_err}"
+        );
+
         // And the wire assembler refuses the same paths end to end.
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
@@ -813,6 +932,28 @@ mod tests {
                 "wire path {bad:?} must be refused, got: {err}"
             );
         }
+    }
+
+    /// A name that is not valid UTF-8 is refused by the component join,
+    /// never lossily converted to `U+FFFD`: a lossy spelling would name a
+    /// different file (and one the destination cannot address). The path is
+    /// built from raw bytes so the test needs no filesystem support for
+    /// invalid-UTF-8 names (macOS APFS rejects them outright).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_entry_name_is_refused_by_component_join() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(OsStr::from_bytes(b"bad\xffname.txt"));
+        let err = canonical_entry_path(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("NFC/UTF-8"),
+            "a non-UTF-8 name must be refused with the rule it broke, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("bad"),
+            "the non-UTF-8 refusal must name the offending entry, got: {err}"
+        );
     }
 
     /// Run the remote verification script on `root` and return its stdout
@@ -849,6 +990,7 @@ mod tests {
     /// enumerate a directory.
     #[test]
     fn remote_script_accepts_an_empty_directory_as_an_empty_manifest() {
+        skip_without_perl!("remote_script_accepts_an_empty_directory_as_an_empty_manifest");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("empty");
         std::fs::create_dir_all(&root).unwrap();
@@ -880,6 +1022,7 @@ mod tests {
     /// deletions under `delete_extraneous`.
     #[test]
     fn remote_script_rejects_a_missing_root() {
+        skip_without_perl!("remote_script_rejects_a_missing_root");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let missing = dir.path().join("does-not-exist");
         let out = run_remote_script_raw(&missing);
@@ -894,6 +1037,7 @@ mod tests {
     /// non-directory root is not a tree with no entries.
     #[test]
     fn remote_script_rejects_a_regular_file_root() {
+        skip_without_perl!("remote_script_rejects_a_regular_file_root");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("plain.txt");
         std::fs::write(&root, b"content").unwrap();
@@ -911,9 +1055,11 @@ mod tests {
     #[test]
     fn remote_script_rejects_an_unreadable_subdirectory() {
         use std::os::unix::fs::PermissionsExt;
-        // Running as root defeats the permission check (DAC override), so the
-        // case is untestable there; skip rather than assert a lie.
-        if unsafe { libc::geteuid() } == 0 {
+        skip_without_perl!("remote_script_rejects_an_unreadable_subdirectory");
+        // A real probe, not `geteuid() == 0`: root, CAP_DAC_READ_SEARCH, and a
+        // mode-ignoring filesystem all let this process list a 0o000 directory,
+        // which would make the script's refusal untestable here.
+        if !an_unreadable_dir_really_refuses_reads() {
             return;
         }
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -977,6 +1123,7 @@ mod tests {
     /// convergence of the two paths on special files.
     #[test]
     fn special_files_rejected_by_both_canonicalizers() {
+        skip_without_perl!("special_files_rejected_by_both_canonicalizers");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
@@ -1014,6 +1161,7 @@ mod tests {
     /// the raw nlink and the assembler refuses nlink > 1.
     #[test]
     fn hard_links_rejected_by_remote_path() {
+        skip_without_perl!("hard_links_rejected_by_remote_path");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
@@ -1043,6 +1191,7 @@ mod tests {
     /// manifest describe bytes outside the tree.
     #[test]
     fn escaping_symlink_rejected_by_both_canonicalizers() {
+        skip_without_perl!("escaping_symlink_rejected_by_both_canonicalizers");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         let outside = dir.path().join("outside.txt");
@@ -1067,40 +1216,61 @@ mod tests {
         );
     }
 
-    /// The remote assembler applies the SAME duplicate-normalized-path rule
-    /// the local canonicalizer applies: two wire paths that NFC-normalize to
-    /// the same string describe the same entry twice and are refused (a local
-    /// filesystem cannot produce that collision on POSIX, so only the wire
-    /// path can).
+    /// Since every accepted path must already be NFC, a decomposed wire
+    /// spelling is refused as non-NFC rather than normalized into a collision
+    /// with its precomposed partner. The duplicate check itself remains as
+    /// defence in depth: two IDENTICAL accepted lines still describe the same
+    /// entry twice and are refused (only exact duplicates can collide now).
     #[test]
-    fn duplicate_normalized_path_rejected_by_remote_assembler() {
+    fn non_nfc_and_duplicate_wire_paths_are_rejected_by_remote_assembler() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
         let hash = "0".repeat(64);
-        // "café" written as e + combining acute, then as the precomposed form:
-        // distinct bytes, one NFC-normalized path.
-        let output =
-            format!("cafe\u{301}.txt\tf\t1a4\t1\t{hash}\t\ncaf\u{e9}.txt\tf\t1a4\t1\t{hash}\t\n");
-        let err = canonicalize_remote_entries(&output, &root).unwrap_err();
+
+        // "café" written as e + combining acute is not NFC: refused, never
+        // normalized.
+        let nfd = format!("cafe\u{301}.txt\tf\t1a4\t1\t{hash}\t\n");
+        let err = canonicalize_remote_entries(&nfd, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("NFC/UTF-8"),
+            "a non-NFC wire path must be refused, got: {err}"
+        );
+        // Its already-NFC partner IS accepted.
+        let nfc = format!("caf\u{e9}.txt\tf\t1a4\t1\t{hash}\t\n");
+        canonicalize_remote_entries(&nfc, &root).unwrap();
+
+        // An exact duplicate line is still refused as a duplicate entry.
+        let duplicate = format!("a.txt\tf\t1a4\t1\t{hash}\t\na.txt\tf\t1a4\t1\t{hash}\t\n");
+        let err = canonicalize_remote_entries(&duplicate, &root).unwrap_err();
         assert!(
             err.to_string().contains("duplicate normalized path"),
-            "remote assembler must reject the duplicated normalized path, got: {err}"
+            "remote assembler must reject a duplicated path, got: {err}"
         );
     }
 
     /// The digest-equivalence pin extended to the entry classes the original
-    /// test missed: an EMPTY file (zero-length content hash) and a UNICODE
-    /// filename (NFC normalization must agree between the two paths).
+    /// test missed: an EMPTY file (zero-length content hash) and an
+    /// already-NFC UNICODE filename (the two canonicalizers must agree on the
+    /// stored spelling). It also pins the new refusal: a tree whose on-disk
+    /// name is decomposed is refused by BOTH the local walk and the wire
+    /// assembler, naming the offending entry, instead of being silently
+    /// normalized into a spelling that cannot address the file on Linux.
     #[test]
-    fn remote_script_digest_matches_for_empty_and_unicode_files() {
+    fn remote_script_digest_matches_for_empty_and_nfc_unicode_files() {
+        skip_without_perl!("remote_script_digest_matches_for_empty_and_nfc_unicode_files");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("empty.txt"), b"").unwrap();
-        // "café" written as e + combining acute (NFC-normalizes to é).
-        std::fs::write(root.join("caf\u{301}.txt"), b"unicode").unwrap();
+        // "café" in the precomposed (NFC) form is stored verbatim.
+        std::fs::write(root.join("caf\u{e9}.txt"), b"unicode").unwrap();
         let local = canonicalize_tree(&root).unwrap();
+        assert!(
+            local.entries.iter().any(|e| e.path == "caf\u{e9}.txt"),
+            "an already-NFC non-ASCII name must be stored verbatim, got {:?}",
+            entry_paths(&local)
+        );
 
         let out = run_remote_script(&root);
         let remote = canonicalize_remote_entries(&out, &root).unwrap();
@@ -1109,6 +1279,25 @@ mod tests {
             "remote-script digest must equal the local canonical digest"
         );
         assert_eq!(remote.entries, local.entries);
+
+        // The decomposed spelling is a DIFFERENT on-disk name: refused by the
+        // local walk and by the wire assembler, both naming the entry.
+        let nfd_root = dir.path().join("nfd");
+        std::fs::create_dir_all(&nfd_root).unwrap();
+        std::fs::write(nfd_root.join("cafe\u{301}.txt"), b"unicode").unwrap();
+        let local_err = canonicalize_tree(&nfd_root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("NFC/UTF-8")
+                && local_err.to_string().contains("cafe\u{301}.txt"),
+            "the local walk must refuse the decomposed name and name it, got: {local_err}"
+        );
+        let nfd_out = run_remote_script(&nfd_root);
+        let remote_err = canonicalize_remote_entries(&nfd_out, &nfd_root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("NFC/UTF-8")
+                && remote_err.to_string().contains("cafe\u{301}.txt"),
+            "the wire assembler must refuse the decomposed name and name it, got: {remote_err}"
+        );
     }
 
     /// A filename containing a newline or tab is refused by BOTH
@@ -1120,6 +1309,7 @@ mod tests {
     /// unverifiable on a remote.
     #[test]
     fn newline_and_tab_filenames_rejected_by_both_canonicalizers() {
+        skip_without_perl!("newline_and_tab_filenames_rejected_by_both_canonicalizers");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
@@ -1159,6 +1349,7 @@ mod tests {
     /// script output must fail closed loudly.
     #[test]
     fn remote_entries_reject_malformed_content_hash() {
+        skip_without_perl!("remote_entries_reject_malformed_content_hash");
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();

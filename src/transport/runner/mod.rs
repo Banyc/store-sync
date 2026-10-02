@@ -554,7 +554,8 @@ mod tests {
             }),
             ..RunnerConfig::production()
         };
-        let runner = fixture_runner(&std::env::temp_dir(), config);
+        let env = SysEnv::from_process();
+        let runner = fixture_runner(&env.temp_dir(), config);
         let out = runner
             .exec(
                 &["sh".into(), "-c".into(), "printf ok; exit 3".into()],
@@ -706,7 +707,8 @@ mod tests {
             }),
             ..RunnerConfig::production()
         };
-        let runner = fixture_runner(&std::env::temp_dir(), config);
+        let env = SysEnv::from_process();
+        let runner = fixture_runner(&env.temp_dir(), config);
         let out = runner
             .exec(
                 &["sh".into(), "-c".into(), "exec sleep 30".into()],
