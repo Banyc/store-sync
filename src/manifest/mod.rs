@@ -24,6 +24,25 @@
 //! destination holding both spellings. The two canonicalizers (the local walk
 //! and the remote wire assembler) apply the same rule, so they accept exactly
 //! the same trees.
+//!
+//! # Symlink targets are bytes: UTF-8 and separator-free, or the tree is refused
+//!
+//! A symlink target is the LINK CONTENT, a byte string the kernel dereferences
+//! literally, and the manifest stores it as a UTF-8 [`String`] on a line- and
+//! tab-separated wire. Canonicalization therefore REFUSES (never truncates,
+//! never lossily converts) a target that is not valid UTF-8 or that contains a
+//! newline, tab, or NUL — all of which would make the stored spelling address a
+//! DIFFERENT path than the on-disk link. The raw target bytes are what the
+//! content hash binds, so the two canonicalizers must agree on them exactly.
+//!
+//! NFC is deliberately NOT required of a target. A name is an index into the
+//! tree, but a target is DATA: the kernel resolves it verbatim, it may contain
+//! `..`, and normalizing it would silently repoint the link (and change the
+//! hash that binds the link's content). Refusing non-NFC targets would reject
+//! legitimate links that merely happen to spell their target in a decomposed
+//! form; accepting them verbatim is faithful and keeps both canonicalizers in
+//! agreement. Only the UTF-8 half of the NAME rule is applied to targets; the
+//! NFC half is not.
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
@@ -195,6 +214,30 @@ fn validate_entry_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// Validate a symlink target exactly as the wire requires: valid UTF-8 (the
+/// manifest's [`TreeEntry::symlink_target`] is a string), free of NUL, and free
+/// of the wire separators `\n`/`\t`. The target is returned UNCHANGED.
+///
+/// NFC is NOT required: a target is not an addressable NAME but the link's
+/// DATA — the kernel dereferences it verbatim, it may legitimately contain `..`,
+/// and normalizing it would repoint the link and change the hash that binds its
+/// content. A non-UTF-8 target cannot be stored in a UTF-8 manifest at all, so
+/// it is refused rather than lossily converted (which would install a link to a
+/// different path). `entry_path` names the offending entry in every error.
+fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
+    if target.contains('\0') {
+        return Err(Error::materialization(format!(
+            "symlink target of entry {entry_path} contains NUL bytes: {target:?}"
+        )));
+    }
+    if target.contains('\n') || target.contains('\t') {
+        return Err(Error::materialization(format!(
+            "symlink target of entry {entry_path} contains newline or tab: {target:?}"
+        )));
+    }
+    Ok(target.to_string())
+}
+
 /// Canonicalize a directory into a [`TreeMetadata`] and compute its digest.
 ///
 /// `root` must be a directory: an absent root is an error (the lexical
@@ -293,9 +336,19 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
                     )));
                 }
             }
+            // The target is LINK CONTENT, so it must be stored faithfully or
+            // the tree refused: a lossy conversion would install a link to a
+            // different path. It is validated as UTF-8 (the manifest stores a
+            // string) and for the wire separators, naming this entry on
+            // refusal; the hash binds the RAW bytes.
             let target_bytes = target.into_os_string().into_encoded_bytes();
+            let target_str = std::str::from_utf8(&target_bytes).map_err(|_| {
+                Error::materialization(format!(
+                    "manifest requires UTF-8 symlink targets, but the target of entry {entry_path} is not valid UTF-8 (raw bytes: {target_bytes:?})"
+                ))
+            })?;
+            symlink_target = Some(validate_symlink_target(&entry_path, target_str)?);
             content_sha256 = Some(sha256_bytes(&target_bytes));
-            symlink_target = Some(String::from_utf8_lossy(&target_bytes).into_owned());
             mode = "0777".to_string();
         } else if meta.is_file() {
             entry_type = "file";
@@ -352,7 +405,8 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 /// verification never transfers the tree CONTENT — only the per-file hashes
 /// — which on a slow link costs a small round trip instead of a full tree
 /// download. Runs via `Remote::exec` as `perl -e <script> <root>`;
-/// `Digest::SHA` is a core perl module on every supported host.
+/// `Digest::SHA` and `Unicode::Normalize` are core perl modules on every
+/// supported host.
 ///
 /// A walk that did not actually enumerate the WHOLE tree must never exit 0
 /// with a short or empty listing: a root that is not a directory, and any
@@ -361,8 +415,41 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 /// exits 0, and a root that IS a directory but has no entries (an existing
 /// empty directory) prints empty stdout with exit 0 — assembling to the
 /// EMPTY manifest it really is.
+///
+/// The script also VALIDATES the raw bytes before printing, because the
+/// client decodes stdout lossily ([`String::from_utf8_lossy`] in the
+/// runner) and so can never recover a byte the script mangled. It `die`s
+/// (non-zero exit) — never truncates or lossily converts — for any entry
+/// NAME that is not valid UTF-8, is not already NFC, or contains a
+/// newline/tab/NUL, and for any symlink TARGET that is not valid UTF-8 or
+/// contains a newline/tab/NUL (the wire separators). NFC is NOT required of
+/// a target: it is link data the kernel dereferences verbatim, not an
+/// addressable name. The client's existing `!out.success()` path turns the
+/// non-zero exit into an error that carries this stderr, so a tree that
+/// cannot cross the wire faithfully is refused where the raw bytes are
+/// still visible rather than silently mis-described.
 pub fn remote_tree_verify_script() -> &'static str {
-    r#"use Digest::SHA qw(sha256_hex); my $root=$ARGV[0]; die qq{not a directory: $root\n} unless defined($root) && -d $root; my $emit = sub { my ($rel,$p)=@_; my @st=lstat($p); die qq{lstat $p: $!\n} unless @st; my $t = -l $p ? q{l} : (-d $p ? q{d} : (-f $p ? q{f} : q{o})); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); die qq{readlink $p: $!\n} unless defined $tg; $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; }; my $walk; $walk = sub { my ($dir,$prefix)=@_; opendir(my $dh,$dir) or die qq{opendir $dir: $!\n}; $! = 0; my @names=readdir($dh); die qq{readdir $dir: $!\n} if $!; closedir($dh) or die qq{closedir $dir: $!\n}; for my $name (@names) { next if $name eq q{.} || $name eq q{..}; my $p=qq{$dir/$name}; my $rel=length($prefix) ? qq{$prefix/$name} : $name; $emit->($rel,$p); $walk->($p,$rel) if -d $p && !-l $p; } }; $walk->($root, q{});"#
+    r#"use Digest::SHA qw(sha256_hex);
+use Unicode::Normalize qw(NFC);
+my $root=$ARGV[0];
+die qq{not a directory: $root\n} unless defined($root) && -d $root;
+my $hex = sub { my ($s)=@_; return unpack(q{H*},$s); };
+my $check_name = sub {
+    my ($n,$dir)=@_;
+    die(qq{entry name under $dir contains a tab, newline, or NUL (the wire format is tab/newline separated): } . $hex->($n) . qq{\n}) if $n =~ /[\n\t\0]/;
+    my $c=$n;
+    die(qq{entry name under $dir is not valid UTF-8: } . $hex->($n) . qq{\n}) unless utf8::decode($c);
+    die(qq{entry name under $dir is not NFC-normalized: $n\n}) if NFC($c) ne $c;
+};
+my $check_target = sub {
+    my ($tg,$rel)=@_;
+    die(qq{symlink target of $rel contains a tab, newline, or NUL (the wire format is tab/newline separated): } . $hex->($tg) . qq{\n}) if $tg =~ /[\n\t\0]/;
+    my $c=$tg;
+    die(qq{symlink target of $rel is not valid UTF-8: } . $hex->($tg) . qq{\n}) unless utf8::decode($c);
+};
+my $emit = sub { my ($rel,$p)=@_; my @st=lstat($p); die qq{lstat $p: $!\n} unless @st; my $t = -l $p ? q{l} : (-d $p ? q{d} : (-f $p ? q{f} : q{o})); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); die qq{readlink $p: $!\n} unless defined $tg; $check_target->($tg,$rel); $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; };
+my $walk; $walk = sub { my ($dir,$prefix)=@_; opendir(my $dh,$dir) or die qq{opendir $dir: $!\n}; $! = 0; my @names=readdir($dh); die qq{readdir $dir: $!\n} if $!; closedir($dh) or die qq{closedir $dir: $!\n}; for my $name (@names) { next if $name eq q{.} || $name eq q{..}; $check_name->($name,$dir); my $p=qq{$dir/$name}; my $rel=length($prefix) ? qq{$prefix/$name} : $name; $emit->($rel,$p); $walk->($p,$rel) if -d $p && !-l $p; } };
+$walk->($root, q{});"#
 }
 
 /// Assemble canonical tree metadata from the remote verification script's
@@ -370,7 +457,12 @@ pub fn remote_tree_verify_script() -> &'static str {
 /// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
 /// names (a non-NFC name is refused, never normalized),
 /// NUL/traversal/absolute/duplicate path rejection, hardlink rejection, and
-/// in-root symlink targets. The per-file content hashes come from the remote
+/// in-root symlink targets that are valid UTF-8 and free of the wire
+/// separators. A line with more than six tab-separated fields is refused too:
+/// the script never emits one, so it can only mean a name or target contained
+/// a tab, which would otherwise be silently TRUNCATED by the field split —
+/// the assembler refuses such a spelling instead of accepting a shorter one
+/// than the far side meant. The per-file content hashes come from the remote
 /// (sha256sum); the digest is computed from the assembled metadata, so a
 /// corrupted or divergent remote tree produces a digest mismatch without any
 /// content transfer. `root` is the remote tree root (absolute, on the
@@ -396,6 +488,17 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
         let nlink = it.next().unwrap_or("0");
         let content_hash = it.next().unwrap_or("");
         let symlink_target = it.next().unwrap_or("");
+        // The script emits EXACTLY six fields per entry. A seventh field can
+        // only come from a tab inside a name or target, which the field split
+        // has already truncated: refuse it rather than assemble a shorter
+        // spelling than the far side printed. (The script itself dies first on
+        // such a tree; this keeps a hand-built or proxied line from being
+        // accepted lossily too.)
+        if let Some(extra) = it.next() {
+            return Err(Error::materialization(format!(
+                "wire line has more than six tab-separated fields; a name or symlink target contains a tab: {line:?} (extra field {extra:?})"
+            )));
+        }
 
         // Path validation — mirror canonicalize_tree exactly by running the
         // SAME validator on the wire spelling. Newline/tab are the
@@ -466,7 +569,12 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                         "missing symlink target for {entry_path}"
                     )));
                 }
-                let target = PathBuf::from(symlink_target);
+                // The target is link DATA, so it must be stored faithfully:
+                // the SAME validator the local walk uses refuses NUL and the
+                // wire separators (the script refuses non-UTF-8 targets
+                // before they reach this string).
+                let symlink_target = validate_symlink_target(&entry_path, symlink_target)?;
+                let target = PathBuf::from(&symlink_target);
                 if target.is_absolute() {
                     return Err(Error::materialization(format!(
                         "absolute symlink not allowed: {entry_path}"
@@ -487,7 +595,7 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                     entry_type: "symlink".to_string(),
                     mode: "0777".to_string(),
                     content_sha256: Some(sha256_bytes(target_bytes)),
-                    symlink_target: Some(symlink_target.to_string()),
+                    symlink_target: Some(symlink_target),
                 }
             }
             other => {
@@ -1281,7 +1389,9 @@ mod tests {
         assert_eq!(remote.entries, local.entries);
 
         // The decomposed spelling is a DIFFERENT on-disk name: refused by the
-        // local walk and by the wire assembler, both naming the entry.
+        // local walk and — more importantly — by the far-side SCRIPT itself,
+        // where the raw bytes are still visible (the client's stdout decode
+        // is lossy, but the non-zero exit is not).
         let nfd_root = dir.path().join("nfd");
         std::fs::create_dir_all(&nfd_root).unwrap();
         std::fs::write(nfd_root.join("cafe\u{301}.txt"), b"unicode").unwrap();
@@ -1291,12 +1401,16 @@ mod tests {
                 && local_err.to_string().contains("cafe\u{301}.txt"),
             "the local walk must refuse the decomposed name and name it, got: {local_err}"
         );
-        let nfd_out = run_remote_script(&nfd_root);
-        let remote_err = canonicalize_remote_entries(&nfd_out, &nfd_root).unwrap_err();
+        let nfd_out = run_remote_script_raw(&nfd_root);
         assert!(
-            remote_err.to_string().contains("NFC/UTF-8")
-                && remote_err.to_string().contains("cafe\u{301}.txt"),
-            "the wire assembler must refuse the decomposed name and name it, got: {remote_err}"
+            !nfd_out.status.success(),
+            "the wire script must refuse the decomposed name far-side, got success with stdout {:?}",
+            String::from_utf8_lossy(&nfd_out.stdout)
+        );
+        let nfd_stderr = String::from_utf8_lossy(&nfd_out.stderr);
+        assert!(
+            nfd_stderr.contains("not NFC-normalized") && nfd_stderr.contains("nfd"),
+            "the far-side refusal must name the NFC rule and the entry, got: {nfd_stderr}"
         );
     }
 
@@ -1330,17 +1444,345 @@ mod tests {
         );
 
         // Remote path: the newline filename mangles the line split and the
-        // tab filename mangles the field split — both must fail closed.
+        // tab filename mangles the field split — the SCRIPT must fail closed
+        // on the raw bytes, because the client decodes stdout lossily and
+        // cannot recover a byte the script mangled.
+        let out = run_remote_script_raw(&root);
+        assert!(
+            !out.status.success(),
+            "remote script must reject the newline filename, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let out2 = run_remote_script_raw(&root2);
+        assert!(
+            !out2.status.success(),
+            "remote script must reject the tab filename, got success with stdout {:?}",
+            String::from_utf8_lossy(&out2.stdout)
+        );
+        // The assembler also refuses a hand-built tab-mangled line (seven
+        // fields) instead of silently truncating the name at the tab.
+        let hash = "0".repeat(64);
+        assert!(
+            canonicalize_remote_entries(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root2).is_err(),
+            "the assembler must refuse a seven-field (tab-mangled) line"
+        );
+    }
+
+    /// A symlink TARGET containing a tab (a wire separator) is refused by the
+    /// LOCAL walk, exactly as a tab-containing NAME is. Pre-fix only the PATH
+    /// was checked, so the local walk ACCEPTED this tree and stored the target
+    /// verbatim; the far side split the printed line at the tab and the pull
+    /// installed a link to `a` instead of `a\tb` while reporting success. This
+    /// assertion therefore FAILS against the pre-fix code.
+    #[test]
+    fn tab_in_symlink_target_rejected_by_local_canonicalizer() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("a\tb", root.join("l")).unwrap();
+        let err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink target"),
+            "a tab target must be refused with the target rule, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("newline or tab"),
+            "the target refusal must name the separator rule, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("entry l"),
+            "the target refusal must name the offending entry, got: {err}"
+        );
+    }
+
+    /// A symlink TARGET that is not valid UTF-8 is refused by the LOCAL walk,
+    /// never lossily stored. Pre-fix the walk wrote the `U+FFFD` replacement
+    /// (and hashed the raw bytes), so the destination link pointed at a
+    /// DIFFERENT path than the source and only post-transfer verification
+    /// caught it — after the destination had already been mutated. This
+    /// assertion therefore FAILS against the pre-fix code. macOS and Linux both
+    /// allow a non-UTF-8 symlink target (unlike a non-UTF-8 name).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_symlink_target_rejected_by_local_canonicalizer() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(OsStr::from_bytes(b"caf\xe9"), root.join("l")).unwrap();
+        let err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "a non-UTF-8 target must be refused with the UTF-8 rule, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("entry l"),
+            "the refusal must name the offending entry, got: {err}"
+        );
+    }
+
+    /// The far-side SCRIPT refuses a tab-containing symlink TARGET before
+    /// printing, so the client's `!out.success()` path turns it into an error
+    /// instead of splitting the target at the tab and assembling a shorter one.
+    /// Pre-fix the script exited 0 and printed `...<hash>\ta\tb`, which the
+    /// assembler read as target `a` — this assertion FAILS against it.
+    #[test]
+    fn wire_script_refuses_tab_in_symlink_target() {
+        skip_without_perl!("wire_script_refuses_tab_in_symlink_target");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("a\tb", root.join("l")).unwrap();
+        let out = run_remote_script_raw(&root);
+        assert!(
+            !out.status.success(),
+            "the wire script must refuse a tab target far-side, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("symlink target") && stderr.contains("tab"),
+            "the far-side refusal must name the target and the separator rule, got: {stderr}"
+        );
+    }
+
+    /// The far-side SCRIPT refuses a non-UTF-8 symlink TARGET before printing
+    /// (a lossy `U+FFFD` target would install a link to a different path).
+    /// Pre-fix the script exited 0 and the assembler accepted the `U+FFFD`
+    /// spelling — this assertion FAILS against it.
+    #[cfg(unix)]
+    #[test]
+    fn wire_script_refuses_non_utf8_symlink_target() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        skip_without_perl!("wire_script_refuses_non_utf8_symlink_target");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(OsStr::from_bytes(b"caf\xe9"), root.join("l")).unwrap();
+        let out = run_remote_script_raw(&root);
+        assert!(
+            !out.status.success(),
+            "the wire script must refuse a non-UTF-8 target far-side, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("symlink target") && stderr.contains("not valid UTF-8"),
+            "the far-side refusal must name the target and the UTF-8 rule, got: {stderr}"
+        );
+    }
+
+    /// The WIRE path refuses a non-UTF-8 NAME where the raw bytes are still
+    /// visible. The client decodes the script's stdout with
+    /// `String::from_utf8_lossy`, so the assembler only ever sees `U+FFFD` and
+    /// cannot tell a real replacement character from a lossy one; the script
+    /// `die`s on the raw name instead, and the client's non-zero-exit check
+    /// surfaces it as an error naming the far side rather than an empty or
+    /// partial manifest. Linux-only: APFS refuses to create such a name
+    /// (`EILSEQ`), so the test SKIPS with a visible reason when creation fails.
+    /// Pre-fix the script exited 0 (the name arrived as `U+FFFD`) — this
+    /// assertion FAILS against it.
+    #[cfg(unix)]
+    #[test]
+    fn wire_script_refuses_non_utf8_entry_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        skip_without_perl!("wire_script_refuses_non_utf8_entry_name");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        if let Err(e) = std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname")), b"content") {
+            eprintln!(
+                "skipping wire_script_refuses_non_utf8_entry_name: this filesystem cannot \
+                 store a non-UTF-8 name ({e})"
+            );
+            return;
+        }
+        let out = run_remote_script_raw(&root);
+        assert!(
+            !out.status.success(),
+            "the wire script must refuse a non-UTF-8 name far-side, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not valid UTF-8"),
+            "the far-side refusal must name the UTF-8 rule, got: {stderr}"
+        );
+        // The message names the FAR SIDE (the remote directory), which is what
+        // the client's error wraps: `remote_manifest` refuses on the non-zero
+        // exit and surfaces `out.stderr` instead of assembling a partial or
+        // empty manifest from the lossy stdout.
+        assert!(
+            stderr.contains(root.to_string_lossy().as_ref()),
+            "the far-side refusal must name the remote directory, got: {stderr}"
+        );
+        // Why the check must live far-side: a `U+FFFD` name is valid UTF-8 and
+        // NFC, so the assembler alone ACCEPTS the lossy spelling. There is no
+        // downstream test that could catch the byte the transport destroyed.
+        let hash = "0".repeat(64);
+        assert!(
+            canonicalize_remote_entries(&format!("bad\u{fffd}name\tf\t1a4\t1\t{hash}\t\n"), &root)
+                .is_ok(),
+            "premise: a U+FFFD spelling is structurally acceptable, so the assembler cannot \
+             detect the transport loss"
+        );
+    }
+
+    /// PARITY: the two canonicalizers accept EXACTLY the same trees. For every
+    /// tree the LOCAL walk refuses on a name/target rule, the WIRE path (the
+    /// real perl script, whose raw-byte checks are the only ones that can see a
+    /// tab or a non-UTF-8 byte) must also refuse. This is the test that catches
+    /// a divergence of the round-17 class: before the far-side check a
+    /// non-UTF-8 name was refused locally but accepted (as `U+FFFD`) over the
+    /// wire. Pre-fix the local walk ACCEPTED the tab and non-UTF-8 TARGET cases
+    /// and the script exited 0 for the tab NAME case, so this test FAILS
+    /// against the pre-fix code in every case it can construct on the host.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalizers_agree_on_unrepresentable_names_and_targets() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        skip_without_perl!("canonicalizers_agree_on_unrepresentable_names_and_targets");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let hash = "0".repeat(64);
+
+        // (1) A tab inside a NAME: refused locally and far-side.
+        let root = dir.path().join("tab_name");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a\tb"), b"content").unwrap();
+        assert!(
+            canonicalize_tree(&root).is_err(),
+            "local walk must refuse a tab name"
+        );
+        assert!(
+            !run_remote_script_raw(&root).status.success(),
+            "wire path must refuse a tab name"
+        );
+
+        // (2) A tab inside a symlink TARGET: refused locally and far-side.
+        let root = dir.path().join("tab_target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("a\tb", root.join("l")).unwrap();
+        assert!(
+            canonicalize_tree(&root).is_err(),
+            "local walk must refuse a tab symlink target"
+        );
+        assert!(
+            !run_remote_script_raw(&root).status.success(),
+            "wire path must refuse a tab symlink target"
+        );
+
+        // (3) A non-UTF-8 symlink TARGET: macOS and Linux both allow one.
+        let root = dir.path().join("non_utf8_target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(OsStr::from_bytes(b"caf\xe9"), root.join("l")).unwrap();
+        assert!(
+            canonicalize_tree(&root).is_err(),
+            "local walk must refuse a non-UTF-8 symlink target"
+        );
+        assert!(
+            !run_remote_script_raw(&root).status.success(),
+            "wire path must refuse a non-UTF-8 symlink target"
+        );
+
+        // (4) A non-UTF-8 NAME: Linux-only (APFS refuses to create one); the
+        //     case is SKIPPED with a visible reason elsewhere.
+        let root = dir.path().join("non_utf8_name");
+        std::fs::create_dir_all(&root).unwrap();
+        match std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname")), b"content") {
+            Ok(()) => {
+                assert!(
+                    canonicalize_tree(&root).is_err(),
+                    "local walk must refuse a non-UTF-8 name"
+                );
+                assert!(
+                    !run_remote_script_raw(&root).status.success(),
+                    "wire path must refuse a non-UTF-8 name"
+                );
+            }
+            Err(e) => eprintln!(
+                "canonicalizers_agree_on_unrepresentable_names_and_targets: skipped case (4), \
+                 this filesystem cannot store a non-UTF-8 name ({e})"
+            ),
+        }
+
+        // The assembler refuses a hand-built seven-field line (a tab inside a
+        // name or target) rather than truncating the field, so it cannot be
+        // fooled by a proxied line either.
+        assert!(
+            canonicalize_remote_entries(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root).is_err(),
+            "assembler must refuse a tab-mangled name line"
+        );
+        assert!(
+            canonicalize_remote_entries(&format!("l\tl\t1ff\t1\t{hash}\ta\tb\n"), &root).is_err(),
+            "assembler must refuse a tab-mangled target line"
+        );
+    }
+
+    /// The refusal rules must not reject LEGAL targets: a `..`-containing
+    /// in-root target and a decomposed non-ASCII target still round-trip
+    /// faithfully through BOTH canonicalizers, byte-for-byte (no NFC
+    /// rewriting of the target DATA — only names are NFC-constrained).
+    #[test]
+    fn legitimate_symlink_targets_round_trip_through_both_canonicalizers() {
+        skip_without_perl!("legitimate_symlink_targets_round_trip_through_both_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("file.txt"), b"content").unwrap();
+        // A `..`-containing target that stays inside the root under the
+        // canonicalizer's ROOT-relative rule.
+        std::os::unix::fs::symlink("sub/../file.txt", root.join("up")).unwrap();
+        // A target spelled in a decomposed form: it is link DATA, not a name,
+        // so it is accepted VERBATIM (never normalized into a different path).
+        std::os::unix::fs::symlink("cafe\u{301}.txt", root.join("nfd_target")).unwrap();
+
+        let local = canonicalize_tree(&root).unwrap();
+        let up = local.entries.iter().find(|e| e.path == "up").unwrap();
+        assert_eq!(
+            up.symlink_target.as_deref(),
+            Some("sub/../file.txt"),
+            "a `..` in-root target must be stored verbatim"
+        );
+        let nfd = local
+            .entries
+            .iter()
+            .find(|e| e.path == "nfd_target")
+            .unwrap();
+        assert_eq!(
+            nfd.symlink_target.as_deref(),
+            Some("cafe\u{301}.txt"),
+            "a decomposed target is DATA and must be stored verbatim, never NFC-normalized"
+        );
+
         let out = run_remote_script(&root);
-        assert!(
-            canonicalize_remote_entries(&out, &root).is_err(),
-            "remote assembler must reject the newline filename"
+        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        assert_eq!(
+            remote.entries, local.entries,
+            "both canonicalizers must store the same target bytes"
         );
-        let out2 = run_remote_script(&root2);
-        assert!(
-            canonicalize_remote_entries(&out2, &root2).is_err(),
-            "remote assembler must reject the tab filename"
-        );
+        assert_eq!(remote.tree_sha256, local.tree_sha256);
+    }
+
+    /// An already-NFC non-ASCII NAME still round-trips unchanged through BOTH
+    /// canonicalizers: the far-side NFC check must accept it, not reject it.
+    /// (This is the non-regression complement of the far-side refusal tests.)
+    #[test]
+    fn already_nfc_non_ascii_name_round_trips_through_both_canonicalizers() {
+        skip_without_perl!("already_nfc_non_ascii_name_round_trips_through_both_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("caf\u{e9}.txt"), b"unicode").unwrap();
+        let local = canonicalize_tree(&root).unwrap();
+        assert_eq!(entry_paths(&local), vec!["caf\u{e9}.txt"]);
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        assert_eq!(remote.entries, local.entries);
+        assert_eq!(remote.tree_sha256, local.tree_sha256);
     }
 
     /// The remote assembler must reject a malformed content hash (wrong
