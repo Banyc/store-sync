@@ -1871,6 +1871,32 @@ type DirListing = Vec<(Vec<u8>, EntryKind)>;
 /// `Display`, which is unchanged.
 type CachedListing = std::result::Result<DirListing, std::rc::Rc<Error>>;
 
+/// TEST-ONLY instrumentation: the number of times the CURRENT thread's applier
+/// obtains a directory listing through [`Applier::listing`] (a cache read OR the
+/// single raw fetch). A thread-local, so the parallel libtest threads do not
+/// share a count. The F2 bound uses it because the destination-level
+/// `Remote::list` count cannot see the defect: the run-scoped cache already
+/// makes the number of RAW fetches O(1) per directory, while pre-fix
+/// `remove_extraneous` still CONSUMED (cloned and scanned) the parent listing
+/// once PER ENTRY. This counter measures that per-entry consumption: it must not
+/// grow with the number of extraneous entries in one directory.
+#[cfg(test)]
+pub(crate) mod listing_reads {
+    use std::cell::Cell;
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn reset() {
+        COUNT.with(|count| count.set(0));
+    }
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+    pub(crate) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+}
+
 /// How a removal attempt ended. The sync's removal walk NEVER uses a recursive
 /// `remove_dir_all`: every directory leaf is removed with a NON-RECURSIVE rmdir
 /// (see [`Applier::remove_subtree`]), and the per-child walk of the directory
@@ -2034,6 +2060,7 @@ fn run(
         // into an O(tree) listing pass beyond the root itself.
         touched_dirs: BTreeSet::from([String::new()]),
         listings: RefCell::new(BTreeMap::new()),
+        ancestry_dirs: RefCell::new(BTreeSet::new()),
         transfers: 0,
     };
     let result = applier.run();
@@ -2230,6 +2257,46 @@ struct Applier<'a, 'b> {
     /// is re-confirmed live, not from the listing). [`RefCell`] because the
     /// read is logically pure at every call site but must fill the cache.
     listings: RefCell<BTreeMap<String, CachedListing>>,
+    /// THE run-scoped ANCESTRY memo for [`Applier::guard_destination`]: the
+    /// manifest spelling of every destination path CONFIRMED (by `kind_opt`,
+    /// `lstat`, never `stat`) to be a real DIRECTORY. A hit is exactly the
+    /// `Some(EntryKind::Dir)` arm of the guard's per-component probe, so it
+    /// replaces that one `kind_opt` with a set lookup.
+    ///
+    /// WHY IT IS SOUND. The guard re-walks EVERY prefix of a path on every
+    /// call, and `widen_ancestors` calls it once per ancestor, so a depth-D
+    /// chain costs O(D^2) probes at this seam (and O(D^3) `openat` once each
+    /// probe resolves its components) with no reuse. A destination path that is
+    /// a real directory is a fact the run owns: under the exclusive ownership
+    /// this crate establishes, nothing but the run itself can turn it into a
+    /// non-directory. The run converts a directory ONLY by (a) renaming it aside
+    /// in [`Applier::claim_aside`]/[`Applier::rename_back`] and installing a
+    /// different kind at the same manifest spelling, or (b) removing it in
+    /// [`Applier::remove_subtree`]. Both are CONTENT mutations, and
+    /// [`Applier::begin_mutation`] DROPS the memo entry for the mutated path, so
+    /// the next guard at or below it re-probes the LIVE object. A MODE mutation
+    /// (a widen or restore) does not invalidate a kind fact. ABSENCE is never
+    /// memoized: a directory the run creates was not a directory before, and
+    /// re-probing an absent component is what keeps a `MustExist` refusal (and a
+    /// `MayCreate` pass) exact after a create; only the positive `Dir` fact is
+    /// stable enough to reuse. A stale entry for a DESCENDANT of a converted
+    /// directory is masked by its converted ancestor, which the top-down prefix
+    /// walk re-probes first.
+    ///
+    /// FRESHNESS, stated precisely: a memoized decision can be invalidated ONLY
+    /// by a mutation the run itself performs on that directory (or an ancestor
+    /// of it) — a rename that replaces its kind, or its removal — never by a
+    /// mode change and never by the passage of time. Both are Content mutations
+    /// and both funnel through [`Applier::begin_mutation`], which removes the
+    /// mutated spelling; nothing else in the run changes a kind. A
+    /// non-cooperating writer is OUTSIDE the exclusive-ownership precondition
+    /// the memo rests on, and the run still fails closed on one: on Unix every
+    /// destination mutation and probe goes through the component-wise
+    /// `O_NOFOLLOW` confinement in `crate::atomic` (the guard is an additional
+    /// preflight, never the only confinement), and every `verify_*` pass
+    /// re-reads LIVE listings and re-probes kinds, so a swapped component is
+    /// DETECTED and the run is failed rather than silently applied.
+    ancestry_dirs: RefCell<BTreeSet<String>>,
     transfers: usize,
 }
 
@@ -2437,6 +2504,15 @@ impl Applier<'_, '_> {
     /// that record, or [`Applier::restore`]'s confirming chmod could silently
     /// resolve a failed write.
     fn begin_mutation(&mut self, path: &str, kind: MutationKind) {
+        // A CONTENT mutation can change the KIND of `path`: a create, a write, a
+        // rename (claim/rollback), or a removal. Any memoized "this path is a
+        // real directory" fact is therefore no longer trustworthy AT this
+        // spelling, so it is dropped here (the ONE mutation choke point) and the
+        // next guard re-probes the LIVE object. A MODE mutation leaves the kind
+        // untouched and keeps the fact.
+        if kind == MutationKind::Content {
+            self.ancestry_dirs.borrow_mut().remove(path);
+        }
         self.transfers += 1;
         let pending = self.indeterminate.entry(path.to_string()).or_default();
         match kind {
@@ -2778,41 +2854,57 @@ impl Applier<'_, '_> {
             prefixes.push(ancestor);
         }
         for ancestor in prefixes.into_iter().rev() {
+            let spelling = manifest_spelling(&ancestor);
+            // A prefix the run already CONFIRMED as a real directory is a
+            // reusable fact (see [`Applier::ancestry_dirs`]); only a MISS
+            // reaches the live probe below.
+            if self.ancestry_dirs.borrow().contains(&spelling) {
+                continue;
+            }
             match self.dest.kind_opt(&ancestor)? {
-                Some(EntryKind::Dir) => {}
+                Some(EntryKind::Dir) => {
+                    self.ancestry_dirs.borrow_mut().insert(spelling);
+                }
                 Some(other) => {
-                    return Err(non_directory_destination_error(
-                        &manifest_spelling(&ancestor),
-                        other,
-                    ));
+                    return Err(non_directory_destination_error(&spelling, other));
                 }
                 None if ancestors == AncestorPolicy::MayCreate => {}
                 None => {
-                    return Err(missing_destination_ancestor_error(&manifest_spelling(
-                        &ancestor,
-                    )));
+                    return Err(missing_destination_ancestor_error(&spelling));
                 }
             }
         }
         match final_component {
             FinalPolicy::Unresolved => {}
-            policy => match self.dest.kind_opt(rel)? {
-                None => {}
-                Some(EntryKind::Dir) => {}
-                Some(EntryKind::Symlink) => {
-                    return Err(non_directory_destination_error(
-                        &manifest_spelling(rel),
-                        EntryKind::Symlink,
-                    ));
+            policy => {
+                // A confirmed directory satisfies EVERY `FinalPolicy` (it is not
+                // a symlink and, where the policy demands a directory, it is
+                // one), so a hit skips the probe; a `File`/`Symlink`/absence is
+                // never memoized.
+                let spelling = manifest_spelling(rel);
+                if self.ancestry_dirs.borrow().contains(&spelling) {
+                    return Ok(());
                 }
-                Some(EntryKind::File) if policy == FinalPolicy::Directory => {
-                    return Err(non_directory_destination_error(
-                        &manifest_spelling(rel),
-                        EntryKind::File,
-                    ));
+                match self.dest.kind_opt(rel)? {
+                    None => {}
+                    Some(EntryKind::Dir) => {
+                        self.ancestry_dirs.borrow_mut().insert(spelling);
+                    }
+                    Some(EntryKind::Symlink) => {
+                        return Err(non_directory_destination_error(
+                            &manifest_spelling(rel),
+                            EntryKind::Symlink,
+                        ));
+                    }
+                    Some(EntryKind::File) if policy == FinalPolicy::Directory => {
+                        return Err(non_directory_destination_error(
+                            &manifest_spelling(rel),
+                            EntryKind::File,
+                        ));
+                    }
+                    Some(EntryKind::File) => {}
                 }
-                Some(EntryKind::File) => {}
-            },
+            }
         }
         Ok(())
     }
@@ -4644,6 +4736,16 @@ impl Applier<'_, '_> {
         if self.extraneous_policy == Extraneous::Keep {
             return Ok(());
         }
+        /// One parent directory's listing for the WHOLE removal pass. `names`
+        /// keeps the raw `(name, kind)` pairs so an on-disk alias that is not
+        /// byte-identical to the manifest spelling can still be NAMED; `index`
+        /// is the name -> kind lookup the per-entry faithful test uses. Built
+        /// ONCE per parent, so k extraneous entries in one directory cost ONE
+        /// listing and k log-k lookups, not k listing clones and O(k^2) scans.
+        struct PassListing {
+            names: DirListing,
+            index: BTreeMap<Vec<u8>, EntryKind>,
+        }
         let mut entries: Vec<(String, EntryKind)> = Vec::new();
         for entry in &self.diff.dest.entries {
             if self.diff.classify(&entry.path) == Some(EntryDiff::Extraneous) {
@@ -4655,6 +4757,19 @@ impl Applier<'_, '_> {
             let db = Path::new(&b.0).components().count();
             db.cmp(&da).then_with(|| a.0.cmp(&b.0))
         });
+        // ONE parent listing for the whole pass. This is SOUND given the pass's
+        // own removals because the per-entry question below is exactly "is THIS
+        // entry's own manifest name, with THIS entry's kind, present in its
+        // parent" — a SIBLING removal changes neither this entry's name nor its
+        // kind, and the pass never removes an ANCESTOR of a path it has not
+        // already folded past: entries are sorted DEEPEST-FIRST, so a child is
+        // processed before its parent, and a path whose ancestor a TRANSFER
+        // already took is caught by [`Applier::is_already_gone`] first. The
+        // snapshot is also the SAME one the pre-fix code consumed: `self.listing`
+        // caches per directory until the next `verify` pass clears it, and no
+        // verify pass runs inside this loop, so hoisting the fetch removes the
+        // per-entry clone/scan WITHOUT changing which listing is observed.
+        let mut pass_listings: BTreeMap<String, PassListing> = BTreeMap::new();
         // A destination-only subtree that CONTAINS residue must not be removed:
         // destroying it would destroy the stranded original the residue holds.
         // Refuse the topmost such directory (and everything under it) and report
@@ -4707,25 +4822,26 @@ impl Applier<'_, '_> {
             // read may be destroyed, and the sanction for THIS path cannot be
             // confirmed at all.
             let expected = file_name_bytes(&path);
-            let listing = match self.listing(&parent_manifest(&path)) {
-                Ok(names) => names,
-                Err(error) => {
-                    return Err(unenumerable_directory_error(
-                        &parent_manifest(&path),
-                        error.as_ref(),
-                    ));
-                }
-            };
+            let parent = parent_manifest(&path);
+            if !pass_listings.contains_key(&parent) {
+                let names = match self.listing(&parent) {
+                    Ok(names) => names,
+                    Err(error) => {
+                        return Err(unenumerable_directory_error(&parent, error.as_ref()));
+                    }
+                };
+                let index = names.iter().cloned().collect();
+                pass_listings.insert(parent.clone(), PassListing { names, index });
+            }
+            let listing = &pass_listings[&parent];
             let faithful = match &expected {
-                Some(expected) => listing
-                    .iter()
-                    .any(|(name, live_kind)| name == expected && *live_kind == kind),
+                Some(expected) => listing.index.get(expected) == Some(&kind),
                 None => false,
             };
             if !faithful {
                 let on_disk = expected
                     .as_deref()
-                    .and_then(|expected| alias_in(&listing, expected));
+                    .and_then(|expected| alias_in(&listing.names, expected));
                 self.name_conflict(&path, kind, on_disk);
                 continue;
             }
@@ -5371,6 +5487,8 @@ impl Applier<'_, '_> {
     /// is reused: within a pass no destination mutation runs, so a second read
     /// of the same directory could only reproduce the same failure.
     fn listing(&self, parent: &str) -> std::result::Result<DirListing, std::rc::Rc<Error>> {
+        #[cfg(test)]
+        listing_reads::bump();
         if let Some(cached) = self.listings.borrow().get(parent) {
             return cached.clone();
         }

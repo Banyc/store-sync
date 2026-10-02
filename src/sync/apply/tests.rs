@@ -382,14 +382,39 @@ fn filesystem_stores_a_non_utf8_name() -> bool {
     }
 }
 
-/// Whether THIS filesystem is CASE-INSENSITIVE: a differently-cased lookup of
-/// an existing entry resolves to that entry.
+/// Whether THIS filesystem FOLDS `written` onto `lookup`: writing an entry
+/// named `written` makes a subsequent lookup of the differently-spelled
+/// `lookup` resolve to that entry.
+///
+/// The fold is SPELLED OUT by the caller, never assumed from "the filesystem is
+/// case-insensitive". A filesystem can fold ASCII while leaving a Unicode pair
+/// distinct — macOS FAT folds `Case-Probe`/`cASE-pROBE` but keeps
+/// `Straße.txt`/`STRASSE.txt` and `ς`/`σ` as SEPARATE entries — so a Unicode-fold
+/// reproduction that gated on the ASCII probe would RUN there and fail on an
+/// environmental property, hiding real regressions behind noise. Gating on the
+/// exact fold the fixture depends on skips a filesystem precisely when it cannot
+/// exhibit the case under test.
+///
+/// This is a PURE predicate: it prints NOTHING. Each caller announces its OWN
+/// truthful skip reason via [`announce_skip`] (a case-insensitive-only
+/// reproduction and a case-sensitive-only one need opposite reasons).
+#[cfg(unix)]
+fn filesystem_folds(written: &str, lookup: &str) -> bool {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    fs::write(dir.path().join(written), b"probe").unwrap();
+    fs::symlink_metadata(dir.path().join(lookup)).is_ok()
+}
+
+/// Whether THIS filesystem is CASE-INSENSITIVE for the ASCII fold used by the
+/// round-18 reproductions.
 ///
 /// macOS APFS is case-insensitive; Linux ext4 is case-sensitive unless the
 /// `casefold` feature is enabled. The reproductions that depend on an install
-/// folding a manifest spelling onto a differently-spelled on-disk entry are only
-/// meaningful where this holds; elsewhere they would be statements about the
-/// filesystem rather than this crate.
+/// folding an ASCII manifest spelling onto a differently-spelled on-disk entry
+/// are only meaningful where this holds; elsewhere they would be statements
+/// about the filesystem rather than this crate. A reproduction that depends on a
+/// UNICODE fold MUST NOT use this predicate — it must probe the exact fold with
+/// [`filesystem_folds`] (see the round-19 fixtures).
 ///
 /// This is a PURE predicate: it prints NOTHING. The two caller classes need
 /// OPPOSITE skip reasons (a case-insensitive-only reproduction skips when this
@@ -399,10 +424,7 @@ fn filesystem_stores_a_non_utf8_name() -> bool {
 /// [`announce_skip`].
 #[cfg(unix)]
 fn filesystem_is_case_insensitive() -> bool {
-    let dir = fixture_tmpdir(&env()).unwrap();
-    let probe = dir.path().join("Case-Probe");
-    fs::write(&probe, b"probe").unwrap();
-    fs::symlink_metadata(dir.path().join("cASE-pROBE")).is_ok()
+    filesystem_folds("Case-Probe", "cASE-pROBE")
 }
 
 /// The direct children of `dir`, as raw names, for a byte-identical assertion
@@ -984,6 +1006,12 @@ struct RecordingRemote {
     /// directory with N entries must cost O(1) listings, so this counts the
     /// delegation to the destination listing seam.
     list_calls: AtomicUsize,
+    /// `metadata`/`metadata_opt` calls seen: the F1 instrument. `Side::kind_opt`
+    /// and `Side::mode`/`mode_opt` on a `Side::Remote` destination both route
+    /// through this one call, one per probed PATH, so a depth-D ancestry walk
+    /// that re-probes every prefix per ancestor shows up here as O(D^2) while
+    /// the memoized form is O(D).
+    metadata_calls: AtomicUsize,
     calls: Mutex<Vec<(String, String)>>,
     set_modes: Mutex<Vec<(String, u32)>>,
 }
@@ -1036,6 +1064,7 @@ impl RecordingRemote {
             ops: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             list_calls: AtomicUsize::new(0),
+            metadata_calls: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
             set_modes: Mutex::new(Vec::new()),
         }
@@ -1091,6 +1120,13 @@ impl RecordingRemote {
     /// The number of destination listings (`Remote::list`) this run performed.
     fn lists(&self) -> usize {
         self.list_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of destination metadata probes (`Remote::metadata`, which is
+    /// what `Side::kind_opt`/`Side::mode`/`Side::mode_opt` call on a remote
+    /// destination) this run performed.
+    fn metadata_probes(&self) -> usize {
+        self.metadata_calls.load(Ordering::SeqCst)
     }
 
     /// Run the failed-write writer, if this is the write it targets.
@@ -1381,6 +1417,7 @@ impl Remote for RecordingRemote {
         self.inner.exists(rel)
     }
     fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
         self.maybe_swap_before_first_op();
         if self.fail_metadata_after_write && self.writes() > 0 {
             // The bytes are already on disk; the mode read that follows them
@@ -2973,6 +3010,171 @@ fn enumerating_a_wide_directory_costs_a_constant_number_of_listings() {
     assert!(
         small_lists <= 8,
         "a one-directory sync needs only a handful of listings, got {small_lists}"
+    );
+}
+
+/// Build a source and destination CHAIN of `depth` directories with ONE changed
+/// file at the bottom, sync it with `Keep`, and return `(destination metadata
+/// probes, destination listings)`. Every destination ancestor must be probed by
+/// the ancestry/guard walk, so this is the fixture that exposes the O(D^3)
+/// same-prefix re-walk.
+#[cfg(unix)]
+fn measure_deep_chain_sync(depth: usize) -> (usize, usize) {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let mut src_leaf = src.clone();
+    let mut dst_leaf = dst.clone();
+    for _ in 0..depth {
+        src_leaf = src_leaf.join("c");
+        dst_leaf = dst_leaf.join("c");
+    }
+    write(&src_leaf.join("leaf"), b"NEW");
+    write(&dst_leaf.join("leaf"), b"old");
+
+    let remote = RecordingRemote::over(transport(&dst), true);
+    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    assert_eq!(
+        read(&dst_leaf.join("leaf")),
+        b"NEW",
+        "the one deep change landed: {report:?}"
+    );
+    (remote.metadata_probes(), remote.lists())
+}
+
+/// F1 DEPTH BOUND: a depth-D chain with ONE change must cost O(D) ancestry
+/// probes, not O(D^2) (and not O(D^3) `openat`: a probe resolves a path
+/// component-wise, so D probes of a depth-D prefix is D^2 `openat` and a
+/// per-ancestor re-walk of every prefix is D of those). The memo is what makes
+/// each `(path, kind)` decision at most once per run, so both assertions below
+/// fail against the pre-fix code: its depth-32 count is 669 probes and its
+/// depth-64 count is 2349 (measured), not a small multiple of the depth, and it
+/// grows QUADRATICALLY when the depth doubles.
+#[cfg(unix)]
+#[test]
+fn a_deep_chain_costs_linear_ancestry_probes() {
+    let depth = 32usize;
+    let (shallow, shallow_lists) = measure_deep_chain_sync(depth);
+    let (deep, deep_lists) = measure_deep_chain_sync(2 * depth);
+
+    // Non-vacuous: the chain really was walked (every level probed at least
+    // once) and the fixture did not silently flatten.
+    assert!(
+        shallow >= depth,
+        "the depth-{depth} chain must be walked, got {shallow} probes"
+    );
+
+    // ABSOLUTE BOUND: O(D), not O(D^2). A small constant multiple of the depth,
+    // plus a constant for the manifest/verification probes that do not scale
+    // with D. Measured: pre-fix the depth-32 count is 669; post-fix it is 141.
+    assert!(
+        shallow <= 8 * depth + 64,
+        "a depth-{depth} chain must cost O(D) ancestry probes, not O(D^2): got \
+         {shallow} (bound {})",
+        8 * depth + 64
+    );
+
+    // ADDITIVE GROWTH: doubling the depth must add only a LINEAR amount, so the
+    // count is independent of a large multiplication of D. Measured: post-fix
+    // 141 -> 269 (adds 128 for 32 more levels); pre-fix 669 -> 2349 (adds 1680).
+    assert!(
+        deep <= shallow + 6 * depth,
+        "doubling the depth must add O(D) probes, not multiply them: \
+         depth {depth} -> {shallow}, depth {} -> {deep}",
+        2 * depth
+    );
+
+    // The destination is listed once per directory of the chain, never once per
+    // path per ancestor; the chain is linear in its length.
+    assert!(
+        deep_lists <= 2 * shallow_lists + 4,
+        "listings must stay linear in the chain length: {shallow_lists} vs {deep_lists}"
+    );
+}
+
+/// Build a source-empty / destination-wide fixture with `n` extraneous FILES in
+/// ONE directory, run the given extraneous policy, and return `(applier listing
+/// reads, destination listings)`.
+fn measure_wide_delete(n: usize, policy: Extraneous) -> (usize, usize) {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    for i in 0..n {
+        write(&dst.join(format!("x{i:05}")), b"e");
+    }
+    let remote = RecordingRemote::over(transport(&dst), true);
+    super::listing_reads::reset();
+    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, policy).unwrap();
+    let consumed = super::listing_reads::get();
+    assert_eq!(
+        report.extraneous.len(),
+        n,
+        "the fixture must be entirely extraneous: {report:?}"
+    );
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    (consumed, remote.lists())
+}
+
+/// F2 WIDTH BOUND: the REMOVAL pass must consume a parent directory's listing
+/// O(1) times, not once per extraneous entry. This mirrors
+/// [`enumerating_a_wide_directory_costs_a_constant_number_of_listings`], which
+/// pins the SKIPPED path; this pins the REMOVAL path. The `Keep` run is the
+/// control: it performs the SAME two post-transfer verification passes (which
+/// legitimately consult the parent listing once per candidate and therefore grow
+/// with the entry count), so `Delete - Keep` isolates exactly what
+/// `remove_extraneous` itself consumed. Pre-fix that delta is one listing clone
+/// per entry (it grows with `n`); post-fix it is the ONE per-parent listing the
+/// pass now fetches, independent of `n`.
+#[test]
+fn removing_a_wide_directory_costs_a_constant_number_of_listing_reads() {
+    let small = 64usize;
+    let (small_keep, small_keep_lists) = measure_wide_delete(small, Keep);
+    let (small_delete, small_delete_lists) = measure_wide_delete(small, Delete);
+    let (large_keep, large_keep_lists) = measure_wide_delete(2 * small, Keep);
+    let (large_delete, large_delete_lists) = measure_wide_delete(2 * small, Delete);
+
+    // The verification passes are the control's cost and are identical for the
+    // two policies; assert the control really is non-trivial so the subtraction
+    // below is meaningful rather than `0 - 0`.
+    assert!(
+        small_keep > 0 && large_keep > small_keep,
+        "the control run must actually verify the wide directory: {small_keep} vs {large_keep}"
+    );
+
+    let small_removal = small_delete.saturating_sub(small_keep);
+    let large_removal = large_delete.saturating_sub(large_keep);
+
+    // ABSOLUTE BOUND: one directory is consumed O(1) times by the removal pass.
+    // Pre-fix this is >= the entry count.
+    assert!(
+        small_removal <= 4,
+        "the removal pass must consume one directory's listing O(1) times, not \
+         once per entry: {small} entries consumed it {small_removal} times"
+    );
+    // NO GROWTH: doubling the entry count must not change the removal pass's
+    // listing consumption. Pre-fix 64 entries -> 64 and 128 -> 128.
+    assert_eq!(
+        large_removal,
+        small_removal,
+        "listing consumption must be independent of the entry count: \
+         {small} entries -> {small_removal}, {} entries -> {large_removal}",
+        2 * small
+    );
+
+    // The raw destination fetch count stays flat too: the run-scoped cache
+    // already makes a directory cost O(1) raw listings, and the removal pass
+    // adds none beyond the one it shares.
+    assert!(
+        small_delete_lists <= small_keep_lists + 2,
+        "the removal pass must not add a per-entry destination listing: \
+         keep {small_keep_lists}, delete {small_delete_lists}"
+    );
+    assert!(
+        large_delete_lists <= large_keep_lists + 2,
+        "the removal pass must not add a per-entry destination listing: \
+         keep {large_keep_lists}, delete {large_delete_lists}"
     );
 }
 
@@ -7228,6 +7430,17 @@ fn a_case_colliding_source_pair_is_reported_not_silently_lost() {
         );
         return;
     }
+    // The crafted manifest encodes a mode (`1a4`), so a mode-ignoring filesystem
+    // would fail the run on a mode mismatch before the collision is asserted:
+    // the collision assertion must not depend on mode preservation.
+    if !the_filesystem_honours_modes() {
+        announce_skip(
+            "this filesystem does not report a chmod, so the crafted manifest's \
+             mode cannot be preserved and the case-collision reproduction would \
+             fail on mode before reaching its assertion",
+        );
+        return;
+    }
     let dir = fixture_tmpdir(&env()).unwrap();
     // The SOURCE is a case-SENSITIVE tree holding BOTH `Foo.txt` and `foo.txt`.
     // THIS host's filesystem cannot hold both (it is case-insensitive), so the
@@ -7441,10 +7654,22 @@ fn delete_extraneous_never_destroys_a_nested_case_aliased_transfer() {
 #[cfg(unix)]
 #[test]
 fn a_unicode_case_fold_never_overwrites_a_destination_entry() {
-    if !filesystem_is_case_insensitive() {
+    if !filesystem_folds("Straße.txt", "STRASSE.txt") {
         announce_skip(
-            "this filesystem is case-SENSITIVE, so `Straße.txt` cannot fold onto \
-             `STRASSE.txt` and the Unicode-fold reproduction is untestable here",
+            "this filesystem does not fold `Straße.txt` onto `STRASSE.txt` (it may \
+             fold ASCII and still keep this Unicode pair distinct, like macOS FAT), \
+             so the Unicode-fold reproduction is untestable here",
+        );
+        return;
+    }
+    // The fixture's manifest encodes a mode (`1a4`), so a mode-ignoring
+    // filesystem would fail the run on a mode mismatch BEFORE the fold is ever
+    // exercised: the fold assertion must not depend on mode preservation.
+    if !the_filesystem_honours_modes() {
+        announce_skip(
+            "this filesystem does not report a chmod, so the crafted manifest's \
+             mode cannot be preserved and the Unicode-fold reproduction would fail \
+             on mode before reaching its fold assertion",
         );
         return;
     }
@@ -7518,10 +7743,21 @@ fn a_unicode_case_fold_never_overwrites_a_destination_entry() {
 #[cfg(unix)]
 #[test]
 fn delete_extraneous_never_destroys_a_unicode_case_aliased_transfer() {
-    if !filesystem_is_case_insensitive() {
+    if !filesystem_folds("Straße.txt", "STRASSE.txt") {
         announce_skip(
-            "this filesystem is case-SENSITIVE, so `Straße.txt` cannot fold onto \
-             `STRASSE.txt` and the Unicode-fold reproduction is untestable here",
+            "this filesystem does not fold `Straße.txt` onto `STRASSE.txt` (it may \
+             fold ASCII and still keep this Unicode pair distinct, like macOS FAT), \
+             so the Unicode-fold reproduction is untestable here",
+        );
+        return;
+    }
+    // The crafted manifest encodes a mode (`1a4`), so a mode-ignoring filesystem
+    // would fail the run on a mode mismatch before the fold is exercised.
+    if !the_filesystem_honours_modes() {
+        announce_skip(
+            "this filesystem does not report a chmod, so the crafted manifest's \
+             mode cannot be preserved and the Unicode-fold reproduction would fail \
+             on mode before reaching its fold assertion",
         );
         return;
     }
@@ -7572,11 +7808,11 @@ fn delete_extraneous_never_destroys_a_unicode_case_aliased_transfer() {
 #[cfg(unix)]
 #[test]
 fn a_nested_unicode_case_fold_never_overwrites_a_destination_entry() {
-    if !filesystem_is_case_insensitive() {
+    if !filesystem_folds("Straße.txt", "STRASSE.txt") {
         announce_skip(
-            "this filesystem is case-SENSITIVE, so a nested `Straße.txt` cannot \
-             fold onto `STRASSE.txt` and the nested Unicode-fold reproduction is \
-             untestable here",
+            "this filesystem does not fold `Straße.txt` onto `STRASSE.txt` (it may \
+             fold ASCII and still keep this Unicode pair distinct, like macOS FAT), \
+             so the nested Unicode-fold reproduction is untestable here",
         );
         return;
     }
@@ -7638,9 +7874,10 @@ fn a_nested_unicode_case_fold_never_overwrites_a_destination_entry() {
 #[cfg(unix)]
 #[test]
 fn a_folded_parent_component_never_mutates_an_unreported_path() {
-    if !filesystem_is_case_insensitive() {
+    if !filesystem_folds("ς", "σ") {
         announce_skip(
-            "this filesystem is case-SENSITIVE, so `ς` cannot fold onto `σ` and the \
+            "this filesystem does not fold `ς` onto `σ` (it may fold ASCII and \
+             still keep this Unicode pair distinct, like macOS FAT), so the \
              parent-component-fold reproduction is untestable here",
         );
         return;
@@ -7708,6 +7945,17 @@ fn a_case_colliding_pair_is_a_clean_conflict_not_a_verification_failure() {
         announce_skip(
             "this filesystem is case-SENSITIVE, so a case-colliding pair IS \
              representable and this refusal reproduction is untestable here",
+        );
+        return;
+    }
+    // The crafted manifest encodes a mode (`1a4`), so a mode-ignoring filesystem
+    // would report a mode verification failure instead of the clean up-front
+    // conflict this reproduction pins.
+    if !the_filesystem_honours_modes() {
+        announce_skip(
+            "this filesystem does not report a chmod, so the crafted manifest's \
+             mode cannot be preserved and the case-collision reproduction would \
+             fail on mode before reaching its assertion",
         );
         return;
     }
