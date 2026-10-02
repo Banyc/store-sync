@@ -429,7 +429,8 @@ impl SshTransport {
 
     /// Build the `ssh <args> -- <command>` argv, forcing the remote command to
     /// run under `bash` regardless of the deployment account's login shell.
-    /// The remote scripts (globs, `[ -e ] || continue`, `stat -c`, ...) are
+    /// The remote scripts (globs, the `[ -e ] || [ -L ] || continue`
+    /// existence guard, `stat -c`, ...) are
     /// written for POSIX sh/bash semantics; a login shell like zsh aborts on
     /// an unmatched glob (`no matches found`) instead of passing the pattern
     /// through, which breaks e.g. the first `list` of an empty object store.
@@ -921,10 +922,21 @@ impl SshTransport {
     /// hidden entries but excludes the `.` and `..` self/parent directories,
     /// and each entry's real mode is fetched with `stat -c '%f'` (raw mode in
     /// hex) so the caller can faithfully reconstruct permissions and types.
+    ///
+    /// The existence guard is `[ -e "$e" ] || [ -L "$e" ]`: it exists ONLY to
+    /// filter the unmatched globs (an empty directory expands each pattern to
+    /// its own literal text, which is not an entry). It must not be a bare
+    /// `[ -e ]`, because POSIX `-e` FOLLOWS a symlink and would therefore omit
+    /// a DANGLING symlink — an entry the far-side manifest walk, which uses
+    /// `lstat`, INCLUDES. The two views of one directory must agree: the
+    /// omission made `sync` report a legitimately installed dangling link as a
+    /// `NameNotFaithful` conflict, refuse to replace an existing one, and (with
+    /// `delete_extraneous`) hide a reserved dangling child from the residue
+    /// gate so the sanctioned recursive removal destroyed the caller's copy.
     fn list_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
         format!(
-            "for e in {p}/* {p}/.[!.]* {p}/..?*; do case \"$e\" in {p}/.|{p}/..) continue;; esac; [ -e \"$e\" ] || continue; n=$(basename \"$e\"); if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; m=$(stat -c '%f' \"$e\"); printf '%s\\t%s\\t%s\\n' \"$n\" \"$t\" \"$m\"; done"
+            "for e in {p}/* {p}/.[!.]* {p}/..?*; do case \"$e\" in {p}/.|{p}/..) continue;; esac; [ -e \"$e\" ] || [ -L \"$e\" ] || continue; n=$(basename \"$e\"); if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; m=$(stat -c '%f' \"$e\"); printf '%s\\t%s\\t%s\\n' \"$n\" \"$t\" \"$m\"; done"
         )
     }
 
@@ -2014,6 +2026,209 @@ mod tests_ssh {
         assert!(script.contains("..?*"), "dot-dot-prefixed entries covered");
         // The self/parent directors are explicitly skipped.
         assert!(script.contains("continue"), "skip guard present");
+    }
+
+    /// A transport rooted at a caller-supplied directory, so the LITERAL
+    /// `list_script` can be executed under `/bin/sh` against a temp tree
+    /// instead of the fixed `/srv/app` the other (command-construction) tests
+    /// use.
+    fn transport_at(root: &Path) -> SshTransport {
+        SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            root,
+            Layout::empty(),
+            Some(Path::new("/dev/null")),
+            None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Run the LITERAL `list_script` for `rel` under `/bin/sh` and return the
+    /// parsed entries. `stat -c` is GNU-only, so on a BSD `stat` the mode
+    /// column is empty (the entry parses with mode 0) — callers must assert on
+    /// NAMES and TYPES here, never on the mode.
+    fn run_list_script(t: &SshTransport, rel: &Path) -> Vec<RemoteEntry> {
+        let script = t.list_script(rel);
+        let out = run_sh_stdin(&script, &[]);
+        assert!(
+            out.status.success(),
+            "list script must exit 0 under sh: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        SshTransport::parse_list_output(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// A DANGLING symlink must be LISTED. The old guard `[ -e "$e" ] ||
+    /// continue` FOLLOWS the symlink, so such an entry vanished from `list`
+    /// while the far-side manifest walk (which uses `lstat`) still included it
+    /// — the two views of one directory disagreed. `sync` then reported a
+    /// legitimately installed dangling link as a `NameNotFaithful` conflict,
+    /// refused to replace an existing one, and (with `delete_extraneous`) could
+    /// no longer see a reserved dangling child, so the sanctioned recursive
+    /// removal destroyed the caller's only copy. This runs the LITERAL script
+    /// under `/bin/sh`; pre-fix the dangling entry is absent, so the assertion
+    /// FAILS.
+    #[test]
+    fn list_script_lists_a_dangling_symlink() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("live"), b"x").unwrap();
+        std::os::unix::fs::symlink("nowhere", tree.join("dangling")).unwrap();
+
+        let entries = run_list_script(&transport_at(dir.path()), Path::new("tree"));
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"dangling"),
+            "a dangling symlink must be listed (POSIX `-e` follows the link); got {names:?}"
+        );
+        assert!(
+            names.contains(&"live"),
+            "a live file must still be listed; got {names:?}"
+        );
+        let dangling = entries.iter().find(|e| e.name == "dangling").unwrap();
+        assert!(
+            dangling.is_symlink,
+            "the dangling entry must be classified as a symlink, got {dangling:?}"
+        );
+        assert!(!dangling.is_dir);
+    }
+
+    /// Non-regression: the `-e`/`-L` guard still filters the UNMATCHED globs.
+    /// When a directory is empty every pattern expands to its own literal text
+    /// (`<dir>/*`, `<dir>/.[!.]*`, `<dir>/..?*`), which is not an entry; a bare
+    /// `|| continue` cannot be dropped, or those literals would be listed as
+    /// bogus names. This pins that the dangling-symlink fix did not open that
+    /// hole.
+    #[test]
+    fn list_script_filters_unmatched_globs_in_an_empty_directory() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("empty");
+        std::fs::create_dir_all(&tree).unwrap();
+        let entries = run_list_script(&transport_at(dir.path()), Path::new("empty"));
+        assert!(
+            entries.is_empty(),
+            "an empty directory must list nothing, got {:?}",
+            entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The two views of one directory must AGREE on a dangling symlink:
+    /// `Remote::list` (the address-fidelity and residue view) and the far-side
+    /// manifest walk (which uses `lstat` and therefore includes it). This is
+    /// the cross-view pin for the defect: pre-fix `list` omitted the entry
+    /// while the manifest kept it, so the assertion on `list` FAILS.
+    #[test]
+    fn list_and_manifest_agree_on_a_dangling_symlink() {
+        if !perl_available() {
+            eprintln!("skipping: perl is not on PATH, so the manifest walk cannot run");
+            return;
+        }
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("live"), b"x").unwrap();
+        std::os::unix::fs::symlink("nowhere", tree.join("dangling")).unwrap();
+
+        // The manifest walk's view (perl `lstat`): includes the dangling link.
+        let out = std::process::Command::new("perl")
+            .args(["-e", crate::manifest::remote_tree_verify_script()])
+            .arg(&tree)
+            .output()
+            .expect("perl must run");
+        assert!(
+            out.status.success(),
+            "manifest walk failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let manifest = crate::manifest::canonicalize_remote_entries(
+            &String::from_utf8_lossy(&out.stdout),
+            &tree,
+        )
+        .unwrap();
+        assert!(
+            manifest.entries.iter().any(|e| e.path == "dangling"),
+            "the manifest walk must include the dangling symlink: {:?}",
+            manifest
+                .entries
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // The list view must agree.
+        let entries = run_list_script(&transport_at(dir.path()), Path::new("tree"));
+        assert!(
+            entries.iter().any(|e| e.name == "dangling" && e.is_symlink),
+            "`list` must include the dangling symlink as a symlink; got {:?}",
+            entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Whether `perl` is on `PATH` (the far-side manifest walk needs it).
+    fn perl_available() -> bool {
+        std::process::Command::new("perl")
+            .args(["-e", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// THE DATA-LOSS PRECONDITION: with `delete_extraneous`, a claimed
+    /// (renamed-aside) directory is recursively removed unless the residue
+    /// gate sees a RESERVED entry inside it. The gate reads the SAME `list`
+    /// view. A RESERVED DANGLING symlink left in the claimed directory must be
+    /// VISIBLE (and typed as a symlink, so the gate treats it as residue, not
+    /// as a removable file); pre-fix the walk saw an ordinary directory, ran
+    /// the recursive `rm -rf`, and destroyed the caller's only copy with
+    /// `residue` empty. This asserts the precondition the gate consumes and
+    /// FAILS pre-fix (the reserved child is absent from the listing).
+    #[test]
+    fn list_reports_a_reserved_dangling_symlink_for_the_residue_gate() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let claimed = dir.path().join("claimed");
+        std::fs::create_dir_all(&claimed).unwrap();
+        std::fs::write(claimed.join("ordinary"), b"x").unwrap();
+        // The reserved entry is a DANGLING symlink: its target was removed (the
+        // object it points at is gone), which is exactly why the naive
+        // existence test dropped it.
+        std::os::unix::fs::symlink("../../objects/gone", claimed.join(".reserved")).unwrap();
+        assert!(
+            !claimed.join(".reserved").exists()
+                && std::fs::symlink_metadata(claimed.join(".reserved"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+            "premise: the reserved entry is a dangling symlink"
+        );
+
+        let entries = run_list_script(&transport_at(dir.path()), Path::new("claimed"));
+        let reserved = entries
+            .iter()
+            .find(|e| e.name == ".reserved")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the residue gate cannot see the reserved dangling child; it would remove the \
+                 claimed subtree recursively and destroy it. listing: {:?}",
+                    entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            reserved.is_symlink,
+            "the reserved child must be typed as a symlink so the gate treats it as residue"
+        );
+        assert!(
+            entries.iter().any(|e| e.name == "ordinary"),
+            "the ordinary sibling is still listed"
+        );
     }
 
     // Finding 4: try_write_new creates the parent directory before the

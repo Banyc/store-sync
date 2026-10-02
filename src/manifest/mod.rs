@@ -53,7 +53,7 @@
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -504,6 +504,56 @@ fn validate_wire_hash(hash: &str, entry_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Require a manifest to be PARENT-CLOSED: every entry path that has a `/`
+/// must have an entry for its parent directory, and that parent entry must be
+/// a `dir`. Refuse, naming the offending entry, otherwise.
+///
+/// The wire walk emits a child only after its parent (`$walk` recurses after
+/// emitting), but nothing in the manifest FORMAT requires that: a hand-built
+/// or proxied line `d/x ...` with no `d` line used to be accepted. The apply
+/// layer verifies only the FINAL component of a path, so a parent component's
+/// spelling was never checked unless the parent happened to be a source
+/// manifest entry: on a case-insensitive destination a crafted `d/x` could be
+/// reported as `applied` while the destination held `D/x` (one on-disk entry
+/// named under two spellings), and on a case-sensitive one the write's
+/// `ensure_private_dir_fd` would IMPLICITLY create `d` — an on-disk entry named
+/// by NO report list (and, with `delete_extraneous`, the just-installed entry
+/// destroyed by the sanctioned removal of the pre-existing `D`). Requiring
+/// closure at assembly makes both consequences unreachable.
+///
+/// The LOCAL walk is closed by construction: `WalkDir` yields a directory
+/// before the entries inside it, so every nested path's parent is already an
+/// entry of the same kind. Only the wire assembler needs the explicit gate.
+fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
+    let kinds: BTreeMap<&str, &str> = entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.entry_type.as_str()))
+        .collect();
+    for entry in entries {
+        let Some((parent, _)) = entry.path.rsplit_once('/') else {
+            // A top-level entry's parent is the tree root itself, which is not
+            // an entry (the manifest is root-relative).
+            continue;
+        };
+        match kinds.get(parent) {
+            None => {
+                return Err(Error::materialization(format!(
+                    "manifest is not parent-closed: entry {:?} has no entry for its parent directory {:?}; every parent must be listed as a `dir` entry so a parent's spelling is verified instead of being implicitly created",
+                    entry.path, parent
+                )));
+            }
+            Some(kind) if *kind != "dir" => {
+                return Err(Error::materialization(format!(
+                    "manifest has a non-directory parent: entry {:?} is under {:?}, which is a {:?}, not a `dir`",
+                    entry.path, parent, kind
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Assemble canonical tree metadata from the remote verification script's
 /// output ([`remote_tree_verify_script`]), applying the SAME validations the
 /// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
@@ -690,6 +740,11 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
         };
         entries.push(entry);
     }
+    // The manifest must be parent-closed (see [`require_parent_closed`]); the
+    // wire walk emits parents first, so a complete far-side listing already
+    // satisfies this, and a hand-built or proxied line that does not is
+    // refused rather than implicitly creating an unnamed parent.
+    require_parent_closed(&entries)?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut meta = TreeMetadata {
         tree_schema_version: TREE_SCHEMA_VERSION,
@@ -847,16 +902,45 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Announce a SKIPPED test on the REAL console of a PLAIN `cargo test` run.
+    ///
+    /// libtest CAPTURES `print!`/`eprintln!` per test and DISCARDS the captured
+    /// output of a PASSING test, so a skip message written with those macros is
+    /// invisible in the default gate: a skipped assertion is then
+    /// indistinguishable from a passing one. This writes a single
+    /// machine-greppable line DIRECTLY to file descriptor 1 (bypassing libtest's
+    /// capture) and names the test with the harness thread's name (libtest
+    /// names each test thread after the test). Grep a plain `cargo test` for
+    /// `STORE_SYNC_SKIP` to enumerate every skipped test.
+    #[cfg(unix)]
+    fn announce_skip(reason: &str) {
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("<unknown test>")
+            .to_string();
+        let line = format!("STORE_SYNC_SKIP test={test} reason={reason}\n");
+        unsafe {
+            libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
+        }
+    }
+
+    /// Non-Unix fallback: no raw-fd bypass is needed where the reproductions
+    /// that use it are `#[cfg(unix)]`.
+    #[cfg(not(unix))]
+    fn announce_skip(reason: &str) {
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("<unknown test>")
+            .to_string();
+        println!("STORE_SYNC_SKIP test={test} reason={reason}");
+    }
+
     /// Skip the current test, with a clear reason, when `perl` is not on
     /// `PATH`. Used at the top of every test that runs the remote script.
     macro_rules! skip_without_perl {
         ($name:literal) => {
             if !perl_on_path() {
-                eprintln!(
-                    "skipping {}: perl is not on PATH, so the remote verification \
-                     script cannot run",
-                    $name
-                );
+                announce_skip("perl is not on PATH, so the remote verification script cannot run");
                 return;
             }
         };
@@ -882,10 +966,10 @@ mod tests {
         // Restore so the TempDir's recursive cleanup can remove the tree.
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
         if !refused {
-            eprintln!(
-                "skipping: this process can still enumerate a mode-0o000 directory \
+            announce_skip(
+                "this process can still enumerate a mode-0o000 directory \
                  (effective uid 0, CAP_DAC_READ_SEARCH, or a mode-ignoring \
-                 filesystem?), so the unreadable-subdirectory premise is untestable here"
+                 filesystem?), so the unreadable-subdirectory premise is untestable here",
             );
         }
         refused
@@ -1678,10 +1762,9 @@ mod tests {
         let root = dir.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
         if let Err(e) = std::fs::write(root.join(OsStr::from_bytes(b"bad\xffname")), b"content") {
-            eprintln!(
-                "skipping wire_script_refuses_non_utf8_entry_name: this filesystem cannot \
-                 store a non-UTF-8 name ({e})"
-            );
+            announce_skip(&format!(
+                "this filesystem cannot store a non-UTF-8 name ({e})"
+            ));
             return;
         }
         let out = run_remote_script_raw(&root);
@@ -1787,10 +1870,10 @@ mod tests {
                     "wire path must refuse a non-UTF-8 name"
                 );
             }
-            Err(e) => eprintln!(
+            Err(e) => announce_skip(&format!(
                 "canonicalizers_agree_on_unrepresentable_names_and_targets: skipped case (4), \
                  this filesystem cannot store a non-UTF-8 name ({e})"
-            ),
+            )),
         }
 
         // The assembler refuses a hand-built seven-field line (a tab inside a
@@ -2138,6 +2221,122 @@ mod tests {
         }
         // The well-formed output still parses.
         canonicalize_remote_entries(&good, &root).unwrap();
+    }
+
+    /// A wire manifest must be PARENT-CLOSED: every entry with a `/` must have
+    /// an entry for its parent directory, and that parent entry must be a
+    /// `dir`. The wire walk emits parents first, but the FORMAT did not require
+    /// it, so a crafted `d/x` line with no `d` line was accepted. The apply
+    /// layer verifies only the FINAL path component, so the parent's spelling
+    /// was never checked unless it happened to be a source entry: on a
+    /// case-insensitive destination `applied` could name `d/x` while the
+    /// destination held `D/x` (one on-disk entry under two spellings, broken
+    /// report injectivity, every re-run repeating), and on a case-sensitive one
+    /// the durable write's `ensure_private_dir_fd` IMPLICITLY created `d`, an
+    /// on-disk entry no report list named (with `delete_extraneous` the
+    /// just-installed entry was then destroyed by the sanctioned removal of the
+    /// pre-existing `D`). This assertion FAILS against the pre-fix assembler,
+    /// which accepted the crafted line.
+    #[test]
+    fn assembler_requires_parent_closed_manifests() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        let hash = "0".repeat(64);
+
+        // (1) A child with NO parent entry: refused, naming the child and the
+        // missing parent.
+        let orphan = format!("d/x\tf\t1a4\t1\t{hash}\t\n");
+        let err = canonicalize_remote_entries(&orphan, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("not parent-closed"),
+            "a child without its parent entry must be refused, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("d/x"),
+            "the refusal must name the child, got: {err}"
+        );
+        assert!(
+            err.to_string().contains('d') && err.to_string().contains("parent directory"),
+            "the refusal must name the missing parent directory, got: {err}"
+        );
+
+        // (2) The CONTROL: adding the parent `dir` line makes the SAME entry
+        // acceptable, so the gap is precisely the missing closure — not the
+        // path, the type, or the hash.
+        let closed = format!("d\td\t1ed\t1\t\t\nd/x\tf\t1a4\t1\t{hash}\t\n");
+        canonicalize_remote_entries(&closed, &root).unwrap();
+
+        // (3) The reverse: a parent that is present but NOT a `dir` (a file
+        // with children) is refused, naming both.
+        let file_parent = format!("p\tf\t1a4\t1\t{hash}\t\np/x\tf\t1a4\t1\t{hash}\t\n");
+        let err = canonicalize_remote_entries(&file_parent, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("non-directory parent"),
+            "a file entry with children must be refused, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("p/x") && err.to_string().contains('p'),
+            "the refusal must name the child and the non-directory parent, got: {err}"
+        );
+
+        // (4) A WELL-FORMED nested manifest is still accepted, and every
+        // accepted entry's parent is a `dir` — the invariant the apply layer
+        // relies on to keep its reports injective and to avoid implicitly
+        // creating an unnamed parent.
+        let meta = canonicalize_remote_entries(
+            &format!("a\td\t1ed\t1\t\t\na/b\td\t1ed\t1\t\t\na/b/c\tf\t1a4\t1\t{hash}\t\n"),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(entry_paths(&meta), vec!["a", "a/b", "a/b/c"]);
+        for entry in &meta.entries {
+            if let Some((parent, _)) = entry.path.rsplit_once('/') {
+                let p = meta
+                    .entries
+                    .iter()
+                    .find(|e| e.path == parent)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "accepted manifest is not parent-closed at {}: no entry for {}",
+                            entry.path, parent
+                        )
+                    });
+                assert_eq!(p.entry_type, "dir", "parent {parent} must be a dir");
+            }
+        }
+    }
+
+    /// The LOCAL walk is parent-closed BY CONSTRUCTION and needs no gate:
+    /// `WalkDir` yields a directory before the entries inside it, so every
+    /// nested path's parent is already an entry of the same kind. This pins
+    /// that invariant (the remote assembler's [`require_parent_closed`] gate is
+    /// the only one needed).
+    #[test]
+    fn local_walk_is_parent_closed_by_construction() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        build_tree(&root);
+        let meta = canonicalize_tree(&root).unwrap();
+        assert_eq!(
+            entry_paths(&meta),
+            vec!["file.txt", "sub", "sub/link", "sub/nested.txt"]
+        );
+        for entry in &meta.entries {
+            if let Some((parent, _)) = entry.path.rsplit_once('/') {
+                let p = meta
+                    .entries
+                    .iter()
+                    .find(|e| e.path == parent)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "local walk produced {} with no parent entry {}",
+                            entry.path, parent
+                        )
+                    });
+                assert_eq!(p.entry_type, "dir", "parent {parent} must be a dir");
+            }
+        }
     }
 
     /// One systematically-mutated metadata field the verifier must reject
