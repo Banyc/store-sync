@@ -49,6 +49,66 @@
 //! form; accepting them verbatim is faithful and keeps both canonicalizers in
 //! agreement. Only the UTF-8 half of the NAME rule is applied to targets; the
 //! NFC half is not.
+//!
+//! # Fidelity scope: what a sync carries, and what it silently does not
+//!
+//! A sync transports THIS manifest plus the file bytes, and the manifest
+//! model is exactly the fields of [`TreeEntry`] — so fidelity is bounded by
+//! them. This section is the crate's authoritative statement of scope: every
+//! item under "carried" was verified end to end, and every item under "not
+//! carried" is a deliberate, currently-unimplemented limitation rather than
+//! a guarantee. A caller must be able to read this and predict the result
+//! without experimenting.
+//!
+//! **CARRIED faithfully:** the entry's path name (NFC UTF-8, `/`-separated;
+//! see above), its kind (file, directory, or symlink), its mode INCLUDING
+//! the setuid/setgid/sticky bits (stored as the full octal mode and applied
+//! with an explicit `chmod`, so a permissive umask cannot narrow it), the
+//! file's content (the SHA-256-bound bytes), and a symlink's target (the raw
+//! target bytes).
+//!
+//! **NOT carried — silently dropped.** The manifest has no field for any of
+//! these, so a sync neither reproduces nor REPORTS them:
+//!
+//! * **ownership** (`uid`/`gid`) — a destination entry ends up owned by the
+//!   transferring account;
+//! * **extended attributes** — Linux `user.*` and `security.*` (including
+//!   `security.capability`) and macOS `com.apple.*` (resource forks,
+//!   `com.apple.FinderInfo`);
+//! * **POSIX access and default ACLs**;
+//! * **timestamps** (`mtime`/`atime`);
+//! * **file flags** (`chattr +i`, `chflags uchg`);
+//! * **sparseness** — a sparse file is written out fully allocated.
+//!
+//! The loss of xattrs, `security.capability`, and ACLs is INVISIBLE TO THE
+//! DIFFER: a second sync compares only the manifest model, sees the entry as
+//! already `Same`, and reports success, so only xattr/ACL-aware tooling on
+//! the destination can reveal the divergence.
+//!
+//! **NOT carried — REFUSED, not dropped:** a hard link (an entry with
+//! `nlink > 1`) is rejected by BOTH canonicalizers — the local walk and the
+//! remote wire assembler — with an error naming the entry, rather than being
+//! silently materialized as two independent copies. Refusal is the crate's
+//! doctrine for anything it cannot reproduce faithfully (the name and
+//! symlink-target rules above follow the same principle): a silent
+//! transformation that changes what the tree means is worse than a loud
+//! failure.
+//!
+//! **A push/pull asymmetry the manifest model cannot express.** Setting the
+//! model aside, the two directions mutate a destination differently, so
+//! pre-existing metadata the model does not carry fares differently across
+//! them:
+//!
+//! * a **push** overwrites a file's bytes IN PLACE (the SSH transport's
+//!   `cat >`, the local transport's `O_TRUNC` create), so the destination
+//!   file keeps its inode and any PRE-EXISTING xattrs and owner survive the
+//!   overwrite;
+//! * a **pull** PUBLISHES the received file by atomic rename (a NEW inode),
+//!   so the replaced file's pre-existing xattrs and owner are destroyed
+//!   along with the old inode.
+//!
+//! A caller that needs `security.capability`, ACLs, ownership, or timestamps
+//! preserved must apply them out of band after the sync.
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};

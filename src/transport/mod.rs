@@ -352,13 +352,23 @@ pub trait Remote {
     /// staging base (the previous tree is copied into the staging dir, then
     /// only the changed files are uploaded). `dest` must not already exist
     /// (the caller removes a stale staging dir first); its parent is
-    /// created. The DEFAULT is a naive list/read/write walk — correct for
-    /// every transport, and for a [`LocalTransport`] it is a real local-disk
-    /// copy (the "download" is a local read); the [`SshTransport`] overrides
-    /// it with a same-filesystem `cp -a` on the remote so no bytes cross the
-    /// link. The walk is TWO-PHASE (directories are created owner-writable
-    /// and chmodded to their final mode deepest-first after every child is
-    /// copied), so a read-only source tree copies cleanly.
+    /// created.
+    ///
+    /// FIDELITY IS NOT UNIFORM: the two realizations of this ONE operation
+    /// carry DIFFERENT metadata, so a caller must not assume they agree. The
+    /// DEFAULT below is a list/read/write walk that recreates names, kind,
+    /// modes (including the setuid/setgid/sticky bits; two-phase, so a
+    /// read-only source tree copies cleanly) and symlink targets, but DROPS
+    /// ownership, extended attributes, ACLs, and timestamps — it has no way
+    /// to carry them through [`Remote::list`]/[`Remote::read`]/
+    /// [`Remote::write`]. A [`LocalTransport`] uses this DEFAULT (a real
+    /// local-disk copy: the "download" is a local read), so it drops all
+    /// four. The [`SshTransport`] override runs a same-filesystem `cp -a` on
+    /// the remote (no bytes cross the link) and ADDITIONALLY preserves
+    /// extended attributes, ACLs, and timestamps; ownership is kept as the
+    /// copier's for a non-root far-side user (see the override). The full
+    /// carried/not-carried list is the crate's fidelity scope in
+    /// [`crate::manifest`].
     fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
         if let Some(parent) = dest.parent() {
             self.create_dir_all(&parent)?;
@@ -3399,5 +3409,443 @@ mod tests {
             sleeps.borrow().is_empty(),
             "EINTR must retry without sleeping"
         );
+    }
+
+    /// FIDELITY SCOPE PINS.
+    ///
+    /// `crate::manifest`'s "Fidelity scope" section is the authoritative
+    /// statement of what a sync carries: name, kind, mode INCLUDING the
+    /// setuid/setgid/sticky bits, content, and symlink target ARE carried;
+    /// ownership, xattrs, ACLs, timestamps, file flags, and sparseness are
+    /// SILENTLY dropped; hard links are REFUSED. `Remote::copy_tree` has TWO
+    /// implementations with DIFFERENT fidelity, so the carried and the
+    /// not-carried axes are pinned per path here.
+    ///
+    /// WHICH IS WHICH:
+    /// * `copy_tree_*_carries_special_mode_bits` are BEHAVIOUR pins of the
+    ///   CARRIED set: they pin ALREADY-CORRECT behaviour (so they cannot fail
+    ///   pre-fix either) and protect against a FUTURE regression that starts
+    ///   dropping something currently kept.
+    /// * `copy_tree_default_walk_drops_*` and `copy_tree_ssh_cp_a_*` are
+    ///   CHARACTERIZATION tests of a DOCUMENTED LIMITATION: they pin the
+    ///   current behaviour of an intentional omission and so cannot fail
+    ///   pre-fix either; a later change that starts carrying (or refuses to
+    ///   carry) one of these must be an explicit, test-visible act. Each
+    ///   announces a `STORE_SYNC_SKIP` with its reason when the
+    ///   filesystem/tool cannot set up the fixture (xattrs, a foreign gid),
+    ///   rather than failing the suite on an environment that cannot support
+    ///   it.
+    #[cfg(unix)]
+    mod fidelity {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::ffi::{CString, OsString};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::path::{Path, PathBuf};
+
+        /// The environment variable the shim reads to find its "remote"
+        /// working directory (the directory a remote login shell would start
+        /// in).
+        const SHIM_WORK_VAR: &str = "STORE_SYNC_SSH_SHIM_WORK";
+
+        /// Test-only `ssh` shim: it never opens a network connection. It
+        /// reproduces the far side by running the transport's final argument
+        /// (the remote command string `bash -c '<script>'`) in
+        /// `$STORE_SYNC_SSH_SHIM_WORK` with stdin/stdout/stderr connected
+        /// exactly as the real operation connects them.
+        const SHIM_SCRIPT: &str = r#"#!/bin/sh
+set -u
+work=${STORE_SYNC_SSH_SHIM_WORK:?the shim work directory is not configured}
+last=''
+for arg in "$@"; do last="$arg"; done
+cd "$work" || exit 125
+exec /bin/sh -c "$last"
+"#;
+
+        fn rooted(p: &str) -> RootedRelativePath {
+            RootedRelativePath::parse(Path::new(p)).expect("parse the rooted relative path")
+        }
+
+        // ---- unix xattr syscalls (libc is a direct dependency; the
+        // platform signatures differ: macOS carries position/options, Linux
+        // only flags) ---------------------------------------------------
+
+        #[cfg(target_os = "macos")]
+        unsafe fn raw_setxattr(
+            path: *const libc::c_char,
+            name: *const libc::c_char,
+            value: *const libc::c_void,
+            size: libc::size_t,
+        ) -> libc::c_int {
+            unsafe { libc::setxattr(path, name, value, size, 0, 0) }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        unsafe fn raw_setxattr(
+            path: *const libc::c_char,
+            name: *const libc::c_char,
+            value: *const libc::c_void,
+            size: libc::size_t,
+        ) -> libc::c_int {
+            unsafe { libc::setxattr(path, name, value, size, 0) }
+        }
+
+        #[cfg(target_os = "macos")]
+        unsafe fn raw_getxattr(
+            path: *const libc::c_char,
+            name: *const libc::c_char,
+            value: *mut libc::c_void,
+            size: libc::size_t,
+        ) -> libc::ssize_t {
+            unsafe { libc::getxattr(path, name, value, size, 0, 0) }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        unsafe fn raw_getxattr(
+            path: *const libc::c_char,
+            name: *const libc::c_char,
+            value: *mut libc::c_void,
+            size: libc::size_t,
+        ) -> libc::ssize_t {
+            unsafe { libc::getxattr(path, name, value, size) }
+        }
+
+        fn cstr(path: &Path) -> CString {
+            CString::new(path.as_os_str().as_bytes()).expect("path has no interior NUL")
+        }
+
+        fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+            let p = cstr(path);
+            let n = CString::new(name).expect("xattr name has no interior NUL");
+            let rc =
+                unsafe { raw_setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len()) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        fn has_xattr(path: &Path, name: &str) -> bool {
+            let p = cstr(path);
+            let n = CString::new(name).expect("xattr name has no interior NUL");
+            let rc = unsafe { raw_getxattr(p.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
+            rc >= 0
+        }
+
+        /// Whether a `user.*` xattr can be set on `dir`'s filesystem. On
+        /// failure this ANNOUNCES a skip (with the reason) and returns false,
+        /// so the xattr half of a test is skipped rather than failing on a
+        /// filesystem/tool that cannot support it.
+        fn xattrs_available(dir: &Path) -> bool {
+            let probe = dir.join(".store-sync-xattr-probe");
+            std::fs::write(&probe, b"x").expect("write the xattr probe file");
+            match set_xattr(&probe, "user.store_sync.probe", b"1") {
+                Ok(()) => true,
+                Err(e) => {
+                    crate::test_support::announce_skip(&format!(
+                        "this filesystem/tool cannot set a user extended attribute on {} ({e}), \
+                         so xattr fidelity cannot be asserted here",
+                        dir.display()
+                    ));
+                    false
+                }
+            }
+        }
+
+        fn chgrp(path: &Path, gid: u32) -> std::io::Result<()> {
+            let p = cstr(path);
+            let rc = unsafe { libc::chown(p.as_ptr(), !0 as libc::uid_t, gid) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        /// A supplementary group of the current process different from its
+        /// effective gid, or `None` when there is none. Used to build a
+        /// source entry whose group the transferring account can set but whose
+        /// value the DEFAULT walk does not reproduce.
+        fn supplementary_gid() -> Option<u32> {
+            let egid = unsafe { libc::getegid() };
+            let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+            if n <= 0 {
+                return None;
+            }
+            let mut buf = vec![0 as libc::gid_t; n as usize];
+            let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+            if got <= 0 {
+                return None;
+            }
+            buf.truncate(got as usize);
+            buf.into_iter().find(|&g| g != egid)
+        }
+
+        /// The shim harness: a shim bin dir, a "remote" working directory,
+        /// and the destination root inside it.
+        struct SshHarness {
+            tmp: tempfile::TempDir,
+            work: PathBuf,
+            root: PathBuf,
+        }
+
+        impl SshHarness {
+            fn new() -> SshHarness {
+                let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env())
+                    .expect("create the harness tempdir");
+                let work = tmp.path().join("work");
+                std::fs::create_dir_all(&work).expect("create the shim work dir");
+                let bin = tmp.path().join("bin");
+                std::fs::create_dir_all(&bin).expect("create the shim bin dir");
+                // The shared helper (a short-lived process, never an
+                // `fs::write` in this test process) keeps the shim's write fd
+                // out of the descriptor table, so a sibling test's fork cannot
+                // inherit it and make a later exec of the shim fail ETXTBSY.
+                crate::test_support::write_executable(&bin.join("ssh"), SHIM_SCRIPT.as_bytes());
+                let root = work.join("dst");
+                std::fs::create_dir_all(&root).expect("create the destination root");
+                SshHarness { tmp, work, root }
+            }
+
+            fn env(&self) -> SysEnv {
+                let bin = self.tmp.path().join("bin");
+                let mut vars: BTreeMap<OsString, OsString> = BTreeMap::new();
+                vars.insert(
+                    OsString::from("PATH"),
+                    OsString::from(format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    )),
+                );
+                vars.insert(
+                    OsString::from(SHIM_WORK_VAR),
+                    self.work.as_os_str().to_os_string(),
+                );
+                SysEnv::from_map(vars)
+            }
+
+            fn transport(&self) -> SshTransport {
+                let env = self.env();
+                SshTransport::new(
+                    "deploy",
+                    "shim.invalid",
+                    2222,
+                    &self.root,
+                    Layout::empty(),
+                    Some(Path::new("/dev/null")),
+                    None,
+                    &self.tmp.path().join("knownhosts"),
+                    &env,
+                    false,
+                )
+                .expect("construct the shimmed ssh transport")
+            }
+        }
+
+        /// Create a source tree exercising the CARRIED metadata axis — the
+        /// three special mode bits, a read-only directory and file, file
+        /// content, and a symlink target — and return `(rel path, mode)` pairs.
+        fn build_carried_tree(root: &Path) -> Vec<(&'static str, u32)> {
+            std::fs::create_dir_all(root.join("ro")).expect("mkdir ro");
+            std::fs::write(root.join("ro/inside"), b"x").expect("write ro/inside");
+            std::fs::write(root.join("setuid"), b"u").expect("write setuid");
+            std::fs::write(root.join("setgid"), b"g").expect("write setgid");
+            std::fs::write(root.join("plain"), b"content").expect("write plain");
+            std::fs::create_dir_all(root.join("sticky")).expect("mkdir sticky");
+            std::fs::write(root.join("sticky/child"), b"c").expect("write sticky/child");
+            std::os::unix::fs::symlink("plain", root.join("link")).expect("symlink link -> plain");
+            let modes: [(&'static str, u32); 6] = [
+                ("ro", 0o555),
+                ("ro/inside", 0o444),
+                ("setuid", 0o4755),
+                ("setgid", 0o2755),
+                ("sticky", 0o1777),
+                ("sticky/child", 0o644),
+            ];
+            // Directory modes LAST: a 0555 directory cannot be written into.
+            for (rel, mode) in &modes {
+                std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(*mode))
+                    .unwrap_or_else(|e| panic!("chmod {rel} {mode:o}: {e}"));
+            }
+            modes.to_vec()
+        }
+
+        /// Copy `src` to `dest` through `transport` and assert the CARRIED set
+        /// survived: every special mode bit, the read-only directory's
+        /// content, the file content, and the symlink target.
+        fn assert_carried_set(
+            transport: &impl Remote,
+            src: &str,
+            dest: &str,
+            expected: &[(&str, u32)],
+        ) {
+            transport
+                .copy_tree(&rooted(src), &rooted(dest))
+                .expect("copy_tree");
+            let dest_root = transport.root().join(Path::new(dest));
+            for (rel, mode) in expected {
+                let p = dest_root.join(rel);
+                let actual = std::fs::symlink_metadata(&p)
+                    .unwrap_or_else(|e| panic!("stat copied {rel}: {e}"))
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                assert_eq!(
+                    actual, *mode,
+                    "the CARRIED set: copied {rel} must keep mode {mode:o}, got {actual:o}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(dest_root.join("plain")).expect("read copied plain"),
+                b"content",
+                "the CARRIED set: file content must round-trip"
+            );
+            let link = dest_root.join("link");
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("stat copied link")
+                    .file_type()
+                    .is_symlink(),
+                "the CARRIED set: a symlink must stay a symlink"
+            );
+            assert_eq!(
+                std::fs::read_link(&link).expect("read copied link target"),
+                Path::new("plain"),
+                "the CARRIED set: the symlink target must round-trip"
+            );
+        }
+
+        /// BEHAVIOUR PIN (local half): a tree with setuid/setgid/sticky and a
+        /// read-only directory round-trips through the DEFAULT walk with every
+        /// bit intact.
+        #[test]
+        fn copy_tree_default_walk_carries_special_mode_bits() {
+            let dir =
+                crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let base = dir.path().join("remote");
+            let src = base.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let expected = build_carried_tree(&src);
+            let t = LocalTransport::new(&SysEnv::from_process(), base, Layout::empty()).unwrap();
+            assert_carried_set(&t, "src", "dest", &expected);
+        }
+
+        /// BEHAVIOUR PIN (ssh half): the `cp -a` override — the OTHER
+        /// implementation of the same operation — also carries every special
+        /// mode bit and the read-only directory.
+        #[test]
+        fn copy_tree_ssh_cp_a_carries_special_mode_bits() {
+            let h = SshHarness::new();
+            let src = h.root.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let expected = build_carried_tree(&src);
+            let t = h.transport();
+            assert_carried_set(&t, "src", "dest", &expected);
+        }
+
+        /// CHARACTERIZATION (not-carried half, local): the DEFAULT
+        /// list/read/write walk documents that it DROPS xattrs and ownership.
+        /// Cannot fail pre-fix — the behaviour already exists — so it exists
+        /// to make a later change to the limitation deliberate and visible.
+        #[test]
+        fn copy_tree_default_walk_drops_xattrs_and_ownership() {
+            let dir =
+                crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let base = dir.path().join("remote");
+            let src = base.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let file = src.join("f");
+            std::fs::write(&file, b"payload").unwrap();
+
+            if xattrs_available(&src) {
+                set_xattr(&file, "user.store_sync.fidelity", b"present").unwrap();
+                let t = LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty())
+                    .unwrap();
+                t.copy_tree(&rooted("src"), &rooted("dest")).unwrap();
+                let dst = base.join("dest/f");
+                assert!(dst.is_file(), "premise: the file was copied");
+                assert!(
+                    !has_xattr(&dst, "user.store_sync.fidelity"),
+                    "CHARACTERIZATION of a DOCUMENTED LIMITATION: the default list/read/write \
+                     walk must DROP xattrs, but it carried user.store_sync.fidelity; the \
+                     documented fidelity scope is now wrong"
+                );
+            }
+
+            let Some(gid) = supplementary_gid() else {
+                crate::test_support::announce_skip(
+                    "the current user has no supplementary group different from its effective \
+                     gid, so a source entry the default walk cannot re-own cannot be built; \
+                     ownership fidelity is unasserted here",
+                );
+                return;
+            };
+            let owned = src.join("owned");
+            std::fs::write(&owned, b"o").unwrap();
+            chgrp(&owned, gid).unwrap();
+            assert_eq!(
+                std::fs::symlink_metadata(&owned).unwrap().gid(),
+                gid,
+                "premise: the source group differs from the copier's effective gid"
+            );
+            let t = LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty())
+                .unwrap();
+            t.copy_tree(&rooted("src"), &rooted("owned-dest")).unwrap();
+            let dst = base.join("owned-dest/owned");
+            let egid = unsafe { libc::getegid() };
+            assert_eq!(
+                std::fs::symlink_metadata(&dst).unwrap().gid(),
+                egid,
+                "CHARACTERIZATION of a DOCUMENTED LIMITATION: the default walk must NOT carry \
+                 ownership — the destination entry is owned by the transferring account"
+            );
+        }
+
+        /// CHARACTERIZATION (divergence): the `cp -a` override documents the
+        /// OPPOSITE of the default walk for xattrs and reproduces the source
+        /// gid when the caller may set it. Cannot fail pre-fix.
+        #[test]
+        fn copy_tree_ssh_cp_a_preserves_xattrs_and_gid() {
+            let h = SshHarness::new();
+            let src = h.root.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let file = src.join("f");
+            std::fs::write(&file, b"payload").unwrap();
+
+            let Some(gid) = supplementary_gid() else {
+                crate::test_support::announce_skip(
+                    "the current user has no supplementary group different from its effective \
+                     gid, so the `cp -a` gid-reproduction half cannot be asserted here",
+                );
+                return;
+            };
+            chgrp(&file, gid).unwrap();
+            let xattr = xattrs_available(&src);
+            if xattr {
+                set_xattr(&file, "user.store_sync.fidelity", b"present").unwrap();
+            }
+
+            let t = h.transport();
+            t.copy_tree(&rooted("src"), &rooted("dest")).unwrap();
+            let dst = h.root.join("dest/f");
+
+            if xattr {
+                assert!(
+                    has_xattr(&dst, "user.store_sync.fidelity"),
+                    "CHARACTERIZATION of the DOCUMENTED DIVERGENCE: the SshTransport `cp -a` \
+                     override preserves xattrs (unlike the default walk), but it dropped \
+                     user.store_sync.fidelity"
+                );
+            }
+            assert_eq!(
+                std::fs::symlink_metadata(&dst).unwrap().gid(),
+                gid,
+                "CHARACTERIZATION of the DOCUMENTED DIVERGENCE: `cp -a` reproduces the source \
+                 gid when the copier may set it (the default walk does not)"
+            );
+        }
     }
 }

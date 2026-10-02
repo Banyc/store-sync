@@ -1803,11 +1803,32 @@ impl Remote for SshTransport {
         }
         let s = self.root.join(src).to_string_lossy().into_owned();
         let d = self.root.join(dest).to_string_lossy().into_owned();
-        // Same-filesystem `cp -a` on the remote: no bytes cross the link, and
-        // `-a` preserves modes, ownership, timestamps, and symlinks (GNU and
-        // BSD cp both handle read-only source dirs by creating the dest dirs
-        // writable and chmodding them at the end). The destination must not
-        // already exist (the caller removes a stale staging dir first).
+        // Same-filesystem `cp -a` on the remote: no bytes cross the link.
+        // `-a` preserves modes (including the setuid/setgid/sticky bits),
+        // symlink targets, and timestamps, and on both GNU and current
+        // macOS/BSD userlands it also preserves extended attributes and
+        // POSIX ACLs (GNU `-a` is `-dR --preserve=all`; BSD/macOS `-a` is
+        // `-R -P -p`). Both userlands copy a read-only source directory by
+        // creating the destination directory writable and chmodding it at
+        // the end.
+        //
+        // It does NOT preserve OWNERSHIP for a NON-ROOT caller. `cp -a`
+        // tries to reproduce the source uid/gid, but a non-root caller may
+        // only set ownership within its own permissions: the uid becomes the
+        // COPIER's (a chown to a different uid fails, and `cp` IGNORES the
+        // failure and still exits 0), and the gid is reproduced only when the
+        // copier is a member of that group — otherwise it too becomes the
+        // copier's. The loss is silent. A caller that needs the source owner
+        // reproduced must run the copy privileged, or apply `chown` out of
+        // band.
+        //
+        // Relative to the DEFAULT walk, this override is therefore HIGHER
+        // fidelity: xattrs, ACLs, and timestamps survive here but not in the
+        // walk, while ownership is the copier's in both (the walk sets both
+        // uid and gid to the copier's; `cp -a` always sets the uid and the
+        // gid when it cannot reproduce it). See the crate's fidelity scope in
+        // `crate::manifest`. The destination must not already exist (the
+        // caller removes a stale staging dir first).
         self.run_remote_ok(&Self::argv_cmd(&["cp".into(), "-a".into(), s, d]))
     }
 

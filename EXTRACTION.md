@@ -70,6 +70,32 @@ cargo test
   plus `atomic`'s `_fd` family once slice-atomic has landed. This is a
   required follow-up, not an accepted loss.
 
+## Fidelity scope
+
+The crate's authoritative statement of what a sync carries lives in the
+`manifest` module documentation (`src/manifest/mod.rs`, the "Fidelity scope"
+section). It is reflected here so a slice author cannot silently widen or
+narrow it:
+
+* CARRIED: path name, kind, mode **including the setuid/setgid/sticky
+  bits**, content, symlink target.
+* NOT CARRIED (silent, invisible to the differ): ownership, extended
+  attributes (`user.*`, `security.*` including `security.capability`, macOS
+  `com.apple.*`), POSIX access/default ACLs, timestamps, file flags,
+  sparseness.
+* REFUSED, not dropped: hard links — both canonicalizers reject `nlink > 1`.
+* Push/pull asymmetry: a push overwrites in place (`cat >` / `O_TRUNC`), so a
+  destination file's pre-existing xattrs and owner survive; a pull publishes
+  by atomic rename (a new inode), destroying them.
+* `Remote::copy_tree` has TWO implementations with different fidelity: the
+  default list/read/write walk drops xattrs, ACLs, and timestamps; the
+  `SshTransport` `cp -a` override preserves all three (and keeps ownership
+  as the copier's for a non-root far-side user, silently).
+
+These are pinned by characterization and behaviour tests in
+`src/transport/mod.rs` (`fidelity scope pins`); a change to any pinned
+behaviour is a deliberate, test-visible act.
+
 ## Slices
 
 ### slice-core — `src/digest.rs`, `src/platform.rs`, `src/trace.rs`, `src/id.rs`
