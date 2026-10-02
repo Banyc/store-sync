@@ -271,28 +271,52 @@ pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
 /// descriptor).
 #[cfg(test)]
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
-    {
-        let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
-        let path = entry.path();
-        let ft = entry
-            .file_type()
-            .map_err(|e| Error::store(format!("file_type: {e}")))?;
-        let target = dst.join(entry.file_name());
-        if ft.is_dir() {
-            copy_dir_recursive(&path, &target)?;
-        } else if ft.is_symlink() {
-            let link = std::fs::read_link(&path)
-                .map_err(|e| Error::store(format!("readlink {}: {e}", path.display())))?;
-            let _ = std::fs::remove_file(&target);
-            std::os::unix::fs::symlink(&link, &target)
-                .map_err(|e| Error::store(format!("symlink {}: {e}", target.display())))?;
-        } else {
-            std::fs::copy(&path, &target)
-                .map_err(|e| Error::store(format!("copy {}: {e}", path.display())))?;
+    // Same explicit-stack shape as [`copy_dir_recursive_fd`]: a path-based
+    // walk must not recurse per level either (a deep test-only store clone
+    // would otherwise abort the test process). A directory's non-directory
+    // entries are copied immediately and its subdirectories are queued, so
+    // the heap `Vec` — not the C stack — holds the frontier.
+    struct Job {
+        src: PathBuf,
+        dst: PathBuf,
+    }
+
+    let mut stack: Vec<Job> = vec![Job {
+        src: src.to_path_buf(),
+        dst: dst.to_path_buf(),
+    }];
+    while let Some(job) = stack.pop() {
+        std::fs::create_dir_all(&job.dst)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", job.dst.display())))?;
+        let mut subdirs: Vec<Job> = Vec::new();
+        for entry in std::fs::read_dir(&job.src)
+            .map_err(|e| Error::store(format!("read_dir {}: {e}", job.src.display())))?
+        {
+            let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| Error::store(format!("file_type: {e}")))?;
+            let target = job.dst.join(entry.file_name());
+            if ft.is_dir() {
+                subdirs.push(Job {
+                    src: path,
+                    dst: target,
+                });
+            } else if ft.is_symlink() {
+                let link = std::fs::read_link(&path)
+                    .map_err(|e| Error::store(format!("readlink {}: {e}", path.display())))?;
+                let _ = std::fs::remove_file(&target);
+                std::os::unix::fs::symlink(&link, &target)
+                    .map_err(|e| Error::store(format!("symlink {}: {e}", target.display())))?;
+            } else {
+                std::fs::copy(&path, &target)
+                    .map_err(|e| Error::store(format!("copy {}: {e}", path.display())))?;
+            }
+        }
+        // Push in reverse so subdirectories are visited in `readdir` order.
+        while let Some(job) = subdirs.pop() {
+            stack.push(job);
         }
     }
     Ok(())
@@ -560,6 +584,85 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
     }
     unsafe { libc::closedir(dir) };
     Ok(())
+}
+
+/// Read every entry name of the directory `dir_fd` (excluding `.`/`..`) into
+/// an owned `Vec`, in `readdir` order. The tree walks below used to descend
+/// from inside [`for_each_dir_entry`]'s callback, holding a live `DIR*`
+/// across a recursive call; collecting the names first preserves the order
+/// but lets the walk own its iteration explicitly, on the heap.
+fn dir_entry_names(dir_fd: &OwnedFd) -> Result<Vec<Vec<u8>>> {
+    let mut names = Vec::new();
+    for_each_dir_entry(dir_fd, |name| {
+        names.push(name.to_vec());
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` on `name` relative to `dir_fd`, returning
+/// the raw `st_mode` (file-type bits included): the entry itself is
+/// classified, never a symlink target. The raw `io::Result` lets each walk
+/// attach its own path context to the error.
+fn fstatat_mode_io(dir_fd: &OwnedFd, name: &[u8]) -> std::io::Result<libc::mode_t> {
+    let c = CString::new(name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component with NUL")
+    })?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st.st_mode)
+}
+
+/// Normalize a `mode_t` to the `u32` the mode-taking primitives expect.
+/// `mode_t` is 16-bit on some Unixes (macOS) and 32-bit on others (Linux),
+/// so the widening cast is necessary on the former and lint-spurious on the
+/// latter; the local `allow` keeps `-D warnings` clean on both.
+fn mode_u32(mode: libc::mode_t) -> u32 {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        mode as u32
+    }
+}
+
+/// `readlinkat` on `name` relative to `dir_fd` (a symlink's target is read
+/// as the entry itself, never followed), growing the buffer until the target
+/// fits. Used by the fd-relative copy walk: reading the source through an
+/// open descriptor keeps a source tree deeper than `PATH_MAX` addressable.
+fn readlinkat_fd(dir_fd: &OwnedFd, name: &[u8]) -> std::io::Result<PathBuf> {
+    let c = CString::new(name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component with NUL")
+    })?;
+    let mut cap = 256usize;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let n = unsafe {
+            libc::readlinkat(
+                dir_fd.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                cap,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n < cap {
+            buf.truncate(n);
+            return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
+        }
+        cap = cap.saturating_mul(2);
+    }
 }
 
 /// Best-effort unlink of a FAILED descriptor-relative atomic replace's temp
@@ -980,118 +1083,281 @@ pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the CONTENTS of the directory `dir_fd` (recursively), leaving the
-/// directory itself in place.
+/// Remove the CONTENTS of the directory `dir_fd`, leaving the directory
+/// itself in place.
+///
+/// The walk is a POST-ORDER over an explicit heap `Vec` of open directory
+/// frames instead of one recursive call per level. The recursive form used
+/// one C stack frame per directory level, so a tree deeper than the stack
+/// overflowed it and Rust's stack-overflow handler ABORTED the whole host
+/// process — never an acceptable outcome for a library call. Each frame
+/// holds the directory's descriptor and the entry names read from it (in
+/// `readdir` order); a subdirectory's frame is pushed when its entry is
+/// reached and popped — its entry removed from its parent — only after the
+/// subdirectory's own contents are gone, which is exactly the recursion's
+/// deepest-first order.
 fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
-    for_each_dir_entry(dir_fd, |name| {
-        let child_rel = rel.join(Path::new(std::ffi::OsStr::from_bytes(name)));
-        let c = CString::new(name).map_err(|_| Error::store("path component with NUL"))?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::fstatat(
-                dir_fd.as_raw_fd(),
-                c.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if r < 0 {
-            return Err(Error::store(format!(
-                "fstatat {}: {}",
-                child_rel.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
-            let sub = openat_no_follow(
-                dir_fd,
-                Path::new(std::ffi::OsStr::from_bytes(name)),
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-            )?;
-            remove_dir_contents_fd(&sub, &child_rel)?;
-            let r = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+    struct Frame {
+        fd: OwnedFd,
+        rel: PathBuf,
+        names: std::vec::IntoIter<Vec<u8>>,
+    }
+
+    let root_frame = Frame {
+        fd: dir_fd
+            .try_clone()
+            .map_err(|e| Error::store(format!("dup dir: {e}")))?,
+        rel: rel.to_path_buf(),
+        names: dir_entry_names(dir_fd)?.into_iter(),
+    };
+    let mut stack: Vec<Frame> = vec![root_frame];
+
+    while let Some(top) = stack.last_mut() {
+        let next = top.names.next();
+        let Some(name) = next else {
+            // This directory's contents are gone: pop it and, unless it is
+            // the walk root (whose caller removes it), remove its entry from
+            // the parent, now the top frame.
+            let done = stack.pop().expect("the frame just examined");
+            let Some(parent) = stack.last() else {
+                break;
+            };
+            let file_name = match done.rel.file_name() {
+                Some(n) => n.to_os_string(),
+                None => {
+                    return Err(Error::store(format!(
+                        "{} has no file name",
+                        done.rel.display()
+                    )));
+                }
+            };
+            let c = CString::new(file_name.as_bytes())
+                .map_err(|_| Error::store("rmdir name with NUL"))?;
+            let r =
+                unsafe { libc::unlinkat(parent.fd.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
             if r < 0 {
                 return Err(Error::store(format!(
                     "rmdir {}: {}",
-                    child_rel.display(),
+                    done.rel.display(),
                     std::io::Error::last_os_error()
                 )));
             }
-        } else {
-            // A file or symlink: unlinkat removes the entry itself (a
-            // symlink is removed, never its target).
-            unlinkat_fd(dir_fd, std::ffi::OsStr::from_bytes(name))?;
+            continue;
+        };
+
+        let child_name = std::ffi::OsStr::from_bytes(&name);
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
+            let child_rel = top.rel.join(Path::new(child_name));
+            let mode = fstatat_mode_io(&top.fd, &name)
+                .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
+            if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                let sub = openat_no_follow(
+                    &top.fd,
+                    Path::new(child_name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?;
+                let names = dir_entry_names(&sub)?;
+                Some(Frame {
+                    fd: sub,
+                    rel: child_rel,
+                    names: names.into_iter(),
+                })
+            } else {
+                // A file or symlink: unlinkat removes the entry itself (a
+                // symlink is removed, never its target).
+                unlinkat_fd(&top.fd, child_name)?;
+                None
+            }
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
-/// The descriptor-relative recursive tree copy: the DESTINATION resolves
-/// component-wise relative to `root` with O_NOFOLLOW (a symlink injected
-/// into a destination component is refused); the SOURCE is read from its
-/// absolute path (a read, never a mutation). Directory and file modes are
-/// copied EXACTLY from the source (the tree digest includes modes — a
-/// mode-shifted copy would fail the staged-object verification).
+/// The iterative, descriptor-relative removal of a directory NAME (a PATH,
+/// not a root-relative spelling). The transport removes a directory that is
+/// not necessarily under a descriptor it already holds; its previous
+/// delegation, `std::fs::remove_dir_all`, recurses one Rust frame per
+/// directory level, so a deep tree there could also exhaust the C stack and
+/// abort the host. This walk reuses [`remove_dir_contents_fd`]'s explicit
+/// heap frame stack and is bounded by the descriptor limit — a clean `Err`
+/// (or success), never an abort. Semantics follow the Unix
+/// `std::fs::remove_dir_all` the transport relied on: a MISSING `path` is a
+/// successful no-op (idempotent removal), and a symlink at `path` is
+/// unlinked as the entry itself, never followed.
+pub fn remove_dir_all_path(path: &Path) -> Result<()> {
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::store(format!("lstat {}: {e}", path.display()))),
+    };
+    if md.file_type().is_symlink() {
+        return std::fs::remove_file(path)
+            .map_err(|e| Error::store(format!("remove {}: {e}", path.display())));
+    }
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::store("remove_dir_all path with NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::store(format!(
+            "open dir {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    remove_dir_contents_fd(&dir_fd, path)?;
+    let r = unsafe { libc::rmdir(c.as_ptr()) };
+    if r < 0 {
+        return Err(Error::store(format!(
+            "rmdir {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// The descriptor-relative iterative tree copy. The DESTINATION resolves
+/// component-wise relative to `root` with `O_NOFOLLOW` (a symlink injected
+/// into a destination component is refused); below the root each level is
+/// created and entered relative to its PARENT's descriptor, so the walk
+/// costs one `openat` per level instead of re-resolving the whole path from
+/// the root. The SOURCE ROOT is opened once (that single open follows a
+/// symlink exactly as `std::fs::read_dir(src)` did); every entry below it is
+/// classified with `fstatat`/`readlinkat`/`openat` relative to the source
+/// descriptor, so an entry is never followed AND the SOURCE PATH'S LENGTH no
+/// longer bounds the walk. Directory and file modes are copied EXACTLY from
+/// the source (the tree digest includes modes — a mode-shifted copy would
+/// fail the staged-object verification).
+///
+/// The traversal uses an explicit heap `Vec` of frames instead of the call
+/// stack: a tree deeper than the C stack must fail cleanly (or succeed),
+/// never overflow the stack and ABORT the host process.
 pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
-    // Create the destination directory with the SOURCE directory's mode
-    // (the digest includes modes; the copy must preserve them exactly).
-    let src_mode = std::fs::metadata(src)
+    struct Frame {
+        src_fd: OwnedFd,
+        dst_fd: OwnedFd,
+        rel: PathBuf,
+        names: std::vec::IntoIter<Vec<u8>>,
+    }
+
+    let src_file = std::fs::File::open(src)
+        .map_err(|e| Error::store(format!("open source {}: {e}", src.display())))?;
+    // Create the destination directory with the SOURCE directory's mode (the
+    // digest includes modes; the copy must preserve them exactly).
+    let src_mode = src_file
+        .metadata()
         .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?
         .permissions()
         .mode();
+    let src_fd: OwnedFd = src_file.into();
     create_dir_chain_fd(root.as_fd(), dst_rel, src_mode)?;
     let dst_fd = openat_no_follow(root.as_fd(), dst_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
-    {
-        let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
-        let name = entry.file_name();
-        let ft = entry
-            .file_type()
-            .map_err(|e| Error::store(format!("file_type: {e}")))?;
-        let child_rel = dst_rel.join(&name);
-        if ft.is_dir() {
-            copy_dir_recursive_fd(root, &entry.path(), &child_rel)?;
-        } else if ft.is_symlink() {
-            let link = std::fs::read_link(entry.path())
-                .map_err(|e| Error::store(format!("readlink {}: {e}", entry.path().display())))?;
-            // Remove any existing entry at the target (the original removes
-            // the target before symlinking), then symlinkat.
-            let _ = unlinkat_fd(&dst_fd, &name);
-            let name_c =
-                CString::new(name.as_bytes()).map_err(|_| Error::store("symlink name with NUL"))?;
-            let target_c = CString::new(link.as_os_str().as_bytes())
-                .map_err(|_| Error::store("symlink target with NUL"))?;
-            let r =
-                unsafe { libc::symlinkat(target_c.as_ptr(), dst_fd.as_raw_fd(), name_c.as_ptr()) };
-            if r < 0 {
-                return Err(Error::store(format!(
-                    "symlinkat {}: {}",
-                    child_rel.display(),
-                    std::io::Error::last_os_error()
-                )));
+    let names = dir_entry_names(&src_fd)?;
+    let mut stack: Vec<Frame> = vec![Frame {
+        src_fd,
+        dst_fd,
+        rel: dst_rel.to_path_buf(),
+        names: names.into_iter(),
+    }];
+
+    while let Some(top) = stack.last_mut() {
+        let next = top.names.next();
+        let Some(name) = next else {
+            stack.pop();
+            continue;
+        };
+        let child_name = std::ffi::OsStr::from_bytes(&name);
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
+            let child_rel = top.rel.join(Path::new(child_name));
+            let mode = fstatat_mode_io(&top.src_fd, &name)
+                .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
+            if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                let child_src_fd = openat_no_follow_io(
+                    &top.src_fd,
+                    Path::new(child_name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )
+                .map_err(|e| Error::store(format!("openat {}: {e}", child_rel.display())))?;
+                // Create the destination child relative to the PARENT
+                // descriptor (the component-wise O_NOFOLLOW discipline is
+                // preserved), then open it the same way.
+                create_dir_chain_fd(&top.dst_fd, Path::new(child_name), mode_u32(mode))?;
+                let child_dst_fd = openat_no_follow_io(
+                    &top.dst_fd,
+                    Path::new(child_name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )
+                .map_err(|e| Error::store(format!("openat {}: {e}", child_rel.display())))?;
+                let names = dir_entry_names(&child_src_fd)?;
+                Some(Frame {
+                    src_fd: child_src_fd,
+                    dst_fd: child_dst_fd,
+                    rel: child_rel,
+                    names: names.into_iter(),
+                })
+            } else if (mode & libc::S_IFMT) == libc::S_IFLNK {
+                let link = readlinkat_fd(&top.src_fd, &name)
+                    .map_err(|e| Error::store(format!("readlink {}: {e}", child_rel.display())))?;
+                // Remove any existing entry at the target (the original
+                // removes the target before symlinking), then symlinkat.
+                let _ = unlinkat_fd(&top.dst_fd, child_name);
+                let name_c = CString::new(name.clone())
+                    .map_err(|_| Error::store("symlink name with NUL"))?;
+                let target_c = CString::new(link.as_os_str().as_bytes())
+                    .map_err(|_| Error::store("symlink target with NUL"))?;
+                let r = unsafe {
+                    libc::symlinkat(target_c.as_ptr(), top.dst_fd.as_raw_fd(), name_c.as_ptr())
+                };
+                if r < 0 {
+                    return Err(Error::store(format!(
+                        "symlinkat {}: {}",
+                        child_rel.display(),
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                None
+            } else {
+                let src_f = std::fs::File::from(
+                    openat_no_follow_io(
+                        &top.src_fd,
+                        Path::new(child_name),
+                        libc::O_RDONLY | libc::O_NOFOLLOW,
+                        0,
+                    )
+                    .map_err(|e| Error::store(format!("open {}: {e}", child_rel.display())))?,
+                );
+                let dst_f = openat_no_follow_io(
+                    &top.dst_fd,
+                    Path::new(child_name),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    mode_u32(mode),
+                )
+                .map_err(|e| Error::store(format!("openat {}: {e}", child_rel.display())))?;
+                let mut dst_f = std::fs::File::from(dst_f);
+                std::io::copy(&mut &src_f, &mut dst_f)
+                    .map_err(|e| Error::store(format!("copy {}: {e}", child_rel.display())))?;
+                dst_f
+                    .set_permissions(std::fs::Permissions::from_mode(mode_u32(mode)))
+                    .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
+                None
             }
-        } else {
-            let src_f = std::fs::File::open(entry.path())
-                .map_err(|e| Error::store(format!("open {}: {e}", entry.path().display())))?;
-            let mode = src_f
-                .metadata()
-                .map_err(|e| Error::store(format!("fstat {}: {e}", entry.path().display())))?
-                .permissions()
-                .mode();
-            let dst_f = openat_no_follow(
-                &dst_fd,
-                Path::new(&name),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                mode,
-            )?;
-            let mut dst_f = std::fs::File::from(dst_f);
-            std::io::copy(&mut &src_f, &mut dst_f)
-                .map_err(|e| Error::store(format!("copy {}: {e}", entry.path().display())))?;
-            dst_f
-                .set_permissions(std::fs::Permissions::from_mode(mode))
-                .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
         }
     }
     Ok(())
@@ -1130,43 +1396,71 @@ fn create_dir_chain_fd(root: &OwnedFd, rel: &Path, mode: u32) -> Result<()> {
 /// never followed. Symlinks are SKIPPED (their durability is their
 /// directory entry, covered by the parent-dir fsync).
 pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    struct Frame {
+        fd: OwnedFd,
+        rel: PathBuf,
+        names: std::vec::IntoIter<Vec<u8>>,
+    }
+
     let dir_fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    for_each_dir_entry(&dir_fd, |name| {
-        let child_rel = rel.join(Path::new(std::ffi::OsStr::from_bytes(name)));
-        let c = CString::new(name).map_err(|_| Error::store("path component with NUL"))?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::fstatat(
-                dir_fd.as_raw_fd(),
-                c.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
+    let names = dir_entry_names(&dir_fd)?;
+    let mut stack: Vec<Frame> = vec![Frame {
+        fd: dir_fd,
+        rel: rel.to_path_buf(),
+        names: names.into_iter(),
+    }];
+
+    while let Some(top) = stack.last_mut() {
+        let next = top.names.next();
+        let Some(name) = next else {
+            // Deepest-first: every child has been fsynced before its parent's
+            // own directory descriptor, exactly as the recursion fsynced on
+            // unwind.
+            let done = stack.pop().expect("the frame just examined");
+            fsync_dir_fd(&done.fd)?;
+            continue;
         };
-        if r < 0 {
-            return Err(Error::store(format!(
-                "fstatat {}: {}",
-                child_rel.display(),
-                std::io::Error::last_os_error()
-            )));
+
+        let child_name = std::ffi::OsStr::from_bytes(&name);
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
+            let child_rel = top.rel.join(Path::new(child_name));
+            let mode = fstatat_mode_io(&top.fd, &name)
+                .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
+            if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                let sub = openat_no_follow(
+                    &top.fd,
+                    Path::new(child_name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?;
+                let names = dir_entry_names(&sub)?;
+                Some(Frame {
+                    fd: sub,
+                    rel: child_rel,
+                    names: names.into_iter(),
+                })
+            } else if (mode & libc::S_IFMT) == libc::S_IFREG {
+                let f = std::fs::File::from(openat_no_follow(
+                    &top.fd,
+                    Path::new(child_name),
+                    libc::O_RDONLY | libc::O_NOFOLLOW,
+                    0,
+                )?);
+                f.sync_all()
+                    .map_err(|e| Error::store(format!("fsync {}: {e}", child_rel.display())))?;
+                None
+            } else {
+                // Symlinks and other entries are SKIPPED (their durability is
+                // their directory entry, covered by the parent-dir fsync).
+                None
+            }
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
         }
-        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
-            fsync_tree_recursive_fd(root, &child_rel)?;
-        } else if (st.st_mode & libc::S_IFMT) == libc::S_IFREG {
-            let f = std::fs::File::from(openat_no_follow(
-                &dir_fd,
-                Path::new(std::ffi::OsStr::from_bytes(name)),
-                libc::O_RDONLY | libc::O_NOFOLLOW,
-                0,
-            )?);
-            f.sync_all()
-                .map_err(|e| Error::store(format!("fsync {}: {e}", child_rel.display())))?;
-        }
-        // Symlinks and other entries are SKIPPED (their durability is their
-        // directory entry, covered by the parent-dir fsync).
-        Ok(())
-    })?;
-    fsync_dir_fd(&dir_fd)
+    }
+    Ok(())
 }
 
 /// The descriptor-relative plain file write (create-or-truncate, 0o600):

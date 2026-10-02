@@ -41,4 +41,7 @@ pub mod transport;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[cfg(all(test, unix))]
+mod deep_tree_regression;
+
 pub use error::{Error, Result};

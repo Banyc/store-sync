@@ -375,7 +375,7 @@ pub trait Remote {
         }
         // (dest, final_mode, depth) collected during the walk for phase 2.
         let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
-        copy_tree_recursive(self, src, dest, 0, &mut dirs)?;
+        copy_tree_walk(self, src, dest, &mut dirs)?;
         dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
         for (d, mode, _depth) in dirs {
             self.set_mode(&d, mode)?;
@@ -504,32 +504,74 @@ fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
     root.join(rel.as_path())
 }
 
-/// The naive recursive half of [`Remote::copy_tree`]'s default: walk `src`
-/// with [`Remote::list`], recreating every entry at `dest` (directories
+/// The iterative half of [`Remote::copy_tree`]'s default: walk `src` with
+/// [`Remote::list`], recreating every entry at `dest` (directories
 /// owner-writable during the walk, files/symlinks with their final modes),
 /// collecting `(dest, final_mode, depth)` for the caller's phase-2 finalize.
-fn copy_tree_recursive<R: Remote + ?Sized>(
+///
+/// The walk keeps an explicit heap `Vec` of frames instead of recursing one
+/// Rust frame per directory level: a deep tree used to exhaust the C stack,
+/// and Rust's stack-overflow handler ABORTS the host process — a library
+/// must surface a clean `Err` instead. Each frame holds the directory's
+/// `(src, dest, depth)` and the entries [`Remote::list`] returned, so the
+/// visit order is exactly the recursion's depth-first order.
+fn copy_tree_walk<R: Remote + ?Sized>(
     remote: &R,
     src: &RootedRelativePath,
     dest: &RootedRelativePath,
-    depth: usize,
     dirs: &mut Vec<(RootedRelativePath, u32, usize)>,
 ) -> Result<()> {
+    struct Frame {
+        src: RootedRelativePath,
+        dest: RootedRelativePath,
+        depth: usize,
+        entries: std::vec::IntoIter<RemoteEntry>,
+    }
+
     remote.create_dir_all(dest)?;
-    for e in remote.list(src)? {
-        let s = src.join(&e.name)?;
-        let d = dest.join(&e.name)?;
-        if e.is_dir {
-            remote.create_dir_all(&d)?;
-            remote.set_mode(&d, (e.mode | 0o200) & 0o7777)?;
-            dirs.push((d.clone(), e.mode & 0o7777, depth));
-            copy_tree_recursive(remote, &s, &d, depth + 1, dirs)?;
-        } else if e.is_symlink {
-            let target = remote.read_link(&s)?;
-            remote.symlink(&target, &d)?;
-        } else {
-            let data = remote.read(&s)?;
-            remote.write(&d, &data, e.mode & 0o7777)?;
+    let mut stack: Vec<Frame> = vec![Frame {
+        src: src.clone(),
+        dest: dest.clone(),
+        depth: 0,
+        entries: remote.list(src)?.into_iter(),
+    }];
+    while let Some(top) = stack.last_mut() {
+        let next = top.entries.next();
+        let Some(e) = next else {
+            stack.pop();
+            continue;
+        };
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
+            let s = top.src.join(&e.name)?;
+            let d = top.dest.join(&e.name)?;
+            if e.is_dir {
+                remote.create_dir_all(&d)?;
+                remote.set_mode(&d, (e.mode | 0o200) & 0o7777)?;
+                dirs.push((d.clone(), e.mode & 0o7777, top.depth));
+                // The recursion created the child directory a second time
+                // when it entered it; keep that prologue and the listing in
+                // the same order.
+                remote.create_dir_all(&d)?;
+                let entries = remote.list(&s)?;
+                Some(Frame {
+                    src: s,
+                    dest: d,
+                    depth: top.depth + 1,
+                    entries: entries.into_iter(),
+                })
+            } else if e.is_symlink {
+                let target = remote.read_link(&s)?;
+                remote.symlink(&target, &d)?;
+                None
+            } else {
+                let data = remote.read(&s)?;
+                remote.write(&d, &data, e.mode & 0o7777)?;
+                None
+            }
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
         }
     }
     Ok(())
@@ -1798,15 +1840,29 @@ impl Remote for LocalTransport {
 
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = join(&self.base, rel);
-        std::fs::remove_dir_all(&p)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+        #[cfg(unix)]
+        {
+            // Iterative and descriptor-relative: `std::fs::remove_dir_all`
+            // recurses one Rust frame per directory level, so a deep tree
+            // could exhaust the C stack and ABORT the host process. The walk
+            // surfaces a clean `Err` (or succeeds), never an abort, and
+            // keeps the component-wise O_NOFOLLOW discipline. A missing
+            // `p` is the old idempotent no-op.
+            crate::atomic::remove_dir_all_path(&p)
+                .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_dir_all(&p)
+                .or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+        }
     }
 
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
