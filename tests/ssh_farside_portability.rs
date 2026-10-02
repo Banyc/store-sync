@@ -67,12 +67,50 @@ pub const FSYNC_FILE_TOKEN: &str = "STORE_SYNC_TEST_FSYNC_FILE";
 /// The directory-fsync counterpart of [`FSYNC_FILE_TOKEN`].
 pub const FSYNC_DIR_TOKEN: &str = "STORE_SYNC_TEST_FSYNC_DIR";
 
+/// Install `body` as an executable at `path` by writing it from a SHORT-LIVED
+/// HELPER PROCESS, never from the test process itself.
+///
+/// Why this is not a direct `std::fs::write`: libtest runs the tests of one
+/// binary on many threads of ONE process, and every `std::process::Command`
+/// spawn forks a child that COPIES the caller's descriptor table. A direct
+/// `write` opens `path` for writing, so a sibling test's concurrent fork
+/// inherits that write fd; a FAILED `execve` does not close `O_CLOEXEC`
+/// descriptors (a `PATH` search issues several), so the inherited fd can
+/// outlive this test's own write. The kernel then refuses to run `path` with
+/// `ETXTBSY` ("Text file busy") because the inode's `i_writecount` is still
+/// positive, even though this test closed its own fd.
+///
+/// Writing from a helper keeps the executable's write fd out of the test
+/// process's descriptor table entirely, so no sibling fork can ever inherit
+/// it; the helper also stages the bytes under a private name and renames them
+/// into place, so `path` never exists half-written.
+fn write_executable(path: &Path, body: &[u8]) {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().expect("executable path has a parent"))
+        .expect("create the executable's directory");
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1.tmp.$$\" && chmod 755 \"$1.tmp.$$\" && mv -f \"$1.tmp.$$\" \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the executable-writing helper");
+    child
+        .stdin
+        .take()
+        .expect("the helper's piped stdin")
+        .write_all(body)
+        .expect("write the executable body to the helper");
+    let status = child
+        .wait()
+        .expect("wait for the executable-writing helper");
+    assert!(status.success(), "installing {path:?} failed: {status:?}");
+}
+
 fn install_shim_ssh(bin: &Path) {
     std::fs::create_dir_all(bin).expect("create shim bin dir");
-    let shim = bin.join("ssh");
-    std::fs::write(&shim, SHIM_SCRIPT).expect("write shim ssh");
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the shim executable");
+    write_executable(&bin.join("ssh"), SHIM_SCRIPT.as_bytes());
 }
 
 /// Install a far-side `perl` on `bin` that (a) records the path operand of any
@@ -101,10 +139,7 @@ exec {perl} \"$@\"\n",
         fault_file = if fault_file { 1 } else { 0 },
         perl = shell_quote(&real_perl.to_string_lossy()),
     );
-    let p = bin.join("perl");
-    std::fs::write(&p, script).expect("write the fake perl probe");
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the fake perl probe");
+    write_executable(&bin.join("perl"), script.as_bytes());
 }
 
 fn which_perl() -> PathBuf {

@@ -3802,11 +3802,9 @@ mod tests_ssh {
     /// Install a fake `perl` on `bin` that faults on `needle` (see
     /// [`fake_perl_body`]).
     fn install_fake_perl(bin: &Path, needle: &str, code: i32) {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(bin).unwrap();
         let p = bin.join("perl");
-        std::fs::write(&p, fake_perl_body(needle, code)).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&p, fake_perl_body(needle, code).as_bytes());
     }
 
     // The old temp name derived from the LOCAL pid + a per-process counter, so
@@ -4262,9 +4260,7 @@ mod tests_ssh {
                 }
             };
             let p = fakebin.join(name);
-            std::fs::write(&p, body).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&p, body.as_bytes());
 
             let out = run_sh_stdin(
                 &format!(

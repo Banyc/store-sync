@@ -23,6 +23,46 @@ pub(crate) fn fixture_tmpdir(env: &SysEnv) -> std::io::Result<tempfile::TempDir>
     tempfile::Builder::new().tempdir_in(env.temp_dir())
 }
 
+/// Install `body` as an executable at `path` by writing it from a SHORT-LIVED
+/// HELPER PROCESS, never from the test process itself.
+///
+/// libtest runs a binary's tests on many threads of ONE process, and every
+/// `std::process::Command` spawn forks a child that COPIES the caller's
+/// descriptor table. A direct `std::fs::write` opens `path` for writing, so a
+/// sibling test's concurrent fork inherits that write fd; a FAILED `execve`
+/// does not close `O_CLOEXEC` descriptors (a `PATH` search issues several), so
+/// the inherited fd can outlive this test's own write, and a later `execve` of
+/// `path` fails with `ETXTBSY` ("Text file busy") because the inode's
+/// `i_writecount` is still positive.
+///
+/// Writing from a helper keeps the executable's write fd out of the test
+/// process's descriptor table entirely, so no sibling fork can inherit it; the
+/// helper stages the bytes under a private name and renames them into place so
+/// `path` is never observed half-written.
+pub(crate) fn write_executable(path: &std::path::Path, body: &[u8]) {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().expect("executable path has a parent"))
+        .expect("create the executable's directory");
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1.tmp.$$\" && chmod 755 \"$1.tmp.$$\" && mv -f \"$1.tmp.$$\" \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the executable-writing helper");
+    child
+        .stdin
+        .take()
+        .expect("the helper's piped stdin")
+        .write_all(body)
+        .expect("write the executable body to the helper");
+    let status = child
+        .wait()
+        .expect("wait for the executable-writing helper");
+    assert!(status.success(), "installing {path:?} failed: {status:?}");
+}
+
 /// Announce a SKIPPED test on the REAL console of a PLAIN `cargo test` run.
 ///
 /// libtest CAPTURES `print!`/`eprintln!` per test and DISCARDS the captured

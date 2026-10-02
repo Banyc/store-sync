@@ -40,7 +40,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -65,22 +65,51 @@ cd "$work" || exit 125
 exec /bin/sh -c "$last"
 "#;
 
+/// Install `body` as an executable at `path` by writing it from a SHORT-LIVED
+/// HELPER PROCESS, never from the test process itself.
+///
+/// A direct `std::fs::write` runs in the test process, and libtest runs this
+/// binary's tests on many threads of ONE process: every `std::process::Command`
+/// spawn forks a child that copies the caller's descriptor table, so a sibling
+/// test's fork can inherit the shim's still-open write fd. A failed `execve`
+/// does not close `O_CLOEXEC` descriptors, so the inherited fd can outlive this
+/// test's own write and make a later `execve` of the shim fail with `ETXTBSY`.
+/// Writing from a helper keeps that fd out of the test process entirely, and
+/// the helper renames the staged bytes into place so `path` is never
+/// half-written.
+fn write_executable(path: &Path, body: &[u8]) {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().expect("executable path has a parent"))
+        .expect("create the executable's directory");
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1.tmp.$$\" && chmod 755 \"$1.tmp.$$\" && mv -f \"$1.tmp.$$\" \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the executable-writing helper");
+    child
+        .stdin
+        .take()
+        .expect("the helper's piped stdin")
+        .write_all(body)
+        .expect("write the executable body to the helper");
+    let status = child
+        .wait()
+        .expect("wait for the executable-writing helper");
+    assert!(status.success(), "installing {path:?} failed: {status:?}");
+}
+
 fn install_shim(bin: &Path) {
     std::fs::create_dir_all(bin).expect("create shim bin dir");
-    let shim = bin.join("ssh");
-    std::fs::write(&shim, SHIM_SCRIPT).expect("write shim ssh");
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the shim executable");
+    write_executable(&bin.join("ssh"), SHIM_SCRIPT.as_bytes());
     // A far-side program whose NAME starts with `-`, used to pin that
     // `Remote::exec` passes its program as an operand rather than an option.
-    let dash_prog = bin.join("-prog");
-    std::fs::write(
-        &dash_prog,
-        "#!/bin/sh\nprintf 'DASH-PROG-RAN %s\\n' \"$*\"\n",
-    )
-    .expect("write the leading-dash helper program");
-    std::fs::set_permissions(&dash_prog, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the leading-dash helper program");
+    write_executable(
+        &bin.join("-prog"),
+        b"#!/bin/sh\nprintf 'DASH-PROG-RAN %s\\n' \"$*\"\n",
+    );
 }
 
 /// One hermetic fixture: a shim bin dir, a "remote" working directory, and the
