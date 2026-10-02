@@ -102,12 +102,20 @@ const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
 /// instead of a swallowed success, and the path arrives after `--` as a
 /// positional argument, so a leading `-` is an operand, never an option.
 ///
+/// The open is `sysopen` with `O_RDONLY | O_NONBLOCK`, NOT `open "<"`: the
+/// latter BLOCKS indefinitely on a FIFO (a read open of a fifo with no writer
+/// waits for one), so a single non-regular entry in a tree could hang a deploy
+/// forever. `O_NONBLOCK` returns immediately, and an opened entry that is
+/// neither a regular file nor a directory is then REFUSED (`die`) rather than
+/// fsynced — `fsync(2)` is not meaningful for a fifo/socket/device, and
+/// refusing loudly keeps the primitive terminating and fail-closed.
+///
 /// The two trailing COMMENT tokens are the stable hooks a test's fake `perl`
 /// on `PATH` matches to fault-inject or record the file fsync and the
 /// directory fsync independently; being comments they change nothing about the
 /// executed script.
-const PERL_FSYNC_FILE: &str = "use IO::Handle; open my $fh, \"<\", $ARGV[0] or die \"fsync-open $ARGV[0]: $!\"; $fh->sync or die \"fsync $ARGV[0]: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_FILE";
-const PERL_FSYNC_DIR: &str = "use IO::Handle; open my $fh, \"<\", $ARGV[0] or die \"fsync-open $ARGV[0]: $!\"; $fh->sync or die \"fsync $ARGV[0]: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_DIR";
+const PERL_FSYNC_FILE: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_FILE";
+const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_DIR";
 
 /// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
 /// `crate::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
@@ -509,22 +517,48 @@ impl SshTransport {
     }
 
     /// Build the remote command that fsyncs `root.join(rel)` and every entry
-    /// BELOW it, deepest-first, so a staged bundle is durable before the atomic
-    /// install rename. `find -depth -exec ... {} ;` is portable (POSIX `find`);
-    /// the fsync PROGRAM is the portable perl primitive ([`PERL_FSYNC_DIR`])
-    /// because `sync <path>` is GNU-only and a silent no-op on BSD/macOS.
+    /// BELOW it, children before parents, so a staged bundle is durable before
+    /// the atomic install rename. The primitive is the portable perl
+    /// ([`PERL_FSYNC_DIR`]) because `sync <path>` is GNU-only and a silent
+    /// no-op on BSD/macOS.
+    ///
+    /// The walk mirrors `LocalTransport::fsync_tree`'s classification exactly:
+    /// `-type d` and `-type f` (like `symlink_metadata`, `-type` does NOT
+    /// follow a symlink) select the regular files and directories; symlinks
+    /// and every other entry are SKIPPED — their durability is their
+    /// directory entry, which the parent-directory fsync covers. A dangling
+    /// symlink is therefore not a failure, and a fifo is never opened.
+    ///
+    /// `-exec … {} +`, NOT `-exec … {} ;`, is what makes a failed fsync an
+    /// error: `find` IGNORES the invoked command's exit status for `;` (proved
+    /// on GNU and BSD: a tree whose every fsync exited 9 still made `find` exit
+    /// 0), while for `+` POSIX `find` exits nonzero if ANY invocation does.
+    /// The `sh -c` wrapper stops at the first failed entry (`|| exit 1`), so
+    /// the single nonzero invocation survives as `find`'s nonzero exit and
+    /// [`Remote::fsync_tree`] surfaces an `Err` instead of a durability claim
+    /// nothing backed.
     fn fsync_tree_cmd(root: &Path, rel: &Path) -> String {
         let p = root.join(rel).to_string_lossy().into_owned();
+        let fsync = shell_quote(PERL_FSYNC_DIR);
+        let wrapper = format!("for f do perl -e {fsync} -- \"$f\" || exit 1; done");
         Self::argv_cmd(&[
             "find".into(),
             p,
             "-depth".into(),
+            "(".into(),
+            "-type".into(),
+            "d".into(),
+            "-o".into(),
+            "-type".into(),
+            "f".into(),
+            ")".into(),
             "-exec".into(),
-            "perl".into(),
-            "-e".into(),
-            PERL_FSYNC_DIR.into(),
+            "sh".into(),
+            "-c".into(),
+            wrapper,
+            "sh".into(),
             "{}".into(),
-            ";".into(),
+            "+".into(),
         ])
     }
 
@@ -1022,16 +1056,22 @@ impl SshTransport {
     /// rejects `-c`, so the old script produced an EMPTY mode on a supported
     /// macOS remote and the parser silently defaulted every entry to mode 0.
     ///
-    /// The FRAME is one NUL-terminated record per entry, `type<TAB>mode<TAB>name`
-    /// — unchanged by the portability fix. NUL is the only byte a POSIX file
+    /// The FRAME is one NUL-terminated record per entry,
+    /// `type<TAB>mode<TAB>size<TAB>name`. NUL is the only byte a POSIX file
     /// name cannot contain, so it is the only unambiguous delimiter: a tab- or
     /// newline-delimited frame silently truncates a name containing that byte,
     /// and `sync`'s listing check is BYTE-EXACT — two distinct on-disk names
     /// must never collapse into one compared spelling. The name is the
     /// `readdir` entry printed VERBATIM (no `basename`/parameter expansion, so
     /// neither a trailing newline nor an embedded TAB/LF is ever stripped) and
-    /// is the LAST field, so the Rust parser can `splitn(3, '\t')` and keep
-    /// every remaining byte as the name.
+    /// is the LAST field, so the Rust parser can `splitn(4, '\t')` and keep
+    /// every remaining byte as the name. The two numeric fields are the ones
+    /// the LOCAL listing reports, so the two views of one tree compare equal:
+    /// the RAW `st_mode` (type bits INCLUDED, not masked to `0o7777`) and the
+    /// REAL `st_size` (for a symlink, the length of its target — `lstat` never
+    /// follows it). The previous mask + literal `size: 0` made the SSH view
+    /// report `600:0` where the local view reported `100600:1`, so a
+    /// field-by-field comparison of the two views could never agree.
     ///
     /// The classification is `lstat`-based (not `-e`/`-d`, which FOLLOW a
     /// symlink), so a DANGLING symlink is INCLUDED — an entry the far-side
@@ -1042,19 +1082,34 @@ impl SshTransport {
     /// child from the residue gate so the sanctioned recursive removal
     /// destroyed the caller's copy. `.`/`..` are skipped explicitly.
     ///
-    /// A directory that cannot be opened (ENOENT, EACCES, a non-directory) makes
-    /// the script `die` — nonzero, on stderr — rather than silently listing
-    /// nothing, so [`Remote::list`] agrees with `LocalTransport::list`'s
-    /// `read_dir` failure on an entry that is not a readable directory. Names
-    /// are printed as RAW BYTES (`binmode STDOUT`); a non-UTF-8 name is refused
-    /// by the Rust decoder, never lossily decoded.
+    /// The errno of an `opendir`/`lstat` failure is handled the way
+    /// `LocalTransport::list` handles it, so the two views agree on FAILURE
+    /// too:
+    ///
+    /// * `opendir` ENOENT ⇒ empty output, exit 0. `LocalTransport::list`
+    ///   deliberately treats a `NotFound` directory as an empty listing (an
+    ///   unprovisioned remote root is not an error), and the pre-rewrite glob
+    ///   also produced empty output; the rewrite's bare `die` made the SSH view
+    ///   diverge for an absent directory.
+    /// * any OTHER `opendir` failure (EACCES, ENOTDIR, ...) ⇒ `die` loudly.
+    /// * ANY `lstat` failure ⇒ `die` loudly. An entry that cannot be stat'd
+    ///   must fail the listing, never vanish: the old `next unless @s` silently
+    ///   dropped every entry of a `chmod 400` directory (opendir succeeds on
+    ///   the read bit, each `lstat` then fails EACCES), so the SSH view
+    ///   returned an empty list for a NON-EMPTY directory while the local view
+    ///   returned `Permission denied`.
+    ///
+    /// Names are printed as RAW BYTES (`binmode STDOUT`); a non-UTF-8 name is
+    /// refused by the Rust decoder, never lossily decoded.
     fn list_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
         format!(
-            "perl -e 'binmode STDOUT; my $dir = $ARGV[0]; opendir(my $dh, $dir) or die \"list: opendir $dir: $!\"; \
-for my $n (readdir($dh)) {{ next if $n eq \".\" || $n eq \"..\"; my @s = lstat(\"$dir/$n\"); next unless @s; \
+            "perl -e 'binmode STDOUT; my $dir = $ARGV[0]; \
+opendir(my $dh, $dir) or do {{ exit 0 if (($! + 0) == 2); die \"list: opendir $dir: $!\"; }}; \
+for my $n (readdir($dh)) {{ next if $n eq \".\" || $n eq \"..\"; \
+my @s = lstat(\"$dir/$n\"); die \"list: lstat $dir/$n: $!\" unless @s; \
 my $mt = $s[2] & 0170000; my $t = ($mt == 0120000) ? \"l\" : (($mt == 0040000) ? \"d\" : \"f\"); \
-printf \"%s\\t%x\\t%s\\0\", $t, $s[2] & 0xffff, $n; }}' -- {p}"
+printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
         )
     }
 
@@ -1169,16 +1224,26 @@ printf \"%s\\t%x\\t%s\\0\", $t, $s[2] & 0xffff, $n; }}' -- {p}"
     /// helpers print, whose `S_IFMT` bits and permission bits are POSIX on
     /// GNU and BSD alike) into a [`RemoteMeta`] — the shared classification of
     /// the framed lstat protocol AND the descriptor-bound verify-open protocol.
+    ///
+    /// `mode` is the RAW `st_mode`, type bits INCLUDED: the same value
+    /// `LocalTransport::metadata` reports through `meta_to_remote` (which uses
+    /// `metadata_mode`), so the two views of one entry compare equal. Every
+    /// consumer of the field masks it with `& 0o7777` itself (see
+    /// `verify_existing`), so the raw value changes no decision; the old
+    /// `& 0o7777` here made the field silently different from the local view.
     fn meta_from_raw_mode(raw: u32) -> RemoteMeta {
-        let mode = raw & 0o7777;
         let is_symlink = (raw & 0o170000) == 0o120000;
         let is_dir = (raw & 0o170000) == 0o040000;
         RemoteMeta {
             is_dir,
             is_symlink,
             is_file: !is_symlink && !is_dir,
+            // The verify-open frame carries no size; content is compared
+            // byte-exactly, so the field is unused there. The framed-lstat
+            // parser (`parse_lstat_frame`) overwrites it with the REAL size
+            // from the frame, so `metadata()` agrees with the local view.
             size: 0,
-            mode,
+            mode: raw,
         }
     }
 
@@ -1381,8 +1446,8 @@ printf \"%s\\t%x\\t%s\\0\", $t, $s[2] & 0xffff, $n; }}' -- {p}"
 
     /// Decode the RAW stdout of [`SshTransport::list_script`] into entries.
     ///
-    /// The frame is NUL-terminated records of `type<TAB>mode<TAB>name` (see
-    /// [`SshTransport::list_script`]); the name is the FINAL field and may
+    /// The frame is NUL-terminated records of `type<TAB>mode<TAB>size<TAB>name`
+    /// (see [`SshTransport::list_script`]); the name is the FINAL field and may
     /// contain a tab, a newline, or a carriage return, so each record is split
     /// on TAB at most three times and the remainder is the name verbatim. The
     /// payload must be valid UTF-8: a name that is NOT is REFUSED (fail-closed)
@@ -1417,27 +1482,39 @@ printf \"%s\\t%x\\t%s\\0\", $t, $s[2] & 0xffff, $n; }}' -- {p}"
     /// Parse the NUL-framed records produced by [`SshTransport::list_script`].
     /// `.` and `..` are never emitted by the script, but are skipped here
     /// defensively. The parse is STRICT on every field: a structurally
-    /// malformed record (fewer than three TAB fields) is refused, and a mode
-    /// field that is not hex is an ERROR rather than a silent 0. The old
+    /// malformed record (fewer than four TAB fields) is refused, a mode field
+    /// that is not hex is an ERROR rather than a silent 0, and a size field
+    /// that is not decimal is an error rather than a silent 0. The old
     /// `unwrap_or(0)` default was exactly how a BSD/macOS `stat -c` failure
     /// turned every entry's mode into 0 without a single error — a public field
     /// that was silently wrong on a supported platform. The producer is now
     /// portable, so an unparseable mode means a mangled frame, never a
     /// userland we do not support.
+    ///
+    /// The `mode` is carried RAW — the full `st_mode`, type bits INCLUDED —
+    /// and the `size` is the real `st_size`, so an entry parsed here is
+    /// field-by-field identical to the entry `LocalTransport::list` builds from
+    /// `symlink_metadata`. The old `& 0o7777` mask and literal `size: 0` were a
+    /// silent divergence between the two views of one tree. The `type` field is
+    /// the script's own classification and must AGREE with the mode's type bits
+    /// (both come from the same `lstat`), so a frame cannot carry a type that
+    /// contradicts its mode.
     fn parse_list_output(text: &str) -> Result<Vec<RemoteEntry>> {
         let mut entries = Vec::new();
         for record in text.split('\0') {
             if record.is_empty() {
                 continue;
             }
-            let mut it = record.splitn(3, '\t');
-            let t = it.next().unwrap_or("f");
-            let raw = it.next().unwrap_or("");
-            let name = it.next().ok_or_else(|| {
+            let malformed = || {
                 Error::transport(format!(
-                    "ssh list: malformed listing record (expected type<TAB>mode<TAB>name): {record:?}"
+                    "ssh list: malformed listing record (expected type<TAB>mode<TAB>size<TAB>name): {record:?}"
                 ))
-            })?;
+            };
+            let mut it = record.splitn(4, '\t');
+            let t = it.next().ok_or_else(malformed)?;
+            let raw = it.next().ok_or_else(malformed)?;
+            let raw_size = it.next().ok_or_else(malformed)?;
+            let name = it.next().ok_or_else(malformed)?;
             if name.is_empty() || name == "." || name == ".." {
                 continue;
             }
@@ -1445,12 +1522,30 @@ printf \"%s\\t%x\\t%s\\0\", $t, $s[2] & 0xffff, $n; }}' -- {p}"
                 Error::transport(format!(
                     "ssh list: malformed mode field (expected hex, got {raw:?}) in record {record:?}"
                 ))
-            })? & 0o7777;
+            })?;
+            let size = raw_size.parse::<u64>().map_err(|_| {
+                Error::transport(format!(
+                    "ssh list: malformed size field (expected decimal, got {raw_size:?}) in record {record:?}"
+                ))
+            })?;
+            // The raw mode is authoritative for the type (it is the same source
+            // `LocalTransport::list` classifies from); the `type` field must
+            // agree, or the record is refused rather than trusted.
+            let derived_t = match mode & 0o170000 {
+                0o040000 => "d",
+                0o120000 => "l",
+                _ => "f",
+            };
+            if t != derived_t {
+                return Err(Error::transport(format!(
+                    "ssh list: type field {t:?} contradicts the raw mode {raw:?} in record {record:?}"
+                )));
+            }
             entries.push(RemoteEntry {
                 name: name.to_string(),
                 is_dir: t == "d",
                 is_symlink: t == "l",
-                size: 0,
+                size,
                 mode,
             });
         }
@@ -2205,12 +2300,35 @@ mod tests_ssh {
         assert!(!msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC="));
     }
 
+    /// The framed-lstat `RemoteMeta` must carry the RAW `st_mode` (type bits
+    /// INCLUDED) and the REAL size, so it matches `LocalTransport::metadata`
+    /// (`meta_to_remote`). The old `& 0o7777` mask made the field silently
+    /// different from the local view; every consumer masks it itself, so the
+    /// raw value is safe. Frame: `P\t<size>\t<rawmode_hex>`.
+    #[test]
+    fn lstat_frame_carries_the_raw_mode_and_the_real_size() {
+        let file = SshTransport::parse_lstat_frame("P\t7\t81a4\n")
+            .unwrap()
+            .expect("a P frame is an existing entry");
+        assert_eq!(file.mode, 0o100644, "the RAW file mode is carried");
+        assert_eq!(file.size, 7, "the REAL size is carried");
+        assert!(file.is_file && !file.is_dir && !file.is_symlink);
+
+        let link = SshTransport::parse_lstat_frame("P\t3\ta1ed\n")
+            .unwrap()
+            .expect("a P frame is an existing entry");
+        assert_eq!(link.mode, 0o120755, "the RAW symlink mode is carried");
+        assert_eq!(link.size, 3, "a symlink carries its own size");
+        assert!(link.is_symlink && !link.is_file && !link.is_dir);
+    }
+
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.
     #[test]
     fn list_excludes_dot_entries_and_keeps_modes() {
-        // The wire frame is NUL-terminated records of `type<TAB>mode<TAB>name`;
-        // 0o81ed = 100755 (executable), 0o81a4 = 100644.
-        let out = "f\t81ed\tapp\0d\t41ed\t.\0d\t41ed\t..\0l\t41ed\thidden\0f\t81a4\treadme\0";
+        // The wire frame is NUL-terminated records of
+        // `type<TAB>mode<TAB>size<TAB>name`; 0x81ed = 100755 (executable),
+        // 0x81a4 = 100644, 0xa1ed = 120755 (symlink), 0x41ed = 040755 (dir).
+        let out = "f\t81ed\t3\tapp\0d\t41ed\t64\t.\0d\t41ed\t64\t..\0l\ta1ed\t6\thidden\0f\t81a4\t6\treadme\0";
         let entries = SshTransport::parse_list_output(out).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&"."), ". must be excluded");
@@ -2221,11 +2339,15 @@ mod tests_ssh {
 
         let app = entries.iter().find(|e| e.name == "app").unwrap();
         assert!(!app.is_dir && !app.is_symlink);
-        assert_eq!(app.mode, 0o755, "executable mode preserved");
+        assert_eq!(app.mode, 0o100755, "the RAW executable mode is preserved");
+        assert_eq!(app.size, 3, "the real size is preserved");
         let readme = entries.iter().find(|e| e.name == "readme").unwrap();
-        assert_eq!(readme.mode, 0o644, "file mode preserved");
+        assert_eq!(readme.mode, 0o100644, "the RAW file mode is preserved");
+        assert_eq!(readme.size, 6, "the real size is preserved");
         let hidden = entries.iter().find(|e| e.name == "hidden").unwrap();
         assert!(hidden.is_symlink, "symlink type preserved");
+        assert_eq!(hidden.mode, 0o120755, "the RAW symlink mode is preserved");
+        assert_eq!(hidden.size, 6, "a symlink reports its OWN size");
     }
 
     /// F2: the LITERAL `list_script` must report the REAL mode on a BSD
@@ -2270,11 +2392,16 @@ mod tests_ssh {
         };
         assert_eq!(
             get("exec.sh").mode,
-            0o755,
-            "the executable mode must be real on a BSD userland, never silently 0"
+            0o100755,
+            "the RAW executable mode must be real on a BSD userland, never silently 0"
         );
-        assert_eq!(get(".hidden").mode, 0o600, "the hidden file's real mode");
-        assert_eq!(get("sub").mode, 0o700, "the directory's real mode");
+        assert_eq!(get(".hidden").mode, 0o100600, "the hidden file's raw mode");
+        assert_eq!(get("sub").mode, 0o040700, "the directory's raw mode");
+        assert_eq!(
+            get("exec.sh").size,
+            b"#!/bin/sh\n".len() as u64,
+            "the real size must be carried, never a literal 0"
+        );
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&".hidden"), "hidden entries are covered");
         assert!(!names.contains(&"."), ". must never be emitted");
@@ -2316,6 +2443,150 @@ mod tests_ssh {
             String::from_utf8_lossy(&out.stderr)
         );
         SshTransport::decode_list_output(&out.stdout).unwrap()
+    }
+
+    /// Run the LITERAL `list_script` for `rel` and return the RAW outcome, so a
+    /// test can assert on a FAILING listing (an unreadable directory) without
+    /// the success assertion [`run_list_script`] makes.
+    fn run_list_script_raw(t: &SshTransport, rel: &Path) -> std::process::Output {
+        run_sh_stdin(&t.list_script(rel), &[])
+    }
+
+    /// DEFECT 3: an ABSENT directory must list EMPTY, matching
+    /// `LocalTransport::list`'s deliberate `NotFound` ⇒ empty rule. Pre-fix
+    /// `opendir … or die` exited 2 for a missing directory.
+    #[test]
+    fn list_script_absent_directory_is_empty() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let entries = run_list_script(&transport_at(dir.path()), Path::new("never-created"));
+        assert!(
+            entries.is_empty(),
+            "an absent directory must list empty, got {entries:?}"
+        );
+    }
+
+    /// DEFECT 2 + 3: a `chmod 400` directory has the READ bit (so `opendir`
+    /// succeeds) but no SEARCH bit, so every `lstat` fails EACCES. The old
+    /// `next unless @s` silently dropped every entry, printing ZERO bytes and
+    /// exiting 0 for a NON-EMPTY directory — `Ok(vec![])` where the local view
+    /// returned `Permission denied`. The listing must now FAIL. A `chmod 111`
+    /// directory has no read bit, so `opendir` itself must fail loudly.
+    #[test]
+    fn list_script_unreadable_directory_is_an_error_not_an_empty_listing() {
+        for (mode, needle) in [(0o400u32, "lstat"), (0o111u32, "opendir")] {
+            let dir =
+                crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let locked = dir.path().join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("entry"), b"payload").unwrap();
+            std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .unwrap();
+
+            let out = run_list_script_raw(&transport_at(dir.path()), Path::new("locked"));
+            std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+
+            assert!(
+                !out.status.success(),
+                "a chmod {mode:o} directory must fail the listing, not return an empty Ok \
+                 (stdout {:?})",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(needle),
+                "the failure must name `{needle}`; stderr was {stderr:?}"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "a failed listing must emit NOTHING, got {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    /// DEFECT 5: the fsync primitives must TERMINATE on a FIFO. The old
+    /// `open my $fh, "<", $ARGV[0]` blocks forever on a fifo with no writer
+    /// (proved on GNU and BSD with `timeout 3` → rc 124); `sysopen` with
+    /// `O_NONBLOCK` returns immediately and the non-regular entry is refused.
+    /// Both primitives share the pattern, so both are pinned.
+    #[test]
+    fn fsync_primitives_refuse_a_fifo_without_blocking() {
+        for (prim, name) in [(PERL_FSYNC_DIR, "dir"), (PERL_FSYNC_FILE, "file")] {
+            let dir =
+                crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let fifo = dir.path().join(format!("pipe-{name}"));
+            mkfifo(&fifo);
+            let cmd = format!(
+                "perl -e {prim} -- {p}",
+                prim = shell_quote(prim),
+                p = shell_quote(&fifo.to_string_lossy())
+            );
+            let out = run_sh_with_timeout(&cmd, 15)
+                .unwrap_or_else(|| panic!("the {name} fsync primitive must NOT block on a FIFO"));
+            assert!(
+                !out.status.success(),
+                "a FIFO must be REFUSED, not fsynced (primitive {name})"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("fsync-refuse"),
+                "the refusal must be loud (primitive {name}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// DEFECT 1 (the hole): the `fsync_tree` command must exit NONZERO when a
+    /// far-side fsync fails. Pre-fix `find … -exec … {} ;` ignored the invoked
+    /// command's exit status, so a fake perl that failed EVERY call still made
+    /// the whole command exit 0. This runs the LITERAL command under `/bin/sh`
+    /// with such a fake on `PATH`.
+    #[test]
+    fn fsync_tree_cmd_propagates_a_failed_fsync() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("a"), b"a").unwrap();
+        std::fs::write(tree.join("sub/b"), b"b").unwrap();
+        let fakebin = dir.path().join("fakebin");
+        install_fake_perl(&fakebin, FSYNC_DIR_HOOK, 9);
+
+        let cmd = SshTransport::fsync_tree_cmd(dir.path(), Path::new("tree"));
+        let out = run_sh_stdin(
+            &format!(
+                "PATH={fake}:$PATH; {cmd}",
+                fake = shell_quote(&fakebin.to_string_lossy())
+            ),
+            &[],
+        );
+        assert!(
+            !out.status.success(),
+            "a failed far-side fsync ANYWHERE in the tree must make the command exit nonzero \
+             (pre-fix find exited 0); stdout {:?} stderr {:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// DEFECT 5, at the TREE level: `find -type d -o -type f` (like the local
+    /// walk's `symlink_metadata`) never selects a FIFO, so the tree walk
+    /// terminates AND succeeds — no entry ever opens it.
+    #[test]
+    fn fsync_tree_cmd_skips_a_fifo_and_terminates() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("file"), b"x").unwrap();
+        mkfifo(&tree.join("pipe"));
+
+        let cmd = SshTransport::fsync_tree_cmd(dir.path(), Path::new("tree"));
+        let out = run_sh_with_timeout(&cmd, 20)
+            .expect("the tree fsync must terminate on a tree containing a FIFO");
+        assert!(
+            out.status.success(),
+            "the FIFO is skipped (matching the local walk): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A DANGLING symlink must be LISTED. The old guard `[ -e "$e" ] ||
@@ -2378,8 +2649,8 @@ mod tests_ssh {
     /// tab/LF-delimited, so `a\tb` parsed as `a` (the tab split the fields)
     /// and `line1\nline2` split into TWO bogus entries — the listing view used
     /// by the byte-exact comparison silently disagreed with the directory.
-    /// The frame is now NUL-terminated (`type<TAB>mode<TAB>name`), and NUL is
-    /// the one byte a POSIX name cannot contain. Runs on any POSIX host (these
+    /// The frame is now NUL-terminated (`type<TAB>mode<TAB>size<TAB>name`), and
+    /// NUL is the one byte a POSIX name cannot contain. Runs on any POSIX host (these
     /// names are legal on APFS too).
     #[test]
     fn list_script_carries_a_tab_and_a_newline_in_a_name() {
@@ -2438,7 +2709,7 @@ mod tests_ssh {
     fn decode_list_output_refuses_two_distinct_non_utf8_names() {
         // 0xff and 0xfe are both invalid standalone UTF-8, so `from_utf8_lossy`
         // renders both as U+FFFD — indistinguishable.
-        let raw = b"f\t81a4\t\xff\0f\t81a4\t\xfe\0";
+        let raw = b"f\t81a4\t1\t\xff\0f\t81a4\t1\t\xfe\0";
         let err = SshTransport::decode_list_output(raw)
             .expect_err("a non-UTF-8 name must refuse the listing, never decode to U+FFFD");
         let msg = err.to_string();
@@ -2453,12 +2724,12 @@ mod tests_ssh {
     /// defaulting it.
     #[test]
     fn parse_list_output_keeps_tabs_and_newlines_in_names() {
-        let text = "f\t81a4\ta\tb\0f\t81a4\tline1\nline2\0f\t81a4\tx \0";
+        let text = "f\t81a4\t1\ta\tb\0f\t81a4\t1\tline1\nline2\0f\t81a4\t1\tx \0";
         let entries = SshTransport::parse_list_output(text).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a\tb", "line1\nline2", "x "]);
 
-        // A record with fewer than three TAB fields is malformed, not an
+        // A record with fewer than four TAB fields is malformed, not an
         // empty-named entry.
         assert!(
             SshTransport::parse_list_output("f\t81a4").is_err(),
@@ -3443,6 +3714,58 @@ mod tests_ssh {
             .write_all(stdin)
             .expect("write payload");
         child.wait_with_output().expect("wait sh -c")
+    }
+
+    /// Run `sh -c "$command"` but return `None` if it has not exited within
+    /// `secs` (the child is killed and reaped). A blocking primitive under test
+    /// then FAILS the test instead of hanging the suite forever.
+    fn run_sh_with_timeout(command: &str, secs: u64) -> Option<std::process::Output> {
+        use std::io::Read;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh -c");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    if let Some(mut s) = child.stdout.take() {
+                        s.read_to_end(&mut stdout).ok();
+                    }
+                    if let Some(mut e) = child.stderr.take() {
+                        e.read_to_end(&mut stderr).ok();
+                    }
+                    return Some(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    /// Create a FIFO with the POSIX `mkfifo` utility (portable on GNU and BSD).
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {path:?} must succeed");
     }
 
     /// Resolve the REAL `perl` from the test process's own `PATH`, before a

@@ -39,7 +39,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use store_sync::env::SysEnv;
-use store_sync::transport::{CreateNewVerdict, Layout, Remote, RootedRelativePath, SshTransport};
+use store_sync::transport::{
+    CreateNewVerdict, Layout, LocalTransport, Remote, RemoteEntry, RootedRelativePath, SshTransport,
+};
 
 /// The environment variable the shim reads to find its "remote working
 /// directory" (the directory a remote login shell would start in).
@@ -453,26 +455,34 @@ fn list_reports_the_real_mode_on_bsd_userland() {
             .unwrap_or_else(|| panic!("entry {n} missing from {entries:?}"))
             .clone()
     };
+    // RAW `st_mode`, type bits INCLUDED: the value `LocalTransport::list`
+    // reports from `symlink_metadata`, not the old perm-only `& 0o7777` mask.
     assert_eq!(
         by_name("script.sh").mode,
-        0o755,
-        "the executable mode must survive the listing on a BSD userland"
+        0o100755,
+        "the RAW executable mode must survive the listing on a BSD userland"
     );
     assert_eq!(
         by_name("private").mode,
-        0o600,
-        "the private mode must survive the listing on a BSD userland"
+        0o100600,
+        "the RAW private mode must survive the listing on a BSD userland"
     );
     assert_eq!(
         by_name("sub").mode,
-        0o750,
-        "the directory mode must survive the listing on a BSD userland"
+        0o040750,
+        "the RAW directory mode must survive the listing on a BSD userland"
+    );
+    assert_eq!(
+        by_name("script.sh").size,
+        b"#!/bin/sh\n".len() as u64,
+        "the REAL size must survive the listing, not a literal 0"
     );
 }
 
-/// The wire frame is UNCHANGED by the portability fix: NUL-terminated records
-/// of `type<TAB>mode<TAB>name` with the name LAST, so a name containing a TAB
-/// or a NEWLINE round-trips verbatim — and now carries its real mode too.
+/// The wire frame is NUL-terminated records of
+/// `type<TAB>mode<TAB>size<TAB>name` with the name LAST, so a name containing a
+/// TAB or a NEWLINE round-trips verbatim — and the entry carries its RAW mode
+/// and REAL size too, matching the local view.
 #[test]
 fn list_frames_tab_and_newline_names_with_real_modes() {
     let h = Harness::new("dst");
@@ -493,7 +503,8 @@ fn list_frames_tab_and_newline_names_with_real_modes() {
         "newline name must survive: {names:?}"
     );
     let tab = entries.iter().find(|e| e.name == "a\tb").unwrap();
-    assert_eq!(tab.mode, 0o640, "the tab-named entry keeps its real mode");
+    assert_eq!(tab.mode, 0o100640, "the tab-named entry keeps its RAW mode");
+    assert_eq!(tab.size, b"tab".len() as u64, "and its real size");
 }
 
 // ---------------------------------------------------------------------------
@@ -604,4 +615,198 @@ fn try_write_new_already_present_fsyncs_the_parent_portably() {
         "the AlreadyPresent retry must fsync the parent directory {parent:?} via the portable \
          perl primitive; fsync log was {log:?}"
     );
+}
+
+/// DEFECT 1, THE HOLE: `fsync_tree` used `find -depth -exec perl … {} ;`, and
+/// `find` IGNORES the invoked command's exit status for `;`, so a tree whose
+/// EVERY far-side fsync failed still made `find` exit 0 and `fsync_tree` return
+/// `Ok(())`. The probe's fake perl exits 9 on the directory-fsync hook; the
+/// walk must surface that as an `Err`, never a swallowed success.
+///
+/// Pre-fix this test FAILED with `Ok(())` (the reviewer proved it over a GNU
+/// sshd on 2222 and a BSD sshd on 2223). `fsync_parent` already propagated
+/// (`fsync_parent_failure_propagates`), so this is the one hole.
+#[test]
+fn fsync_tree_failure_propagates() {
+    let h = Harness::new("dst");
+    h.probe(true, false);
+    let tree = h.root.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("a"), b"a").unwrap();
+    std::fs::write(tree.join("sub/b"), b"b").unwrap();
+
+    let res = h.transport().fsync_tree(&rooted("tree"));
+    assert!(
+        res.is_err(),
+        "a failed far-side fsync ANYWHERE in the tree must be a propagated error, got {res:?}"
+    );
+    // The failure is not merely logged: the walked entries are still visible,
+    // so the test cannot pass by never invoking the primitive.
+    assert!(
+        !h.logged().is_empty(),
+        "the walk must actually invoke the fsync primitive"
+    );
+}
+
+/// DEFECT 5: the old fsync primitive opened with `"<"`, which BLOCKS FOREVER
+/// on a FIFO (a read open waits for a writer). `fsync_tree` must terminate —
+/// and, matching the LOCAL walk (which skips non-regular entries), succeed by
+/// never opening the fifo.
+#[test]
+fn fsync_tree_over_a_fifo_terminates() {
+    let h = Harness::new("dst");
+    let tree = h.root.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("file"), b"x").unwrap();
+    mkfifo(&tree.join("pipe"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let transport = h.transport();
+    std::thread::spawn(move || {
+        let res = transport.fsync_tree(&rooted("tree"));
+        let _ = tx.send(res.map_err(|e| e.to_string()));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("fsync_tree must terminate on a tree containing a FIFO, never block forever");
+    outcome.expect("fsync_tree skips the non-regular FIFO and succeeds");
+}
+
+/// DEFECT 3: an ABSENT directory must list EMPTY, agreeing with
+/// `LocalTransport::list` (which deliberately treats `NotFound` as empty so an
+/// unprovisioned remote root is inspectable). The rewrite's bare
+/// `opendir … or die` made the SSH view error while the pre-fix glob (and the
+/// local view) returned empty.
+#[test]
+fn list_absent_directory_agrees_with_local_empty() {
+    let h = Harness::new("dst");
+    let remote = h
+        .transport()
+        .list(&rooted("never-created"))
+        .expect("the SSH listing of an absent directory must be an empty Ok, not an error");
+    assert!(remote.is_empty(), "an absent directory lists nothing");
+    let local = list_local(&h, "never-created");
+    assert!(
+        local.is_empty(),
+        "the local listing of an absent directory lists nothing"
+    );
+}
+
+/// DEFECT 2 + 3: a present-but-unreadable directory must fail the listing on
+/// BOTH views. A `chmod 400` directory has the READ bit (so `opendir`
+/// succeeds) but no SEARCH bit (so every `lstat` fails EACCES): pre-fix the
+/// remote script's `next unless @s` dropped every entry and returned an empty
+/// `Ok` for a NON-EMPTY directory, while the local view returned `Permission
+/// denied`. A `chmod 111` directory fails `opendir` itself. This pins
+/// remote/local AGREEMENT in both directions.
+#[test]
+fn list_unreadable_directory_agrees_with_local_error() {
+    for (name, mode) in [("read-no-search", 0o400u32), ("search-no-read", 0o111u32)] {
+        let h = Harness::new("dst");
+        let d = h.root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("entry"), b"payload").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let remote = h.transport().list(&rooted(name));
+        let local = LocalTransport::new(&h.env(), h.root.clone(), Layout::empty())
+            .unwrap()
+            .list(&rooted(name));
+
+        // Restore the mode so the fixture can be removed.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            remote.is_err(),
+            "the SSH listing of a chmod {mode:o} directory must fail, never silently drop its \
+             entries; got {remote:?}"
+        );
+        assert!(
+            local.is_err(),
+            "the local listing of the SAME chmod {mode:o} directory must fail too; got {local:?}"
+        );
+        assert!(
+            std::fs::read_dir(&d).unwrap().next().is_some(),
+            "premise: the directory is NON-EMPTY, so the remote empty listing would be a lie"
+        );
+    }
+}
+
+/// DEFECT 4, THE CROSS-VIEW PIN: the SSH listing and the LOCAL listing of the
+/// SAME tree must agree FIELD BY FIELD (`name`, `is_dir`, `is_symlink`,
+/// `size`, `mode`). Pre-fix the SSH view masked `mode` with `& 0o7777` and
+/// hardcoded `size: 0`, so for `exec.sh` it reported `755:0` where local
+/// reported `100755:10`; the two views of one directory could never agree.
+/// Positives preserved: a symlink reports its OWN mode/size (never the
+/// target's), a dangling symlink is listed, and tab/newline names round-trip.
+#[test]
+fn list_remote_and_local_agree_field_by_field_on_the_same_tree() {
+    let h = Harness::new("dst");
+    let tree = h.root.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join(".hidden"), b"h").unwrap();
+    std::fs::set_permissions(tree.join(".hidden"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(tree.join("exec.sh"), b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(tree.join("exec.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(tree.join("sub/data"), b"payload").unwrap();
+    std::fs::write(tree.join("a\tb"), b"tab-name").unwrap();
+    std::fs::write(tree.join("line\nbreak"), b"nl-name").unwrap();
+    symlink("nowhere", tree.join("dangling"));
+    symlink("exec.sh", tree.join("link"));
+
+    let mut remote = h.transport().list(&rooted("tree")).expect("remote list");
+    let mut local = list_local(&h, "tree");
+    remote.sort_by(|a, b| a.name.cmp(&b.name));
+    local.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let field = |e: &RemoteEntry| {
+        format!(
+            "{}|{}|{}|{}|{:o}",
+            e.name, e.is_dir, e.is_symlink, e.size, e.mode
+        )
+    };
+    let remote_fields: Vec<String> = remote.iter().map(field).collect();
+    let local_fields: Vec<String> = local.iter().map(field).collect();
+    assert_eq!(
+        remote_fields, local_fields,
+        "the SSH and local listings of the SAME tree must agree field by field"
+    );
+    // The values the reviewer's `b1_list_tree` vs `b1_LISTLOCAL` comparison
+    // pinned: raw modes (type bits included) and real sizes.
+    let get = |name: &str| remote.iter().find(|e| e.name == name).unwrap();
+    assert_eq!(get(".hidden").mode, 0o100600);
+    assert_eq!(get(".hidden").size, 1);
+    assert_eq!(get("exec.sh").mode, 0o100755);
+    assert_eq!(get("exec.sh").size, 10);
+    let dangling = get("dangling");
+    assert!(dangling.is_symlink, "a dangling symlink must be listed");
+    assert_eq!(
+        dangling.mode & 0o170000,
+        0o120000,
+        "a symlink reports its OWN mode (the symlink type bits), never the target's regular-file \
+         type"
+    );
+    assert_eq!(
+        dangling.size,
+        "nowhere".len() as u64,
+        "a symlink reports its OWN size (target length), never the target's"
+    );
+}
+
+/// Build a [`LocalTransport`] rooted at the SAME directory as `h`'s SSH
+/// transport, so the two listings can be compared field by field.
+fn list_local(h: &Harness, rel: &str) -> Vec<RemoteEntry> {
+    LocalTransport::new(&h.env(), h.root.clone(), Layout::empty())
+        .expect("build the local transport over the same root")
+        .list(&rooted(rel))
+        .expect("the local listing must succeed")
+}
+
+/// Create a FIFO with the POSIX `mkfifo` utility (portable on GNU and BSD).
+fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {path:?} must succeed");
 }
