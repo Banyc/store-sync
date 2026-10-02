@@ -10878,3 +10878,128 @@ fn removing_an_all_extraneous_nested_chain_does_not_fail_the_removal_verify() {
         "the extraneous chain must be fully removed: {report:?}"
     );
 }
+
+/// Build an [`Applier`] with a FRESH ancestry memo, for asserting exactly
+/// which destinations may populate it. Every other field is the empty default
+/// the run constructor uses, so `guard_destination` is the only code that can
+/// touch `ancestry_dirs`.
+fn applier_with_ancestry_memo<'a, 'b>(
+    source: &'b Side<'a>,
+    dest: &'b Side<'a>,
+    policy: &'b dyn Policy,
+    diff: &'b TreeDiff,
+) -> Applier<'a, 'b> {
+    Applier {
+        source,
+        dest,
+        policy,
+        extraneous_policy: Keep,
+        diff,
+        outcomes: BTreeMap::new(),
+        conflicts: BTreeMap::new(),
+        extraneous: BTreeSet::new(),
+        verify: Vec::new(),
+        verified: BTreeSet::new(),
+        verify_failures: BTreeSet::new(),
+        indeterminate: BTreeMap::new(),
+        pending_final: BTreeMap::new(),
+        journal: ModeJournal::default(),
+        removed: BTreeSet::new(),
+        claim_failures: Vec::new(),
+        unconfirmed_moves: Vec::new(),
+        source_reserved: BTreeMap::new(),
+        dest_residue: BTreeSet::new(),
+        aliased_dest: BTreeMap::new(),
+        dest_case_insensitive: None,
+        touched_dirs: BTreeSet::from([String::new()]),
+        listings: std::cell::RefCell::new(BTreeMap::new()),
+        ancestry_dirs: std::cell::RefCell::new(BTreeSet::new()),
+        transfers: 0,
+    }
+}
+
+/// The confinement predicate is a CONJUNCTION: the side kind ([`Side::Local`])
+/// AND the platform property ([`crate::atomic::COMPONENT_CONFINED`]). This
+/// pins both values on the running platform without a cfg: a `Side::Local` is
+/// confined exactly where the platform's primitives are, and a path-based
+/// `Side::Remote` is NEVER confined (the applier treats a remote destination
+/// as path-based even when a `LocalTransport` backs it, because it cannot see
+/// the transport's primitives).
+#[test]
+fn the_confinement_predicate_conjoins_the_side_and_the_platform() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let local = LocalSide::open(dir.path(), true).unwrap();
+    let remote = transport(dir.path());
+    let local_side = Side::Local(&local);
+    let remote_side = Side::Remote(&remote);
+
+    assert!(
+        matches!(&local_side, Side::Local(_)),
+        "the fixture must exercise the local side"
+    );
+    assert!(
+        matches!(&remote_side, Side::Remote(_)),
+        "the fixture must exercise a path-based side"
+    );
+    assert_eq!(
+        local_side.is_confined_local(),
+        crate::atomic::COMPONENT_CONFINED,
+        "a Side::Local is confined exactly where the platform's primitives are"
+    );
+    assert!(
+        !remote_side.is_confined_local(),
+        "a Side::Remote (even one backed by a LocalTransport) is never confined"
+    );
+}
+
+/// The ancestry memo is a cached CONFINEMENT fact, so only a destination whose
+/// own primitives enforce component confinement may reuse it. This pins the
+/// CODE PATH (not the comment): with a path-based `Side::Remote` destination
+/// `guard_destination` must leave `ancestry_dirs` EMPTY, and with a
+/// `Side::Local` destination it populates the memo exactly where the platform
+/// primitives are component-confined.
+#[test]
+fn the_ancestry_memo_is_off_for_a_path_based_destination_on_this_platform() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    let local = LocalSide::open(root, true).unwrap();
+    let remote = transport(root);
+    let local_side = Side::Local(&local);
+    let remote_side = Side::Remote(&remote);
+    let empty = LocalSide::empty_tree();
+    let diff = crate::sync::diff::diff_trees(&empty, &empty);
+    let policy = ReplaceAll;
+    let rel = rooted("a/b/c").unwrap();
+
+    // PATH-BASED destination: the preflight IS the confinement, so every
+    // probe is live and nothing is cached.
+    let remote_applier = applier_with_ancestry_memo(&local_side, &remote_side, &policy, &diff);
+    remote_applier
+        .guard_destination(&rel, AncestorPolicy::MustExist, FinalPolicy::Unresolved)
+        .expect("the existing ancestor chain guards cleanly");
+    assert!(
+        remote_applier.ancestry_dirs.borrow().is_empty(),
+        "a path-based destination must probe live and cache nothing"
+    );
+
+    // LOCAL destination: the memo is populated exactly when the platform is
+    // component-confined. On a path-based port the local destination is ALSO
+    // unconfined, so the memo must stay empty there too.
+    let local_applier = applier_with_ancestry_memo(&local_side, &local_side, &policy, &diff);
+    local_applier
+        .guard_destination(&rel, AncestorPolicy::MustExist, FinalPolicy::Unresolved)
+        .expect("the existing ancestor chain guards cleanly");
+    assert_eq!(
+        !local_applier.ancestry_dirs.borrow().is_empty(),
+        crate::atomic::COMPONENT_CONFINED,
+        "a Side::Local destination memoizes exactly where the primitives are confined"
+    );
+    if crate::atomic::COMPONENT_CONFINED {
+        let memo = local_applier.ancestry_dirs.borrow();
+        assert!(
+            memo.contains("a") && memo.contains("a/b"),
+            "the memo must hold the confirmed ancestors, got {memo:?}"
+        );
+    }
+}

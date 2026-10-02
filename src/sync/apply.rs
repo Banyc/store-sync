@@ -521,10 +521,11 @@
 //! additionally refuses to enumerate a path that is not a real directory (only
 //! a CONFIRMED absent path enumerates as empty) and carries the live KIND, so a
 //! symlink where the manifest says `Dir` is never treated as an intact
-//! directory. The preflight duplicates a window the fd-confined local
-//! destination already closes in `crate::atomic`; for a
-//! [`LocalTransport`](crate::transport::LocalTransport) used as the applier's
-//! [`Side::Local`] the transport itself
+//! directory. The preflight duplicates a window a component-confined
+//! destination already closes in `crate::atomic` (the platform property is
+//! [`crate::atomic::COMPONENT_CONFINED`]; on Unix every `_fd` primitive
+//! resolves components with `O_NOFOLLOW`); for a
+//! [`LocalTransport`](crate::transport::LocalTransport) the transport itself
 //! resolves every non-root path component-wise with `O_NOFOLLOW` (no window) —
 //! mutations AND the reads this applier verifies against (`read`, `read_link`,
 //! `metadata_opt`, `exists`), so a verification verdict cannot be sourced from
@@ -534,13 +535,16 @@
 //! between the check and the operation is a residual race — the same class as
 //! the root-swap race above, not a guarantee this module claims to close.
 //!
-//! The applier sees only [`Side::is_confined_local`], a property of the SIDE it
-//! was handed, not of a concrete transport: a [`Side::Remote`] destination may
-//! be backed by a [`LocalTransport`](crate::transport::LocalTransport) whose
-//! own primitives happen to be fd-confined, but the applier cannot know that.
-//! It therefore treats EVERY [`Side::Remote`] destination as path-based, where
-//! the preflight IS the confinement, and caches nothing that would let a
-//! repeated probe be skipped (see [`Applier::ancestry_dirs`]).
+//! The applier sees only [`Side::is_confined_local`], a property of the SIDE
+//! AND THE PLATFORM it was handed, not of a concrete transport: a
+//! [`Side::Remote`] destination may be backed by a
+//! [`LocalTransport`](crate::transport::LocalTransport) whose own primitives
+//! happen to be fd-confined, but the applier cannot know that, and a
+//! [`Side::Local`] destination on a platform whose primitives are path-based is
+//! not confined either ([`crate::atomic::COMPONENT_CONFINED`]). It therefore
+//! treats every destination whose own primitives are not component-confined as
+//! path-based, where the preflight IS the confinement, and caches nothing that
+//! would let a repeated probe be skipped (see [`Applier::ancestry_dirs`]).
 //!
 //! ## The destination root's mode is NOT journalled
 //!
@@ -2371,16 +2375,20 @@ struct Applier<'a, 'b> {
     /// `Some(EntryKind::Dir)` arm of the guard's per-component probe, so it
     /// replaces that one `kind_opt` with a set lookup.
     ///
-    /// SCOPED TO CONFINED DESTINATIONS — A PROPERTY OF THE SIDE, ENFORCED AT
-    /// THE USE SITE. The memo is populated and consulted ONLY while
-    /// [`Side::is_confined_local`] holds: a [`Side::Local`] destination, whose
-    /// every mutation and probe is resolved component-wise with `O_NOFOLLOW`
-    /// through `crate::atomic`. On a PATH-BASED [`Side::Remote`] destination the
-    /// preflight is the confinement (see "Destination-component confinement" on
-    /// the module), so the applier caches NOTHING there and probes live on every
-    /// operation. The condition is structural — the destination KIND, checked at
-    /// the point of use — never a comment assuming a guarantee that only holds
-    /// on some of the paths the applier serves.
+    /// SCOPED TO CONFINED DESTINATIONS — A PROPERTY OF THE SIDE AND THE
+    /// PLATFORM, ENFORCED AT THE USE SITE. The memo is populated and consulted
+    /// ONLY while [`Side::is_confined_local`] holds: a [`Side::Local`]
+    /// destination on a platform whose `_fd` primitives resolve components with
+    /// `O_NOFOLLOW` ([`crate::atomic::COMPONENT_CONFINED`]), so every mutation
+    /// and probe is resolved component-wise through `crate::atomic`. On a
+    /// PATH-BASED [`Side::Remote`] destination — and equally on a [`Side::Local`]
+    /// one where the platform's primitives are path-based — the preflight is
+    /// the confinement (see "Destination-component confinement" on the module),
+    /// so the applier caches NOTHING there and probes live on every operation.
+    /// The condition is structural — the destination KIND together with the
+    /// platform primitive property, checked at the point of use — never a
+    /// comment assuming a guarantee that only holds on some of the paths the
+    /// applier serves.
     ///
     /// WHY IT IS SOUND ON A CONFINED DESTINATION. A memo hit can skip only a
     /// REDUNDANT preflight; it can never skip the confinement. Even if a
@@ -2981,8 +2989,9 @@ impl Applier<'_, '_> {
         //
         // The ancestry memo is consulted ONLY where the destination's own
         // primitives enforce component-wise confinement
-        // ([`Side::is_confined_local`]); on a path-based destination the
-        // preflight IS the confinement, so every operation probes live and
+        // ([`Side::is_confined_local`], which conjoins the side kind with
+        // [`crate::atomic::COMPONENT_CONFINED`]); on a path-based destination
+        // the preflight IS the confinement, so every operation probes live and
         // nothing is cached (see [`Applier::ancestry_dirs`]).
         let memo_ancestry = self.dest.is_confined_local();
         let mut prefixes: Vec<RootedRelativePath> = Vec::new();
@@ -6427,12 +6436,24 @@ enum Side<'a> {
 }
 
 impl Side<'_> {
-    /// Whether this side is the fd-confined LOCAL implementation (the one that
-    /// resolves every mutation through `crate::atomic` descriptors). A local
-    /// transport is a [`Side::Remote`] with `is_local()` true, but its writes
-    /// are path-based and need different widening.
+    /// Whether this side is the fd-confined LOCAL implementation ON THIS
+    /// PLATFORM: a [`Side::Local`] AND a platform whose `_fd` primitives
+    /// resolve components without following symlinks
+    /// ([`crate::atomic::COMPONENT_CONFINED`]).
+    ///
+    /// The side kind alone is not the property the name claims. A
+    /// [`Side::Local`] routes its mutations through `crate::atomic`, but on a
+    /// path-based port those primitives follow a symlinked component, so a
+    /// local destination there is NOT confined and no caller may skip a live
+    /// preflight on its account. The platform half is single-sourced next to
+    /// the primitives, so this answer cannot drift from what `crate::atomic`
+    /// actually enforces.
+    ///
+    /// A local transport is a [`Side::Remote`] with `is_local()` true, but its
+    /// writes are path-based and need different widening; it is unconfined
+    /// here regardless of platform.
     fn is_confined_local(&self) -> bool {
-        matches!(self, Side::Local(_))
+        crate::atomic::COMPONENT_CONFINED && matches!(self, Side::Local(_))
     }
 
     fn manifest(&self) -> Result<TreeMetadata> {

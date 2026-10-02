@@ -91,6 +91,30 @@ pub use unix::*;
 #[cfg(windows)]
 pub use windows::*;
 
+/// THE component-confinement property of the platform's primitives: `true`
+/// exactly when the `_fd` surface selected by the `mod` declarations above
+/// resolves every path COMPONENT without following a symlink, so a symlink
+/// injected into a path component is REFUSED rather than traversed.
+///
+/// It lives HERE, at the single `#[cfg]` switch that chooses `unix` or
+/// `windows`, so the claim is stated once and cannot drift from the
+/// implementations it describes:
+///
+/// * `true` on Unix: the `unix` module resolves every parent component with
+///   component-wise `openat(O_NOFOLLOW)` and raises `ELOOP` on a symlink
+///   there for EVERY primitive, reads included. That is the confinement an
+///   operation can rely on INSTEAD of a live path check.
+/// * `false` on Windows: the `windows` module is path-based (`Path::join`
+///   plus `std::fs`), and `Path::join` has no component-wise `O_NOFOLLOW`,
+///   so a symlink in a path component is followed. A caller must not treat a
+///   path as confined here; the live preflight remains the only guarantee.
+///
+/// A caller that reads "component-confined" as a licence to skip a live
+/// confinement check MUST consult this property. Consulting the side kind
+/// alone is not enough: the side kind says which caller API is in use, not
+/// whether THIS platform's primitives refuse a swapped component.
+pub const COMPONENT_CONFINED: bool = cfg!(unix);
+
 /// The path-based JSON reader — TEST-ONLY (the crash-consistency assertions
 /// read a REOPENED store's files directly to verify the on-disk state). The
 /// store's OWN record reads route through [`read_json_fd`]
@@ -406,6 +430,32 @@ mod tests {
     use crate::error::Error;
     use crate::test_support::{fixture_env, fixture_tmpdir, proptest_cases, slow_tests_enabled};
     use proptest::prelude::*;
+
+    /// Pin the platform property ITSELF, so a future port cannot leave the
+    /// constant claiming a confinement its primitives do not enforce. The
+    /// value is cfg-gated because each branch is a claim about the SELECTED
+    /// implementation: on Unix the primitives refuse a symlinked component
+    /// (`O_NOFOLLOW`), and on every other supported port they are path-based
+    /// and follow it. A build in which the constant and the selected
+    /// primitives disagree fails HERE.
+    #[test]
+    fn the_component_confinement_property_matches_the_selected_primitives() {
+        // Read through a binding so this stays a runtime assertion about the
+        // BUILT platform rather than a constant the linter folds away.
+        let confined: bool = super::COMPONENT_CONFINED;
+        #[cfg(unix)]
+        assert!(
+            confined,
+            "the Unix primitives refuse a symlinked path component (O_NOFOLLOW), so this \
+             platform IS component-confined"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !confined,
+            "the path-based primitives (Path::join has no component-wise O_NOFOLLOW) follow a \
+             symlinked path component, so this platform is NOT component-confined"
+        );
+    }
 
     fn marker_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
