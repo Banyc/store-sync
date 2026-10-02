@@ -30,10 +30,16 @@
 //! A symlink target is the LINK CONTENT, a byte string the kernel dereferences
 //! literally, and the manifest stores it as a UTF-8 [`String`] on a line- and
 //! tab-separated wire. Canonicalization therefore REFUSES (never truncates,
-//! never lossily converts) a target that is not valid UTF-8 or that contains a
-//! newline, tab, or NUL — all of which would make the stored spelling address a
-//! DIFFERENT path than the on-disk link. The raw target bytes are what the
-//! content hash binds, so the two canonicalizers must agree on them exactly.
+//! never lossily converts) a target that is not valid UTF-8 or that contains
+//! any `WIRE_UNREPRESENTABLE_CHARS` character (NUL, LF, CR, or TAB). LF and
+//! TAB are the wire separators; CR is refused because a CRLF-folding line
+//! reader (Rust's `str::lines`, which the assembler must not use) strips a CR
+//! that ends a line, and the LAST wire field is the target — a target ending
+//! in CR would be silently truncated and then re-hashed, hiding the
+//! divergence; NUL cannot be a C string. Any of them would make the stored
+//! spelling address a DIFFERENT path than the on-disk link. The raw target
+//! bytes are what the content hash binds, so the two canonicalizers must agree
+//! on them exactly.
 //!
 //! NFC is deliberately NOT required of a target. A name is an index into the
 //! tree, but a target is DATA: the kernel resolves it verbatim, it may contain
@@ -171,28 +177,57 @@ fn has_only_normal_components(path: &str) -> bool {
         .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
+/// The characters an entry NAME or a symlink TARGET may not contain: the ONE
+/// refused set that both canonicalizers share.
+///
+/// - NUL cannot appear in a POSIX path or in the C string a link target is.
+/// - LF and TAB are the manifest wire's line and field separators.
+/// - CR is refused because a CRLF-folding line reader (Rust's `str::lines`,
+///   which the assembler must not use) strips a CR that ends a line; the last
+///   wire field is the symlink target, so a target ending in CR would be
+///   silently truncated and then re-hashed, hiding the divergence.
+///
+/// [`validate_entry_path`] and [`validate_symlink_target`] both consult this
+/// set, and the far-side script refuses the same four bytes, so the local walk
+/// and the wire path accept exactly the same trees.
+const WIRE_UNREPRESENTABLE_CHARS: [char; 4] = ['\0', '\n', '\r', '\t'];
+
+/// The first character in `s` that cannot cross the wire faithfully
+/// ([`WIRE_UNREPRESENTABLE_CHARS`]), or `None` when `s` is wire-clean.
+fn first_unrepresentable_char(s: &str) -> Option<char> {
+    s.chars().find(|c| WIRE_UNREPRESENTABLE_CHARS.contains(c))
+}
+
+/// A short human-readable name for a refused character, used in errors so the
+/// refusal says exactly which byte broke the wire rule.
+fn unrepresentable_char_name(c: char) -> &'static str {
+    match c {
+        '\0' => "NUL",
+        '\n' => "newline (LF)",
+        '\r' => "carriage return (CR)",
+        '\t' => "tab",
+        _ => "unrepresentable character",
+    }
+}
+
 /// Validate an entry path (the local spelling built by
 /// [`canonical_entry_path`], or the raw WIRE spelling the remote script
 /// printed) and return it UNCHANGED. Both canonicalizers funnel through this
 /// so they accept exactly the same set of trees.
 ///
-/// Rejects NUL bytes and newline/tab characters (the remote script's output
-/// is line- and tab-separated, so such a name would mangle the wire format
-/// and make a tree unverifiable on a remote), rejects absolute paths and any
-/// empty or traversal (`.`/`..`) component, and — because the manifest stores
-/// on-disk names — REQUIRES the spelling to be already NFC instead of
-/// normalizing it. A non-NFC name is refused, naming the entry: storing a
-/// normalized spelling would address a path that does not exist on a
-/// normalization-sensitive filesystem.
+/// Rejects any [`WIRE_UNREPRESENTABLE_CHARS`] character (NUL, LF, CR, or TAB) —
+/// LF/TAB are the wire separators, and a CR would be folded by a CRLF-aware
+/// line reader and silently truncate the field — naming the character and the
+/// entry. It also rejects absolute paths and any empty or traversal (`.`/`..`)
+/// component, and — because the manifest stores on-disk names — REQUIRES the
+/// spelling to be already NFC instead of normalizing it. A non-NFC name is
+/// refused, naming the entry: storing a normalized spelling would address a
+/// path that does not exist on a normalization-sensitive filesystem.
 fn validate_entry_path(path: &str) -> Result<String> {
-    if path.contains('\0') {
+    if let Some(c) = first_unrepresentable_char(path) {
         return Err(Error::materialization(format!(
-            "path contains NUL bytes: {path}"
-        )));
-    }
-    if path.contains('\n') || path.contains('\t') {
-        return Err(Error::materialization(format!(
-            "path contains newline or tab: {path}"
+            "path contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {path}",
+            unrepresentable_char_name(c)
         )));
     }
     if path.starts_with('/') {
@@ -215,8 +250,9 @@ fn validate_entry_path(path: &str) -> Result<String> {
 }
 
 /// Validate a symlink target exactly as the wire requires: valid UTF-8 (the
-/// manifest's [`TreeEntry::symlink_target`] is a string), free of NUL, and free
-/// of the wire separators `\n`/`\t`. The target is returned UNCHANGED.
+/// manifest's [`TreeEntry::symlink_target`] is a string), and free of every
+/// [`WIRE_UNREPRESENTABLE_CHARS`] character (NUL, LF, CR, or TAB). The target
+/// is returned UNCHANGED.
 ///
 /// NFC is NOT required: a target is not an addressable NAME but the link's
 /// DATA — the kernel dereferences it verbatim, it may legitimately contain `..`,
@@ -225,14 +261,10 @@ fn validate_entry_path(path: &str) -> Result<String> {
 /// it is refused rather than lossily converted (which would install a link to a
 /// different path). `entry_path` names the offending entry in every error.
 fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
-    if target.contains('\0') {
+    if let Some(c) = first_unrepresentable_char(target) {
         return Err(Error::materialization(format!(
-            "symlink target of entry {entry_path} contains NUL bytes: {target:?}"
-        )));
-    }
-    if target.contains('\n') || target.contains('\t') {
-        return Err(Error::materialization(format!(
-            "symlink target of entry {entry_path} contains newline or tab: {target:?}"
+            "symlink target of entry {entry_path} contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {target:?}",
+            unrepresentable_char_name(c)
         )));
     }
     Ok(target.to_string())
@@ -246,9 +278,10 @@ fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
 /// existing EMPTY directory is a legitimate tree and canonicalizes to a
 /// manifest with no entries.
 ///
-/// Rejects absolute paths, `..`, NUL bytes, newline/tab filenames (the
-/// remote verification wire format is line- and tab-separated, so the two
-/// verification paths must agree), names that are not valid UTF-8 or not
+/// Rejects absolute paths, `..`, NUL/LF/CR/TAB in names and targets (the
+/// remote verification wire format is line- and tab-separated and a CRLF
+/// reader folds a trailing CR, so the two verification paths must agree),
+/// names that are not valid UTF-8 or not
 /// already NFC (the stored path IS the on-disk name, never a normalized
 /// re-spelling), duplicate paths, escaping/absolute symbolic links, devices,
 /// sockets, FIFOs, and hard links.
@@ -284,8 +317,8 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
         // into a separator.
         let joined = canonical_entry_path(rel_os)?;
         // Validate the spelling the manifest will store — the ON-DISK name —
-        // because that is exactly what the remote assembler sees too: NUL
-        // bytes, newline/tab, absolute paths, empty/traversal components, and
+        // because that is exactly what the remote assembler sees too: NUL,
+        // LF, CR, and TAB, absolute paths, empty/traversal components, and
         // names that are not already NFC are refused here exactly as they are
         // there. The accepted spelling is stored UNCHANGED; a normalized
         // spelling would name a different file on a normalization-sensitive
@@ -339,8 +372,8 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             // The target is LINK CONTENT, so it must be stored faithfully or
             // the tree refused: a lossy conversion would install a link to a
             // different path. It is validated as UTF-8 (the manifest stores a
-            // string) and for the wire separators, naming this entry on
-            // refusal; the hash binds the RAW bytes.
+            // string) and for every wire-unrepresentable character, naming
+            // this entry on refusal; the hash binds the RAW bytes.
             let target_bytes = target.into_os_string().into_encoded_bytes();
             let target_str = std::str::from_utf8(&target_bytes).map_err(|_| {
                 Error::materialization(format!(
@@ -420,11 +453,13 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 /// client decodes stdout lossily ([`String::from_utf8_lossy`] in the
 /// runner) and so can never recover a byte the script mangled. It `die`s
 /// (non-zero exit) — never truncates or lossily converts — for any entry
-/// NAME that is not valid UTF-8, is not already NFC, or contains a
-/// newline/tab/NUL, and for any symlink TARGET that is not valid UTF-8 or
-/// contains a newline/tab/NUL (the wire separators). NFC is NOT required of
-/// a target: it is link data the kernel dereferences verbatim, not an
-/// addressable name. The client's existing `!out.success()` path turns the
+/// NAME that is not valid UTF-8, is not already NFC, or contains any
+/// NUL/LF/CR/TAB, and for any symlink TARGET that is not valid UTF-8 or
+/// contains any NUL/LF/CR/TAB. LF and TAB are the wire separators; CR is
+/// refused because a CRLF-folding line reader would strip a trailing CR and
+/// truncate the last field (the target). NFC is NOT required of a target: it
+/// is link data the kernel dereferences verbatim, not an addressable name.
+/// The client's existing `!out.success()` path turns the
 /// non-zero exit into an error that carries this stderr, so a tree that
 /// cannot cross the wire faithfully is refused where the raw bytes are
 /// still visible rather than silently mis-described.
@@ -436,14 +471,14 @@ die qq{not a directory: $root\n} unless defined($root) && -d $root;
 my $hex = sub { my ($s)=@_; return unpack(q{H*},$s); };
 my $check_name = sub {
     my ($n,$dir)=@_;
-    die(qq{entry name under $dir contains a tab, newline, or NUL (the wire format is tab/newline separated): } . $hex->($n) . qq{\n}) if $n =~ /[\n\t\0]/;
+    die(qq{entry name under $dir contains a tab, newline, carriage return, or NUL (the manifest wire refuses NUL/LF/CR/TAB): } . $hex->($n) . qq{\n}) if $n =~ /[\n\r\t\0]/;
     my $c=$n;
     die(qq{entry name under $dir is not valid UTF-8: } . $hex->($n) . qq{\n}) unless utf8::decode($c);
     die(qq{entry name under $dir is not NFC-normalized: $n\n}) if NFC($c) ne $c;
 };
 my $check_target = sub {
     my ($tg,$rel)=@_;
-    die(qq{symlink target of $rel contains a tab, newline, or NUL (the wire format is tab/newline separated): } . $hex->($tg) . qq{\n}) if $tg =~ /[\n\t\0]/;
+    die(qq{symlink target of $rel contains a tab, newline, carriage return, or NUL (the manifest wire refuses NUL/LF/CR/TAB): } . $hex->($tg) . qq{\n}) if $tg =~ /[\n\r\t\0]/;
     my $c=$tg;
     die(qq{symlink target of $rel is not valid UTF-8: } . $hex->($tg) . qq{\n}) unless utf8::decode($c);
 };
@@ -452,21 +487,45 @@ my $walk; $walk = sub { my ($dir,$prefix)=@_; opendir(my $dh,$dir) or die qq{ope
 $walk->($root, q{});"#
 }
 
+/// Validate a 64-character lowercase-hex SHA-256 as printed by the far-side
+/// script (Digest::SHA's `sha256_hex`). Returns an error naming the entry for
+/// a wrong-length, non-hex, or uppercase hash, so a corrupted or divergent
+/// line fails closed instead of silently producing a confusing digest.
+fn validate_wire_hash(hash: &str, entry_path: &str) -> Result<()> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(Error::materialization(format!(
+            "invalid content hash {hash:?} for {entry_path}"
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble canonical tree metadata from the remote verification script's
 /// output ([`remote_tree_verify_script`]), applying the SAME validations the
 /// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
 /// names (a non-NFC name is refused, never normalized),
 /// NUL/traversal/absolute/duplicate path rejection, hardlink rejection, and
-/// in-root symlink targets that are valid UTF-8 and free of the wire
-/// separators. A line with more than six tab-separated fields is refused too:
-/// the script never emits one, so it can only mean a name or target contained
-/// a tab, which would otherwise be silently TRUNCATED by the field split —
-/// the assembler refuses such a spelling instead of accepting a shorter one
-/// than the far side meant. The per-file content hashes come from the remote
-/// (sha256sum); the digest is computed from the assembled metadata, so a
-/// corrupted or divergent remote tree produces a digest mismatch without any
-/// content transfer. `root` is the remote tree root (absolute, on the
-/// remote host) used for the in-root symlink check.
+/// in-root symlink targets that are valid UTF-8 and free of every
+/// `WIRE_UNREPRESENTABLE_CHARS` character (NUL/LF/CR/TAB). A line is split on
+/// LF ALONE and refused when it ends in a bare CR (Rust's `str::lines` would
+/// fold it away, truncating the last field), and a line that does not have
+/// exactly six tab-separated fields is refused: the script never emits one,
+/// so it can only mean a name or target contained a tab — which the field
+/// split would silently TRUNCATE — or a mangled/short line, and the assembler
+/// refuses such a spelling instead of accepting a shorter one than the far
+/// side meant. A SYMLINK's `content_sha256` is the hash the far side computed
+/// over the RAW target bytes; the assembler validates its shape and REQUIRES
+/// it to equal the hash of the target that crossed the wire, so a wire split
+/// or fold can never be hidden by recomputing the hash after decoding. The
+/// per-file content hashes come from the remote (sha256sum); the digest is
+/// computed from the assembled metadata, so a corrupted or divergent remote
+/// tree produces a digest mismatch without any content transfer. `root` is
+/// the remote tree root (absolute, on the remote host) used for the in-root
+/// symlink check.
 ///
 /// `output` must come from a walk that actually enumerated the whole tree:
 /// [`remote_tree_verify_script`] exits non-zero for an absent, non-directory,
@@ -477,33 +536,50 @@ $walk->($root, q{});"#
 pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for line in output.lines() {
-        let mut it = line.split('\t');
-        let path = it.next().unwrap_or("");
-        if path.is_empty() {
+    for line in output.split('\n') {
+        // The script terminates every line with a single LF and never emits a
+        // CR. `str::lines()` would fold a CR that immediately precedes the LF,
+        // silently truncating the LAST wire field (the symlink target) so the
+        // far side's bytes and the assembled target diverge. Split on LF alone
+        // and refuse a bare CR explicitly, keeping the byte visible instead of
+        // folding it away.
+        if line.is_empty() {
             continue;
         }
-        let entry_type = it.next().unwrap_or("");
-        let mode_hex = it.next().unwrap_or("");
-        let nlink = it.next().unwrap_or("0");
-        let content_hash = it.next().unwrap_or("");
-        let symlink_target = it.next().unwrap_or("");
-        // The script emits EXACTLY six fields per entry. A seventh field can
-        // only come from a tab inside a name or target, which the field split
-        // has already truncated: refuse it rather than assemble a shorter
+        if line.ends_with('\r') {
+            return Err(Error::materialization(format!(
+                "wire line ends with a bare carriage return; the far side emits LF-terminated lines only, so this CR is field DATA that a CRLF-folding reader would discard: {line:?}"
+            )));
+        }
+        // The script emits EXACTLY six tab-separated fields per entry:
+        // path, type, mode, nlink, content_sha256, symlink_target. A different
+        // count can only come from a tab inside a name or target (which the
+        // split has already truncated) or from a mangled/short line; refuse it
+        // rather than defaulting the missing fields and accepting a shorter
         // spelling than the far side printed. (The script itself dies first on
         // such a tree; this keeps a hand-built or proxied line from being
         // accepted lossily too.)
-        if let Some(extra) = it.next() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 6 {
             return Err(Error::materialization(format!(
-                "wire line has more than six tab-separated fields; a name or symlink target contains a tab: {line:?} (extra field {extra:?})"
+                "wire line does not have exactly six tab-separated fields (path/type/mode/nlink/hash/target); a name or symlink target contains a tab, or the line is malformed: {line:?}"
             )));
         }
+        let path = fields[0];
+        if path.is_empty() {
+            continue;
+        }
+        let entry_type = fields[1];
+        let mode_hex = fields[2];
+        let nlink = fields[3];
+        let content_hash = fields[4];
+        let symlink_target = fields[5];
 
         // Path validation — mirror canonicalize_tree exactly by running the
-        // SAME validator on the wire spelling. Newline/tab are the
-        // wire-format breakers (the script's output is line- and
-        // tab-separated), absolute/empty/traversal components are refused,
+        // SAME validator on the wire spelling. NUL/LF/CR/TAB are the
+        // wire-unrepresentable characters (the script's output is line- and
+        // tab-separated, and a CRLF reader folds a trailing CR),
+        // absolute/empty/traversal components are refused,
         // and a name that is not already NFC is refused rather than
         // normalized, so the two verification paths accept exactly the same
         // trees.
@@ -546,15 +622,7 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                 // length, non-hex, or uppercase) is rejected with a clear
                 // error instead of silently producing a confusing digest
                 // mismatch.
-                if content_hash.len() != 64
-                    || !content_hash
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    return Err(Error::materialization(format!(
-                        "invalid content hash {content_hash:?} for {entry_path}"
-                    )));
-                }
+                validate_wire_hash(content_hash, &entry_path)?;
                 TreeEntry {
                     path: entry_path,
                     entry_type: "file".to_string(),
@@ -569,10 +637,21 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                         "missing symlink target for {entry_path}"
                     )));
                 }
+                // The script hashes the RAW link bytes (`readlink`) with
+                // `sha256_hex`. The assembler must NOT silently RECOMPUTE the
+                // hash over the decoded target: recomputation is exactly what
+                // hides a wire split or fold, because a truncated target would
+                // be re-hashed after truncation and the manifest would agree
+                // with itself while disagreeing with the far side. Validate the
+                // hash's shape and REQUIRE it to equal the hash of the target
+                // that crossed the wire; a mismatch is refused, naming the
+                // entry, rather than binding the far side's bytes to a
+                // different target.
+                validate_wire_hash(content_hash, &entry_path)?;
                 // The target is link DATA, so it must be stored faithfully:
-                // the SAME validator the local walk uses refuses NUL and the
-                // wire separators (the script refuses non-UTF-8 targets
-                // before they reach this string).
+                // the SAME validator the local walk uses refuses NUL, LF, CR,
+                // and TAB (the script refuses them before they reach this
+                // string).
                 let symlink_target = validate_symlink_target(&entry_path, symlink_target)?;
                 let target = PathBuf::from(&symlink_target);
                 if target.is_absolute() {
@@ -589,12 +668,17 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                         )));
                     }
                 }
-                let target_bytes = symlink_target.as_bytes();
+                let recomputed = sha256_bytes(symlink_target.as_bytes());
+                if recomputed != content_hash {
+                    return Err(Error::materialization(format!(
+                        "symlink target hash mismatch for {entry_path}: the far side hashed its raw target bytes as {content_hash}, but the target that crossed the wire hashes to {recomputed}; refusing rather than recording a hash of a target that is not what the far side saw"
+                    )));
+                }
                 TreeEntry {
                     path: entry_path,
                     entry_type: "symlink".to_string(),
                     mode: "0777".to_string(),
-                    content_sha256: Some(sha256_bytes(target_bytes)),
+                    content_sha256: Some(recomputed),
                     symlink_target: Some(symlink_target),
                 }
             }
@@ -1430,7 +1514,7 @@ mod tests {
         std::fs::write(root.join("a\nb"), b"content").unwrap();
         let local_err = canonicalize_tree(&root).unwrap_err();
         assert!(
-            local_err.to_string().contains("newline or tab"),
+            local_err.to_string().contains("newline (LF)"),
             "local canonicalizer must reject the newline filename, got: {local_err}"
         );
 
@@ -1439,7 +1523,7 @@ mod tests {
         std::fs::write(root2.join("a\tb"), b"content").unwrap();
         let local_err2 = canonicalize_tree(&root2).unwrap_err();
         assert!(
-            local_err2.to_string().contains("newline or tab"),
+            local_err2.to_string().contains("tab"),
             "local canonicalizer must reject the tab filename, got: {local_err2}"
         );
 
@@ -1459,8 +1543,8 @@ mod tests {
             "remote script must reject the tab filename, got success with stdout {:?}",
             String::from_utf8_lossy(&out2.stdout)
         );
-        // The assembler also refuses a hand-built tab-mangled line (seven
-        // fields) instead of silently truncating the name at the tab.
+        // The assembler also refuses a hand-built tab-mangled line instead of
+        // silently truncating the name at the tab.
         let hash = "0".repeat(64);
         assert!(
             canonicalize_remote_entries(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root2).is_err(),
@@ -1486,7 +1570,7 @@ mod tests {
             "a tab target must be refused with the target rule, got: {err}"
         );
         assert!(
-            err.to_string().contains("newline or tab"),
+            err.to_string().contains("tab"),
             "the target refusal must name the separator rule, got: {err}"
         );
         assert!(
@@ -1764,6 +1848,246 @@ mod tests {
             remote.entries, local.entries,
             "both canonicalizers must store the same target bytes"
         );
+        assert_eq!(remote.tree_sha256, local.tree_sha256);
+    }
+
+    /// A symlink target ending in CR is refused by the LOCAL walk. CR is not a
+    /// wire separator, so pre-fix the walk stored `x\r` verbatim (hash
+    /// `896dfdac…`), while the far side printed `…\tx\r\n` and the assembler's
+    /// `output.lines()` stripped the CR and re-hashed `x` (`2d711642…`): two
+    /// DIFFERENT manifests for one tree, falsifying the "both canonicalizers
+    /// accept exactly the same trees" invariant, and an end-to-end sync that
+    /// reported `Ok`/`skipped` while the destination still held `x\r`. This
+    /// assertion FAILS against the pre-fix code (`unwrap_err` on `Ok`).
+    #[test]
+    fn trailing_cr_symlink_target_rejected_by_local_canonicalizer() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("x\r", root.join("l")).unwrap();
+        let err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink target"),
+            "a CR target must be refused with the target rule, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("carriage return"),
+            "the target refusal must name the CR rule, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("entry l"),
+            "the target refusal must name the offending entry, got: {err}"
+        );
+    }
+
+    /// The far-side script refuses a CR-containing symlink TARGET on the RAW
+    /// bytes, before printing a line that a CRLF-folding reader would misread.
+    /// Pre-fix the script exited 0 and the client assembled `x` (the CR
+    /// already folded away) — this assertion FAILS against it.
+    #[test]
+    fn wire_script_refuses_cr_in_symlink_target() {
+        skip_without_perl!("wire_script_refuses_cr_in_symlink_target");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("x\r", root.join("l")).unwrap();
+        let out = run_remote_script_raw(&root);
+        assert!(
+            !out.status.success(),
+            "the wire script must refuse a CR target far-side, got success with stdout {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("symlink target") && stderr.contains("carriage return"),
+            "the far-side refusal must name the target and the CR rule, got: {stderr}"
+        );
+    }
+
+    /// A NAME containing CR — interior OR trailing — is refused by BOTH
+    /// canonicalizers. A trailing CR in a name is not folded by a tab-splitting
+    /// reader (the name is not the last field), but the wire format has ONE
+    /// refused set: any NUL/LF/CR/TAB in a name is refused everywhere so no
+    /// reader can depend on field position. Pre-fix both canonicalizers
+    /// ACCEPTED these names — this assertion FAILS against the pre-fix code.
+    #[test]
+    fn cr_in_entry_name_rejected_by_both_canonicalizers() {
+        skip_without_perl!("cr_in_entry_name_rejected_by_both_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        for (sub, name) in [("interior", "x\ry"), ("trailing", "x\r")] {
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(name), b"content").unwrap();
+            let local_err = canonicalize_tree(&root).unwrap_err();
+            assert!(
+                local_err.to_string().contains("carriage return"),
+                "the local walk must refuse the {sub} CR name with the CR rule, got: {local_err}"
+            );
+            let out = run_remote_script_raw(&root);
+            assert!(
+                !out.status.success(),
+                "the wire script must refuse the {sub} CR name, got success with stdout {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("carriage return"),
+                "the far-side refusal must name the CR rule for the {sub} CR name, got: {stderr}"
+            );
+        }
+    }
+
+    /// The ASSEMBLER cannot see a CR that `str::lines()` already folded (the
+    /// fold happens before any validator runs), so the local/far-side checks
+    /// alone do not protect a hand-built or proxied line. Three assertions
+    /// close that class:
+    /// (1) a line ending in a bare CR is refused rather than folded;
+    /// (2) a dir line whose CR-only target `lines()` would fold is refused;
+    /// (3) a symlink whose hash disagrees with the target that crossed the
+    ///     wire is refused instead of re-hashing the (possibly truncated)
+    ///     target — the exact recomputation that made the defect invisible.
+    /// The mismatch case specifically FAILS against the pre-fix assembler,
+    /// which recomputed `sha256("x")` and accepted.
+    #[test]
+    fn assembler_refuses_bare_cr_and_mismatched_symlink_hash() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        let hash = "0".repeat(64);
+
+        // (1) The exact reproduction line: stdout `L\tl\t1ff\t1\t<hash>\tx\r\n`.
+        // Pre-fix `lines()` folded the CR and accepted target `x`.
+        let cr_target_hash = crate::digest::sha256_bytes(b"x\r");
+        let raw = format!("L\tl\t1ff\t1\t{cr_target_hash}\tx\r\n");
+        let err = canonicalize_remote_entries(&raw, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("carriage return"),
+            "a bare CR before the line terminator must be refused, got: {err}"
+        );
+
+        // (2) A dir line with a CR-only final field: pre-fix `lines()` folded
+        // the CR and the dir was accepted (the target is ignored for dirs).
+        let dir_line = "d\td\t1ed\t1\t\t\r\n";
+        assert!(
+            canonicalize_remote_entries(dir_line, &root).is_err(),
+            "a dir line whose final field is a bare CR must be refused"
+        );
+
+        // (3) The far side hashed `x\r` but the line carries target `x`: the
+        // assembler must NOT recompute the hash over `x` and call it equal.
+        // Pre-fix it recomputed (`sha256("x")`), stored the recomputed hash,
+        // and accepted the divergent line.
+        let mismatch = format!("L\tl\t1ff\t1\t{cr_target_hash}\tx\n");
+        let err = canonicalize_remote_entries(&mismatch, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink target hash mismatch"),
+            "a script hash that disagrees with the wire target must be refused, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("L"),
+            "the mismatch refusal must name the entry, got: {err}"
+        );
+
+        // A short (five-field) line is refused rather than defaulting the
+        // missing field, so a CR hiding in a line-final hash cannot be folded
+        // away either.
+        assert!(
+            canonicalize_remote_entries(&format!("f.txt\tf\t1a4\t1\t{hash}"), &root).is_err(),
+            "a five-field line must be refused, not defaulted"
+        );
+    }
+
+    /// PARITY over the ONE refused set: for every [`WIRE_UNREPRESENTABLE_CHARS`]
+    /// character the local walk and the wire path agree. NUL cannot appear in
+    /// an on-disk name or target (POSIX names and link targets are C strings),
+    /// so it is checked through the shared validators and a hand-built line;
+    /// LF, CR, and TAB are checked end to end on real trees. Pre-fix the local
+    /// walk and the script both ACCEPTED CR in names and targets, so the CR
+    /// rows FAIL against the pre-fix code.
+    #[test]
+    fn refused_character_set_agrees_between_local_walk_and_wire() {
+        skip_without_perl!("refused_character_set_agrees_between_local_walk_and_wire");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let hash = "0".repeat(64);
+
+        assert_eq!(
+            WIRE_UNREPRESENTABLE_CHARS,
+            ['\0', '\n', '\r', '\t'],
+            "the refused set is exactly NUL/LF/CR/TAB"
+        );
+        assert!(validate_entry_path("a\0b").is_err());
+        assert!(validate_symlink_target("l", "a\0b").is_err());
+
+        // NUL cannot be materialized on the host, so exercise the wire path
+        // with a hand-built line.
+        let nul_root = dir.path().join("nul");
+        std::fs::create_dir_all(&nul_root).unwrap();
+        assert!(
+            canonicalize_remote_entries(&format!("a\0b\tf\t1a4\t1\t{hash}\t\n"), &nul_root)
+                .is_err(),
+            "the assembler must refuse a NUL name"
+        );
+
+        for (c, label) in [('\n', "lf"), ('\r', "cr"), ('\t', "tab")] {
+            // A NAME containing `c`, in the interior and trailing positions.
+            for (pos, name) in [
+                ("interior", format!("x{c}y")),
+                ("trailing", format!("x{c}")),
+            ] {
+                let root = dir.path().join(format!("name_{label}_{pos}"));
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(root.join(&name), b"content").unwrap();
+                assert!(
+                    canonicalize_tree(&root).is_err(),
+                    "local walk must refuse the {pos} {c:?} name"
+                );
+                assert!(
+                    !run_remote_script_raw(&root).status.success(),
+                    "wire path must refuse the {pos} {c:?} name"
+                );
+            }
+            // A symlink TARGET containing `c`, interior and trailing.
+            for (pos, target) in [
+                ("interior", format!("x{c}y")),
+                ("trailing", format!("x{c}")),
+            ] {
+                let root = dir.path().join(format!("target_{label}_{pos}"));
+                std::fs::create_dir_all(&root).unwrap();
+                std::os::unix::fs::symlink(&target, root.join("l")).unwrap();
+                assert!(
+                    canonicalize_tree(&root).is_err(),
+                    "local walk must refuse the {pos} {c:?} target"
+                );
+                assert!(
+                    !run_remote_script_raw(&root).status.success(),
+                    "wire path must refuse the {pos} {c:?} target"
+                );
+            }
+        }
+    }
+
+    /// Non-regression: a legitimate target containing a SPACE still round-trips
+    /// byte-for-byte through BOTH canonicalizers (the shared refused set must
+    /// not reject legal link data). This guards the new refusal rules against
+    /// over-reach.
+    #[test]
+    fn space_in_symlink_target_round_trips_through_both_canonicalizers() {
+        skip_without_perl!("space_in_symlink_target_round_trips_through_both_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file with space.txt"), b"content").unwrap();
+        std::os::unix::fs::symlink("file with space.txt", root.join("l")).unwrap();
+
+        let local = canonicalize_tree(&root).unwrap();
+        let link = local.entries.iter().find(|e| e.path == "l").unwrap();
+        assert_eq!(
+            link.symlink_target.as_deref(),
+            Some("file with space.txt"),
+            "a space in a target is legal link DATA and must be stored verbatim"
+        );
+        let remote = canonicalize_remote_entries(&run_remote_script(&root), &root).unwrap();
+        assert_eq!(remote.entries, local.entries);
         assert_eq!(remote.tree_sha256, local.tree_sha256);
     }
 
