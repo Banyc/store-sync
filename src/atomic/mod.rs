@@ -55,13 +55,19 @@
 //! The platform-dependent primitives — private permissions, the atomic
 //! replace's rename/fsync semantics, and the owned-root confinement — live
 //! in the [`unix`] / [`windows`] submodules, selected by the TWO `mod`
-//! declarations below (the single cfg switch point). [`unix`] is the
-//! descriptor-relative implementation (`openat`/`renameat`/`linkat`/
-//! `unlinkat`/`mkdirat` with `O_NOFOLLOW` — every PARENT component is
-//! refused as a symlink, and the open/create-new helpers refuse the FINAL
-//! component too, while the atomic replace installs with `renameat` and
-//! replaces the final entry without ever following it; see [`unix`]'s
-//! module docs — plus the POSIX parent-directory fsync durability).
+//! declarations below (the single cfg switch point). [`unix`] provides the
+//! descriptor-relative `_fd` implementation (`openat`/`renameat`/`linkat`/
+//! `unlinkat`/`mkdirat` with `O_NOFOLLOW` — on that `_fd` surface every
+//! PARENT component is refused as a symlink, and the open/create-new helpers
+//! refuse the FINAL component too, while the atomic replace installs with
+//! `renameat` and replaces the final entry without ever following it; see
+//! [`unix`]'s module docs — plus the POSIX parent-directory fsync
+//! durability). That component confinement covers the `_fd` surface only:
+//! [`unix`]'s PATH-BASED free functions (`set_private`,
+//! `write_atomic_replace`, `sync_parent_dir`, `ensure_private_dir`,
+//! `ensure_private_dir_durable`, `remove_dir_all_path`) take an ordinary
+//! path and are NOT covered — see [`unix`]'s module docs for the exact
+//! split.
 //! [`windows`] is the path-based implementation with documented weaker
 //! guarantees: no directory descriptors (the root is a path), no
 //! parent-directory fsync durability, a non-atomic replace (Windows

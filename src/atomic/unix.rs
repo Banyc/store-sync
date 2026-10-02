@@ -6,22 +6,34 @@
 //!
 //! # Which path SPELLINGS are refused
 //!
-//! Every path this module resolves is validated as ROOT-RELATIVE first
-//! ([`validate_rel`]): only normal components are admitted, so an ABSOLUTE
-//! path (whose `RootDir`/`Prefix` component makes `openat` ignore the root
-//! descriptor) and a `..` component (which walks ABOVE the root) are
-//! refused as path errors, as are `.` and the empty path (they name the
-//! root, not an entry under it). Trailing and repeated separators are NOT
-//! refused — [`Path::components`] erases them, so `a/b/` and `a//b` name
-//! the same entry as `a/b` and resolve identically. The owned root itself
-//! is normalized the same way before it is opened
+//! Every path the DESCRIPTOR-RELATIVE (`_fd`) surface resolves is validated
+//! as ROOT-RELATIVE first ([`validate_rel`]): only normal components are
+//! admitted, so an ABSOLUTE path (whose `RootDir`/`Prefix` component makes
+//! `openat` ignore the root descriptor) and a `..` component (which walks
+//! ABOVE the root) are refused as path errors, as are `.` and the empty path
+//! (they name the root, not an entry under it). Trailing and repeated
+//! separators are NOT refused — [`Path::components`] erases them, so `a/b/`
+//! and `a//b` name the same entry as `a/b` and resolve identically. The owned
+//! root itself is normalized the same way before it is opened
 //! ([`super::normalize_root`]), so `dir/` and `dir` are one root.
 //!
 //! # Which path components are refused
 //!
-//! Every PARENT component is resolved with component-wise
-//! `openat(O_NOFOLLOW)` and a symlink there is REFUSED (ELOOP) — for every
-//! primitive, reads included.
+//! On the DESCRIPTOR-RELATIVE (`_fd`) surface — the one that resolves a
+//! root-relative path component-wise against an [`OwnedFd`] for the owned
+//! root — every PARENT component is resolved with component-wise
+//! `openat(O_NOFOLLOW)` and a symlink there is REFUSED (ELOOP), reads
+//! included.
+//!
+//! NOT COVERED by that component confinement: the module's PATH-BASED free
+//! functions take an ordinary [`Path`] and resolve it with
+//! `std::fs`/`std::fs::Permissions`, so an INTERMEDIATE symlink in that path
+//! IS followed. They are [`set_private`], [`write_atomic_replace`],
+//! [`sync_parent_dir`], [`ensure_private_dir`],
+//! [`ensure_private_dir_durable`], [`copy_dir_recursive`], and
+//! [`remove_dir_all_path`] (the manifest walk's root access is path-based by
+//! design). The component confinement claimed below belongs to the `_fd`
+//! surface only, never to these.
 //!
 //! The OPEN / CREATE-NEW helpers — [`openat_no_follow`], [`write_file_fd`],
 //! [`write_atomic_cas_fd`] — also open the FINAL component with
