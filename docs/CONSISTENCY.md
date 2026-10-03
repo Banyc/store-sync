@@ -73,13 +73,26 @@ is only settled by reading the consumer, and the honest rule it demonstrates is
 that "cannot determine" must be a state the caller reports, not a value that
 silently feeds a branch.
 
-**J — the public surface is not the same on both platforms.**
-`atomic::{fsync_dir_fd, openat_no_follow, openat_no_follow_io,
-remove_dir_all_path}` exist on unix and not on windows, while both ports
-`pub use …::*` into the same `atomic` namespace. A consumer using any of them
-compiles on unix and fails on windows — and the two `openat_*` forms are
-inherently POSIX, so the choice is to demote them or to state the platform in
-the API, not to pretend they are neutral. **Open.**
+**J — the public surface was not the same on both platforms. FIXED.**
+The crate exposed unix-only public names while both ports `pub use …::*` into the
+same namespaces, so a consumer using one compiled on unix and failed on windows.
+The set was `atomic::{fsync_dir_fd, openat_no_follow, openat_no_follow_io}`
+(`remove_dir_all_path` had already left the surface with API constraint #1) plus
+`transport::kill_process_group`.
+
+Every one of them turned out to be reachable only from inside the crate — the
+`tests/confinement.rs` mention of `openat_no_follow` is prose, not a call — so
+the fix is not to document the platform in the API but to stop exposing the
+names: all three `atomic` primitives became `pub(crate)`, `kill_process_group`
+stays public on neither port (it is the SSH runner's kill path, so it became
+`pub(crate)` under the same `#[cfg(unix)]`), `RealKill` stays public because BOTH
+ports implement it, and a dead transport-level re-export of `kill_process_group`
+was removed outright.
+
+Verified by re-running the sweep: the unix-only and windows-only public sets in
+`atomic` are now both EMPTY. The crate's public-function total fell 186 → 174
+across this and API constraint #1 — the constraint's real product is a smaller
+surface, not a longer document.
 
 **K — a reading taken from the wrong revision.** A `pub fn` surface count and a
 full `cargo test --lib` were both run from a checkout whose working copy was

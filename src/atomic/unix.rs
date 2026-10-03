@@ -458,7 +458,7 @@ fn rel_components(rel: &Path) -> Vec<&[u8]> {
 /// the underlying io error (so a caller can distinguish a genuine NotFound
 /// from a symlink refusal); [`openat_no_follow`] wraps it with the path
 /// context.
-pub fn openat_no_follow_io(
+pub(crate) fn openat_no_follow_io(
     dir_fd: &OwnedFd,
     rel: &RootedRelativePath,
     flags: i32,
@@ -520,7 +520,7 @@ fn open_flags_mutate(flags: i32) -> bool {
 
 /// [`openat_no_follow_io`] with the path context folded into the store
 /// error.
-pub fn openat_no_follow(
+pub(crate) fn openat_no_follow(
     dir_fd: &OwnedFd,
     rel: &RootedRelativePath,
     flags: i32,
@@ -592,7 +592,7 @@ fn parent_fd_of<'a>(root: &OwnedFd, rel: &'a Path) -> Result<(OwnedFd, &'a OsStr
 }
 
 /// fsync a directory fd (the descriptor-relative parent-dir sync).
-pub fn fsync_dir_fd(fd: &OwnedFd) -> Result<()> {
+pub(crate) fn fsync_dir_fd(fd: &OwnedFd) -> Result<()> {
     let f = std::fs::File::from(
         fd.try_clone()
             .map_err(|e| Error::store(format!("dup dir: {e}")))?,

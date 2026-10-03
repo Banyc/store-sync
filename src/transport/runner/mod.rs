@@ -123,7 +123,9 @@ use unix as platform;
 use windows as platform;
 
 #[cfg(unix)]
-pub use unix::{RealKill, kill_process_group};
+pub use unix::RealKill;
+#[cfg(unix)]
+pub(crate) use unix::kill_process_group;
 // The bounded pipe-drain discipline (non-blocking setup, the running-drain
 // and the bounded post-exit drain) is re-exported so the SSH runner's Unix
 // seam reuses ONE implementation instead of keeping a divergent copy. The

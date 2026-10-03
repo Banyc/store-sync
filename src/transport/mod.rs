@@ -76,8 +76,6 @@ pub(crate) mod scripted;
 mod ssh;
 
 pub use crate::relpath::RootedRelativePath;
-#[cfg(unix)]
-pub use runner::kill_process_group;
 pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
 pub use ssh::SshTransport;
 
