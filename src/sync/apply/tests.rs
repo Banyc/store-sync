@@ -4943,6 +4943,261 @@ fn a_parent_sync_never_destroys_a_held_nested_lock_record() {
     drop(held);
 }
 
+/// F1: the crate's own `sync` must not carry the lock record over a live
+/// holder's inode. Pre-fix `is_reserved_path` consulted only the byte-exact
+/// reserved spellings, which do NOT include the application lock record
+/// `operation.lock`, so a source entry `state/operation.lock` was neither
+/// stripped nor treated as residue and was applied as ordinary content: the
+/// record's inode changed and a SECOND `FileLock::acquire` SUCCEEDED while the
+/// first holder was alive. The manifest-path model now consults the SAME
+/// authority the id rule does, so the source collision is a `ReservedName`
+/// conflict, the destination record is residue, and the inode never moves.
+#[cfg(unix)]
+#[test]
+fn a_push_cannot_carry_the_lock_record_over_a_live_holder() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // The SOURCE holds the record spelling (the `Layout::empty().lock` path).
+    write(&src.join("normal"), b"payload");
+    write(&src.join("state/operation.lock"), b"evil");
+    // A live holder of the destination's record.
+    std::fs::create_dir_all(dst.join("state")).unwrap();
+    let record = dst.join("state/operation.lock");
+    let held = FileLock::acquire(&record, "the test's holder").expect("hold the record");
+    let inode_before = std::fs::metadata(&record).unwrap().ino();
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+
+    assert!(
+        !report.applied.contains(&"state/operation.lock".to_string()),
+        "the record must never be transferred: {report:?}"
+    );
+    assert!(
+        report
+            .conflicts
+            .iter()
+            .any(|c| c.path == "state/operation.lock" && c.reason == ConflictReason::ReservedName),
+        "the source collision must be REPORTED as a reserved name, not silently skipped: {report:?}"
+    );
+    // The record is recognized internally as DESTINATION residue too; the
+    // report's precedence gives the source conflict (a higher-precedence list)
+    // the path, but the record must still be left on disk and named somewhere.
+    assert!(
+        report.residue.contains(&"state/operation.lock".to_string())
+            || report
+                .conflicts
+                .iter()
+                .any(|c| c.path == "state/operation.lock"),
+        "the destination record must be named (residue or the higher-precedence conflict): {report:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().ino(),
+        inode_before,
+        "the record must keep the holder's stable inode"
+    );
+    let second = match FileLock::acquire(&record, "the second holder") {
+        Ok(_) => panic!("a second holder must not acquire while the first is alive"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(second, Error::LockContended(_)),
+        "the second acquisition must be typed contention: {second:?}"
+    );
+    drop(held);
+}
+
+/// F1, ALIAS form: every spelling that can ALIAS the record is stripped too.
+/// A source entry whose final component is a case alias of `operation.lock`
+/// (`.STATE/OPERATION.LOCK`) is a collision and is never transferred.
+#[cfg(unix)]
+#[test]
+fn a_push_strips_a_case_alias_of_the_lock_record() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("normal"), b"payload");
+    write(&src.join("STATE/OPERATION.LOCK"), b"evil");
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    assert!(
+        !report
+            .applied
+            .iter()
+            .any(|p| p.to_lowercase().ends_with("operation.lock")),
+        "a case alias of the record must never be transferred: {report:?}"
+    );
+    assert!(
+        report
+            .conflicts
+            .iter()
+            .any(|c| c.path == "STATE/OPERATION.LOCK"),
+        "the alias collision must be reported: {report:?}"
+    );
+}
+
+/// F6: a bare destination `operation.lock` is RESIDUE, not a failed deletion.
+/// Pre-fix `Extraneous::Delete` over the record hard-errored with a transport
+/// conflict and `indeterminate=["state/operation.lock"]` (or `["operation.lock"]`
+/// for the root-level spelling); the record is now recognized as residue (the
+/// same authority gap as F1), left in place, and named in the report so a
+/// caller learns it is there. Both the in-root `state/operation.lock` and the
+/// bare root-level `operation.lock` are covered (G2).
+#[cfg(unix)]
+#[test]
+fn extraneous_delete_spares_and_names_the_lock_record() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(dst.join("state")).unwrap();
+    let record = dst.join("state/operation.lock");
+    std::fs::write(&record, b"held").unwrap();
+    // The BARE application lock record at the destination root too (G2).
+    let bare = dst.join("operation.lock");
+    std::fs::write(&bare, b"held").unwrap();
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("deleting extraneous content must not abort on the lock record");
+    assert!(
+        record.exists() && bare.exists(),
+        "both lock-record spellings must survive a sanctioned deletion: {report:?}"
+    );
+    for spelling in ["state/operation.lock", "operation.lock"] {
+        assert!(
+            report.residue.contains(&spelling.to_string()),
+            "the surviving record {spelling} must be NAMED as residue: {report:?}"
+        );
+        assert!(
+            !report.extraneous.contains(&spelling.to_string()),
+            "the record {spelling} is never extraneous content: {report:?}"
+        );
+    }
+    assert!(
+        report.indeterminate.is_empty(),
+        "no failed mutation may be recorded for a record: {report:?}"
+    );
+}
+
+/// G1: a far-side `mktemp` temp is a CRATE TEMP, not a held-aside, so
+/// `Extraneous::Delete` removes it. Pre-fix `is_crate_temp_name` required an
+/// all-digit `<pid>.<counter>` tail, so `.sync-aside.foo.tmp.aB3xY9` (the
+/// far-side six-alphanumeric tail) was classified as residue, was never
+/// removable, and was misreported as holding the original.
+#[cfg(unix)]
+#[test]
+fn a_farside_mktemp_temp_is_extraneous_not_residue() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("a"), b"payload");
+    std::fs::create_dir_all(&dst).unwrap();
+    let temp = dst.join(".sync-aside.foo.tmp.aB3xY9");
+    std::fs::write(&temp, b"partial payload").unwrap();
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    assert!(
+        report
+            .extraneous
+            .contains(&".sync-aside.foo.tmp.aB3xY9".to_string()),
+        "a crashed far-side temp must be reachable as extraneous: {report:?}"
+    );
+    assert!(
+        !report
+            .residue
+            .contains(&".sync-aside.foo.tmp.aB3xY9".to_string()),
+        "a far-side temp holds no original and must NOT be residue: {report:?}"
+    );
+    assert!(!temp.exists(), "a sanctioned deletion removes the temp");
+}
+
+/// G3: on a case-insensitive filesystem a CASE ALIAS of a reserved spelling is
+/// the SAME INODE, so `Extraneous::Delete` must not destroy it — matching the
+/// README's "a reserved spelling is never destroyed by `Extraneous::Delete`".
+/// The destination residue classifier consults the SAME unaddressable
+/// authority as the id rule, so the alias is residue. The reproduction needs a
+/// case-folding filesystem (macOS APFS by default); on a case-sensitive one the
+/// two spellings are distinct and the test skips with an announced reason.
+#[cfg(unix)]
+#[test]
+fn extraneous_delete_spares_a_case_alias_of_a_reserved_spelling() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    // Create the entry under its CASE-ALIAS spelling: APFS preserves the case
+    // used at creation, so the on-disk name is the alias.
+    std::fs::write(dst.join(".SYNC-ASIDE.1"), b"held original").unwrap();
+    if std::fs::symlink_metadata(dst.join(".sync-aside.1")).is_err() {
+        crate::test_support::announce_skip(
+            "this filesystem is case-SENSITIVE, so `.SYNC-ASIDE.1` and `.sync-aside.1` are distinct \
+             entries and the on-disk alias reproduction is untestable here",
+        );
+        return;
+    }
+    // The alias resolves to the SAME inode as the lowercase spelling.
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("deleting extraneous content must not abort on a reserved alias");
+    assert!(
+        dst.join(".SYNC-ASIDE.1").exists(),
+        "the aliased reserved entry must survive a sanctioned deletion: {report:?}"
+    );
+    assert!(
+        report.residue.contains(&".SYNC-ASIDE.1".to_string()),
+        "the surviving reserved alias must be NAMED as residue: {report:?}"
+    );
+    assert!(
+        !report.extraneous.contains(&".SYNC-ASIDE.1".to_string()),
+        "a reserved alias is never extraneous content: {report:?}"
+    );
+    println!(
+        "G3 case-alias probe ran on platform={} (the filesystem folds case)",
+        std::env::consts::OS
+    );
+}
+
+/// F5: the derived lock-record name is BOUNDED to `NAME_MAX`. Pre-fix
+/// `destination_lock_path` built `.` + the full destination component +
+/// `.operation.lock`, so a 240-byte component produced a 256-byte record name
+/// and `FileLock::acquire` failed `ENAMETOOLONG`. The embedded component is
+/// bounded by the SAME authority that bounds temp names, so the record fits
+/// and the derivation stays deterministic.
+#[cfg(unix)]
+#[test]
+fn the_derived_lock_record_name_is_bounded_to_name_max() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let long = "n".repeat(240);
+    let root = dir.path().join(&long);
+    std::fs::create_dir_all(&root).unwrap();
+    let record = destination_lock_path(&root).expect("a sibling record location");
+    let name = record
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("the record names a UTF-8 file");
+    assert!(
+        name.len() <= crate::atomic::NAME_MAX,
+        "the record name for a 240-byte destination must be <= NAME_MAX, got {} bytes: {name}",
+        name.len()
+    );
+    assert!(
+        crate::reserved::is_reserved_name(name),
+        "the bounded record must still be a reserved spelling: {name}"
+    );
+    // Deterministic: the same root derives the same record, so the
+    // port-keyed stable-inode property holds.
+    assert_eq!(
+        destination_lock_path(&root),
+        Some(record.clone()),
+        "the record derivation must be deterministic"
+    );
+    let held = FileLock::acquire(&record, "bounded holder")
+        .expect("the bounded record name must be acquirable");
+    drop(held);
+}
+
 /// B2: a run REFUSED for an unrepresentable SOURCE must create NOTHING. The
 /// pre-fix order provisioned the destination (creating the root) and took the
 /// destination lock (creating the sibling record) BEFORE the source manifest

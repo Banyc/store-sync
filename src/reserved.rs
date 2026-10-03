@@ -41,10 +41,15 @@
 //! that [`crate::lock::FileLock`] holds at a store root — is likewise not one
 //! of the two byte-exact reserved families, but it is unaddressable as an
 //! identity ([`APPLICATION_LOCK_NAME`]): accepting it would let consumer
-//! content share the name of the crate's own lock record. The crate's own
-//! removal primitives refuse the whole lock-record spelling family
-//! ([`is_lock_record_name`]), so the record's stable inode cannot be unlinked
-//! through the substrate.
+//! content share the name of the crate's own lock record.
+//!
+//! [`is_unaddressable_name`] is the ONE authority for "the crate may not name
+//! this": the id rule ([`crate::id::valid_name`]) consults it, and the sync's
+//! manifest-path model consults its path form ([`is_unaddressable_path`]), so
+//! a spelling the crate refuses as an id is EXACTLY a spelling a whole-store
+//! sync refuses to transfer or destroy. The crate's mutating primitives consult
+//! the lock-record subset ([`is_lock_record_name`]) directly, so the record's
+//! stable inode cannot be unlinked, replaced, or renamed through the substrate.
 
 use std::path::{Component, Path};
 
@@ -133,14 +138,45 @@ pub fn is_unaddressable_name(name: &str) -> bool {
     is_reserved_name(name) || is_application_lock_name(name) || is_reserved_case_alias(name)
 }
 
+/// Whether ANY component of a canonical manifest path is UNADDRESSABLE
+/// ([`is_unaddressable_name`]).
+///
+/// This is the PATH-level form of the SAME authority [`crate::id::valid_name`]
+/// consults, and it is what a whole-store sync uses to decide whether a
+/// manifest entry may be transferred or destroyed. It is deliberately
+/// BROADER than [`is_reserved_path`], which stays byte-exact for callers that
+/// need the historical reserved MATCH: a name the id rule refuses — the
+/// application lock record `operation.lock` and every case alias of a reserved
+/// spelling included — is also unaddressable as a manifest path, so the id
+/// rule and the sync's manifest-path model can never disagree about what the
+/// crate may not touch.
+///
+/// Components are split with [`Path::components`], never a literal-separator
+/// split, so the answer is the same whether a manifest spells paths with `/`
+/// (the canonical spelling on every platform) or with the platform separator.
+pub fn is_unaddressable_path(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| match component {
+            Component::Normal(name) => name.to_str().is_some_and(is_unaddressable_name),
+            _ => false,
+        })
+}
+
 /// Whether `name` is a LOCK-RECORD spelling: the application lock record
 /// ([`APPLICATION_LOCK_NAME`]) or the sibling record spelling
 /// [`is_reserved_name`] recognises (`.<name>.operation.lock`), in byte-exact or
-/// case-ALIAS form. The crate's own removal primitives refuse this spelling
-/// ([`crate::atomic::remove_file_fd`] / [`crate::atomic::remove_dir_all_fd`]):
-/// the lock's STABLE INODE is what makes two simultaneous holders impossible,
-/// so removing (or replacing) the record through the substrate would admit a
-/// second holder.
+/// case-ALIAS form. Every MUTATING primitive the crate exposes refuses this
+/// spelling — [`crate::atomic::remove_file_fd`],
+/// [`crate::atomic::remove_dir_all_fd`] (including each entry its walk unlinks),
+/// [`crate::atomic::write_atomic_replace_fd`],
+/// [`crate::atomic::write_atomic_if_match_fd`],
+/// [`crate::atomic::write_atomic_cas_fd`], [`crate::atomic::write_file_fd`], and
+/// [`crate::atomic::renameat_paths`] — because the lock's STABLE INODE is what
+/// makes two simultaneous holders impossible, so removing, replacing, or
+/// renaming the record through the substrate would admit a second holder.
+/// The residual is outside the substrate: `std::fs` and foreign tools are not
+/// stopped (see [`crate::lock::FileLock`]'s assumption section).
 pub fn is_lock_record_name(name: &str) -> bool {
     fn sibling(name: &str) -> bool {
         let Some(base) = name.strip_prefix('.') else {
@@ -249,6 +285,44 @@ mod tests {
         }
     }
 
+    /// The ID rule and the SYNC's manifest-path model consult ONE authority.
+    /// The byte-exact reserved MATCH ([`is_reserved_path`]) deliberately leaves
+    /// the application lock record alone, but the path-level UNADDRESSABLE
+    /// predicate ([`is_unaddressable_path`]) refuses it and its aliases —
+    /// exactly the names [`crate::id::valid_name`] refuses — so the two cannot
+    /// disagree about which manifest paths the crate must never touch.
+    #[test]
+    fn the_manifest_path_authority_agrees_with_the_id_rule() {
+        for path in [
+            "state/operation.lock",
+            "operation.lock",
+            "OPERATION.LOCK",
+            "nested/Operation.Lock",
+            "snapshots/.001.operation.lock",
+            ".DESTROOT.OPERATION.LOCK",
+            ".SYNC-ASIDE.1",
+        ] {
+            assert!(
+                is_unaddressable_path(path),
+                "{path:?} must be unaddressable as a manifest path"
+            );
+            let final_name = path.rsplit('/').next().unwrap();
+            assert!(
+                is_unaddressable_name(final_name),
+                "the path-level answer is the name authority's: {final_name:?}"
+            );
+        }
+        // The byte-exact family is deliberately NARROWER: the application lock
+        // record is not a byte-exact reserved spelling, so a caller that needs
+        // the historical match still gets it.
+        assert!(!is_reserved_path("state/operation.lock"));
+        assert!(is_reserved_path("snapshots/.001.operation.lock"));
+        // Every spelling the id rule accepts is NOT unaddressable as a path.
+        for ok in ["s1", "production", "a/b/operation.lock.txt"] {
+            assert!(!is_unaddressable_path(ok), "{ok:?} is ordinary");
+        }
+    }
+
     /// A name that is not byte-identical to a reserved spelling but CASE-FOLDS
     /// onto one is the SAME directory entry on a case-insensitive filesystem,
     /// so the id/name rule refuses the alias while the byte-exact reserved
@@ -300,7 +374,7 @@ mod tests {
     }
 
     /// The crate's own lock-record spellings are recognised as LOCK RECORDS
-    /// (so the removal primitives can refuse them) without turning the
+    /// (so every mutating primitive can refuse them) without turning the
     /// byte-exact reserved family into a broader match: `.sync-aside.1` is
     /// reserved but is NOT a lock record.
     #[test]

@@ -1573,13 +1573,22 @@ pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
     let root = normalize_root(dest_root);
     let parent = root.parent()?;
     let base = root.file_name()?;
-    let mut record = OsString::from(".");
-    record.push(base);
     // Derived from the ONE reserved-spelling authority (see
     // `OPERATION_LOCK_SUFFIX`), NEVER a second hardcoded literal: the record
     // and `is_reserved_name` must never be able to disagree about whether the
-    // record is reserved.
-    record.push(OPERATION_LOCK_SUFFIX);
+    // record is reserved. The embedded destination component is BOUNDED by the
+    // temp-name authority ([`crate::atomic::bounded_temp_trunk`]), so the
+    // record name the crate derives from a destination at the manifest's legal
+    // maximum (255 bytes) still fits [`crate::atomic::NAME_MAX`] — a record
+    // name even one byte longer would make `FileLock::acquire` fail with
+    // `ENAMETOOLONG` on a destination the crate accepts. The derivation stays
+    // deterministic (the same root derives the same record), so the
+    // port-keyed, stable-inode property is untouched.
+    let record = OsString::from(format!(
+        ".{}{}",
+        crate::atomic::bounded_temp_trunk(&base.to_string_lossy(), OPERATION_LOCK_SUFFIX),
+        OPERATION_LOCK_SUFFIX
+    ));
     // A single-component RELATIVE root (`foo`) has `Path::parent() == Some("")`:
     // the directory the record must be placed in is the CURRENT one, and an
     // empty parent would make the lock helper run `mkdir ""` (ENOENT). Resolve
@@ -2680,12 +2689,13 @@ fn run(
         Ok(entries) => entries,
         Err(error) => return Err(SyncError::from(error)),
     };
-    // DESTINATION residue is a reserved spelling that HOLDS something (a
-    // stranded claim-aside or the operation-lock record). A reserved-namespaced
-    // TEMP (a destination whose own name begins `sync-aside.` leaves
-    // `.sync-aside.<name>.tmp.<pid>.<n>`) is NOT residue: it holds no original,
-    // so it stays in the destination manifest and the diff reports it as
-    // destination-only (`extraneous`) — the spelling the report doc promises.
+    // DESTINATION residue is an UNADDRESSABLE spelling that HOLDS something (a
+    // stranded claim-aside or the lock record, in byte-exact or case-alias
+    // form). An unaddressable-namespaced TEMP (a destination whose own name
+    // begins `sync-aside.` leaves `.sync-aside.<name>.tmp.<pid>.<n>`) is NOT
+    // residue: it holds no original, so it stays in the destination manifest
+    // and the diff reports it as destination-only (`extraneous`) — the spelling
+    // the report doc promises.
     let dest_residue = reserved_paths(&dest_meta);
     let source_meta = strip_reserved(source_meta, is_reserved_path);
     let dest_meta = strip_reserved(dest_meta, is_dest_residue_path);
@@ -6681,22 +6691,24 @@ fn aside_name() -> OsString {
     ))
 }
 
-/// Whether a single file name is in one of the crate's RESERVED spellings — the
-/// claim-aside namespace ([`ASIDE_PREFIX`]) OR the operation-lock record
-/// spelling `.<name>.operation.lock`. Delegates to the ONE authority in
-/// [`crate::reserved`], which [`crate::id::valid_name`] also consults, so a
-/// spelling refused as an id is exactly a spelling this sync strips from the
-/// manifests (and therefore can never transfer or destroy).
+/// Whether a single file name is UNADDRESSABLE — one of the crate's RESERVED
+/// spellings (the claim-aside namespace [`ASIDE_PREFIX`] or the operation-lock
+/// record spelling `.<name>.operation.lock`), the application lock record
+/// `operation.lock`, or a case ALIAS of any of those. Delegates to the ONE
+/// authority in [`crate::reserved`], which [`crate::id::valid_name`] also
+/// consults, so a spelling refused as an id is exactly a spelling this sync
+/// strips from the manifests (and therefore can never transfer or destroy).
 fn is_reserved_name(name: &OsStr) -> bool {
-    name.to_str().is_some_and(crate::reserved::is_reserved_name)
+    name.to_str()
+        .is_some_and(crate::reserved::is_unaddressable_name)
 }
 
-/// Whether ANY component of a canonical manifest path is reserved. A reserved
-/// DIRECTORY makes every entry below it reserved too (the aside holds the whole
-/// stranded subtree). Component splitting lives in [`crate::reserved`], shared
-/// with the public predicate.
+/// Whether ANY component of a canonical manifest path is unaddressable. A
+/// reserved DIRECTORY makes every entry below it reserved too (the aside holds
+/// the whole stranded subtree). Component splitting lives in
+/// [`crate::reserved`], shared with the public predicate.
 fn is_reserved_path(path: &str) -> bool {
-    crate::reserved::is_reserved_path(path)
+    crate::reserved::is_unaddressable_path(path)
 }
 
 /// Join a manifest-style parent path and a child name into a manifest-style
@@ -6882,7 +6894,10 @@ fn flip_ascii_case(name: &str) -> String {
 }
 
 /// The reserved entries of a manifest, with their kind (a source-side
-/// collision must be reported with a kind, like every conflict).
+/// collision must be reported with a kind, like every conflict). Consulted by
+/// the UNADDRESSABLE path authority, so a source name the id rule refuses (the
+/// application lock record and its aliases included) is a collision, never
+/// transferred content.
 fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> {
     let mut reserved = BTreeMap::new();
     for entry in &meta.entries {
@@ -6893,10 +6908,11 @@ fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> 
     Ok(reserved)
 }
 
-/// The DECISIVE test for DESTINATION RESIDUE: a reserved spelling that HOLDS
-/// something the sync must not destroy — a stranded claim-aside
-/// (`.sync-aside.<pid>.<n>`) or the operation-lock record — as opposed to a
-/// CRASHED TEMP.
+/// The DECISIVE test for DESTINATION RESIDUE: an UNADDRESSABLE spelling that
+/// HOLDS something the sync must not destroy — a stranded claim-aside
+/// (`.sync-aside.<pid>.<n>`), the crate's application lock record
+/// (`operation.lock`), the sibling lock record (`.<name>.operation.lock`), or
+/// a case alias of any of those — as opposed to a CRASHED TEMP.
 ///
 /// A temp can inherit the reserved namespace (a destination whose own name
 /// begins `sync-aside.` yields `.sync-aside.<name>.tmp.<pid>.<n>`), but it holds
@@ -6904,8 +6920,8 @@ fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> 
 /// the documented recovery is a removal. The distinction is a SUFFIX test on
 /// the temp-name authority's own spelling ([`crate::atomic::is_crate_temp_name`]):
 /// a name the authority would produce carries `.tmp.<pid>.<n>` (or
-/// `.claim.<pid>.<n>`); a genuine claim-aside never does. Only a name in the
-/// reserved namespace is classified here, so an ordinary destination file that
+/// `.claim.<pid>.<n>`); a genuine claim-aside never does. Only an
+/// unaddressable name is classified here, so an ordinary destination file that
 /// merely ends `.tmp.<pid>.<n>` is untouched by this predicate and stays
 /// ordinary content.
 fn is_dest_residue_path(path: &str) -> bool {
@@ -6921,7 +6937,7 @@ fn is_dest_residue_path(path: &str) -> bool {
 /// meets live names rather than manifest spellings.
 fn is_dest_residue_name(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
-        crate::reserved::is_reserved_name(name) && !crate::atomic::is_crate_temp_name(name)
+        crate::reserved::is_unaddressable_name(name) && !crate::atomic::is_crate_temp_name(name)
     })
 }
 

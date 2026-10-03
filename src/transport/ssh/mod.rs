@@ -976,8 +976,8 @@ impl SshTransport {
         // while it fits and falls back to a truncated prefix plus a hash for
         // long names; `mktemp`'s `XXXXXX` still allocates a UNIQUE name, so
         // concurrent runs cannot collide (a fixed name could).
-        let tmp_suffix = ".tmp.XXXXXX";
-        let tmp_trunk = crate::atomic::bounded_temp_trunk(&basename, tmp_suffix);
+        let tmp_suffix = mktemp_temp_suffix();
+        let tmp_trunk = crate::atomic::bounded_temp_trunk(&basename, &tmp_suffix);
         let tmp_template = format!(
             "{}/.{}{}",
             parent.trim_end_matches('/'),
@@ -1210,6 +1210,27 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The far-side `mktemp` temp SUFFIX: the temp authority's marker plus its
+/// placeholder ([`crate::atomic::MKTEMP_PLACEHOLDER`]), derived from the ONE
+/// authority so the template the shell is handed and the recognizer cannot
+/// drift.
+fn mktemp_temp_suffix() -> String {
+    format!(
+        "{}{}",
+        crate::atomic::TEMP_SUFFIX_MARKER,
+        crate::atomic::MKTEMP_PLACEHOLDER
+    )
+}
+
+/// The far-side `mktemp` CLAIM temp suffix, from the same authority.
+fn mktemp_claim_suffix() -> String {
+    format!(
+        "{}{}",
+        crate::atomic::CLAIM_SUFFIX_MARKER,
+        crate::atomic::MKTEMP_PLACEHOLDER
+    )
+}
+
 /// Build the perl script for atomic compare-and-delete under the sidecar:
 /// open the sidecar, flock exclusively with bounded retry, then read the
 /// lock file, compare to `expected`, unlink if match, otherwise leave it.
@@ -1430,8 +1451,8 @@ impl SshTransport {
         // ([`crate::atomic::bounded_temp_trunk`]), so a destination name at
         // the manifest's `NAME_MAX` (255 bytes) still has a usable temp; the
         // `XXXXXX` keeps the name unique across concurrent runs.
-        let tmp_suffix = ".tmp.XXXXXX";
-        let tmp_trunk = crate::atomic::bounded_temp_trunk(&basename, tmp_suffix);
+        let tmp_suffix = mktemp_temp_suffix();
+        let tmp_trunk = crate::atomic::bounded_temp_trunk(&basename, &tmp_suffix);
         let tmp_template = format!(
             "{}/.{}{}",
             parent.trim_end_matches('/'),
@@ -1613,8 +1634,8 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
         // is dot-prefixed, exactly like write_new_cmd's temp. Its embedded
         // basename is bounded the same way, so a 255-byte destination name is
         // still claimable; `mktemp`'s `XXXXXX` keeps it unique.
-        let claim_suffix = ".claim.XXXXXX";
-        let claim_trunk = crate::atomic::bounded_temp_trunk(&basename, claim_suffix);
+        let claim_suffix = mktemp_claim_suffix();
+        let claim_trunk = crate::atomic::bounded_temp_trunk(&basename, &claim_suffix);
         let tmp_template = format!(
             "{}/.{}{}",
             parent.trim_end_matches('/'),

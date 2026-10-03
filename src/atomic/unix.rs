@@ -873,6 +873,10 @@ fn replace_core(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CoreReplace> {
+    // A replace whose TARGET is a lock-record spelling would rename a fresh
+    // inode over the record and so admit a second holder (F2); the guard is
+    // the SAME authority the removal primitives consult.
+    refuse_lock_record_mutation(rel)?;
     // The parent directory is created if missing — the same
     // `create_dir_all(parent)` the path-based protocol runs first —
     // component-wise with O_NOFOLLOW (a symlink injected into any parent
@@ -1025,6 +1029,9 @@ pub fn write_atomic_if_match_fd(
 /// component is REFUSED (ELOOP) — never followed, never compared against
 /// its target.
 pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    // A CAS that would CREATE the record (or rewrite it) is a mutation of the
+    // same spelling the id rule refuses; consult the ONE guard authority.
+    refuse_lock_record_mutation(rel)?;
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     // If the file exists, its content must be byte-identical (an identical
     // rewrite is an idempotent success; a symlink at the final component is
@@ -1260,7 +1267,14 @@ pub fn sync_parent_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
     fsync_dir_fd(&parent_fd)
 }
 
-/// The descriptor-relative private chmod (0o600) of a file under the root.
+/// The descriptor-relative private chmod (0o600) of a REGULAR FILE under the
+/// root.
+///
+/// A DIRECTORY is REFUSED. `O_RDONLY` admits a directory, so the shared
+/// regular-or-dir opener ([`openat_readable_regular`]) would hand back a
+/// directory descriptor and the chmod would strip the directory's execute bit
+/// (0o600), leaving it unenterable. The opened inode is therefore classified
+/// and only [`PathKind::File`] is accepted.
 pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = std::fs::File::from(openat_readable_regular(
@@ -1268,28 +1282,54 @@ pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
         Path::new(name),
         libc::O_RDONLY,
     )?);
+    let is_file = f
+        .metadata()
+        .map_err(|e| Error::store(format!("fstat {}: {e}", rel.display())))?
+        .is_file();
+    if !is_file {
+        return Err(Error::store(format!(
+            "refusing to chmod {} to 0o600: it is not a regular file (a directory chmod would strip \
+             its execute bit)",
+            rel.display()
+        )));
+    }
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))
 }
 
-/// Refuse a destructive mutation whose FINAL component is one of the crate's
+/// Refuse a destructive mutation whose TARGET names one of the crate's
 /// LOCK-RECORD spellings ([`crate::reserved::is_lock_record_name`]): the
 /// application-store lock record `operation.lock` or the sibling record
 /// `.<name>.operation.lock`, in byte-exact or case-ALIAS form.
 ///
 /// The stable-inode discipline gives "at most one holder" only while the
-/// record is not removed: unlinking the path lets a later acquisition create a
-/// DIFFERENT inode and flock that while a live holder still holds the old one
-/// — two simultaneous holders (A5). Removing a lock record through the crate's
-/// own removal primitives is therefore refused, which makes the guarantee
-/// structural for every caller that goes through the substrate.
-fn refuse_lock_record_removal(rel: &Path) -> Result<()> {
+/// record is not removed or replaced: unlinking the path lets a later
+/// acquisition create a DIFFERENT inode and flock that while a live holder
+/// still holds the old one — two simultaneous holders (A5). This predicate is
+/// the ONE authority the crate's mutating primitives consult, applied at EVERY
+/// point that could unlink, replace, or rename a directory entry:
+/// [`replace_core`] (both atomic replaces and the compare-and-swap replace),
+/// [`write_atomic_cas_fd`], [`write_file_fd`], [`remove_file_fd`],
+/// [`remove_dir_all_fd`] together with every entry its walk
+/// ([`remove_dir_contents_fd`]) unlinks or rmdirs, [`remove_dir_all_path`], and
+/// BOTH ends of [`renameat_paths`]. The guarantee is therefore structural for
+/// every caller that mutates through the substrate.
+///
+/// HONEST RESIDUAL: the confinement is the SUBSTRATE's, not the filesystem's.
+/// A caller that unlinks, replaces, or renames the record with `std::fs` (or a
+/// foreign tool, or another process) acts outside the substrate and is NOT
+/// stopped; and the PATH-BASED free functions that take an arbitrary path and
+/// never destroy an inode (`set_private`, the `ensure_private_dir*` helpers)
+/// leave the record addressable by design. The record is unaddressable to THIS
+/// crate's primitives, not immovable on the machine.
+fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
     if let Some(name) = rel.file_name().and_then(|name| name.to_str())
         && crate::reserved::is_lock_record_name(name)
     {
         return Err(Error::conflict(format!(
-            "refusing to remove the crate's lock record {}: the record's stable inode is what makes \
-             two simultaneous holders impossible, so removing it would admit a second holder",
+            "refusing to mutate the crate's lock record {}: the record's stable inode is what makes \
+             two simultaneous holders impossible, so removing, replacing, or renaming it would \
+             admit a second holder",
             rel.display()
         )));
     }
@@ -1299,7 +1339,7 @@ fn refuse_lock_record_removal(rel: &Path) -> Result<()> {
 /// The descriptor-relative remove of a single file (or symlink — the
 /// symlink itself is removed, never its target).
 pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_removal(rel)?;
+    refuse_lock_record_mutation(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     unlinkat_fd(&parent_fd, name)
 }
@@ -1307,6 +1347,10 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// The descriptor-relative rename of a path under the root to another path
 /// under the root (both parents resolved component-wise with O_NOFOLLOW).
 pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+    // BOTH ends: renaming the record AWAY destroys the inode under the path a
+    // successor acquires, and renaming ONTO it replaces the record's entry.
+    refuse_lock_record_mutation(from)?;
+    refuse_lock_record_mutation(to)?;
     let (from_fd, from_name) = parent_fd_of(root.as_fd(), from)?;
     let (to_fd, to_name) = parent_fd_of(root.as_fd(), to)?;
     renameat_fd(&from_fd, from_name, &to_fd, to_name)
@@ -1318,7 +1362,7 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 /// recursed into, and the tree root is removed last. A symlink injected at
 /// any component is refused (ELOOP) — never followed.
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_removal(rel)?;
+    refuse_lock_record_mutation(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let dir_fd = openat_no_follow(
         &parent_fd,
@@ -1387,6 +1431,10 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
                     )));
                 }
             };
+            // The SAME authority the entry point consults, applied here too:
+            // a subdirectory whose name is a lock-record spelling must not be
+            // rmdir'd by the walk even though the walk root was not one.
+            refuse_lock_record_mutation(&done.rel)?;
             let c = CString::new(file_name.as_bytes())
                 .map_err(|_| Error::store("rmdir name with NUL"))?;
             let r =
@@ -1422,7 +1470,10 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
                 })
             } else {
                 // A file or symlink: unlinkat removes the entry itself (a
-                // symlink is removed, never its target).
+                // symlink is removed, never its target). The guard runs on
+                // EVERY entry the walk unlinks, so removing an ANCESTOR can
+                // never take the record with it (F3).
+                refuse_lock_record_mutation(&child_rel)?;
                 unlinkat_fd(&top.fd, child_name)?;
                 None
             }
@@ -1449,6 +1500,7 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 /// on: a MISSING `path` is a successful no-op (idempotent removal), and a
 /// symlink at `path` is unlinked as the entry itself, never followed.
 pub fn remove_dir_all_path(path: &Path) -> Result<()> {
+    refuse_lock_record_mutation(path)?;
     let md = match std::fs::symlink_metadata(path) {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1503,6 +1555,8 @@ pub fn remove_dir_all_path(path: &Path) -> Result<()> {
 /// confinement tests (which exercise the create-or-truncate open's refusal of
 /// a symlink and a traversal spelling).
 pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    // Create-or-truncate would rewrite the record's content in place.
+    refuse_lock_record_mutation(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = openat_no_follow(
         &parent_fd,
@@ -1730,8 +1784,9 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, path_kind_fd, read_dir_fd, read_fd,
-        read_link_fd, read_root_dir_fd, remove_file_fd, replace_order_probe, write_atomic_cas_fd,
-        write_atomic_replace, write_atomic_replace_fd,
+        read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_file_fd, replace_order_probe,
+        set_private_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
+        write_file_fd,
     };
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -2602,5 +2657,128 @@ mod tests {
         let alias_err = remove_file_fd(&root, Path::new(".Destroot.Operation.Lock"))
             .expect_err("a case alias of the lock record must be refused");
         assert!(matches!(alias_err, Error::Conflict(_)), "{alias_err:?}");
+    }
+
+    /// F2: the atomic REPLACE must consult the same guard as removal. Pre-fix
+    /// `replace_core` renamed a fresh inode over the record: A held
+    /// `operation.lock`, a replace swapped the inode, and C then acquired the
+    /// NEW inode while A still held the old one — two simultaneous holders.
+    /// The replace is now refused, the inode is A's, and C is contended.
+    #[test]
+    fn replacing_the_lock_record_is_refused_so_no_second_holder_can_appear() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, root) = owned_root();
+        let path = dir.path().join("operation.lock");
+        let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
+        let inode_a = std::fs::metadata(&path).unwrap().ino();
+        let err =
+            write_atomic_replace_fd(&root, Path::new("operation.lock"), b"evil", &mut |_| None)
+                .expect_err(
+                    "replacing the crate's lock record through the substrate must be refused",
+                );
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the replace refusal is a conflict: {err:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_a,
+            "the record must keep its stable inode"
+        );
+        let err2 = match crate::lock::FileLock::acquire(&path, "op-C") {
+            Ok(_) => panic!("C must not acquire while A holds the record"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err2, Error::LockContended(_)),
+            "C must be refused with the typed contention signal: {err2:?}"
+        );
+        // Every mutating primitive that could reach the record consults the
+        // SAME authority: the CAS and the plain write refuse too.
+        let cas = write_atomic_cas_fd(&root, Path::new(".Destroot.Operation.Lock"), b"evil")
+            .expect_err("a CAS of a case alias of the record must be refused");
+        assert!(matches!(cas, Error::Conflict(_)), "{cas:?}");
+        let plain = write_file_fd(&root, Path::new("OPERATION.LOCK"), b"evil")
+            .expect_err("a plain write of an alias of the record must be refused");
+        assert!(matches!(plain, Error::Conflict(_)), "{plain:?}");
+        drop(holder);
+    }
+
+    /// F3: removing an ANCESTOR of the record must not unlink it. Pre-fix the
+    /// guard checked only the ENTRY path's final component, so
+    /// `remove_dir_all_fd(root, "state")` walked into `state` and unlinked
+    /// `state/operation.lock`; a second acquisition then succeeded. The walk
+    /// now consults the guard at every unlink, so the ancestor removal is
+    /// refused and the record keeps its inode.
+    #[test]
+    fn removing_an_ancestor_of_the_lock_record_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, root) = owned_root();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let path = dir.path().join("state/operation.lock");
+        let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
+        let inode_a = std::fs::metadata(&path).unwrap().ino();
+        let err = remove_dir_all_fd(&root, Path::new("state"))
+            .expect_err("removing an ancestor of the lock record must be refused");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the ancestor refusal is a conflict: {err:?}"
+        );
+        assert!(
+            path.exists(),
+            "the record must survive the refused ancestor removal"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_a,
+            "the record must keep its stable inode"
+        );
+        let err2 = match crate::lock::FileLock::acquire(&path, "op-C") {
+            Ok(_) => panic!("C must not acquire while A holds the record"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err2, Error::LockContended(_)),
+            "C must be refused with the typed contention signal: {err2:?}"
+        );
+        drop(holder);
+    }
+
+    /// F7: `set_private_fd` used to admit a DIRECTORY (`O_RDONLY` on a
+    /// directory succeeds) and chmod it to 0o600, stripping its execute bit.
+    /// The opened inode is classified now, so a directory is refused and its
+    /// mode is untouched, while a regular file is still chmodded.
+    #[test]
+    fn set_private_refuses_a_directory_and_chmods_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = owned_root();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("sub"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let err = set_private_fd(&root, Path::new("sub"))
+            .expect_err("chmodding a directory to 0o600 must be refused");
+        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        let mode = std::fs::metadata(dir.path().join("sub"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o755,
+            "the refused chmod must leave the directory's execute bit intact"
+        );
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        std::fs::set_permissions(dir.path().join("f"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        set_private_fd(&root, Path::new("f")).expect("a regular file is chmodded");
+        let file_mode = std::fs::metadata(dir.path().join("f"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(file_mode, 0o600, "a regular file is narrowed to 0o600");
     }
 }

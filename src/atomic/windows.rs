@@ -272,13 +272,16 @@ fn rel_join(root: &RootDir, rel: &Path) -> Result<PathBuf> {
     Ok(root.path().join(rel))
 }
 
-/// Path-based atomic replace (see [`write_atomic_replace`]).
+/// Path-based atomic replace (see [`write_atomic_replace`]). Refuses a crate
+/// lock-record spelling (the stable-inode discipline's structural guard; see
+/// the Unix port).
 pub fn write_atomic_replace_fd(
     root: &RootDir,
     rel: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    refuse_lock_record_mutation(rel)?;
     write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
 }
 
@@ -292,6 +295,7 @@ pub fn write_atomic_replace_fd_under_existing_parent(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    refuse_lock_record_mutation(rel)?;
     write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
 }
 
@@ -329,6 +333,7 @@ pub fn write_atomic_if_match_fd(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CompareReplace> {
+    refuse_lock_record_mutation(rel)?;
     let path = rel_join(root, rel)?;
     match std::fs::read(&path) {
         Ok(existing) if existing == expected => {} // still ours: replace below
@@ -346,6 +351,7 @@ pub fn write_atomic_if_match_fd(
 /// atomicity primitive (a racing loser fails on AlreadyExists and can
 /// never clobber a winner); there is no parent-directory fsync durability.
 pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
     let path = rel_join(root, rel)?;
     // If the file exists, its content must be byte-identical.
     match std::fs::read(&path) {
@@ -399,22 +405,66 @@ pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// Path-based remove of a single file. Refuses a crate lock-record spelling
 /// (the stable-inode discipline's structural guard; see the Unix port).
 pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_removal(rel)?;
+    refuse_lock_record_mutation(rel)?;
     std::fs::remove_file(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
 }
 
-/// Refuse a destructive mutation whose FINAL component is one of the crate's
-/// lock-record spellings (see the Unix port for the full rationale).
-fn refuse_lock_record_removal(rel: &Path) -> Result<()> {
+/// Refuse a destructive mutation whose TARGET names one of the crate's
+/// lock-record spellings (see the Unix port for the full rationale and for the
+/// list of mutating primitives that consult it).
+fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
     if let Some(name) = rel.file_name().and_then(|name| name.to_str())
         && crate::reserved::is_lock_record_name(name)
     {
         return Err(Error::conflict(format!(
-            "refusing to remove the crate's lock record {}: the record's stable inode is what makes \
-             two simultaneous holders impossible, so removing it would admit a second holder",
+            "refusing to mutate the crate's lock record {}: the record's stable inode is what makes \
+             two simultaneous holders impossible, so removing, replacing, or renaming it would \
+             admit a second holder",
             rel.display()
         )));
+    }
+    Ok(())
+}
+
+/// Refuse a recursive removal whose tree CONTAINS a lock-record spelling at any
+/// depth.
+///
+/// The Windows port delegates the walk to `std::fs::remove_dir_all`, which
+/// unlinks descendants without consulting this crate's guard, so the guard is
+/// applied to the WHOLE tree before anything is removed (fail closed). A
+/// directory entry's own `file_type` is consulted, so a symlink is classified
+/// as the entry itself and is never descended into.
+fn refuse_lock_record_in_tree(root: &Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::store(format!("read_dir {}: {e}", dir.display()))),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| Error::store(format!("read_dir {}: {e}", dir.display())))?;
+            let child = entry.path();
+            if let Some(name) = child.file_name().and_then(|name| name.to_str())
+                && crate::reserved::is_lock_record_name(name)
+            {
+                return Err(Error::conflict(format!(
+                    "refusing to remove the tree {}: it holds the crate's lock record {} whose \
+                     stable inode is what makes two simultaneous holders impossible",
+                    root.display(),
+                    child.display()
+                )));
+            }
+            let is_dir = entry
+                .file_type()
+                .map_err(|e| Error::store(format!("file_type {}: {e}", child.display())))?
+                .is_dir();
+            if is_dir {
+                stack.push(child);
+            }
+        }
     }
     Ok(())
 }
@@ -423,6 +473,8 @@ fn refuse_lock_record_removal(rel: &Path) -> Result<()> {
 /// root. Windows `rename` does not overwrite an existing target: remove it
 /// first (documented weaker guarantee — not atomic).
 pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+    refuse_lock_record_mutation(from)?;
+    refuse_lock_record_mutation(to)?;
     let from = rel_join(root, from)?;
     let to = rel_join(root, to)?;
     let _ = std::fs::remove_file(&to);
@@ -444,13 +496,18 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 /// path gets from its own walk. (Windows is type-checked only, never run
 /// here.)
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_removal(rel)?;
-    std::fs::remove_dir_all(rel_join(root, rel)?)
+    refuse_lock_record_mutation(rel)?;
+    let joined = rel_join(root, rel)?;
+    // `std::fs::remove_dir_all` unlinks descendants itself, so the whole tree
+    // is checked BEFORE it runs.
+    refuse_lock_record_in_tree(&joined)?;
+    std::fs::remove_dir_all(joined)
         .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
 }
 
 /// Path-based plain file write (create-or-truncate).
 pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
     std::fs::write(rel_join(root, rel)?, bytes)
         .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))
 }

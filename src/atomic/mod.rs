@@ -246,19 +246,86 @@ fn temp_name_string(name: &str) -> String {
     format!(".{}{}", bounded_temp_trunk(name, &suffix), suffix)
 }
 
-/// Whether `name` is one of the crate's own TEMP names — it ENDS with one of
-/// the authorities' suffixes, `.tmp.<pid>.<counter>` (the atomic-replace temp,
-/// [`temp_name_string`]) or `.claim.<pid>.<counter>` (the compare-and-delete
-/// claim temp, [`crate::transport::Remote::remove_file_if`]) — with an
-/// all-digit pid and counter.
+/// The `mktemp` placeholder the far-side authorities append to a temp
+/// TEMPLATE; `mktemp` replaces it with EXACTLY this many alphanumeric
+/// characters. The generators build the placeholder from THIS constant and the
+/// recognizer bounds the far-side tail to its width and charset, so the two
+/// share one definition instead of a second hardcoded `"XXXXXX"`.
+pub(crate) const MKTEMP_PLACEHOLDER: &str = "XXXXXX";
+
+/// Whether `tail` (the text AFTER a temp marker) is `<n>` non-empty all-digit
+/// dot-separated parts.
+fn numeric_tail_parts(tail: &str, n: usize) -> bool {
+    let mut parts = tail.split('.');
+    for _ in 0..n {
+        match parts.next() {
+            Some(part) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
+/// Whether `tail` is exactly one far-side `mktemp` replacement: as many
+/// alphanumeric characters as [`MKTEMP_PLACEHOLDER`] is wide (the charset GNU
+/// and BSD `mktemp` draw their replacement from).
+pub(crate) fn is_mktemp_tail(tail: &str) -> bool {
+    tail.len() == MKTEMP_PLACEHOLDER.len() && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The ONE temp-TAIL grammar: whether `tail`, produced by a generator that
+/// appended `marker` after the destination `trunk`, is a tail one of the
+/// crate's own temp authorities writes. Each arm names its generator:
+///
+/// * `TEMP_SUFFIX_MARKER` + `<pid>.<counter>` — the local atomic replace
+///   ([`temp_name_string`]);
+/// * `TEMP_SUFFIX_MARKER` + `<pid>.<time>.<rand>` — the far-side sidecar
+///   replace (`SshTransport::write_sidecar_cmd`);
+/// * `TEMP_SUFFIX_MARKER` + `<pid>` when the trunk IS the application lock
+///   record — the far-side sidecar recover
+///   (`SshTransport::recover_sidecar_cmd`, whose temp is
+///   `.operation.lock.tmp.<pid>`);
+/// * either marker + one [`MKTEMP_PLACEHOLDER`]-wide alphanumeric token — the
+///   far-side `mktemp` write/claim templates (`SshTransport::write_cmd` /
+///   `SshTransport::remove_file_if_cmd`);
+/// * `CLAIM_SUFFIX_MARKER` + `<pid>.<counter>` — the local compare-and-delete
+///   claim (`LocalTransport::remove_file_if`).
+///
+/// The arms are DISJOINT by shape, so the recognizer cannot confuse a
+/// two-part local tail with a three-part sidecar tail, and the one-part arm is
+/// gated on the trunk so an ordinary name that merely looks like
+/// `.foo.tmp.<digits>` stays ordinary.
+fn is_crate_temp_tail(marker: &str, trunk: &str, tail: &str) -> bool {
+    if marker == TEMP_SUFFIX_MARKER {
+        return numeric_tail_parts(tail, 2)
+            || numeric_tail_parts(tail, 3)
+            || (trunk == crate::reserved::APPLICATION_LOCK_NAME && numeric_tail_parts(tail, 1))
+            || is_mktemp_tail(tail);
+    }
+    if marker == CLAIM_SUFFIX_MARKER {
+        return numeric_tail_parts(tail, 2) || is_mktemp_tail(tail);
+    }
+    false
+}
+
+/// Whether `name` is one of the crate's own TEMP names: it begins with the
+/// authority's leading dot and ends with a marker ([`TEMP_SUFFIX_MARKER`] or
+/// [`CLAIM_SUFFIX_MARKER`]) followed by a tail [`is_crate_temp_tail`] accepts.
+///
+/// The leading dot is PART of the shape, not a heuristic: every generator
+/// emits it ([`temp_name_string`] and the far-side templates all spell
+/// `.<trunk><marker><tail>`), so a name the id rule accepts but no generator
+/// can produce — `report.tmp.123.4` — is NOT a crate temp and is never offered
+/// to the recovery sweep.
 ///
 /// This is how a caller tells a CRASHED TEMP from a HELD-ASIDE. Both can sit
 /// in the RESERVED `.sync-aside.` namespace (`crate::reserved`), because a temp
 /// for a destination whose own name begins `sync-aside.` inherits the prefix:
 /// `.sync-aside.<name>.tmp.<pid>.<n>`. A genuine claim-aside, by contrast, is
 /// `.sync-aside.<pid>.<n>` with NO marker — it HOLDS the stranded original. The
-/// ONLY decisive feature is the authority's own suffix, so the test is a
-/// suffix match on that spelling, never a heuristic on the destination name.
+/// ONLY decisive feature is the authority's own marker and tail, so the test
+/// is a shape match on that spelling, never a heuristic on the destination
+/// name.
 ///
 /// # Crash residue (B2): the recognizer and the recovery recipe
 ///
@@ -273,23 +340,16 @@ fn temp_name_string(name: &str) -> String {
 /// the destination is either wholly OLD or wholly NEW and a stranded temp
 /// carries no committed state. The `.claim.` variant is a compare-and-delete
 /// claim temp and is likewise residue once no operation is live. A genuine
-/// claim-ASIDE (no authority suffix) HOLDS a stranded original and must NOT be
+/// claim-ASIDE (no authority marker) HOLDS a stranded original and must NOT be
 /// removed by this predicate — inspect it first.
 pub fn is_crate_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
     [TEMP_SUFFIX_MARKER, CLAIM_SUFFIX_MARKER]
         .iter()
-        .any(|marker| match name.rsplit_once(marker) {
-            Some((_, tail)) => {
-                let mut parts = tail.split('.');
-                matches!(
-                    (parts.next(), parts.next(), parts.next()),
-                    (Some(pid), Some(counter), None)
-                        if !pid.is_empty()
-                            && !counter.is_empty()
-                            && pid.bytes().all(|b| b.is_ascii_digit())
-                            && counter.bytes().all(|b| b.is_ascii_digit())
-                )
-            }
+        .any(|marker| match rest.rsplit_once(marker) {
+            Some((trunk, tail)) => is_crate_temp_tail(marker, trunk, tail),
             None => false,
         })
 }
@@ -590,14 +650,28 @@ mod tests {
         (dir, path)
     }
 
-    /// The temp-name authority recognises EXACTLY its own suffixes — the
-    /// `.tmp.<pid>.<n>` of [`temp_name_for`]/[`super::temp_file_name`] and the
-    /// `.claim.<pid>.<n>` of the compare-and-delete claim — with an all-digit
-    /// tail. This is what lets the sync tell a CRASHED TEMP (extraneous, a
-    /// removal) from a HELD claim-aside (residue, inspect first), including
-    /// when the temp inherits the `.sync-aside.` prefix from a destination
-    /// named `sync-aside.*`. The predicate is a SHAPE test; the reserved-prefix
-    /// half of the classification lives in `sync::apply`.
+    /// The temp-name authority recognises EXACTLY the shapes its own
+    /// generators emit, and nothing else. This is what lets the sync tell a
+    /// CRASHED TEMP (extraneous, a removal) from a HELD claim-aside (residue,
+    /// inspect first), including when the temp inherits the `.sync-aside.`
+    /// prefix from a destination named `sync-aside.*`. The predicate is a SHAPE
+    /// test; the reserved-prefix half of the classification lives in
+    /// `sync::apply`.
+    ///
+    /// The recognizer is EXACTLY the shapes the crate's own generators emit:
+    /// the local two-part `<pid>.<counter>` tail, the far-side `mktemp`
+    /// six-alphanumeric tail, the sidecar three-part `<pid>.<time>.<rand>`
+    /// tail, and the operation-lock sidecar recover one-part `<pid>` tail —
+    /// and nothing else.
+    ///
+    /// CHANGED DELIBERATELY (G1/F4): the pre-fix predicate was BOTH over- and
+    /// under-broad — it matched `notes.tmp.1.0` (no leading dot: a name the id
+    /// rule ACCEPTS, so the documented recovery sweep could delete live
+    /// content) and MISSED the far-side `mktemp` tail `.tmp.aB3xY9` and the
+    /// sidecar three-part tail, so a crashed far-side temp was misreported as a
+    /// held-aside and never removed. The former "near-miss"
+    /// `.sync-aside.foo.tmp.1.2.3` is a genuine sidecar temp and is asserted
+    /// TRUE now; the dotless spellings moved to the "not a temp" list.
     #[test]
     fn temp_names_are_exactly_the_authoritys_suffixes() {
         let generated = temp_name_for(std::path::Path::new("sync-aside.foo"));
@@ -610,30 +684,63 @@ mod tests {
         assert!(is_crate_temp_name(&generated), "{generated}");
 
         for temp in [
+            // Local atomic-replace tail: `<pid>.<counter>`.
             ".sync-aside.foo.tmp.12345.0",
             ".sync-aside.case.tmp.1.2",
+            // Sidecar replace tail: `<pid>.<time>.<rand>` (G1).
+            ".sync-aside.foo.tmp.1.2.3",
+            ".op.json.tmp.1234.1700000000.42",
+            ".sync-aside.foo.tmp.12345.0.1",
+            // Far-side `mktemp` tail: six alphanumerics (G1).
+            ".sync-aside.foo.tmp.aB3xY9",
+            ".op.json.tmp.abc123",
+            ".sync-aside.foo.claim.Zz09Qw",
+            // Operation-lock sidecar recover tail: one `<pid>`.
+            ".operation.lock.tmp.4242",
+            // Local claim tail: `<pid>.<counter>`.
             ".sync-aside.1234.claim.7.0",
             ".a.claim.1.0",
-            // A shape match anywhere (reservation is a separate check).
-            "notes.tmp.1.0",
         ] {
             assert!(is_crate_temp_name(temp), "{temp:?} is a crate temp");
         }
         for other in [
-            // A genuine claim-aside: reserved, but NO authority suffix.
+            // A genuine claim-aside: reserved, but NO authority marker.
             ".sync-aside.999.0",
             ".sync-aside.case-probe.1.2",
             // Near-misses on the tail shape.
-            ".sync-aside.foo.tmp.12345",
             ".sync-aside.foo.tmp.x.0",
-            ".sync-aside.foo.tmp.12345.0.1",
+            // Four numeric parts: no generator emits this (the sidecar tail is
+            // exactly three), so it is not a temp.
+            ".sync-aside.foo.tmp.12345.0.1.2",
             ".sync-aside.foo.tmp..0",
             ".sync-aside.foo.tmp.0.",
             ".sync-aside.foo.tmp0.1",
-            ".sync-aside.foo.tmp.1.2.3",
+            // A one-part numeric tail with a NON-lock trunk: no generator
+            // emits this, so it stays ordinary.
+            ".sync-aside.foo.tmp.12345",
+            ".operation.lock.tmp.abc",
             "",
         ] {
             assert!(!is_crate_temp_name(other), "{other:?} is NOT a crate temp");
+        }
+
+        // F4 NEAR-MISS: the crate's temps ALWAYS begin with `.`, so a dotless
+        // name the id rule ACCEPTS must NOT be offered to the recovery sweep.
+        // Pre-fix the suffix-only match made every one of these `true`.
+        for near_miss in [
+            "notes.tmp.1.0",
+            "report.tmp.123.4",
+            "report.tmp.123.4.5",
+            "report.tmp.aB3xY9",
+        ] {
+            assert!(
+                !is_crate_temp_name(near_miss),
+                "the dotless near-miss {near_miss:?} must NOT be a crate temp"
+            );
+            assert!(
+                crate::id::valid_name(near_miss),
+                "{near_miss:?} is an addressable id, so the recovery sweep must not delete it"
+            );
         }
     }
 

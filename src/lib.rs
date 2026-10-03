@@ -52,5 +52,5 @@ pub use error::{Error, Result};
 pub use reserved::{
     APPLICATION_LOCK_NAME, ASIDE_PREFIX, OPERATION_LOCK_SUFFIX, is_application_lock_name,
     is_lock_record_name, is_reserved_case_alias, is_reserved_name, is_reserved_path,
-    is_unaddressable_name,
+    is_unaddressable_name, is_unaddressable_path,
 };

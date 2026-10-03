@@ -43,16 +43,24 @@
 //! # The assumption this guarantee rests on
 //!
 //! "Stable inode ⇒ at most one holder" is structural only while the record is
-//! NOT removed or replaced: unlinking the path lets a later acquisition create
-//! a DIFFERENT inode and flock that while a live holder still holds the old
-//! one — two simultaneous holders. The crate therefore refuses that through its
-//! own substrate: [`crate::atomic::remove_file_fd`] and
-//! [`crate::atomic::remove_dir_all_fd`] refuse a lock-record spelling
-//! ([`crate::reserved::is_lock_record_name`]), so the record cannot be unlinked
-//! through the crate's removal primitives. A holder that never calls those
-//! primitives (nor renames/replaces the record by another route) is the one
-//! assumption left; a crash is fine, because the kernel releases the flock and
-//! the record persists for the next acquisition.
+//! NOT removed, replaced, or renamed: unlinking the path lets a later
+//! acquisition create a DIFFERENT inode and flock that while a live holder
+//! still holds the old one — two simultaneous holders. The crate therefore
+//! makes the record UNADDRESSABLE through its own substrate: the identifier
+//! rule refuses the record spelling ([`crate::reserved::is_unaddressable_name`]),
+//! the sync's manifest-path model refuses it at every component
+//! ([`crate::reserved::is_unaddressable_path`]), so a whole-store sync can
+//! neither transfer it nor destroy it, and every mutating primitive —
+//! [`crate::atomic::remove_file_fd`], [`crate::atomic::remove_dir_all_fd`]
+//! (including each entry its walk unlinks), [`crate::atomic::write_atomic_replace_fd`],
+//! [`crate::atomic::write_atomic_if_match_fd`], [`crate::atomic::write_atomic_cas_fd`],
+//! [`crate::atomic::write_file_fd`], and [`crate::atomic::renameat_paths`] —
+//! refuses a lock-record spelling ([`crate::reserved::is_lock_record_name`]).
+//! HONEST RESIDUAL: a caller that unlinks, replaces, or renames the record with
+//! `std::fs`, a foreign tool, or another process acts outside this crate's
+//! substrate and is not stopped; the record is unaddressable to this crate, not
+//! immovable on the machine. A crash is fine, because the kernel releases the
+//! flock and the record persists for the next acquisition.
 //!
 //! # Contention is TYPED and the lock is NON-BLOCKING
 //!

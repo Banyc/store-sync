@@ -162,8 +162,17 @@ simplification; removing one means adding back the logic it removes.
 - **The process's descriptor limit exceeds the tree's depth.** *Buys:* a walk
   holds one descriptor per directory level instead of pooling or segmenting.
 - **A path-based operation addresses no more than the platform's path limit.**
-  *Buys:* path-shaped operations need no segmented traversal. The manifest walk
-  is descriptor-relative and is not limited by this.
+  *Buys:* path-shaped operations need no segmented traversal. This limit DOES
+  apply to the manifest walk: `canonicalize_tree` (`crate::manifest`) uses
+  `WalkDir` plus `symlink_metadata`/`read` on accumulated PATHS, so a tree
+  deeper than the platform's path limit (about depth 512 with macOS
+  `PATH_MAX` 1024, about depth 2500 with Linux `PATH_MAX` 4096) is refused with
+  `ENAMETOOLONG` at the first path that overflows. A descriptor-relative
+  manifest walk would lift this; it is not implemented, and this bullet is the
+  statement of the real limit. The descriptor-relative REMOVAL walk
+  (`crate::atomic::remove_dir_contents_fd`) holds one descriptor per level and
+  is NOT limited by the path limit, so removal supports deeper trees than the
+  walk that describes them.
 - **Metadata beyond name, kind, mode, content and symlink target is outside the
   model.** *Buys:* a small manifest, and no extended-attribute, ACL, ownership,
   timestamp or sparseness machinery.
