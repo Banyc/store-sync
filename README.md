@@ -551,4 +551,8 @@ implied to be checked.
   at the old path — and a test that bakes `env!("CARGO_MANIFEST_DIR")` (both
   source audits do) then reads a directory that no longer exists. Run
   `cargo clean -p storekit` after moving the tree, and treat a gate that ran
-  without a rebuild after a path change as NOT RUN.
+  without a rebuild after a path change as NOT RUN. The same applies to the
+  REVISION: a checkout whose working copy is still parented to an older tip
+  reports on a tree that no longer exists, so name the revision a gate or a
+  count was taken from — a number measured against the wrong tree reads exactly
+  like a real one.

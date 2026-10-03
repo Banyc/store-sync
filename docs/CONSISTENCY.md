@@ -25,6 +25,7 @@ installed between the check and the walk is that kind of residual.
 | H | a test's name ↔ the failure it can express | a tautological assertion; a false proof in `id_macro.rs`; a count-based bound test blind to quadratic |
 | I | an audit pin ↔ the actual count | the funnel `openat` count |
 | J | the `unix` ↔ `windows` twin surface | a public function present on one platform only |
+| K | the revision you are READING ↔ the revision you BELIEVE you are reading | a `pub fn` count and a gate read from a checkout still parented to the previous tip |
 
 ## Findings
 
@@ -55,15 +56,22 @@ both ports.
 `#[cfg(not(unix))]` placeholder so the module compiles everywhere. A `cfg`-gated
 alternative is not a duplication.
 
-**G — an error becomes a destructive decision.** On a candidate-removal path the
-code computes `confirmed = match rooted(&path) { Ok(rel) => …, Err(_) => false }`
-and treats "not confirmed" as permission to remove. An error there is silently
-converted into a reason to delete. Per the crate's own rule 8 this must fail
-closed. **Open.**
+**G — two candidates reviewed, BOTH conservative by construction. No defect.**
+A removal path computes `confirmed = match rooted(&path) { Ok(rel) => …, Err(_) =>
+false }`, and `RenamedEntryLocation::Unknown` collapses every probe error into
+one variant. Both read like fail-open — an error becoming permission — and are
+the opposite: `false` here means "not confirmed PRESENT", and the caller's
+response to unconfirmed is to drop the candidate and emit *"its location is
+unknown and it may be at <both spellings>, which must be checked by hand"*;
+`Unknown` asserts nothing about location and pushes an `UnconfirmedMove` naming
+both spellings. An unconfirmable probe therefore degrades to an explicitly
+reported indeterminate state, never to a destructive decision.
 
-**G — `RenamedEntryLocation::Unknown` collapses every probe error.** The comment
-says the location cannot be confirmed so nothing is named; whether that is
-fail-closed depends on what consumes `Unknown`. **Open:** verify the consumer.
+The entry stays in this list as a RESOLVED false positive rather than being
+deleted, because the shape is a trap for the next reader: the meaning of `false`
+is only settled by reading the consumer, and the honest rule it demonstrates is
+that "cannot determine" must be a state the caller reports, not a value that
+silently feeds a branch.
 
 **J — the public surface is not the same on both platforms.**
 `atomic::{fsync_dir_fd, openat_no_follow, openat_no_follow_io,
@@ -72,6 +80,15 @@ remove_dir_all_path}` exist on unix and not on windows, while both ports
 compiles on unix and fails on windows — and the two `openat_*` forms are
 inherently POSIX, so the choice is to demote them or to state the platform in
 the API, not to pretend they are neutral. **Open.**
+
+**K — a reading taken from the wrong revision.** A `pub fn` surface count and a
+full `cargo test --lib` were both run from a checkout whose working copy was
+still parented to the PREVIOUS tip, so they described a tree that no longer
+existed: the counts said the surface had not shrunk (34/30, not 29/26) and the
+tree lacked `src/relpath.rs` entirely. The change's own `jj diff --stat`
+contradicted the reading, and re-parenting the checkout showed the agent's
+numbers were right. This is the checkout sibling of the stale-binary rule: a
+green gate and a bad count are both only meaningful for a NAMED revision.
 
 **E — the accepted set and the operations over it.** `validate_rel` accepts
 `a/./b`, `a/b/` and `a//b`; `RootedRelativePath::parse` refuses a literal `.`
