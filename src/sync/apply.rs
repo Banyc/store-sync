@@ -896,7 +896,8 @@ use crate::manifest::{
     canonicalize_tree_destination, compute_tree_digest,
 };
 use crate::sync::diff::{
-    EntryDiff, EntryKind, TreeDiff, diff_trees, remote_destination_manifest, remote_manifest,
+    EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_trees, remote_destination_manifest,
+    remote_manifest,
 };
 use crate::transport::{Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
@@ -2697,8 +2698,11 @@ fn run(
     // and the diff reports it as destination-only (`extraneous`) — the spelling
     // the report doc promises.
     let dest_residue = reserved_paths(&dest_meta);
-    let source_meta = strip_reserved(source_meta, is_reserved_path);
-    let dest_meta = strip_reserved(dest_meta, is_dest_residue_path);
+    // The strip is the PUBLIC diff surface's own authority
+    // ([`apply_manifests`]), so a consumer that builds a status on the raw
+    // manifest primitives can reproduce exactly this decision surface instead
+    // of risking a stranded aside being classified `Extraneous` (deletable).
+    let (source_meta, dest_meta) = apply_manifests(&source_meta, &dest_meta);
     let diff = diff_trees(&source_meta, &dest_meta);
     // F2: an unsupported DESTINATION entry may be DELETED under a sanction
     // (`Extraneous::Delete`, when the source does not hold that path), but the
@@ -6202,19 +6206,33 @@ impl Applier<'_, '_> {
             // unsupported kind is likewise not confirmed.
             let intact = match self.dest.kind_opt(&rel) {
                 Ok(Some(actual)) if actual == kind => match (kind, expected_hash.as_deref()) {
-                    (EntryKind::File, Some(expected)) => self
-                        .dest
-                        .read(&rel)
-                        .map(|bytes| crate::digest::sha256_bytes(&bytes) == expected)
-                        .unwrap_or(false),
-                    (EntryKind::Symlink, Some(expected)) => self
-                        .dest
-                        .read_link(&rel)
-                        .map(|target| {
+                    // A FAILED READ is NOT a content mismatch. The old
+                    // `.unwrap_or(false)` folded the two together, so an
+                    // infrastructure read failure (a transport deadline on a
+                    // large file, a permission error) was reported as a
+                    // verification failure and the entry was dropped from
+                    // `skipped` while its content was never compared at all.
+                    // The read error is preserved as the pass's first error
+                    // (keeping the transport/NotFound class), so the run
+                    // fails with the cause instead of claiming the bytes
+                    // differed.
+                    (EntryKind::File, Some(expected)) => match self.dest.read(&rel) {
+                        Ok(bytes) => crate::digest::sha256_bytes(&bytes) == expected,
+                        Err(error) => {
+                            note_verify_read_failure(first_error, &path, error);
+                            false
+                        }
+                    },
+                    (EntryKind::Symlink, Some(expected)) => match self.dest.read_link(&rel) {
+                        Ok(target) => {
                             crate::digest::sha256_bytes(target.as_os_str().as_encoded_bytes())
                                 == expected
-                        })
-                        .unwrap_or(false),
+                        }
+                        Err(error) => {
+                            note_verify_read_failure(first_error, &path, error);
+                            false
+                        }
+                    },
                     // A directory has no content of its own, and a manifest
                     // entry with no recorded hash makes no content claim.
                     _ => true,
@@ -6834,6 +6852,22 @@ fn note_listing_failure(first_error: &mut Option<Error>, dir: &str, cause: &Erro
     }
 }
 
+/// Record a FAILED VERIFICATION READ as the pass's FIRST error, PRESERVING the
+/// underlying error's class and message (a transport timeout stays
+/// [`Error::Transport`], an absent entry stays [`Error::NotFound`]) and adding
+/// the one thing the caller needs: that the entry's content could not be
+/// compared, so this is an infrastructure failure, never a claim that the
+/// bytes differed. See [`Applier::verify_claimed_untouched`], whose former
+/// `.unwrap_or(false)` turned exactly this into a content mismatch.
+fn note_verify_read_failure(first_error: &mut Option<Error>, path: &str, cause: Error) {
+    if first_error.is_none() {
+        *first_error = Some(cause.with_context(format!(
+            "post-transfer verification could not READ {path}: the entry's content could not be \
+             compared to the manifest — this is an infrastructure failure, NOT a content mismatch"
+        )));
+    }
+}
+
 /// The name in `names` that case-folds to `expected` without being
 /// byte-identical to it: the destination's actual on-disk spelling of an entry
 /// the manifest addressed by `expected`. `None` when no listing entry aliases
@@ -6908,37 +6942,12 @@ fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> 
     Ok(reserved)
 }
 
-/// The DECISIVE test for DESTINATION RESIDUE: an UNADDRESSABLE spelling that
-/// HOLDS something the sync must not destroy — a stranded claim-aside
-/// (`.sync-aside.<pid>.<n>`), the crate's application lock record
-/// (`operation.lock`), the sibling lock record (`.<name>.operation.lock`), or
-/// a case alias of any of those — as opposed to a CRASHED TEMP.
-///
-/// A temp can inherit the reserved namespace (a destination whose own name
-/// begins `sync-aside.` yields `.sync-aside.<name>.tmp.<pid>.<n>`), but it holds
-/// NO original entry: it is the leftover of an interrupted atomic replace and
-/// the documented recovery is a removal. The distinction is a SUFFIX test on
-/// the temp-name authority's own spelling ([`crate::atomic::is_crate_temp_name`]):
-/// a name the authority would produce carries `.tmp.<pid>.<n>` (or
-/// `.claim.<pid>.<n>`); a genuine claim-aside never does. Only an
-/// unaddressable name is classified here, so an ordinary destination file that
-/// merely ends `.tmp.<pid>.<n>` is untouched by this predicate and stays
-/// ordinary content.
-fn is_dest_residue_path(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|component| match component {
-            Component::Normal(name) => is_dest_residue_name(name),
-            _ => false,
-        })
-}
-
-/// The single-NAME form of [`is_dest_residue_path`], for the removal walk that
-/// meets live names rather than manifest spellings.
+/// The single-NAME form of [`crate::reserved::is_residue_path`], for the
+/// removal walk that meets LIVE names rather than manifest spellings. The
+/// PREDICATE itself lives once in [`crate::reserved`]; this only bridges the
+/// `OsStr` a directory listing yields to the `&str` the authority takes.
 fn is_dest_residue_name(name: &OsStr) -> bool {
-    name.to_str().is_some_and(|name| {
-        crate::reserved::is_unaddressable_name(name) && !crate::atomic::is_crate_temp_name(name)
-    })
+    name.to_str().is_some_and(crate::reserved::is_residue_name)
 }
 
 /// The reserved paths of a manifest (kind-agnostic), used for destination
@@ -6946,7 +6955,7 @@ fn is_dest_residue_name(name: &OsStr) -> bool {
 fn reserved_paths(meta: &TreeMetadata) -> BTreeSet<String> {
     meta.entries
         .iter()
-        .filter(|entry| is_dest_residue_path(&entry.path))
+        .filter(|entry| crate::reserved::is_residue_path(&entry.path))
         .map(|entry| entry.path.clone())
         .collect()
 }
@@ -7015,27 +7024,6 @@ fn reserved_roots(paths: &BTreeSet<String>) -> Vec<String> {
         })
         .cloned()
         .collect()
-}
-
-/// Strip every path matching `reserved` from a manifest, recomputing the tree
-/// digest so the manifest stays self-consistent. Reserved names are
-/// bookkeeping, never content: the diff is computed as if they did not exist.
-///
-/// The predicate is a PARAMETER because the DESTINATION and the SOURCE strip
-/// DIFFERENT sets: a reserved-namespaced TEMP is stripped from the SOURCE
-/// ([`is_reserved_path`]) so it is never replicated, but it is LEFT in the
-/// destination manifest ([`is_dest_residue_path`]) so the diff can classify it
-/// as `extraneous` — the spelling the report doc promises for a crashed temp.
-/// `compute_tree_digest` hashes the serialized metadata INCLUDING
-/// `tree_sha256`, so the field is BLANKED before recomputing: otherwise the new
-/// digest would hash the old one in and depend on the pre-strip value
-/// (non-canonical, non-idempotent). Every other producer of a tree digest
-/// blanks the field first.
-fn strip_reserved(mut meta: TreeMetadata, reserved: fn(&str) -> bool) -> TreeMetadata {
-    meta.entries.retain(|entry| !reserved(&entry.path));
-    meta.tree_sha256 = String::new();
-    meta.tree_sha256 = compute_tree_digest(&meta);
-    meta
 }
 
 /// Whether `path` is (or is below) a residue-guarded directory, so removing it

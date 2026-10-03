@@ -1318,6 +1318,69 @@ mod runner_property_tests {
         );
     }
 
+    /// D3: a FRESH transport whose ControlMaster socket directory does not
+    /// exist must SELF-PREPARE before its first remote request. The request
+    /// entry points ([`SshTransport::run_remote`], [`SshTransport::upload_bytes`],
+    /// [`Remote::exec`]) prepare at their ONE boundary, so a consumer that calls
+    /// `Remote::exec` (and therefore `remote_manifest`) directly on a fresh
+    /// transport cannot hit `unix_listener: cannot bind to path .../dmux/...`.
+    /// Pre-fix the mux dir stayed absent because the entry point never prepared;
+    /// the fix is [SshTransport::prepare_for_request].
+    #[test]
+    fn a_remote_request_self_prepares_the_mux_dir() {
+        use std::ffi::OsString;
+
+        let dir = crate::test_support::short_fixture_tmpdir().unwrap();
+        let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::from([(
+            OsString::from("TMPDIR"),
+            dir.path().as_os_str().to_os_string(),
+        )]));
+        let cache = dir.path().join("deploy-ssh-knownhosts");
+        let (pubkey, _fingerprint) = host_key();
+        let (seam, _state) = FakeSeam::new(Stall::Complete, Some(pubkey));
+        let runner =
+            SshRunner::with_seam(seam, Duration::from_millis(50), Duration::from_millis(50));
+        // An explicit `known_hosts` file: `prepare_identity` then only creates
+        // the mux dir (no keyscan pin), which is exactly the fresh-transport
+        // path the reviewer reproduced.
+        let transport = SshTransport::with_runner(
+            "deploy",
+            "self-prepare.test",
+            2222,
+            Path::new("/srv/app"),
+            Some(Path::new("/dev/null")),
+            None,
+            &cache,
+            &env,
+            runner,
+        )
+        .unwrap();
+
+        let mux = dir.path().join("dmux");
+        assert!(
+            !mux.exists(),
+            "the fixture must start with NO mux dir, like a fresh transport"
+        );
+
+        // Drive a REAL request entry point (not `prepare_identity` itself): the
+        // entry point must prepare before its request.
+        let _ = transport.exec(&["true".to_string()], Duration::from_millis(50));
+        assert!(
+            mux.is_dir(),
+            "a remote request must create the ControlMaster socket dir before issuing it"
+        );
+
+        // And `run_remote` (the other shared entry point) must do the same.
+        let mux2 = dir.path().join("dmux");
+        std::fs::remove_dir(&mux2).unwrap();
+        assert!(!mux2.exists());
+        let _ = transport.run_remote("true");
+        assert!(
+            mux2.is_dir(),
+            "run_remote must self-prepare the ControlMaster socket dir"
+        );
+    }
+
     /// The property's assertions for one pair. `state` is the fake's full call
     /// log + live-waiter count.
     fn assert_pair(

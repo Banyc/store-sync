@@ -658,12 +658,16 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
 /// supported host.
 ///
 /// A walk that did not actually enumerate the WHOLE tree must never exit 0
-/// with a short or empty listing: a root that is not a directory, and any
-/// directory the walk cannot open or read, makes the script `die` (non-zero
-/// exit) so the caller refuses it. Only a walk that covered the whole tree
-/// exits 0, and a root that IS a directory but has no entries (an existing
-/// empty directory) prints empty stdout with exit 0 — assembling to the
-/// EMPTY manifest it really is.
+/// with a short or empty listing: an ABSENT root, a root that is not a
+/// directory, and any directory the walk cannot open or read each make the
+/// script `die` (non-zero exit) so the caller refuses it. The two root
+/// refusals carry DISTINCT diagnostics — `absent: <root>` versus `not a
+/// directory: <root>` — so the caller can report an absent far side
+/// ([`crate::Error::NotFound`], consistent with how the crate reports absence
+/// elsewhere) separately from a root that exists but cannot be described.
+/// Only a walk that covered the whole tree exits 0, and a root that IS a
+/// directory but has no entries (an existing empty directory) prints empty
+/// stdout with exit 0 — assembling to the EMPTY manifest it really is.
 ///
 /// The script also VALIDATES the raw bytes before printing, because the
 /// client decodes stdout lossily ([`String::from_utf8_lossy`] in the
@@ -683,7 +687,8 @@ pub fn remote_tree_verify_script() -> &'static str {
     r#"use Digest::SHA qw(sha256_hex);
 use Unicode::Normalize qw(NFC);
 my $root=$ARGV[0];
-die qq{not a directory: $root\n} unless defined($root) && -d $root;
+die qq{absent: $root\n} unless defined($root) && -e $root;
+die qq{not a directory: $root\n} unless -d $root;
 my $hex = sub { my ($s)=@_; return unpack(q{H*},$s); };
 my $check_name = sub {
     my ($n,$dir)=@_;

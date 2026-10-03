@@ -139,9 +139,31 @@ pub(crate) fn spawn(
                 std::thread::sleep(Duration::from_millis(1));
             };
             // The saved stdin-write error is surfaced only AFTER the child
-            // was collected.
+            // was collected — so the far side's own stderr and exit status
+            // are available. Preserve them (the Unix seam does the same), so
+            // a failed upload to a full disk is not reported as a bare
+            // `Broken pipe` indistinguishable from a dead host. The class
+            // stays [`RunError::StdinWrite`].
             match write_res {
-                Err(e) => Err(RunError::StdinWrite(format!("stdin write: {e}"))),
+                Err(e) => {
+                    let far_side = match &wait_res {
+                        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                        Err(_) => String::new(),
+                    };
+                    let status = match &wait_res {
+                        Ok(out) => match out.status.code() {
+                            Some(code) => format!("; the far side exited {code}"),
+                            None => "; the far side was killed by a signal".to_string(),
+                        },
+                        Err(_) => String::new(),
+                    };
+                    let detail = if far_side.is_empty() {
+                        status
+                    } else {
+                        format!("{status}; the far side reported: {far_side}")
+                    };
+                    Err(RunError::StdinWrite(format!("stdin write: {e}{detail}")))
+                }
                 Ok(()) => wait_res,
             }
         });

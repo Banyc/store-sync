@@ -16,9 +16,22 @@
 //!
 //! [`diff_trees`] classifies every path in the union of the two manifests as
 //! [`EntryDiff::Missing`], [`EntryDiff::Changed`], [`EntryDiff::Extraneous`],
-//! or [`EntryDiff::Same`], sorted by path. The diff is the WHOLE decision
-//! surface for [`crate::sync::apply`]; producing it reads no content beyond
-//! what a manifest already holds.
+//! or [`EntryDiff::Same`], sorted by path. [`apply_manifests`] produces the
+//! pair of manifests [`crate::sync::apply`] actually diffs — the raw
+//! primitives' result with the crate's reserved bookkeeping stripped, through
+//! the crate's ONE reserved authority ([`crate::reserved`]) — so the diff of
+//! THAT pair is the engine's TRANSFER decision surface; producing it reads no
+//! content beyond what a manifest already holds.
+//!
+//! The RAW diff of [`remote_manifest`]/[`remote_destination_manifest`] is NOT
+//! that surface. `apply` strips reserved paths BEFORE diffing (a stranded
+//! destination `.sync-aside` is `residue`, never `Extraneous`; a source-side
+//! one is a `ReservedName` conflict, never `Missing`), and it derives those,
+//! plus the unsupported-destination preflight, from the RAW manifests. A
+//! consumer that builds a status on the raw primitives MUST call
+//! [`apply_manifests`] (and reproduce the extra decisions) or it risks
+//! deleting a stranded original or writing into the crate's reserved
+//! namespace.
 
 use crate::error::{Error, Result};
 use crate::manifest::{
@@ -171,16 +184,42 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// the root or provision the layout first; [`remote_destination_manifest`] is
 /// the tolerant destination-side form and still refuses an absent root.
 ///
+/// This is the STRICT form and it describes the SOURCE side: an entry the
+/// address-fidelity rules cannot represent (a hard link, an absolute or
+/// escaping symlink) makes the whole manifest an ERROR. Use it for the tree
+/// the content comes FROM. For the DESTINATION a caller must use
+/// [`remote_destination_manifest`], which returns those entries in
+/// [`DestinationTree::unsupported`] instead of refusing the tree; that is
+/// exactly how the engine describes a destination, so a consumer that builds a
+/// status for the destination side from THIS form will refuse a tree the
+/// engine handles.
+///
+/// A consumer that builds a STATUS from this manifest and [`diff_trees`] must
+/// first pass the pair through [`apply_manifests`] (and reproduce the engine's
+/// reserved-conflict, residue, and unsupported-destination decisions): the raw
+/// diff classifies a stranded `.sync-aside` as `Extraneous`/`Missing`, which
+/// the engine never does. See the module doc.
+///
+/// Like the sync entry points, the primitive PREPARES the transport's own
+/// host identity before its first remote request
+/// ([`Remote::prepare_identity`]); a caller of this function does NOT have to
+/// know about that separate step. For `SshTransport` it creates the
+/// ControlMaster socket directory the request argv requires, so a fresh
+/// transport can read the remote tree at all. The call is idempotent.
+///
 /// A non-zero exit is classified by LAYER ([`remote_manifest_failure`]): the
 /// remote command is `ssh … exec -- perl -e <script> <root>`. `ssh` reserves
 /// exit status 255 for its OWN failures, but a far-side `perl` `die` ALSO
 /// exits 255: perl exits 255 when `$!` is 0, and the crate's own script
 /// measures exactly that for a NON-NFC entry name and for a name (or symlink
 /// target) whose diagnostic is hex-encoded (measured on macOS perl 5.34.1 and
-/// Linux perl 5.40.1, invoked exactly as the crate invokes it). A root that
-/// is not a directory exits 2 instead: `perl -e`'s module loading leaves
-/// `$!` = ENOENT, so the script's `not a directory:` `die` propagates 2.
-/// Exit 255 alone therefore establishes nothing. The layer is
+/// Linux perl 5.40.1, invoked exactly as the crate invokes it). An ABSENT root
+/// and a root that is not a directory both exit 2 instead: `perl -e`'s module
+/// loading leaves `$!` = ENOENT, so the script's `absent:` / `not a
+/// directory:` `die` propagates 2. They are told apart by the DIAGNOSTIC, not
+/// the status: `absent:` maps to [`Error::NotFound`] and `not a directory:`
+/// stays a script failure. Exit 255 alone therefore establishes nothing. The
+/// layer is
 /// attributed only from a POSITIVE diagnostic at the START of a stderr line
 /// ([`transport_failed_before_the_command`], [`far_side_script_failed`]);
 /// when neither the transport's markers nor the script's own closed `die`
@@ -192,6 +231,13 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// far-side `die` propagates, so the script's own anchored words outrank the
 /// bare status.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
+    // SELF-PREPARE: the public primitive a consumer calls must not depend on an
+    // undocumented extra caller step. The sync entry points already call
+    // `prepare_identity` themselves before their first remote request; this
+    // primitive does the same, so a fresh `SshTransport` (whose ControlMaster
+    // socket directory has not been created) can read the remote tree. The
+    // default is a no-op and a second call is idempotent.
+    remote.prepare_identity()?;
     let root = remote.root();
     if remote.is_local() {
         // The transport declares the root LOCAL: canonicalize it in process,
@@ -203,6 +249,14 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
             Ok(meta) if meta.is_dir() => canonicalize_tree(root),
             Ok(_) => Err(Error::transport(format!(
                 "local remote root {} is not a directory; refusing to describe it as a tree",
+                root.display()
+            ))),
+            // An ABSENT root is the TYPED absence condition, consistent with
+            // the remote branch and `Remote::metadata_opt`; every other I/O
+            // failure stays a transport error. An absent far side must not
+            // read as "the far side described an empty tree".
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::not_found(format!(
+                "local remote root {} does not exist; refusing to describe an absent root as a tree",
                 root.display()
             ))),
             Err(e) => Err(Error::transport(format!(
@@ -239,13 +293,33 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 /// a root that cannot be described. A PUSH provisions its destination root
 /// before reading this manifest (see `crate::sync::apply`), so a fresh
 /// destination is a real directory by the time this runs.
+///
+/// This is the DESTINATION-side form and the ONE to use for the side content
+/// goes TO; [`remote_manifest`] is the strict SOURCE-side form. It is
+/// self-preparing exactly as [`remote_manifest`] is (see there).
+///
+/// As with [`remote_manifest`], a status built by diffing this result directly
+/// must first pass the pair through [`apply_manifests`]; the raw diff would
+/// report a stranded `.sync-aside` as `Extraneous` (deletable) where the
+/// engine reports it as `residue`.
 pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTree> {
+    // SELF-PREPARE, exactly as the source-side primitive does: a consumer
+    // calling this directly on a fresh transport must not need a separate
+    // `prepare_identity` call.
+    remote.prepare_identity()?;
     let root = remote.root();
     if remote.is_local() {
         return match std::fs::symlink_metadata(root) {
             Ok(meta) if meta.is_dir() => canonicalize_tree_destination(root),
             Ok(_) => Err(Error::transport(format!(
                 "local remote root {} is not a directory; refusing to describe it as a tree",
+                root.display()
+            ))),
+            // An ABSENT root is the TYPED absence condition (see
+            // [`remote_manifest`]); every other I/O failure stays a transport
+            // error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::not_found(format!(
+                "local remote root {} does not exist; refusing to describe an absent root as a tree",
                 root.display()
             ))),
             Err(e) => Err(Error::transport(format!(
@@ -265,6 +339,57 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
         return Err(remote_manifest_failure(root, &out));
     }
     canonicalize_remote_entries_destination(&out.stdout, root)
+}
+
+/// The pair of manifests `crate::sync::apply` actually DIFFS: the SOURCE with
+/// every unaddressable path removed and the DESTINATION with its RESIDUE
+/// removed, both through the crate's ONE reserved authority
+/// ([`crate::reserved`]). `diff_trees(&source, &dest)` of the results is the
+/// engine's transfer decision surface.
+///
+/// A consumer building a status from the RAW manifest primitives MUST apply
+/// this first. Without it the raw diff classifies a stranded destination
+/// `.sync-aside.<pid>.<n>` as [`EntryDiff::Extraneous`] — i.e. DELETABLE under
+/// `Extraneous::Delete` — while the engine reports it as `residue` and never
+/// deletes it, and it classifies a source-side `.sync-aside.<pid>.<n>` as
+/// [`EntryDiff::Missing`] while the engine refuses it with a `ReservedName`
+/// conflict. Acting on the raw list therefore risks destroying a stranded
+/// original or writing into the crate's reserved namespace.
+///
+/// The two sides strip DIFFERENT sets on purpose (see [`crate::sync::apply`]):
+/// a reserved-namespaced CRATE TEMP is stripped from the source so it is never
+/// replicated, but LEFT in the destination so the diff reports it as
+/// destination-only; a genuine stranded aside is stripped from BOTH so it is
+/// never transferred or removed.
+///
+/// The diff alone is NOT the whole `apply` decision surface: `apply` also
+/// derives source `ReservedName` conflicts, destination `residue`, and the
+/// unsupported-destination preflight from the RAW manifests, and a consumer
+/// reporting those must do the same ([`crate::reserved`] and
+/// [`remote_destination_manifest`] are the authorities).
+///
+/// The tree digest is recomputed so each returned manifest stays
+/// self-consistent.
+pub fn apply_manifests(source: &TreeMetadata, dest: &TreeMetadata) -> (TreeMetadata, TreeMetadata) {
+    (
+        strip_reserved(source.clone(), crate::reserved::is_unaddressable_path),
+        strip_reserved(dest.clone(), crate::reserved::is_residue_path),
+    )
+}
+
+/// Strip every path matching `reserved` from a manifest, recomputing the tree
+/// digest so the manifest stays self-consistent. The predicate is a PARAMETER
+/// because the source and the destination strip DIFFERENT sets
+/// ([`apply_manifests`]). `compute_tree_digest` hashes the serialized metadata
+/// INCLUDING `tree_sha256`, so the field is BLANKED before recomputing:
+/// otherwise the new digest would hash the old one in and depend on the
+/// pre-strip value (non-canonical, non-idempotent). Every other producer of a
+/// tree digest blanks the field first.
+pub(crate) fn strip_reserved(mut meta: TreeMetadata, reserved: fn(&str) -> bool) -> TreeMetadata {
+    meta.entries.retain(|entry| !reserved(&entry.path));
+    meta.tree_sha256 = String::new();
+    meta.tree_sha256 = crate::manifest::compute_tree_digest(&meta);
+    meta
 }
 
 /// The error for a NON-ZERO exit of the far-side manifest command, classified
@@ -327,6 +452,22 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     } else {
         stderr
     };
+    // The ABSENT root is a TYPED, distinguishable condition, not a transport
+    // failure: the far-side script reports `absent: <root>` (distinct from
+    // `not a directory: <root>`) and a consumer must not have to string-match
+    // it apart from an unreachable host. `Error::NotFound` is the crate's
+    // absence class, matching `Remote::metadata_opt` and the local branch.
+    if stderr_line_starts_with(stderr, ABSENT_ROOT_PREFIX) {
+        return Error::not_found(format!(
+            "remote tree verification at {} found no root on the far side: the far-side manifest \
+             script reported {:?}. An ABSENT root (this error) is distinct from an unreachable host \
+             or a failed transport (a transport error) and from a root that exists but is not a \
+             directory (a script failure); the caller may create the root or provision the layout \
+             and retry",
+            root.display(),
+            stderr
+        ));
+    }
     // The typed cause is the authority, and this one is decisive: the command
     // RAN and EXITED, and only its bounded post-exit output drain gave up
     // (a pipe-holding process outlived the command). Naming the
@@ -576,7 +717,15 @@ fn transport_marker_at_line_start(stderr: &str) -> bool {
 /// non-zero (see [`crate::manifest::remote_tree_verify_script`]); the
 /// vocabulary is closed because the script has exactly one `die` per
 /// condition and nothing else writes its stderr.
+/// The far-side script's ABSENT-ROOT diagnostic, at the START of a stderr line
+/// (see [`crate::manifest::remote_tree_verify_script`]). Distinct from
+/// [`SCRIPT_DIE_PREFIXES`]'s `not a directory: ` on purpose: the first is the
+/// typed [`crate::Error::NotFound`] condition, the second is a root that
+/// exists but cannot be described.
+const ABSENT_ROOT_PREFIX: &str = "absent: ";
+
 const SCRIPT_DIE_PREFIXES: &[&str] = &[
+    "absent: ",
     "not a directory: ",
     "entry name under ",
     "symlink target of ",
@@ -602,6 +751,13 @@ fn far_side_script_failed(out: &ExecOutcome) -> bool {
 }
 
 /// Classify every path in the union of `source` and `dest`, sorted by path.
+///
+/// This is the RAW differ: it classifies exactly the manifests it is given, so
+/// its result is the engine's transfer decision surface only when the
+/// arguments are [`apply_manifests`]'s output. A `source`/`dest` straight from
+/// [`remote_manifest`]/[`remote_destination_manifest`] still contains the
+/// crate's reserved bookkeeping, which `apply` strips first; see the module
+/// doc.
 pub fn diff_trees(source: &TreeMetadata, dest: &TreeMetadata) -> TreeDiff {
     let source_map: BTreeMap<&str, &TreeEntry> = source
         .entries
@@ -655,14 +811,198 @@ mod tests {
     use super::*;
     use crate::env::SysEnv;
     use crate::test_support::{announce_skip, fixture_tmpdir};
-    use crate::transport::{Layout, LocalTransport};
+    use crate::transport::{
+        CreateNewVerdict, FsBytes, Layout, LocalTransport, RemoteEntry, RemoteMeta,
+        RootedRelativePath,
+    };
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn write(path: &Path, bytes: &[u8]) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, bytes).unwrap();
+    }
+
+    /// A [`Remote`] that REFUSES to run a remote request before
+    /// [`Remote::prepare_identity`] has been called — the trait's stated
+    /// contract, made enforceable. Every other method delegates to an inner
+    /// [`LocalTransport`]; `is_local` is `false` so the manifest primitives
+    /// take their genuinely-REMOTE `exec` branch.
+    struct IdentityProbe {
+        inner: LocalTransport,
+        prepared: AtomicBool,
+        execs: AtomicUsize,
+    }
+
+    impl IdentityProbe {
+        fn over(root: PathBuf) -> IdentityProbe {
+            IdentityProbe {
+                inner: LocalTransport::new(&SysEnv::from_process(), root, Layout::empty()).unwrap(),
+                prepared: AtomicBool::new(false),
+                execs: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Remote for IdentityProbe {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn is_local(&self) -> bool {
+            false
+        }
+        fn prepare_identity(&self) -> Result<()> {
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir(rel)
+        }
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, _argv: &[String], _timeout: Duration) -> Result<ExecOutcome> {
+            if !self.prepared.load(Ordering::SeqCst) {
+                return Err(Error::transport(
+                    "remote request before prepare_identity: the manifest primitive must self-prepare",
+                ));
+            }
+            self.execs.fetch_add(1, Ordering::SeqCst);
+            // An EMPTY successful listing: the primitives then assemble the
+            // empty manifest, which is all this test needs to observe.
+            Ok(ExecOutcome {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                timeout_cause: None,
+            })
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// Gap 4: the RAW diff of the public primitives is NOT `apply`'s decision
+    /// surface. A stranded SOURCE `.sync-aside` reads as `Missing` (the engine
+    /// refuses it with a `ReservedName` conflict) and a stranded DESTINATION
+    /// `.sync-aside` reads as `Extraneous` — i.e. DELETABLE — while the engine
+    /// reports it as `residue` and never deletes it. [`apply_manifests`] is the
+    /// public strip that makes the claim true: the same pair diffed after it
+    /// contains neither reserved path, so a consumer cannot act on a
+    /// syntactically-reserved name.
+    #[test]
+    fn apply_manifests_strips_the_reserved_trap_from_the_raw_primitives() {
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        write(&src.join("f"), b"same");
+        write(&src.join(".sync-aside.7.0"), b"stranded-source");
+        write(&dst.join("f"), b"same");
+        write(&dst.join(".sync-aside.4242.0"), b"stranded-dest");
+
+        let src_t =
+            LocalTransport::new(&SysEnv::from_process(), src.clone(), Layout::empty()).unwrap();
+        let dst_t =
+            LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).unwrap();
+        let source = remote_manifest(&src_t).unwrap();
+        let destination = remote_destination_manifest(&dst_t).unwrap();
+
+        let raw = diff_trees(&source, &destination.meta);
+        assert_eq!(
+            raw.classify(".sync-aside.7.0"),
+            Some(EntryDiff::Missing),
+            "the RAW source diff shows a reserved aside as content to install"
+        );
+        assert_eq!(
+            raw.classify(".sync-aside.4242.0"),
+            Some(EntryDiff::Extraneous),
+            "the RAW destination diff shows a stranded aside as deletable"
+        );
+
+        let (source_stripped, dest_stripped) = apply_manifests(&source, &destination.meta);
+        let decision = diff_trees(&source_stripped, &dest_stripped);
+        assert_eq!(
+            decision.classify(".sync-aside.7.0"),
+            None,
+            "the engine's decision surface never names a reserved source path"
+        );
+        assert_eq!(
+            decision.classify(".sync-aside.4242.0"),
+            None,
+            "the engine's decision surface never names a stranded destination aside"
+        );
+        assert_eq!(decision.classify("f"), Some(EntryDiff::Same));
+    }
+
+    /// D3: `remote_manifest` and `remote_destination_manifest` PREPARE the
+    /// transport's host identity before their first remote request, exactly as
+    /// the sync entry points do. Pre-fix they did not, so a fresh
+    /// `SshTransport` failed a status-only read with
+    /// `unix_listener: cannot bind to path .../dmux/...`. The probe refuses any
+    /// `exec` before preparation, so the primitive's OWN call is the only thing
+    /// that can make this pass.
+    #[test]
+    fn manifest_primitives_prepare_the_transport_identity() {
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+        let root = dir.path().join("r");
+        fs::create_dir_all(&root).unwrap();
+        let probe = IdentityProbe::over(root);
+
+        let manifest = remote_manifest(&probe)
+            .expect("remote_manifest must prepare the transport identity before its request");
+        assert!(probe.prepared.load(Ordering::SeqCst));
+        assert_eq!(probe.execs.load(Ordering::SeqCst), 1);
+        assert!(manifest.entries.is_empty());
+
+        probe.prepared.store(false, Ordering::SeqCst);
+        let destination = remote_destination_manifest(&probe).expect(
+            "remote_destination_manifest must prepare the transport identity before its request",
+        );
+        assert!(probe.prepared.load(Ordering::SeqCst));
+        assert_eq!(probe.execs.load(Ordering::SeqCst), 2);
+        assert!(destination.meta.entries.is_empty());
     }
 
     /// Build a tree containing one entry of EACH kind so the kind-string
@@ -798,21 +1138,81 @@ mod tests {
         // An ABSENT root is an ERROR, never a synthesized empty manifest: an
         // absent far side must not read as "the far side described an empty
         // tree", which is what lets a `delete_extraneous` sync destroy data.
+        // It is the TYPED absence condition (`Error::NotFound`), distinct from
+        // an unreachable host or a transport failure.
         let absent = dir.path().join("absent");
         let ta =
             LocalTransport::new(&SysEnv::from_process(), absent.clone(), Layout::empty()).unwrap();
         assert!(
-            matches!(remote_manifest(&ta), Err(Error::Transport(_))),
-            "an absent local remote root must be a transport error"
+            matches!(remote_manifest(&ta), Err(Error::NotFound(_))),
+            "an absent local remote root must be the typed absence error"
+        );
+        // ... and the destination-side form reports it the same way.
+        assert!(
+            matches!(remote_destination_manifest(&ta), Err(Error::NotFound(_))),
+            "an absent local remote root must be NotFound on the destination form too"
         );
 
-        // A non-directory root is refused the same way (not described as empty).
+        // A non-directory root is refused, but NOT as absence: it exists.
         let file = dir.path().join("not-a-dir");
         write(&file, b"x");
         let tf = LocalTransport::new(&SysEnv::from_process(), file, Layout::empty()).unwrap();
         assert!(
             matches!(remote_manifest(&tf), Err(Error::Transport(_))),
             "a non-directory local remote root must be a transport error"
+        );
+    }
+
+    /// Gap 5: the far side DISTINGUISHES an absent root from a root that is not
+    /// a directory, and the classifier turns the absent diagnostic into the
+    /// typed [`Error::NotFound`] instead of an undifferentiated transport
+    /// error. The REAL script is run on an absent root; before the fix both
+    /// cases printed `not a directory:` and a consumer had to string-match (or
+    /// probe with `exec`) to tell an absent far side from an unreachable host.
+    #[test]
+    fn an_absent_remote_root_is_the_typed_not_found_condition() {
+        if !perl_on_path() {
+            announce_skip("perl is not on PATH, so the remote verification script cannot run");
+            return;
+        }
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+        let absent = dir.path().join("absent");
+        let out = real_script_outcome(&absent).expect("perl must run");
+        assert!(
+            out.stderr.starts_with("absent: "),
+            "the far side must name ABSENCE distinctly, got: {out:?}"
+        );
+        assert!(
+            !out.stderr.starts_with("not a directory: "),
+            "an absent root must not be reported as a non-directory: {out:?}"
+        );
+        let err = remote_manifest_failure(Path::new("/srv/store"), &out);
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "an absent far-side root must be NotFound, got: {err:?}"
+        );
+        // The DIAGNOSTIC is preserved so the caller can see the far side's own
+        // words, and the root is named.
+        let message = err.to_string();
+        assert!(message.contains("/srv/store"), "{message}");
+        assert!(
+            message.contains("found no root on the far side"),
+            "{message}"
+        );
+
+        // An UNREACHABLE host (the `unix_listener:` control-socket shape) is a
+        // DIFFERENT class: a transport error, never NotFound.
+        let unreachable = ExecOutcome {
+            exit_code: 255,
+            stdout: String::new(),
+            stderr: "unix_listener: cannot bind to path /tmp/dmux/mux-1: No such file or directory"
+                .to_string(),
+            timeout_cause: None,
+        };
+        let transport_err = remote_manifest_failure(Path::new("/srv/store"), &unreachable);
+        assert!(
+            matches!(transport_err, Error::Transport(_)),
+            "an unreachable host must stay a transport error: {transport_err:?}"
         );
     }
 
@@ -1382,7 +1782,8 @@ mod tests {
     /// 5.40.1 under the crate's own `perl -e <script> <root>` invocation:
     ///
     /// * root EXISTS but is not a directory -> 2 (`not a directory: …`);
-    /// * root is ABSENT                    -> 2 (`not a directory: …`);
+    /// * root is ABSENT                    -> 2 (`absent: …`, a DISTINCT
+    ///   diagnostic the classifier maps to `Error::NotFound`);
     /// * a directory the walk cannot open  -> 13  (`opendir …: Permission
     ///   denied`), when this filesystem actually refuses the read;
     /// * a non-NFC entry name              -> 255 (name echoed RAW);
@@ -1418,12 +1819,21 @@ mod tests {
         );
         assert_script_layer(&out);
 
-        // An ABSENT root: measured 2 (`-d` sets ENOENT).
+        // An ABSENT root: measured 2 (`-e`/`-d` set ENOENT), but with a
+        // DISTINCT `absent:` diagnostic so the caller can report
+        // `Error::NotFound` instead of string-matching it apart from a
+        // non-directory root or an unreachable host.
         let absent = dir.path().join("absent");
         let out = real_script_outcome(&absent).unwrap();
         assert_eq!(out.exit_code, 2, "an absent root exits 2: {out:?}");
-        assert!(out.stderr.starts_with("not a directory: "), "{out:?}");
-        assert_script_layer(&out);
+        assert!(out.stderr.starts_with("absent: "), "{out:?}");
+        assert!(
+            matches!(
+                remote_manifest_failure(Path::new("/srv/store"), &out),
+                Error::NotFound(_)
+            ),
+            "an absent root is the typed NotFound condition: {out:?}"
+        );
 
         // An existing EMPTY directory: measured 0 with empty stdout — the empty
         // manifest, not a refusal.

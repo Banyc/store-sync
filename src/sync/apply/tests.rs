@@ -1091,6 +1091,10 @@ struct RecordingRemote {
     /// read failure on the confined-local path, where there is no destination
     /// write seam, so a claim rollback runs.
     fail_nth_read: Option<usize>,
+    /// Fail every `read` of a SPECIFIC manifest path. Used by the D1(b)
+    /// verification-read test to fail the `verify_claimed_untouched` re-read
+    /// of one left-alone entry while the run's other reads succeed.
+    fail_read_for: Option<String>,
     /// A destination mutation applied after the Nth `write` FAILS (returns
     /// `Err`): a writer that changes the destination KIND after a failed install
     /// and before the single settle restore (the Finding-2 restore case).
@@ -1168,6 +1172,7 @@ impl RecordingRemote {
             dest_read_before_counts: Mutex::new(BTreeMap::new()),
             reads: AtomicUsize::new(0),
             fail_nth_read: None,
+            fail_read_for: None,
             mutate_after_failed_write: None,
             before_dir_removal: None,
             dir_removals: AtomicUsize::new(0),
@@ -1346,6 +1351,13 @@ impl Remote for RecordingRemote {
         let nth = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
         if self.fail_nth_read == Some(nth) {
             return Err(Error::transport(format!("injected read failure #{nth}")));
+        }
+        if let Some(path) = &self.fail_read_for
+            && rel.as_path().to_string_lossy() == path.as_str()
+        {
+            return Err(Error::transport(format!(
+                "injected read failure for {path}"
+            )));
         }
         // The BEFORE-READ window writer: a concurrent deletion the append's own
         // byte read then observes as an error (not as absent bytes). Counted
@@ -3116,7 +3128,10 @@ fn push_to_an_absent_destination_root_is_an_error_not_a_delete() {
 
     let remote = RecordingRemote::over(transport(&dst), true);
     let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    // The absent ROOT is the TYPED absence condition (gap 5), consistent with
+    // how the crate reports absence elsewhere; it is still an ERROR (no
+    // delete), which is what this test exists to pin.
+    assert!(matches!(err.error(), Error::NotFound(_)), "got {err:?}");
     assert_eq!(remote.ops(), 0);
     assert!(!dst.exists());
 }
@@ -5975,13 +5990,17 @@ fn a_stale_temp_in_the_aside_namespace_is_extraneous_not_residue() {
     // The classification itself: a reserved-namespaced TEMP is NOT residue,
     // while a genuine claim-aside (no authority suffix) IS — and an ordinary
     // reservation-free name is outside this predicate entirely.
-    assert!(!is_dest_residue_path(&short));
-    assert!(!is_dest_residue_path(&long));
-    assert!(!is_dest_residue_path(&control));
-    assert!(is_dest_residue_path(".sync-aside.999.0"));
-    assert!(is_dest_residue_path(".sync-aside.case-probe.1.2"));
-    assert!(is_dest_residue_path("nested/.001.operation.lock"));
-    assert!(!is_dest_residue_path("notes.tmp.1.2"));
+    assert!(!crate::reserved::is_residue_path(&short));
+    assert!(!crate::reserved::is_residue_path(&long));
+    assert!(!crate::reserved::is_residue_path(&control));
+    assert!(crate::reserved::is_residue_path(".sync-aside.999.0"));
+    assert!(crate::reserved::is_residue_path(
+        ".sync-aside.case-probe.1.2"
+    ));
+    assert!(crate::reserved::is_residue_path(
+        "nested/.001.operation.lock"
+    ));
+    assert!(!crate::reserved::is_residue_path("notes.tmp.1.2"));
 
     for name in [&short, &long, &control] {
         write(&dst.join(name.as_str()), b"stale temp");
@@ -6860,7 +6879,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
 
     // (a) Stripping the reserved entry yields the canonical metadata of the
     //     remaining tree, digest included.
-    let stripped = strip_reserved(full.clone(), is_reserved_path);
+    let stripped = crate::sync::diff::strip_reserved(full.clone(), is_reserved_path);
     assert_eq!(
         stripped, expected,
         "stripping the reserved entry must yield the canonical metadata of the \
@@ -6869,7 +6888,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
 
     // (b) A manifest with NO reserved entries strips to ITSELF: the digest
     //     `canonicalize_tree` produced must survive the (identity) strip.
-    let untouched = strip_reserved(expected.clone(), is_reserved_path);
+    let untouched = crate::sync::diff::strip_reserved(expected.clone(), is_reserved_path);
     assert_eq!(
         untouched.tree_sha256, expected.tree_sha256,
         "stripping a manifest with no reserved entries must leave the canonical \
@@ -6879,7 +6898,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
     // (c) Idempotence: a second strip sees a digest already equal to the
     //     canonical one and must not drift again.
     assert_eq!(
-        strip_reserved(stripped.clone(), is_reserved_path),
+        crate::sync::diff::strip_reserved(stripped.clone(), is_reserved_path),
         stripped,
         "strip_reserved must be idempotent"
     );
@@ -9555,6 +9574,56 @@ fn a_claimed_untouched_entry_changed_by_a_writer_is_not_reported_skipped() {
     );
 }
 
+/// D1(b): a FAILED verification READ is an INFRASTRUCTURE error, never a
+/// content-mismatch claim. An entry the run left alone has its bytes re-read to
+/// confirm the no-mutation claim; when that read FAILS (here injected for one
+/// path), the run must surface the read failure. The pre-fix
+/// `.unwrap_or(false)` folded the error into "the entry changed": the run
+/// returned `Ok` with the path in `verify_failures` and DROPPED from `skipped`,
+/// claiming a content mismatch it never observed.
+#[test]
+fn a_failed_verification_read_is_an_infrastructure_error_not_a_content_mismatch() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("d/x"), b"new");
+    write(&src.join("d/skip"), b"same");
+    write(&dst.join("d/skip"), b"same");
+    let mut remote = RecordingRemote::over(transport(&dst), false);
+    // Fail ONLY the claimed-untouched re-read of `d/skip`; the transferred
+    // `d/x` verification read still succeeds, so the failure lands exactly on
+    // `verify_claimed_untouched`.
+    remote.fail_read_for = Some("d/skip".to_string());
+
+    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let err = match result {
+        Ok(report) => panic!(
+            "a failed verification read must not return Ok with a content-mismatch claim: {report:?}"
+        ),
+        Err(err) => err,
+    };
+    let message = err.error().to_string();
+    assert!(
+        message.contains("could not READ d/skip"),
+        "the error must name the path whose read failed: {message}"
+    );
+    assert!(
+        message.contains("injected read failure"),
+        "the error must preserve the read failure's cause: {message}"
+    );
+    assert!(
+        !message.contains("destination hashes"),
+        "a read failure must NOT be reported as a content mismatch: {message}"
+    );
+    // The untouched entry is not advertised as `skipped` on the failure path's
+    // report either: its no-mutation claim was never confirmed.
+    assert!(
+        !err.report().skipped.iter().any(|p| p == "d/skip"),
+        "an unconfirmed untouched claim is not `skipped`: {:?}",
+        err.report()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Round 21: content verification for mode-only transfers, KIND verification for
 // every report-named path, and the faithful destination listing.
@@ -11719,15 +11788,20 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
     let err = sync(Direction::Pull, &local, &owned, &ReplaceAll, Keep)
         .expect_err("the far-side manifest command failed");
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    // The entry point prepares the transport identity, and the source
+    // manifest primitive now SELF-PREPARES too (the D3 fix), so a PULL records
+    // exactly two preparations. What matters is unchanged: EVERY prepare call
+    // runs before the FIRST remote request (op index 0).
     assert_eq!(
         owned.identity_calls(),
-        1,
-        "the owned entry point must prepare the transport identity exactly once"
+        2,
+        "the owned entry point prepares once and the self-preparing source manifest primitive \
+         prepares again (idempotent)"
     );
     assert_eq!(
         owned.identity_op_index(),
-        vec![0],
-        "prepare_identity must run before the FIRST remote request"
+        vec![0, 0],
+        "EVERY prepare_identity call must run before the FIRST remote request"
     );
     assert!(
         owned.remote_requests() > 0,
@@ -11740,8 +11814,17 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
     unowned.exec_failure = Some(broken_exec());
     let _ = sync_unowned(Direction::Pull, &local, &unowned, &ReplaceAll, Keep)
         .expect_err("the far-side manifest command failed");
-    assert_eq!(unowned.identity_calls(), 1);
-    assert_eq!(unowned.identity_op_index(), vec![0]);
+    assert_eq!(
+        unowned.identity_calls(),
+        2,
+        "the unowned entry point prepares once and the self-preparing source manifest primitive \
+         prepares again (idempotent)"
+    );
+    assert_eq!(
+        unowned.identity_op_index(),
+        vec![0, 0],
+        "EVERY prepare_identity call must run before the FIRST remote request"
+    );
     assert!(unowned.remote_requests() > 0);
 }
 

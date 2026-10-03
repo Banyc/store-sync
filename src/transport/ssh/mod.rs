@@ -725,6 +725,29 @@ impl SshTransport {
         Ok(())
     }
 
+    /// Prepare this transport's host identity before a remote request, so
+    /// EVERY request entry point ([`Self::run_remote`], [`Self::upload_bytes`],
+    /// and [`Remote::exec`]) is self-preparing and no caller can forget the
+    /// separate [`Remote::prepare_identity`] step. This is the CLASS fix for
+    /// "an undocumented extra call": `prepare_identity` creates the
+    /// ControlMaster socket directory that `ssh_command_argv`'s `ControlPath`
+    /// requires, so a fresh transport whose mux dir does not exist otherwise
+    /// fails its first request with `unix_listener: cannot bind to path ...`.
+    ///
+    /// IDEMPOTENT and cheap: the sync entry points still call
+    /// [`Remote::prepare_identity`] FIRST (deliberately, before the
+    /// destination lock record is created), and this second call is then a
+    /// `create_dir_all` on an existing directory plus a `chmod`. The default
+    /// implementation of `prepare_identity` is a no-op, so this is a no-op on
+    /// transports without a host-identity concept.
+    fn prepare_for_request(&self) -> Result<()> {
+        self.prepare_identity().map_err(|error| {
+            error.with_context(
+                "the ssh transport's host-identity preparation failed before this remote request",
+            )
+        })
+    }
+
     /// Run a single remote shell command (already fully quoted) and return its
     /// stdout/stderr/status. The command is passed as one `ssh` argument after
     /// `--`, so OpenSSH cannot interpret any part of our data as options or as
@@ -762,6 +785,7 @@ impl SshTransport {
     /// command deadline. `run_remote` and `run_remote_ok` differ only in the
     /// recorded operation kind and in whether they check the exit status.
     fn run_remote_op(&self, op: OpKind, command: &str) -> Result<std::process::Output> {
+        self.prepare_for_request()?;
         let argv = self.ssh_command_argv(command)?;
         self.runner.run(op, &argv, None, None).map_err(|e| match e {
             RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
@@ -919,6 +943,7 @@ impl SshTransport {
     /// time — so a stalled or slow push can be attributed to the exact file
     /// being transferred.
     pub(crate) fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        self.prepare_for_request()?;
         let remote_path = self.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         // The parent is computed HERE and single-quoted, never via an unquoted
@@ -1066,13 +1091,57 @@ impl SshTransport {
         Ok(())
     }
 
-    fn download_bytes(&self, rel: &Path) -> Result<Vec<u8>> {
-        let remote_path = self.root.join(rel);
+    /// Read a file's bytes from the remote. The deadline is SIZE-AWARE,
+    /// exactly as an upload's ([`transfer_deadline`]): the entry's size comes
+    /// from the same framed `lstat` helper the rest of the transport uses,
+    /// and the bound is `max(command deadline, size / min_rate)`. The fixed
+    /// command deadline ALONE killed a large read mid-transfer (the local
+    /// `ssh` client is killed at the deadline and the truncated stdout was
+    /// then reported by the caller as a content failure), the read-path
+    /// counterpart of the reason uploads already scale. The extra `lstat`
+    /// runs over the persistent `ControlMaster` session (one round trip on an
+    /// already-open connection, never a new handshake); a read whose size
+    /// cannot be learned — a vanished or unreadable entry — falls back to the
+    /// command deadline, and the following `cat` then reports the real
+    /// failure rather than a size-derived one.
+    fn download_bytes(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        let remote_path = self.root.join(rel.as_path());
         let remote_path_str = remote_path.to_string_lossy().into_owned();
+        let command_deadline = self.runner.command_deadline();
+        let min_rate = upload_min_rate_bytes_per_sec(&self.env);
+        let size = self.metadata(rel).ok().map(|meta| meta.size);
+        let deadline = match size {
+            Some(bytes) => transfer_deadline(bytes, min_rate, command_deadline),
+            None => command_deadline,
+        };
         // Read the file contents with `cat`; the path is quoted so a path that
         // happens to contain shell metacharacters (or an executable-bit path) is
         // never executed.
-        let out = self.run_remote(&format!("cat {}", shell_quote(&remote_path_str)))?;
+        let command = format!("cat {}", shell_quote(&remote_path_str));
+        let argv = self.ssh_command_argv(&command)?;
+        let out = self
+            .runner
+            .run(OpKind::Remote, &argv, None, Some(deadline))
+            .map_err(|e| match e {
+                RunError::Spawn(m) => Error::transport(format!("ssh download spawn: {m}")),
+                RunError::StdinWrite(m) => {
+                    Error::transport(format!("ssh download stdin write: {m}"))
+                }
+                RunError::Wait(m) => Error::transport(format!("ssh download wait: {m}")),
+                RunError::Background(m) => Error::transport(format!("ssh download: {m}")),
+                RunError::Timeout {
+                    after,
+                    leftover_pipes,
+                } => read_timeout_error(
+                    after,
+                    &leftover_pipes,
+                    size,
+                    &remote_path_str,
+                    deadline,
+                    command_deadline,
+                    min_rate,
+                ),
+            })?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh download failed: {}",
@@ -1104,15 +1173,22 @@ fn upload_failure(rel: &Path, code: Option<i32>, stderr: &str) -> Error {
     }
 }
 
-/// The size-aware upload deadline: `max(runner command deadline, bytes /
-/// min_rate)` — a large upload over a slow link is never killed mid-transfer,
-/// while a hung upload (a remote that stops reading stdin) is still bounded.
-/// The BASE deadline is the runner's [`SshRunner::command_deadline`], never
-/// a hardcoded constant: the test seam injects a tiny command deadline and
-/// MUST see it applied to uploads too (the fake Hang child waits for THIS
-/// bound, not a production constant).
-fn upload_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> Duration {
+/// The size-aware TRANSFER deadline, shared by the upload and READ paths:
+/// `max(runner command deadline, bytes / min_rate)` — a large transfer over a
+/// slow link is never killed mid-transfer, while a transfer that makes no
+/// progress burns the same bound and is still killed. The BASE deadline is
+/// the runner's [`SshRunner::command_deadline`], never a hardcoded constant:
+/// the test seam injects a tiny command deadline and MUST see it applied to
+/// both directions (the fake Hang child waits for THIS bound, not a
+/// production constant).
+fn transfer_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> Duration {
     command_deadline.max(Duration::from_secs(data_len / min_rate))
+}
+
+/// The size-aware upload deadline ([`transfer_deadline`]). Kept as a named
+/// alias so the upload call site reads as a transfer in the write direction.
+fn upload_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> Duration {
+    transfer_deadline(data_len, min_rate, command_deadline)
 }
 
 /// Build the DIAGNOSTIC error for an upload that hit its deadline. A size-
@@ -1149,6 +1225,46 @@ fn upload_timeout_error(
             "ssh upload timed out after {after:?}{leftover}: {bytes} bytes to '{remote_path}' did not \
              finish within the base command deadline ({command_deadline:?}) — the remote likely \
              stopped reading stdin (a hung remote or wedged filesystem)"
+        ))
+    }
+}
+
+/// Build the DIAGNOSTIC error for a READ that hit its deadline: the read-path
+/// counterpart of [`upload_timeout_error`], naming the remote file and its
+/// size (when the pre-flight `lstat` learned it) and separating a slow link
+/// (the size-scaled deadline was the binding bound — recoverable via the
+/// `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override) from a stalled remote (the
+/// base command deadline was the binding bound).
+fn read_timeout_error(
+    after: Duration,
+    leftover_pipes: &Option<String>,
+    size: Option<u64>,
+    remote_path: &str,
+    deadline: Duration,
+    command_deadline: Duration,
+    min_rate: u64,
+) -> Error {
+    let leftover = leftover_pipe_note(leftover_pipes);
+    let bytes = match size {
+        Some(bytes) => format!("{bytes} bytes"),
+        None => "a file of unknown size".to_string(),
+    };
+    if deadline > command_deadline {
+        let suggested = (min_rate / 2).max(1024);
+        Error::transport(format!(
+            "ssh download timed out after {after:?}{leftover}: {bytes} from '{remote_path}' did not \
+             finish within the size-scaled deadline (bytes / min_rate = {} / {min_rate} B/s; the \
+             default minimum is {SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC} B/s, overridable via \
+             DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC). The link is slower than the assumed minimum — \
+             retry with DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC={suggested} (half the current rate) or \
+             lower so the deadline scales to the real link speed",
+            size.unwrap_or(0)
+        ))
+    } else {
+        Error::transport(format!(
+            "ssh download timed out after {after:?}{leftover}: {bytes} from '{remote_path}' did not \
+             finish within the base command deadline ({command_deadline:?}) — the remote likely \
+             stopped sending (a hung remote or wedged filesystem)"
         ))
     }
 }
@@ -2159,7 +2275,7 @@ impl Remote for SshTransport {
     }
 
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
-        self.download_bytes(rel.as_path())
+        self.download_bytes(rel)
     }
 
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
@@ -2396,6 +2512,7 @@ impl Remote for SshTransport {
         if argv.is_empty() {
             return Err(Error::transport("empty command"));
         }
+        self.prepare_for_request()?;
         // Preserve argv boundaries: quote every argument and run them via `exec`
         // so the program receives exactly `argv` and the remote shell cannot
         // reinterpret spaces/metacharacters inside an argument.
@@ -2891,6 +3008,71 @@ mod tests_ssh {
         assert!(msg.contains("stopped reading stdin"));
         // The slow-link fix must NOT be suggested for a hang.
         assert!(!msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC="));
+    }
+
+    /// D1: the READ deadline is the SAME size-aware rule the upload path uses
+    /// ([`transfer_deadline`]), so a large read is bounded by
+    /// `max(command deadline, bytes / min_rate)` and a slow link is not killed
+    /// by the fixed 60 s. `download_bytes` computes it from the entry's framed
+    /// `lstat`; a 400 MB read at the 64 KB/s minimum gets 6400 s, so it is no
+    /// longer the 60 s fixed window that decides.
+    #[test]
+    fn transfer_deadline_scales_for_reads_too() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        assert_eq!(transfer_deadline(0, 64 * 1024, base), base);
+        assert_eq!(
+            upload_deadline(24 * 1024 * 1024, 64 * 1024, base),
+            transfer_deadline(24 * 1024 * 1024, 64 * 1024, base),
+            "the read and upload deadlines come from ONE rule"
+        );
+        let mb400 = 400u64 * 1024 * 1024;
+        assert_eq!(
+            transfer_deadline(mb400, 64 * 1024, base),
+            Duration::from_secs(mb400 / (64 * 1024))
+        );
+        assert!(transfer_deadline(mb400, 64 * 1024, base) > base);
+    }
+
+    /// D1: a read timeout is diagnosed as a DOWNLOAD, names the file and its
+    /// size, and points at the rate override for a slow link — distinct from a
+    /// stalled remote (which the base-deadline branch names instead).
+    #[test]
+    fn read_timeout_error_names_file_size_and_rate_fix() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        let msg = read_timeout_error(
+            Duration::from_secs(372),
+            &None,
+            Some(400 * 1024 * 1024),
+            "/srv/app/data.bin",
+            Duration::from_secs(6400),
+            base,
+            64 * 1024,
+        )
+        .to_string();
+        assert!(msg.contains("ssh download timed out"), "{msg}");
+        assert!(msg.contains("/srv/app/data.bin"), "{msg}");
+        assert!(msg.contains("419430400 bytes"), "{msg}");
+        assert!(
+            msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC=32768"),
+            "{msg}"
+        );
+        assert!(msg.contains("size-scaled"), "{msg}");
+
+        let hang = read_timeout_error(
+            base,
+            &None,
+            Some(512),
+            "/srv/app/small.bin",
+            base,
+            base,
+            64 * 1024,
+        )
+        .to_string();
+        assert!(hang.contains("base command deadline"), "{hang}");
+        assert!(
+            !hang.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC="),
+            "a hang must not be blamed on the link rate: {hang}"
+        );
     }
 
     /// The framed-lstat `RemoteMeta` must carry the RAW `st_mode` (type bits

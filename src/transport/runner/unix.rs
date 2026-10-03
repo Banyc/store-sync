@@ -307,9 +307,14 @@ pub(crate) fn exec(
     // that follows the loop). On timeout, terminate the group and
     // escalate exactly as before; every kill failure is recorded.
     loop {
-        drain_available(&mut owned.child.stdout, &mut stdout)
+        // Bytes drained THIS pass: a pass that moved data must not sleep
+        // before the next one, or the drain would be capped at
+        // `chunk / 1 ms` no matter how fast the link is. A silent child (no
+        // progress) yields to the scheduler so the loop does not busy-spin.
+        let mut drained = 0usize;
+        drained += drain_available(&mut owned.child.stdout, &mut stdout)
             .map_err(|e| RunError::Wait(e.to_string()))?;
-        drain_available(&mut owned.child.stderr, &mut stderr)
+        drained += drain_available(&mut owned.child.stderr, &mut stderr)
             .map_err(|e| RunError::Wait(e.to_string()))?;
         if child_exited_unreaped(pid).map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))? {
             break;
@@ -367,7 +372,9 @@ pub(crate) fn exec(
                 )));
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        if drained == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // The child has EXITED but is still a ZOMBIE: the `waitid` WNOWAIT
@@ -512,38 +519,74 @@ pub(crate) fn set_nonblocking<R: AsRawFd>(stream: &mut Option<R>) -> std::io::Re
     Ok(())
 }
 
-/// Drain whatever bytes a running child currently has buffered in a pipe
-/// WITHOUT blocking: `poll(2)` with a zero timeout reports readability first,
-/// then a single `read`, so the wait loop never parks on a pipe while the
-/// child is still running — a child that produces a lot of output is drained
-/// while running instead of filling its pipe and stalling. `pub(crate)`:
-/// shared with the SSH runner's Unix seam (see [`set_nonblocking`]).
-pub(crate) fn drain_available<R>(stream: &mut Option<R>, buf: &mut Vec<u8>) -> std::io::Result<()>
+/// The per-CALL byte cap on [`drain_available`]: large enough that a normal
+/// transfer drains a pipe in a few calls (and, since a caller that sees
+/// progress does not sleep, at syscall speed), small enough that the wait
+/// loop regains control — and consults its deadline — promptly even against a
+/// writer that keeps the pipe continuously readable.
+pub(crate) const DRAIN_AVAILABLE_CALL_CAP: usize = 1 << 20;
+
+/// Drain EVERYTHING a running child currently has buffered in a pipe WITHOUT
+/// blocking, returning the number of bytes appended to `buf` by THIS call.
+///
+/// `poll(2)` with a zero timeout reports readability, then a `read` appends a
+/// chunk; the poll/read pair repeats until the pipe reports no more readable
+/// data (or `read` returns `WouldBlock`/EOF). The wait loop therefore never
+/// parks on a pipe while the child is still running, and the OLD single-read
+/// shape — one 8192-byte chunk per wait-loop pass, with the caller sleeping
+/// 1 ms between passes — is gone: that shape capped EVERY remote read at
+/// ~8 MiB/s regardless of the link, because the pipe was drained one chunk
+/// per millisecond. A caller that receives a nonzero return has made
+/// progress and must NOT sleep before the next pass.
+///
+/// `pub(crate)`: shared with the SSH runner's Unix seam (see
+/// [`set_nonblocking`]), so the drain policy has ONE implementation.
+pub(crate) fn drain_available<R>(
+    stream: &mut Option<R>,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize>
 where
     R: Read + AsRawFd,
 {
     let Some(stream) = stream.as_mut() else {
-        return Ok(());
+        return Ok(0);
     };
-    let mut pfd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `poll` with a zero timeout on a real pipe read end this runner
-    // opened for its own child; the fd is always valid here and never blocks.
-    if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
-        return Ok(());
-    }
-    let mut chunk = [0u8; 8192];
-    match stream.read(&mut chunk) {
-        Ok(0) => Ok(()),
-        Ok(n) => {
-            buf.extend_from_slice(&chunk[..n]);
-            Ok(())
+    let mut total = 0usize;
+    // A larger chunk cuts syscalls without changing the drain's semantics: a
+    // short read is appended and the loop re-polls, so a full pipe is emptied
+    // in as few reads as its contents allow.
+    let mut chunk = [0u8; 65536];
+    loop {
+        // Return after a bounded amount so the WAIT LOOP regains control and
+        // can consult its deadline: a writer that keeps the pipe continuously
+        // readable must not keep this call in the loop forever (the same
+        // unbounded-loop hazard [`drain_to_eof`] bounds). The cap is per
+        // CALL, never cumulative, and is large enough that a normal transfer
+        // pays it rarely: a caller that sees progress does not sleep, so the
+        // loop still runs at syscall speed.
+        if total >= DRAIN_AVAILABLE_CALL_CAP {
+            return Ok(total);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-        Err(e) => Err(e),
+        let mut pfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` with a zero timeout on a real pipe read end this
+        // runner opened for its own child; the fd is always valid here and
+        // never blocks.
+        if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
+            return Ok(total);
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(total),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                total += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(total),
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -677,10 +720,90 @@ mod tests {
 /// buffered growth.
 #[cfg(all(test, unix))]
 mod drain_tests {
-    use super::{DrainState, MAX_DRAIN_BYTES, drain_to_eof};
+    use super::{
+        DRAIN_AVAILABLE_CALL_CAP, DrainState, MAX_DRAIN_BYTES, drain_available, drain_to_eof,
+    };
     use std::io::Read;
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::{Duration, Instant};
+
+    /// A `Read` that yields `remaining` bytes in `chunk`-sized pieces and then
+    /// reports `WouldBlock`. Its fd is `/dev/null`'s, which `poll` reports as
+    /// always readable, so the drain's `poll` gate always passes and only the
+    /// `Read` result ends the loop — exactly the shape needed to observe how
+    /// much ONE `drain_available` call drains.
+    struct BurstRead {
+        fd: RawFd,
+        remaining: usize,
+        chunk: usize,
+    }
+
+    impl Read for BurstRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let n = buf.len().min(self.remaining).min(self.chunk);
+            buf[..n].fill(0x5A);
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    impl AsRawFd for BurstRead {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    /// D1: ONE `drain_available` call must drain the WHOLE readable backlog,
+    /// not a single 8192-byte chunk. Pre-fix the wait loop appended one chunk
+    /// per call and slept 1 ms between passes, capping every remote read at
+    /// ~8 MiB/s regardless of the link; the fix loops until the pipe reports
+    /// no more data. (Verified before the fix: this assertion sees 8192, not
+    /// 65536.)
+    #[test]
+    fn drain_available_drains_the_whole_backlog_in_one_call() {
+        let dev_null = std::fs::File::open("/dev/null").unwrap();
+        let mut stream = Some(BurstRead {
+            fd: dev_null.as_raw_fd(),
+            remaining: 64 * 1024,
+            // The pre-fix per-read chunk, so a single-read implementation
+            // would stop at exactly one of these.
+            chunk: 8192,
+        });
+        let mut buf = Vec::new();
+        let drained = drain_available(&mut stream, &mut buf).unwrap();
+        assert_eq!(
+            drained,
+            64 * 1024,
+            "one call must drain the whole backlog, not one 8192-byte chunk"
+        );
+        assert_eq!(buf.len(), 64 * 1024);
+    }
+
+    /// The per-call cap keeps the running-phase drain bounded: a writer that
+    /// keeps the pipe continuously readable must not hold `drain_available`
+    /// forever (the wait loop needs the return to consult its deadline). The
+    /// call returns at the cap instead of looping without end.
+    #[test]
+    fn drain_available_is_bounded_per_call() {
+        let dev_null = std::fs::File::open("/dev/null").unwrap();
+        let mut stream = Some(BurstRead {
+            fd: dev_null.as_raw_fd(),
+            remaining: usize::MAX,
+            chunk: 65536,
+        });
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        let drained = drain_available(&mut stream, &mut buf).unwrap();
+        assert_eq!(drained, DRAIN_AVAILABLE_CALL_CAP);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the per-call cap must return promptly: {:?}",
+            start.elapsed()
+        );
+    }
 
     /// A `Read` that is ALWAYS readable: every `read` returns data, so the
     /// drain loop can never reach its `WouldBlock` arm. Before the fix the

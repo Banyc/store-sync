@@ -175,6 +175,41 @@ pub fn is_unaddressable_path(path: &str) -> bool {
         })
 }
 
+/// Whether `name` is destination RESIDUE: an UNADDRESSABLE spelling
+/// ([`is_unaddressable_name`]) that HOLDS something the sync must not destroy,
+/// as opposed to a CRASHED TEMP. A crate temp can inherit the reserved
+/// namespace (a destination whose own name begins `sync-aside.` yields
+/// `.sync-aside.<name>.tmp.<pid>.<n>`) but holds NO original, so it is NOT
+/// residue and stays ordinary destination content.
+///
+/// This is the DESTINATION-side stripping predicate the sync uses; the SOURCE
+/// side strips every unaddressable path ([`is_unaddressable_path`]) so a crate
+/// temp is never replicated. Exposed so a consumer building its own status on
+/// the raw manifest primitives can strip EXACTLY what the engine strips (see
+/// [`crate::sync::diff::apply_manifests`]).
+///
+/// The distinction is a test on the temp-name authority's own spelling:
+/// [`crate::atomic::is_crate_temp_name`] is true exactly for the temporary and
+/// claim names the crate's atomic primitives PRODUCE.
+pub fn is_residue_name(name: &str) -> bool {
+    is_unaddressable_name(name) && !crate::atomic::is_crate_temp_name(name)
+}
+
+/// Whether ANY component of a canonical manifest path is destination residue
+/// ([`is_residue_name`]).
+///
+/// Components are split with [`Path::components`], never a literal-separator
+/// split, so the answer is the same whether a manifest spells paths with `/`
+/// (the canonical spelling on every platform) or with the platform separator.
+pub fn is_residue_path(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| match component {
+            Component::Normal(name) => name.to_str().is_some_and(is_residue_name),
+            _ => false,
+        })
+}
+
 /// Whether `name` is a LOCK-RECORD spelling: the application lock record
 /// ([`APPLICATION_LOCK_NAME`]) or the sibling record spelling
 /// [`is_reserved_name`] recognises (`.<name>.operation.lock`), in byte-exact or

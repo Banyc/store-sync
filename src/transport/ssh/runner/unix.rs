@@ -161,14 +161,22 @@ pub(crate) fn spawn(
             let mut stderr = Vec::new();
             let wait_res = loop {
                 let mut exited: Option<(OwnedChild, std::process::ExitStatus)> = None;
+                // Bytes drained THIS pass. A pass that moved data must not
+                // sleep before the next one: the old shape drained one chunk
+                // per 1 ms pass, capping every remote read at ~8 MiB/s
+                // regardless of the link (the fixed command deadline then
+                // killed a large read). Progress means no sleep; a silent
+                // running child yields so the loop does not busy-spin and the
+                // deadline path can still take the child slot.
+                let mut drained = 0usize;
                 {
                     let mut guard = wait_child.lock().unwrap();
                     let owned = guard
                         .as_mut()
                         .expect("the wait thread is the sole consumer of the child slot");
-                    drain_available(&mut owned.child.stdout, &mut stdout)
+                    drained += drain_available(&mut owned.child.stdout, &mut stdout)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    drain_available(&mut owned.child.stderr, &mut stderr)
+                    drained += drain_available(&mut owned.child.stderr, &mut stderr)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     match owned.child.try_wait() {
                         Ok(Some(status)) => {
@@ -217,12 +225,39 @@ pub(crate) fn spawn(
                         stderr,
                     });
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                if drained == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             };
             // The saved stdin-write error is surfaced only AFTER the
-            // child was collected.
+            // child was collected — which means the child's OWN stderr (and
+            // exit status) are already drained and available. Preserve them
+            // on the error: without the far-side diagnostic, a FAILED UPLOAD
+            // to a full disk (`cat: -: No space left on device`) was
+            // indistinguishable from a dead host, because the caller saw
+            // only `stdin write: Broken pipe`. The error CLASS stays
+            // [`RunError::StdinWrite`] — the local write DID fail — and the
+            // far side's own words are appended so the CAUSE is recoverable.
             match write_res {
-                Err(e) => Err(RunError::StdinWrite(format!("stdin write: {e}"))),
+                Err(e) => {
+                    let (far_side, status) = match &wait_res {
+                        Ok(out) => (
+                            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                            match out.status.code() {
+                                Some(code) => format!("; the far side exited {code}"),
+                                None => "; the far side was killed by a signal".to_string(),
+                            },
+                        ),
+                        // A wait error already carries its own detail.
+                        Err(_) => (String::new(), String::new()),
+                    };
+                    let detail = if far_side.is_empty() {
+                        status
+                    } else {
+                        format!("{status}; the far side reported: {far_side}")
+                    };
+                    Err(RunError::StdinWrite(format!("stdin write: {e}{detail}")))
+                }
                 Ok(()) => wait_res,
             }
         });
@@ -232,4 +267,88 @@ pub(crate) fn spawn(
         kill,
         wait,
     })
+}
+
+/// Real-subprocess tests for the Unix ssh seam: the drain's throughput, and
+/// the far-side diagnostic preserved on a failed upload. Both drive
+/// [`SshRunner`] through the REAL seam with an injected tiny command deadline,
+/// so a regression cannot hang the suite: the runner kills the child at the
+/// deadline and returns.
+#[cfg(test)]
+mod real_seam_tests {
+    use super::*;
+
+    fn real_runner(command_deadline: Duration) -> SshRunner {
+        SshRunner::with_seam(
+            Arc::new(RealRunner::new(&crate::test_support::fixture_env())),
+            Duration::from_secs(10),
+            command_deadline,
+        )
+    }
+
+    /// D1: the running-phase drain must not be capped at one 8192-byte chunk
+    /// per 1 ms wait-loop pass. Pre-fix that capped every remote read at
+    /// ~8 MiB/s, so this 64 MiB read outlived the tiny 3 s command deadline
+    /// and was KILLED (`RunError::Timeout`); post-fix the same tiny deadline
+    /// is ample because the drain runs at syscall speed. The injected
+    /// deadline means the pre-fix path fails fast instead of hanging.
+    #[test]
+    fn large_read_completes_under_a_tiny_command_deadline() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        let runner = real_runner(Duration::from_secs(3));
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("head -c {BYTES} /dev/zero"),
+        ];
+        let out = runner
+            .run(OpKind::Remote, &argv, None, None)
+            .expect("a 64 MiB read must complete within the deadline after the drain fix");
+        assert_eq!(
+            out.stdout.len(),
+            BYTES,
+            "the whole read must be drained, not a truncated prefix"
+        );
+        assert!(out.status.success());
+    }
+
+    /// D2: a failed stdin write (the far side stopped reading / exited) must
+    /// carry the far side's OWN stderr, so a full disk is not reported as a
+    /// bare `Broken pipe`. Pre-fix the message was only
+    /// `stdin write: Broken pipe (os error 32)` and the far-side
+    /// `No space left on device` line was discarded.
+    #[test]
+    fn stdin_write_failure_preserves_the_far_side_stderr() {
+        let runner = real_runner(Duration::from_secs(10));
+        // The child never reads stdin and exits non-zero with a diagnostic on
+        // stderr, exactly as a far-side `cat` does when the write fails. The
+        // payload is larger than the pipe buffer, so `write_all` blocks, the
+        // child exits, the read end closes, and the write fails with EPIPE.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 'cat: -: No space left on device' >&2; exit 1".to_string(),
+        ];
+        let payload = vec![0u8; 4 * 1024 * 1024];
+        let err = runner
+            .run(OpKind::Upload, &argv, Some(&payload), None)
+            .expect_err("a writer whose reader exited must fail the stdin write");
+        match err {
+            RunError::StdinWrite(message) => {
+                assert!(
+                    message.contains("No space left on device"),
+                    "the far side's stderr must be preserved on the StdinWrite error: {message}"
+                );
+                assert!(
+                    message.contains("stdin write:"),
+                    "the local write failure must still be named: {message}"
+                );
+                assert!(
+                    message.contains("the far side exited 1"),
+                    "the far-side exit status must be preserved: {message}"
+                );
+            }
+            other => panic!("expected RunError::StdinWrite, got {other:?}"),
+        }
+    }
 }

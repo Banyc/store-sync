@@ -120,6 +120,6 @@ pub use apply::{
     push, push_unowned, sync, sync_unowned,
 };
 pub use diff::{
-    EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, diff_trees, local_manifest,
-    remote_manifest,
+    EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests, diff_trees,
+    local_manifest, remote_manifest,
 };
