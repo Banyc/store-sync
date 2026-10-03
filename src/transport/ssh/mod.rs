@@ -205,17 +205,24 @@ pub struct SshTransport {
     /// construction boundary, never read from the process env.
     known_hosts_cache_dir: PathBuf,
     /// The directory holding the SSH connection-multiplexing (ControlMaster)
-    /// sockets, one per `user@host:port` — a short path under the system
+    /// sockets, one per distinct CONNECTION IDENTITY — the socket name is a
+    /// short hash of `user@host:port` PLUS the identity material (the USER's
+    /// key path or the ambient marker, the resolved known-hosts source, the
+    /// configured fingerprint, and the caller's ssh options). Keying on the
+    /// identity is what makes multiplexing SAFE: reusing a master skips both
+    /// the host-key verification and the `-i` key selection, so a master may
+    /// only be shared with a transport whose authentication and host-key
+    /// request is identical. The directory is a short path under the system
     /// temp dir (`<temp_dir>/dmux`, created 0700 in
     /// [`SshTransport::prepare_identity`] before any ssh op) because Unix
     /// domain socket paths are length-limited (~104 bytes) and the
     /// known-hosts cache path is too long to host them. Every ssh subprocess
     /// this transport spawns reuses ONE persistent master connection per
-    /// remote, so the per-operation SSH handshake (banner, key exchange,
-    /// auth, session — several round trips at the link's RTT) is paid once
-    /// per push instead of once per operation; the master daemonizes into
-    /// its own process group, so the runner's foreground-only containment is
-    /// unaffected.
+    /// remote/identity, so the per-operation SSH handshake (banner, key
+    /// exchange, auth, session — several round trips at the link's RTT) is
+    /// paid once per push instead of once per operation; the master daemonizes
+    /// into its own process group, so the runner's foreground-only containment
+    /// is unaffected.
     mux_socket_dir: PathBuf,
     /// The environment snapshot (owned): the pin path's `ssh-keygen`
     /// fingerprint-verification child receives its variables.
@@ -423,10 +430,58 @@ impl SshTransport {
         self
     }
 
+    /// The identity material the multiplexing socket is keyed on.
+    ///
+    /// A ControlMaster is authenticated ONCE, at the first connection: every
+    /// later client that reuses the socket inherits that authenticated
+    /// session, so NEITHER the host-key check NOR the `-i` key selection runs
+    /// for it. A socket keyed only on `user@host:port` therefore lets a second
+    /// transport — or any ssh client — silently bypass its OWN configured
+    /// host key and user key by landing on a master another identity
+    /// established. The crate's principle is "a view is faithful, or the check
+    /// does not run; a check that cannot run is a failure", so the socket must
+    /// be keyed on everything that determines the connection's identity: the
+    /// target and port, the USER's key (or the ambient marker when none was
+    /// supplied), the resolved HOST-identity source (an explicit known-hosts
+    /// file, the pinned file, or the configured fingerprint before the pin
+    /// resolves), and every caller-supplied ssh option (which may carry
+    /// `IdentityFile`, `CertificateFile`, `HostKeyAlgorithms`, or
+    /// `ProxyJump`). Identical material derives the same socket and DOES
+    /// multiplex.
+    fn mux_identity_material(&self, pinned: Option<&Path>) -> String {
+        let host_identity = match (&self.known_hosts, pinned) {
+            (Some(known_hosts), _) => format!("known_hosts={}", known_hosts.display()),
+            (None, Some(pinned)) => format!("pinned={}", pinned.display()),
+            // A fingerprint configured without an explicit file: the pin has
+            // not resolved yet (a dry-run status inspection calls this before
+            // `prepare_identity` has pinned). Include the fingerprint so two
+            // DIFFERENT fingerprints never derive one socket even before the
+            // pin resolves.
+            (None, None) => "known_hosts=<unresolved>".to_string(),
+        };
+        let user_identity = match &self.identity_file {
+            Some(path) => format!("identity={}", path.display()),
+            None => "identity=<ambient>".to_string(),
+        };
+        format!(
+            "target={}:{}|{}|{}|fingerprint={}|options={}",
+            self.target,
+            self.port,
+            user_identity,
+            host_identity,
+            self.host_key_fingerprint.as_deref().unwrap_or(""),
+            self.ssh_options.join("\u{1f}"),
+        )
+    }
+
     /// Build the fixed `ssh` arguments (options + target). Errors if no host
     /// identity has been configured, so the caller cannot accidentally fall back
     /// to trust-on-first-use.
     fn ssh_args(&self) -> Result<Vec<String>> {
+        // Read the pinned path through the lock; it is set only by
+        // `prepare_identity`. It is part of BOTH the mux identity (below) and
+        // the host-key options (the match at the end), so it is read once.
+        let pinned = self.pinned_known_hosts.lock().ok().and_then(|g| g.clone());
         let mut args: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -437,30 +492,29 @@ impl SshTransport {
             "-o".into(),
             "Compression=yes".into(),
             // SSH connection multiplexing: every operation of a push reuses
-            // ONE persistent master connection per user@host:port, so the
-            // multi-round-trip handshake (banner, key exchange, auth,
-            // session) is paid once per push instead of once per operation.
-            // The socket name is a short FNV hash of user@host:port (Unix
-            // domain socket paths are length-limited); the master daemonizes
-            // into its own process group, so the runner's foreground-only
-            // containment is unaffected; a stale socket (dead master) is
-            // detected and replaced by ssh itself.
+            // ONE persistent master connection per user@host:port AND
+            // IDENTITY, so the multi-round-trip handshake (banner, key
+            // exchange, auth, session) is paid once per push instead of once
+            // per operation. The socket name is a short FNV hash of the
+            // connection identity (Unix domain socket paths are
+            // length-limited); keying on the identity is what keeps a reused
+            // master from bypassing a DIFFERENT transport's host-key check or
+            // `-i` key. The master daemonizes into its own process group, so
+            // the runner's foreground-only containment is unaffected; a stale
+            // socket (dead master) is detected and replaced by ssh itself.
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
             format!(
                 "ControlPath={}/mux-{}",
                 self.mux_socket_dir.display(),
-                simple_hash(&format!("{}:{}", self.target, self.port))
+                simple_hash(&self.mux_identity_material(pinned.as_deref()))
             ),
             "-o".into(),
             "ControlPersist=120".into(),
             "-p".into(),
             self.port.to_string(),
         ];
-        // Read the pinned path through the lock; it is set only by
-        // `prepare_identity`.
-        let pinned = self.pinned_known_hosts.lock().ok().and_then(|g| g.clone());
         match (&self.known_hosts, &pinned) {
             (Some(kh), _) => {
                 args.push("-o".into());
@@ -1770,10 +1824,12 @@ impl Remote for SshTransport {
 
     fn prepare_identity(&self) -> Result<()> {
         // Create the local ControlMaster socket directory (0700) before any
-        // ssh op: the multiplexing sockets live here, keyed by
-        // `user@host:port`. Local-only, like the known-hosts pin below — a
-        // dry run's status inspection still connects over ssh and therefore
-        // needs the mux dir to exist.
+        // ssh op: the multiplexing sockets live here, keyed by the CONNECTION
+        // IDENTITY (`user@host:port` plus the user key, the resolved
+        // known-hosts source, and the caller's ssh options — see
+        // `mux_identity_material`). Local-only, like the known-hosts pin
+        // below — a dry run's status inspection still connects over ssh and
+        // therefore needs the mux dir to exist.
         std::fs::create_dir_all(&self.mux_socket_dir).map_err(|e| {
             Error::transport(format!(
                 "create ssh mux dir {}: {e}",
@@ -3271,6 +3327,124 @@ mod tests_ssh {
         assert!(
             strict_pos < caller_pos,
             "crate options precede caller options: {args:?}"
+        );
+    }
+
+    /// FIX A: the ControlMaster socket is keyed on the CONNECTION IDENTITY,
+    /// not only on `user@host:port`.
+    ///
+    /// A master is authenticated once; every later client that reuses its
+    /// socket inherits that session, so the host-key check and the `-i` key
+    /// selection do NOT run for the reuser. A socket keyed only on
+    /// `user@host:port` therefore lets a second `SshTransport` (or any ssh
+    /// client) bypass its OWN configured host key and user key by landing on a
+    /// master another identity established. This test pins the fix: transports
+    /// whose identity material differs must derive DIFFERENT sockets, and two
+    /// transports with identical material must derive the SAME socket so
+    /// multiplexing still helps. Pre-fix every path below was equal (the hash
+    /// covered only `target:port`), so the `assert_ne!`s fail.
+    #[test]
+    fn the_control_socket_is_keyed_on_the_connection_identity() {
+        fn control_path(args: &[String]) -> String {
+            args.iter()
+                .find(|arg| arg.starts_with("ControlPath="))
+                .expect("a ControlPath option")
+                .clone()
+        }
+        fn build(
+            known_hosts: &str,
+            identity: Option<&str>,
+            options: &[(&str, &str)],
+        ) -> SshTransport {
+            let mut transport = SshTransport::new(
+                "deploy",
+                "db.example.com",
+                2222,
+                Path::new("/srv/app"),
+                Layout::empty(),
+                Some(Path::new(known_hosts)),
+                None,
+                Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+                &test_env(),
+                false,
+            )
+            .unwrap();
+            if let Some(identity) = identity {
+                transport = transport.with_identity_file(identity);
+            }
+            for (key, value) in options {
+                transport = transport.with_ssh_option(*key, *value);
+            }
+            transport
+        }
+
+        let base_path = control_path(&build("/dev/null", None, &[]).ssh_args().unwrap());
+        let key_path = control_path(
+            &build("/dev/null", Some("/home/deploy/.ssh/id_a"), &[])
+                .ssh_args()
+                .unwrap(),
+        );
+        let other_key_path = control_path(
+            &build("/dev/null", Some("/home/deploy/.ssh/id_b"), &[])
+                .ssh_args()
+                .unwrap(),
+        );
+
+        // Same identity material (including no caller options) shares ONE
+        // socket: multiplexing is preserved.
+        assert_eq!(
+            control_path(&build("/dev/null", None, &[]).ssh_args().unwrap()),
+            base_path,
+            "two transports with identical identity material must share a socket"
+        );
+        assert_eq!(
+            control_path(
+                &build("/dev/null", Some("/home/deploy/.ssh/id_a"), &[])
+                    .ssh_args()
+                    .unwrap()
+            ),
+            key_path,
+            "two transports with identical identity material must share a socket"
+        );
+        // Differing user keys must NOT share a master: the second must do its
+        // own `-i` selection.
+        assert_ne!(
+            key_path, other_key_path,
+            "two different user keys must not share one master (the second would \
+             skip its `-i` selection)"
+        );
+        assert_ne!(
+            base_path, key_path,
+            "a configured user key must not share the ambient-identity master"
+        );
+
+        // Differing host identity must not share: a second known-hosts file
+        // must run its own host-key verification.
+        let other_known_hosts = build("/etc/ssh/ssh_known_hosts", None, &[]);
+        assert_ne!(
+            base_path,
+            control_path(&other_known_hosts.ssh_args().unwrap()),
+            "two different known-hosts files must not share one master (the second \
+             would skip its host-key verification)"
+        );
+
+        // A caller ssh option that carries identity/connection material must
+        // not share either.
+        let with_option = build(
+            "/dev/null",
+            None,
+            &[("IdentityFile", "/home/deploy/.ssh/id_c")],
+        );
+        assert_ne!(
+            base_path,
+            control_path(&with_option.ssh_args().unwrap()),
+            "a caller ssh option that changes the connection must not share a master"
+        );
+
+        // The socket lives where `prepare_identity` creates it.
+        assert!(
+            base_path.starts_with("ControlPath=") && base_path.contains("/dmux/mux-"),
+            "got {base_path}"
         );
     }
 

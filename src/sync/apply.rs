@@ -589,10 +589,13 @@
 //!       EVERY [`crate::transport::SshTransport`] `prepare_identity` call,
 //!       plus the `mux-<hash>` control sockets ssh later creates inside it
 //!       (`ControlPath=<temp_dir>/dmux/mux-<hash>`, `ControlMaster=auto`,
-//!       `ControlPersist=120`), which the crate never removes; and, only when
-//!       the transport was configured with a `host_key_fingerprint` and NO
-//!       explicit `known_hosts`, the managed known-hosts pin — the pin cache
-//!       directory (0700, resolved at the transport boundary as
+//!       `ControlPersist=120`), which the crate never removes; the hash is
+//!       keyed on the CONNECTION IDENTITY (`user@host:port` plus the user
+//!       key, the resolved known-hosts source, and the caller's ssh
+//!       options), so two different identities never share one socket; and,
+//!       only when the transport was configured with a `host_key_fingerprint`
+//!       and NO explicit `known_hosts`, the managed known-hosts pin — the pin
+//!       cache directory (0700, resolved at the transport boundary as
 //!       `DEPLOY_SSH_KNOWNHOSTS_DIR` else `<temp_dir>/deploy-ssh-knownhosts`)
 //!       and the pinned `knownhosts-<hash>.txt` file (0600), likewise never
 //!       removed.
@@ -1812,6 +1815,39 @@ enum DestinationOwnership {
 /// path cannot be resolved from this host, so the relationship is UNDECIDABLE
 /// here and NO refusal is computed — see the module docs for the residual the
 /// caller must cover in that case.
+///
+/// # Cost of verifying a path (and of a deep chain)
+///
+/// Verification is PATH-BASED: every manifest path's live ancestry is probed
+/// before it is mutated (and its ancestor directories are listed by the
+/// name-fidelity pass). For a path of depth D the run performs O(D) ancestry
+/// probes and O(D) ancestor-directory listings — `a_deep_chain_costs_linear_
+/// ancestry_probes` bounds that COUNT. The count is linear, but the WORK per
+/// probe is not, and the two destination kinds pay differently:
+///
+/// * **A LOCAL path-based destination** resolves the probed prefix
+///   component-wise (the preflight IS the confinement there, so no prefix is
+///   memoized), so probing the i-th prefix costs i path resolutions and a
+///   depth-D path costs O(D^2) path operations. Measured wall clock for a
+///   chain with ONE changed leaf: 0.70 s / 3.64 s / 22.05 s at D = 100 / 200 /
+///   400 (macOS), i.e. ~5x per doubling — super-linear, as O(D^2) predicts.
+///   The bound the deep-chain test pins is the OPERATION count, not this wall
+///   time.
+/// * **A REMOTE ([`SshTransport`](crate::transport::SshTransport))
+///   destination** turns each probe and each listing into exactly ONE ssh
+///   round trip: the far side lstat's or lists the WHOLE path in one perl
+///   command, so path depth costs bytes on the wire, not extra round trips.
+///   A depth-D path therefore costs O(D) ssh round trips — for the same
+///   one-changed-leaf chain, 5D+13 metadata probes plus 2D+3 listings (D = 100
+///   -> 716 round trips) — and O(D^2) bytes of path spelling. It is NOT O(D^2)
+///   round trips. A caller reasoning about a remote transfer should budget
+///   ~7 round trips per level of the deepest changed path, plus a constant for
+///   the manifest, lock, and verification passes.
+///
+/// Fixing the local quadratic would mean not re-probing a prefix the same
+/// operation already confirmed; that is deliberately not done for a
+/// path-based destination, where the per-mutation preflight is the
+/// confinement and a skipped probe would be an unverified mutation path.
 pub fn sync(
     direction: Direction,
     local_root: &Path,
@@ -2368,11 +2404,64 @@ enum FinalPolicy {
 /// never [`EntryKind::Dir`]). See [`Applier::dir_listing`].
 type DirListing = Vec<(Vec<u8>, EntryKind)>;
 
-/// A cached listing outcome. [`Error`] is not `Clone`, so the (rare) failure is
-/// held behind an [`Rc`](std::rc::Rc) to let the ONE cached read be handed to
-/// every consumer of the same directory; every consumer only reads the cause's
-/// `Display`, which is unchanged.
-type CachedListing = std::result::Result<DirListing, std::rc::Rc<Error>>;
+/// The run-scoped cache VALUE: a directory listing behind the one `Rc` every
+/// consumer of that directory shares.
+///
+/// `Rc::clone` here shares the listing (O(1), no entry copied), which is what
+/// makes a directory cost ONE enumeration per verify pass instead of one deep
+/// `Vec` clone per consultation. `Clone` on this type is the DEEP clone that
+/// the pre-fix consultation ran per call; it exists so a consumer that really
+/// needs an owned listing can ask for one, and it is TEST-ONLY instrumented
+/// ([`listing_elements`]) so the F2 bound measures the WORK a cached
+/// consultation does, not only the number of calls it makes.
+#[derive(Debug)]
+struct Listing(DirListing);
+
+impl std::ops::Deref for Listing {
+    type Target = DirListing;
+    fn deref(&self) -> &DirListing {
+        &self.0
+    }
+}
+
+impl Clone for Listing {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        listing_elements::add(self.0.len());
+        Listing(self.0.clone())
+    }
+}
+
+/// A cached listing outcome: the shared listing, or the (rare) failure held
+/// behind an [`Rc`](std::rc::Rc) because [`Error`] is not `Clone`. Every
+/// consumer only reads the cause's `Display`, which is unchanged.
+type CachedListing = std::result::Result<std::rc::Rc<Listing>, std::rc::Rc<Error>>;
+
+/// TEST-ONLY instrumentation: the number of listing ELEMENTS materialized by
+/// the cached path of [`Applier::listing`] — i.e. the number of `(name, kind)`
+/// pairs (and their owned name bytes) COPIED while handing the run-scoped cache
+/// to a consumer. The fixed hand-out shares the `Rc`, so this is ZERO no matter
+/// how wide the directory is; the pre-fix hand-out deep-cloned the whole `Vec`
+/// once per consultation, so it grew with the directory width EVERY time. A
+/// thread-local, so the parallel libtest threads do not share a count. This is
+/// the WORK bound the `listing_reads` CALL counter cannot express: the cache
+/// kept the call count O(1) while the clone kept the work O(entries).
+#[cfg(test)]
+pub(crate) mod listing_elements {
+    use std::cell::Cell;
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn reset() {
+        COUNT.with(|count| count.set(0));
+    }
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+    pub(crate) fn add(n: usize) {
+        COUNT.with(|count| count.set(count.get() + n));
+    }
+}
 
 /// TEST-ONLY instrumentation: the number of times the CURRENT thread's applier
 /// obtains a directory listing through [`Applier::listing`] (a cache read OR the
@@ -5459,7 +5548,7 @@ impl Applier<'_, '_> {
         /// ONCE per parent, so k extraneous entries in one directory cost ONE
         /// listing and k log-k lookups, not k listing clones and O(k^2) scans.
         struct PassListing {
-            names: DirListing,
+            names: std::rc::Rc<Listing>,
             index: BTreeMap<Vec<u8>, EntryKind>,
         }
         let mut entries: Vec<(String, EntryKind)> = Vec::new();
@@ -5908,7 +5997,7 @@ impl Applier<'_, '_> {
                 }
             }
             let mut unexpected: Vec<String> = Vec::new();
-            for (name, _kind) in &live {
+            for (name, _kind) in live.iter() {
                 let name_text = String::from_utf8_lossy(name);
                 if is_reserved_name(OsStr::new(name_text.as_ref())) {
                     continue;
@@ -6218,16 +6307,28 @@ impl Applier<'_, '_> {
     /// [`Applier::dir_listing`] (the ONLY place that touches the destination
     /// for a listing) on the first request for that directory. Every consumer
     /// goes through here, so a directory with N entries is enumerated ONCE per
-    /// verify pass, not once per entry. The cached `Result` (success OR failure)
-    /// is reused: within a pass no destination mutation runs, so a second read
-    /// of the same directory could only reproduce the same failure.
-    fn listing(&self, parent: &str) -> std::result::Result<DirListing, std::rc::Rc<Error>> {
+    /// verify pass, not once per entry, and every consumer SHARES the one
+    /// `Rc<Listing>` (a consultation copies no entry). The cached `Result`
+    /// (success OR failure) is reused: within a pass no destination mutation
+    /// runs, so a second read of the same directory could only reproduce the
+    /// same failure.
+    fn listing(
+        &self,
+        parent: &str,
+    ) -> std::result::Result<std::rc::Rc<Listing>, std::rc::Rc<Error>> {
         #[cfg(test)]
         listing_reads::bump();
         if let Some(cached) = self.listings.borrow().get(parent) {
+            // SHARE the cached listing: `Rc::clone` copies no entry, so a
+            // directory with N entries costs O(1) per consultation, not the
+            // O(N) deep `Vec` clone (name bytes included) the pre-fix code
+            // ran here.
             return cached.clone();
         }
-        let fresh = self.dir_listing(parent).map_err(std::rc::Rc::new);
+        let fresh = self
+            .dir_listing(parent)
+            .map(|listing| std::rc::Rc::new(Listing(listing)))
+            .map_err(std::rc::Rc::new);
         self.listings
             .borrow_mut()
             .insert(parent.to_string(), fresh.clone());

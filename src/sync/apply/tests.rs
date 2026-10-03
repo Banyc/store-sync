@@ -3317,8 +3317,9 @@ fn an_absent_root_with_only_the_filesystem_root_as_ancestor_still_resolves() {
 // ---------------------------------------------------------------------------
 
 /// Sync a source/destination pair of `n` identical entries with ONE changed
-/// file, returning `(destination listings, skipped count)`.
-fn measure_wide_sync(n: usize) -> (usize, usize) {
+/// file, returning `(destination listings, skipped count, listing elements
+/// materialized by cached consultations)`.
+fn measure_wide_sync(n: usize) -> (usize, usize, usize) {
     let dir = fixture_tmpdir(&env()).unwrap();
     let src = dir.path().join("src");
     let dst = dir.path().join("dst");
@@ -3332,23 +3333,33 @@ fn measure_wide_sync(n: usize) -> (usize, usize) {
     write(&src.join("f0000"), b"CHANGED");
 
     let remote = RecordingRemote::over(transport(&dst), true);
+    super::listing_elements::reset();
     let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let materialized = super::listing_elements::get();
     assert_eq!(
         read(&dst.join("f0000")),
         b"CHANGED",
         "the one change landed"
     );
-    (remote.lists(), report.skipped.len())
+    (remote.lists(), report.skipped.len(), materialized)
 }
 
 /// The LISTING-COUNT BOUND: the number of destination listings must not grow
 /// with the number of entries in the directory. Pre-fix `verify_claimed_-
 /// untouched` re-listed the parent once per `Skipped` entry, so the 2N case
 /// cost about twice the N case; the shared cache makes the two counts EQUAL.
+///
+/// It ALSO pins the WORK, not only the calls: `listing_elements` counts the
+/// listing ENTRIES (name bytes included) a cached consultation copies. The
+/// cache once kept the fetch count O(1) while still deep-cloning the `Vec` per
+/// consultation, so the call count stayed flat against an O(N^2) run. The
+/// mutation (reinstating the per-call deep clone) leaves `large_lists ==
+/// small_lists` true and makes `large_elements` grow with the width, which is
+/// exactly the defect these assertions now catch.
 #[test]
 fn enumerating_a_wide_directory_costs_a_constant_number_of_listings() {
-    let (small_lists, small_skipped) = measure_wide_sync(32);
-    let (large_lists, large_skipped) = measure_wide_sync(64);
+    let (small_lists, small_skipped, small_elements) = measure_wide_sync(32);
+    let (large_lists, large_skipped, large_elements) = measure_wide_sync(64);
     assert!(
         large_skipped > small_skipped,
         "the fixture must actually be wider (non-vacuous): {small_skipped} vs {large_skipped}"
@@ -3363,6 +3374,21 @@ fn enumerating_a_wide_directory_costs_a_constant_number_of_listings() {
     assert!(
         small_lists <= 8,
         "a one-directory sync needs only a handful of listings, got {small_lists}"
+    );
+    // THE WORK BOUND: handing a cached listing to each of the N `Skipped`
+    // candidates must COPY nothing, so the materialized-element count is the
+    // same for both widths (and zero). Pre-fix/mutation this is ~N per cached
+    // consultation and the 2N case is about four times the N case.
+    assert_eq!(
+        large_elements, small_elements,
+        "the work of consulting the cached listing must not scale with the \
+         directory width: 32 entries materialized {small_elements} elements, \
+         64 entries materialized {large_elements}"
+    );
+    assert!(
+        small_elements <= 8,
+        "sharing the cached listing must copy no entry; 32 entries copied \
+         {small_elements} elements"
     );
 }
 
@@ -3409,6 +3435,13 @@ fn measure_deep_chain_sync(depth: usize) -> (usize, usize) {
 /// the depth, and it grows QUADRATICALLY when the depth doubles. Measured after
 /// the per-operation restructuring (no memo, path-based destination): 173 ->
 /// 333, i.e. a 5*D growth in the count, linear in the depth.
+///
+/// The bound is on the number of OPERATIONS, not on wall time: each probe of a
+/// PATH-BASED destination resolves its prefix component-wise, so the local
+/// wall time is O(D^2) (measured ~5x per doubling). For a REMOTE destination
+/// each probe is one ssh round trip, so the round-trip count IS the linear
+/// operation count; `sync`'s "Cost of verifying a path" states the real bound
+/// per destination kind.
 #[cfg(unix)]
 #[test]
 fn a_deep_chain_costs_linear_ancestry_probes() {
