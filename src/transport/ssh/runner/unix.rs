@@ -4,11 +4,12 @@
 
 use super::*;
 use crate::transport::runner::{
-    DrainState, KILL_REAP_BOUND, TERM_TO_KILL_GRACE, drain_available, drain_to_eof,
-    kill_process_group, set_nonblocking,
+    DrainState, KILL_REAP_BOUND, OwnedChild, RealKill, TERM_TO_KILL_GRACE, drain_available,
+    drain_to_eof, kill_process_group, set_nonblocking,
 };
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,11 +65,24 @@ pub(crate) fn spawn(
     // pid. A kill on a slot the wait thread already reaped (None) is a
     // no-op by construction: a consumed handle cannot signal anything, so
     // a pid the OS recycled to an unrelated process can never be hit.
-    let child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+    //
+    // The slot holds the SAME [`OwnedChild`] the local runner owns, so the
+    // SSH runner inherits the local runner's drop backstop (ONE authority
+    // for "every error path leaves no uncollected child"): a `drain_available`
+    // or `try_wait` error that returns early from the wait closure drops the
+    // slot — and the owned child with it — kills the group, and reaps, where
+    // a bare `Child`'s own `Drop` would neither wait nor kill.
+    let child: Arc<Mutex<Option<OwnedChild>>> =
+        Arc::new(Mutex::new(Some(OwnedChild::new(child, Arc::new(RealKill)))));
+    // The typed "the child has already been reaped" fact the runner's deadline
+    // path reads to tell a deadline kill from a drain that merely outlasted a
+    // completed command. Armed the instant `try_wait` consumes the exit
+    // status, before the bounded post-exit drain begins.
+    let reaped = Arc::new(AtomicBool::new(false));
     let kill_child = child.clone();
     let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
         let mut guard = kill_child.lock().unwrap();
-        let Some(child) = guard.as_mut() else {
+        let Some(owned) = guard.as_mut() else {
             // The wait thread already reaped the child: a kill on the
             // consumed handle is a NO-OP by construction — a pid the OS
             // recycled to an unrelated process can never be signalled.
@@ -78,7 +92,7 @@ pub(crate) fn spawn(
         // child-runner): graceful TERM first, then — after the shared
         // grace — an escalated KILL, so a child that ignores TERM (and
         // any grandchild in the group) still dies.
-        let pgid = child.id() as i32;
+        let pgid = owned.child.id() as i32;
         match kill_process_group(pgid, libc::SIGTERM) {
             Ok(()) => {
                 std::thread::sleep(TERM_TO_KILL_GRACE);
@@ -90,20 +104,21 @@ pub(crate) fn spawn(
                     // The escalated group kill failed: fall back to the
                     // OWNED handle so the direct child still dies and the
                     // join reaps it; the failure is surfaced.
-                    Err(e) => child.kill().or(Err(e)),
+                    Err(e) => owned.child.kill().or(Err(e)),
                 }
             }
             // The group is already gone (the child exited, or escaped via
             // setsid): fall back to the OWNED handle so a live direct
             // child is still terminated.
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => child.kill(),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => owned.child.kill(),
             // A real group-kill failure: fall back to the owned handle so
             // the direct child still dies (the join then reaps it), and
             // surface the failure.
-            Err(e) => child.kill().or(Err(e)),
+            Err(e) => owned.child.kill().or(Err(e)),
         }
     });
     let wait_child = child.clone();
+    let wait_reaped = reaped.clone();
     // Own the argv for the wait closure: the bounded-drain violation message
     // names the command (the local runner's `{argv:?}` wording).
     let argv = argv.to_vec();
@@ -123,7 +138,7 @@ pub(crate) fn spawn(
                 .lock()
                 .unwrap()
                 .as_mut()
-                .and_then(|c| c.stdin.take());
+                .and_then(|c| c.child.stdin.take());
             // Write the payload FIRST, saving any error: `?` here would
             // return BEFORE the child is collected — a write error (EPIPE
             // after the deadline kill, or a hung-remote pipe) would leave
@@ -145,25 +160,33 @@ pub(crate) fn spawn(
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let wait_res = loop {
-                let mut exited: Option<(std::process::Child, std::process::ExitStatus)> = None;
+                let mut exited: Option<(OwnedChild, std::process::ExitStatus)> = None;
                 {
                     let mut guard = wait_child.lock().unwrap();
-                    let c = guard
+                    let owned = guard
                         .as_mut()
                         .expect("the wait thread is the sole consumer of the child slot");
-                    drain_available(&mut c.stdout, &mut stdout)
+                    drain_available(&mut owned.child.stdout, &mut stdout)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    drain_available(&mut c.stderr, &mut stderr)
+                    drain_available(&mut owned.child.stderr, &mut stderr)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    match c.try_wait() {
+                    match owned.child.try_wait() {
                         Ok(Some(status)) => {
-                            exited = guard.take().map(|c| (c, status));
+                            // `try_wait` consumed the exit status: the child
+                            // is reaped, so mark the handle collected (never
+                            // signal the released pid) and arm the typed
+                            // deadline fact before the drain begins.
+                            let mut taken =
+                                guard.take().expect("the slot was occupied a moment ago");
+                            taken.mark_reaped();
+                            wait_reaped.store(true, Ordering::SeqCst);
+                            exited = Some((taken, status));
                         }
                         Ok(None) => {}
                         Err(e) => return Err(RunError::Wait(format!("wait: {e}"))),
                     }
                 }
-                if let Some((mut c, status)) = exited {
+                if let Some((mut owned, status)) = exited {
                     // BOUNDED drain (the same helper, and the same bound, the
                     // shared local runner uses): the child is reaped and its
                     // pipes hold the remaining output. A process that outlived
@@ -172,15 +195,17 @@ pub(crate) fn spawn(
                     // pin the operation open: the drain gives up at
                     // [`KILL_REAP_BOUND`] and the violation is reported, never a
                     // silent clean outcome.
-                    let stdout_drain = drain_to_eof(&mut c.stdout, &mut stdout, KILL_REAP_BOUND)
-                        .map_err(|e| RunError::Wait(format!("read: {e}")))?;
+                    let stdout_drain =
+                        drain_to_eof(&mut owned.child.stdout, &mut stdout, KILL_REAP_BOUND)
+                            .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     if matches!(stdout_drain, DrainState::BoundExpired) {
                         return Err(RunError::Background(format!(
                             "command {argv:?} left processes holding its output pipes open"
                         )));
                     }
-                    let stderr_drain = drain_to_eof(&mut c.stderr, &mut stderr, KILL_REAP_BOUND)
-                        .map_err(|e| RunError::Wait(format!("read: {e}")))?;
+                    let stderr_drain =
+                        drain_to_eof(&mut owned.child.stderr, &mut stderr, KILL_REAP_BOUND)
+                            .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     if matches!(stderr_drain, DrainState::BoundExpired) {
                         return Err(RunError::Background(format!(
                             "command {argv:?} left processes holding its error pipes open"
@@ -201,5 +226,10 @@ pub(crate) fn spawn(
                 Ok(()) => wait_res,
             }
         });
-    Ok(SpawnedChild { pid, kill, wait })
+    Ok(SpawnedChild {
+        pid,
+        reaped,
+        kill,
+        wait,
+    })
 }

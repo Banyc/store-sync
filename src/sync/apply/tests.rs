@@ -1514,6 +1514,7 @@ impl Remote for RecordingRemote {
                 exit_code: 0,
                 stdout: output.clone(),
                 stderr: String::new(),
+                timeout_cause: None,
             });
         }
         self.inner.exec(argv, timeout)
@@ -2960,6 +2961,7 @@ fn remote_manifest_hashes_the_far_side_and_missing_perl_is_an_error() {
         exit_code: 127,
         stdout: String::new(),
         stderr: "perl: command not found".to_string(),
+        timeout_cause: None,
     });
     let err = crate::sync::diff::remote_manifest(&broken).unwrap_err();
     let msg = err.to_string();
@@ -6818,6 +6820,7 @@ fn an_unreadable_far_side_root_is_an_error_and_destroys_nothing() {
         exit_code: 1,
         stdout: String::new(),
         stderr: format!("cannot open {}: Permission denied", remote_root.display()),
+        timeout_cause: None,
     });
     let err = sync(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
@@ -10720,6 +10723,7 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
         exit_code: 1,
         stdout: String::new(),
         stderr: "far-side boom".to_string(),
+        timeout_cause: None,
     };
 
     let mut owned = RecordingRemote::over(transport(&remote_root), false);
@@ -10776,6 +10780,7 @@ fn a_transport_preparation_failure_leaves_nothing_behind() {
         exit_code: 1,
         stdout: String::new(),
         stderr: "downstream far-side failure".to_string(),
+        timeout_cause: None,
     });
 
     // A PULL puts the LOCAL tree on the destination side, so the owned entry

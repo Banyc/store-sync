@@ -1,9 +1,16 @@
-//! THE bounded subprocess runner every ssh operation goes through: hard
-//! deadline, kill, and deterministic reap, so no operation can run unbounded
-//! after connection establishment.
+//! THE bounded subprocess runner every ssh operation goes through: the child
+//! is bounded by a deadline, killed, and deterministically reaped.
+//!
+//! The deadline bounds the CHILD, not the whole call: the termination sequence
+//! and the bounded post-exit pipe drain are ADDITIVE with it, so a call may
+//! return up to about `deadline + 2.2 s` and a program of N stalled operations
+//! pays that tail N times. The exact accounting (and the measured numbers) is
+//! on [`SshRunner::run`]; do not read "hard deadline" as "the call returns at
+//! the deadline".
 
 use crate::env::SysEnv;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -92,10 +99,11 @@ pub(crate) enum RunError {
     /// The output drain's bound expired while a process that outlived the
     /// child still held a pipe open: the command left a pipe-holding process
     /// behind. This is the shared local runner's `RunError::Background` —
-    /// same wording, same meaning. It surfaces when the operation did NOT
-    /// already time out; when it did, the same fact is carried inside
-    /// [`RunError::Timeout::leftover_pipes`] so the timeout outcome is
-    /// preserved.
+    /// same wording, same meaning. It is returned whenever the CHILD HAD
+    /// ALREADY EXITED, at ANY deadline: the deadline never flips a completed
+    /// command's outcome to a timeout (see [`SshRunner::run`]), so this
+    /// variant is the typed carrier of "the command ran and exited, only its
+    /// drain outlasted".
     ///
     /// Constructed only by the Unix seam (the Windows port drains with
     /// reader threads and documents the weaker, unbounded-drain guarantee);
@@ -103,12 +111,12 @@ pub(crate) enum RunError {
     /// is not dead code there.
     #[cfg_attr(windows, allow(dead_code))]
     Background(String),
-    /// The hard deadline fired; the child was killed and reaped. `leftover_pipes`
-    /// is `Some(message)` when the bounded drain ALSO gave up because a
-    /// process that outlived the child still held a pipe open — the outcome
-    /// stays a timeout (`exec` still reports `exit_code == -1`), and the
-    /// message carries the actionable fact that something outlived the
-    /// command.
+    /// The hard deadline fired while the child was still RUNNING: it was
+    /// killed and reaped, so no far-side exit status exists. `leftover_pipes`
+    /// is `Some(message)` when the post-kill bounded drain ALSO found a
+    /// process that outlived the child holding a pipe open — the deadline
+    /// kill is primary, so the outcome stays a timeout and the message carries
+    /// the actionable leftover fact.
     Timeout {
         after: Duration,
         leftover_pipes: Option<String>,
@@ -144,6 +152,13 @@ struct SpawnedChild {
     /// pid to a file (a child-written pidfile races the kill: the child can
     /// be killed before it writes).
     pid: u32,
+    /// Set by the wait closure the instant the child has been REAPED (its exit
+    /// status consumed), before the bounded post-exit drain begins. The
+    /// runner's deadline path reads it to tell the two meanings `-1` gained
+    /// when the drain was bounded: the child was still RUNNING when the
+    /// deadline fired (killed), or it had already EXITED and only the drain
+    /// outlasted the deadline. A typed fact, never re-derived from a message.
+    reaped: Arc<AtomicBool>,
     /// Request the force-kill of the live child (SIGKILL on the owned
     /// handle). A no-op once the wait thread has reaped the child. The real
     /// seam locks the child slot shared with the wait thread and calls
@@ -273,10 +288,40 @@ impl SshRunner {
         self
     }
 
-    /// Run `op` with `argv`, bounding the whole wait by a hard deadline: the
-    /// runner's policy for the op kind, unless `timeout` is `Some` (`exec`'s
-    /// caller-supplied bound). On deadline the child is killed and the wait
-    /// thread joined (deterministic reap) BEFORE the Timeout is returned.
+    /// Run `op` with `argv`, bounding the CHILD's lifetime by `deadline` (the
+    /// runner's policy for the op kind, unless `timeout` is `Some`). On the
+    /// deadline the child is killed and the wait thread joined (deterministic
+    /// reap) BEFORE a `Timeout` is returned — UNLESS the child had already
+    /// exited, in which case the deadline did not interrupt the command and the
+    /// bounded post-exit drain is allowed to finish, so its real result
+    /// (success, or `Background` for a pipe-holding leftover) is returned and
+    /// the outcome never flips with the deadline.
+    ///
+    /// THE BOUND IS ADDITIVE, NOT `deadline`. After the deadline fires the
+    /// runner still
+    ///
+    /// * sends the group SIGTERM, sleeps [`TERM_TO_KILL_GRACE`] (200 ms), and
+    ///   sends SIGKILL (plus the owned-handle escalation), and
+    /// * lets the bounded post-exit drain finish ([`KILL_REAP_BOUND`], 2 s per
+    ///   pipe; the two pipes are drained sequentially).
+    ///
+    /// so a call may return up to about `deadline + TERM_TO_KILL_GRACE +
+    /// KILL_REAP_BOUND` (**≈ deadline + 2.2 s**), and — when BOTH pipes have a
+    /// holder — up to about `deadline + 4.2 s`. MEASURED: a plain timeout with
+    /// no pipe holder returned at `deadline + 401 ms` for a 200 ms deadline; a
+    /// same-group pipe holder returned at ~2.0 s; a `setsid`-escaped holder
+    /// returned at ~2.7 s for a 500 ms deadline. A caller that runs many
+    /// operations pays this PER OPERATION — 100 stalled operations can take
+    /// ~270 s, not `100 × deadline` — which the 120 s manifest deadline and any
+    /// caller budget must account for. The deadline alone does NOT bound the
+    /// call.
+    ///
+    /// A caller can still tell the cases apart WITHOUT timing: the returned
+    /// `RunError`/outcome variant is the authority (`Timeout` = the deadline
+    /// killed a RUNNING command; `Background` = the command exited and a
+    /// pipe-holding process outlasted it; `Ok` = the command completed and its
+    /// drain finished, however long the drain took). [`RunError::Timeout::after`]
+    /// is always the CONFIGURED deadline, never the elapsed wall clock.
     pub(crate) fn run(
         &self,
         op: OpKind,
@@ -300,7 +345,12 @@ impl SshRunner {
         // the child EXCLUSIVELY through the seam's handle, so the deadline
         // path can kill while the wait thread is mid-wait and a kill after
         // the wait has reaped the child is a no-op by construction.
-        let SpawnedChild { pid, kill, wait } = child;
+        let SpawnedChild {
+            pid,
+            reaped,
+            kill,
+            wait,
+        } = child;
         // The test-only spawn observer records the pid in the PARENT here,
         // synchronously, immediately after spawn — before the deadline clock
         // starts — so a test can assert the pid is gone after the deadline
@@ -333,23 +383,45 @@ impl SshRunner {
                 let _ = handle.join();
                 Err(e)
             }
-            Err(_) => {
-                // HARD DEADLINE: request a kill through the OWNED child handle
-                // — never a libc::kill of a detached pid — then reap by
-                // joining the wait thread that owns the child (its `wait`
-                // returns promptly after the kill). Both complete before this
-                // function returns, so the child is deterministically
-                // collected — no zombie, no kill-vs-wait race, no
-                // return-before-reap — and a pid the OS recycled after the
-                // reap can never be signalled: a kill on a consumed handle is
-                // a no-op by construction.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if reaped.load(Ordering::SeqCst) {
+                    // The child had ALREADY EXITED when the deadline fired:
+                    // the deadline did not interrupt the command, it only
+                    // outlasted the bounded post-exit drain. Do NOT kill (the
+                    // handle is consumed — a kill is a no-op) and do NOT
+                    // report a timeout: collect the closure's REAL result. The
+                    // closure is bounded (the drain gives up at
+                    // [`crate::transport::runner::KILL_REAP_BOUND`]), so this
+                    // wait terminates, and the outcome for the same command no
+                    // longer flips between Timeout and Background depending on
+                    // the deadline. Because the child is reaped, `Background`
+                    // here always means "the command exited and a process that
+                    // outlived it held its pipes open", never "the command was
+                    // killed".
+                    let res = rx.recv().unwrap_or_else(|_| {
+                        Err(RunError::Wait(
+                            "the wait thread exited without a result".to_string(),
+                        ))
+                    });
+                    let _ = handle.join();
+                    return res;
+                }
+                // The child was still RUNNING at the deadline: request a kill
+                // through the OWNED child handle — never a libc::kill of a
+                // detached pid — then reap by joining the wait thread that
+                // owns the child (its `wait` returns promptly after the kill).
+                // Both complete before this function returns, so the child is
+                // deterministically collected — no zombie, no kill-vs-wait
+                // race, no return-before-reap — and a pid the OS recycled
+                // after the reap can never be signalled: a kill on a consumed
+                // handle is a no-op by construction.
                 let _ = kill();
                 let _ = handle.join();
                 // The wait thread has now finished and queued its result: if
                 // it reported a pipe-holding process (the bounded drain gave
-                // up), carry that actionable fact into the timeout. The
-                // outcome classification is unchanged — a timeout is still a
-                // timeout — only the message gains the leftover fact.
+                // up after the kill), carry that actionable fact into the
+                // timeout. The outcome classification is the deadline kill —
+                // the leftover is secondary.
                 let leftover_pipes = match rx.try_recv() {
                     Ok(Err(RunError::Background(m))) => Some(m),
                     _ => None,
@@ -358,6 +430,16 @@ impl SshRunner {
                     after: deadline,
                     leftover_pipes,
                 })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The wait thread panicked without sending a result: the child
+                // may still be live. Kill, join (surfacing nothing further),
+                // and report the wait failure — never a fabricated outcome.
+                let _ = kill();
+                let _ = handle.join();
+                Err(RunError::Wait(
+                    "the wait thread exited without a result".to_string(),
+                ))
             }
         }
     }
@@ -619,6 +701,12 @@ mod runner_property_tests {
         /// kill request on this handle is a NO-OP — the fake's mirror of the
         /// real runner's consumed `Child` handle.
         reaped: AtomicBool,
+        /// The same "the child has been reaped" fact the runner's deadline
+        /// path reads (the fake's mirror of `SpawnedChild::reaped`): armed the
+        /// instant the exit status is consumed, BEFORE the completion is
+        /// delivered, so the deadline path can tell "killed a running child"
+        /// from "the child had already exited".
+        collected: Arc<AtomicBool>,
         stall: Stall,
         /// Whether the op pipes a stdin payload: the write-error stall is
         /// meaningful only when there is something to write (the upload op).
@@ -667,6 +755,7 @@ mod runner_property_tests {
             // AFTER the reap but BEFORE the completion notification — the
             // window the pid-reuse test exploits; only that test sets it.
             self.reaped.store(true, Ordering::SeqCst);
+            self.collected.store(true, Ordering::SeqCst);
             self.state.push(LogEntry::Reap { pid: self.pid });
             // Injected scheduler delay at the AFTER-REAP stage: the child is
             // reaped but the completion has not been delivered — a deadline
@@ -693,9 +782,18 @@ mod runner_property_tests {
         /// the fallback sends the value and the assertion fails.
         fn injected_delay(&self) {
             match self.size {
-                DelaySize::Past => {
+                // A `Past` delay at the WAIT stage is gated on the deadline
+                // latch: the child has NOT exited, so the runner's deadline
+                // path arms the latch through the kill, and the delayed
+                // completion can never win the race.
+                DelaySize::Past if self.delay_at == DelayAt::Wait => {
                     let _ = self.deadline.wait(PAST_DELAY_FALLBACK);
                 }
+                // A `Past` delay at the AFTER-REAP stage cannot use the
+                // latch: the child is already reaped, so the runner does NOT
+                // kill (it waits for the closure's real result). A real sleep
+                // past the deadline still exercises the window.
+                DelaySize::Past => std::thread::sleep(self.delay),
                 DelaySize::None | DelaySize::Tiny => std::thread::sleep(self.delay),
             }
         }
@@ -841,6 +939,7 @@ mod runner_property_tests {
                 pid,
                 killed: AtomicBool::new(false),
                 reaped: AtomicBool::new(false),
+                collected: Arc::new(AtomicBool::new(false)),
                 // Benign: the reused child's wait never runs in the test.
                 stall: Stall::Complete,
                 has_stdin: false,
@@ -881,6 +980,7 @@ mod runner_property_tests {
                 pid,
                 killed: AtomicBool::new(false),
                 reaped: AtomicBool::new(false),
+                collected: Arc::new(AtomicBool::new(false)),
                 stall: self.stall,
                 has_stdin: stdin.is_some(),
                 keyscan_line: self.keyscan_line.clone(),
@@ -919,10 +1019,16 @@ mod runner_property_tests {
                 Ok(())
             });
             let wait_ctl = ctl;
+            let wait_reaped = wait_ctl.collected.clone();
             let wait: Box<
                 dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send,
             > = Box::new(move || wait_ctl.wait());
-            Ok(SpawnedChild { pid, kill, wait })
+            Ok(SpawnedChild {
+                pid,
+                reaped: wait_reaped,
+                kill,
+                wait,
+            })
         }
     }
 
@@ -1471,14 +1577,25 @@ mod runner_property_tests {
     /// died (30.0 s, measured) — the defect the real sshd reproduces via its
     /// mux master holding the pipe. This child reproduces the MECHANISM
     /// hermetically, so the regression is caught without an sshd on either
-    /// platform. The timeout outcome is preserved (`Exec` still maps it to
-    /// `exit_code == -1`) and the message names the leftover-pipe condition.
+    /// platform.
+    ///
+    /// F2 FLIP REMOVAL: the same command is run under a SHORT (200 ms) and a
+    /// LONG (5 s) deadline. Because the direct child exits before either
+    /// deadline, the deadline only outlasts the bounded post-exit drain, and
+    /// the outcome must be the SAME at both deadlines — the pipe-holding
+    /// violation, [`RunError::Background`] — never a deadline-dependent
+    /// `Timeout`. PRE-FIX (probe, before the fix): the 200 ms run returned
+    /// `Err(RunError::Timeout { after: 200ms, leftover_pipes: Some("... left
+    /// processes holding its output pipes open") })` while the 5 s run
+    /// returned `Err(RunError::Background("... left processes holding its
+    /// output pipes open"))` — the same command, two different outcome
+    /// variants, depending only on the deadline.
     #[test]
     fn real_runner_deadline_bounds_a_pipe_holding_background_child() {
-        let spawned = Arc::new(Mutex::new(None));
+        let spawned = Arc::new(Mutex::new(Vec::new()));
         let runner = SshRunner::new(&crate::test_support::fixture_env()).with_spawn_observer({
             let spawned = spawned.clone();
-            Arc::new(move |pid: u32| *spawned.lock().unwrap() = Some(pid))
+            Arc::new(move |pid: u32| spawned.lock().unwrap().push(pid))
         });
         // `(sleep 30 &)` leaves the sleep in the child's own process group
         // with the inherited stdout/stderr pipes; `exec true` then exits at
@@ -1488,48 +1605,43 @@ mod runner_property_tests {
             "-c".to_string(),
             "(sleep 30 &) ; exec true".to_string(),
         ];
-        let deadline = Duration::from_millis(200);
-        let start = Instant::now();
-        let res = runner.run(OpKind::Exec, &argv, None, Some(deadline));
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the deadline must bound the call even when a background process \
-             still holds the output pipes (took {elapsed:?}; unbounded it is 30s)"
-        );
-        match res {
-            Err(RunError::Timeout {
-                after,
-                leftover_pipes,
-            }) => {
-                assert_eq!(after, deadline, "the reported deadline is unchanged");
-                let msg = leftover_pipes.expect(
-                    "the timeout must name the leftover-pipe condition, not merely \
-                     report the elapsed deadline",
-                );
-                assert!(
-                    msg.contains("holding its output pipes open"),
-                    "the message must reuse the local runner's wording, got: {msg}"
-                );
+        for deadline in [Duration::from_millis(200), Duration::from_secs(5)] {
+            let start = Instant::now();
+            let res = runner.run(OpKind::Exec, &argv, None, Some(deadline));
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "the bound must stop the call even when a background process \
+                 still holds the output pipes (took {elapsed:?}; unbounded it is 30s)"
+            );
+            match res {
+                Err(RunError::Background(msg)) => {
+                    assert!(
+                        msg.contains("holding its output pipes open"),
+                        "the violation must reuse the local runner's wording at {deadline:?}, \
+                         got: {msg}"
+                    );
+                }
+                Err(RunError::Timeout { .. }) => panic!(
+                    "a command that exited within its deadline must not report a timeout at \
+                     {deadline:?}: the deadline outlasted the drain, not the command"
+                ),
+                other => panic!(
+                    "the pipe-holding violation must be a Background at {deadline:?}, got {other:?}"
+                ),
             }
-            other => panic!(
-                "the timeout outcome must be preserved (exit_code == -1 for exec), \
-                 got {other:?}"
-            ),
         }
-        // The background `sleep` deliberately outlived the child: kill its
+        // The background `sleep`s deliberately outlived the child: kill each
         // process group now so the test leaves no process behind (the runner
         // cannot — it has no portable way to signal a member of a group whose
         // leader it already reaped, which is exactly the defect being pinned).
-        let pgid: i32 = spawned
-            .lock()
-            .unwrap()
-            .expect("the spawn observer must record the child pid (== pgid) in the parent")
-            as i32;
-        // SAFETY: the pgid is this child's own group; the background sleep is
-        // still a live member (it holds the pipe), so the id is not recycled.
-        unsafe {
-            libc::killpg(pgid, libc::SIGKILL);
+        for pid in spawned.lock().unwrap().iter().copied() {
+            // SAFETY: the pgid is this child's own group; the background sleep
+            // is still a live member (it holds the pipe), so the id is not
+            // recycled.
+            unsafe {
+                libc::killpg(pid as i32, libc::SIGKILL);
+            }
         }
     }
 
@@ -1675,7 +1787,12 @@ mod runner_property_tests {
         // The pid comes from the PARENT: the seam reads it synchronously at
         // spawn time (`Child::id`) and returns it on the handle — no
         // child-written pidfile.
-        let SpawnedChild { pid, kill, wait } = child;
+        let SpawnedChild {
+            pid,
+            reaped: _,
+            kill,
+            wait,
+        } = child;
         let out = std::thread::spawn(wait)
             .join()
             .unwrap()
@@ -1698,6 +1815,53 @@ mod runner_property_tests {
         // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
         let still_exists = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!still_exists, "reaped child {pid} must be gone");
+    }
+
+    /// F4: the SSH runner's Unix seam reuses the LOCAL runner's
+    /// [`crate::transport::runner::OwnedChild`] drop backstop (ONE authority
+    /// for "every error path leaves no uncollected child"). If a
+    /// `drain_available`/`try_wait` error makes the wait closure return while
+    /// the child is still live and uncollected, the shared slot is dropped and
+    /// `OwnedChild::drop` kills the group and reaps it; a bare
+    /// [`std::process::Child`]'s own `Drop` neither waits nor kills, so the
+    /// old SSH seam abandoned the process.
+    ///
+    /// The error itself cannot be injected through the public seam (there is
+    /// no fault seam between `drain_available` and the child slot), so this
+    /// test exercises the backstop directly: it ABANDONS a real handle exactly
+    /// as the early-return path does, then proves the child is gone. The
+    /// contract is therefore stated (and its mechanism pinned) even though the
+    /// triggering error is not injected.
+    #[test]
+    fn an_abandoned_child_is_collected_by_the_shared_drop_backstop() {
+        let env = crate::test_support::fixture_env();
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec sleep 30".to_string(),
+        ];
+        let child = platform::spawn(&env, OpKind::Exec, &argv, None)
+            .expect("the real seam must spawn the child");
+        let SpawnedChild {
+            pid,
+            reaped: _,
+            kill,
+            wait,
+        } = child;
+        // Abandon the handle: drop both Arcs without ever invoking the wait
+        // closure, exactly as an early `?`-return inside the wait closure
+        // does. The LAST drop runs the shared `OwnedChild::drop` backstop.
+        drop(wait);
+        drop(kill);
+        let budget = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < budget {
+            // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the abandoned child {pid} must be killed and reaped by the shared drop backstop");
     }
 
     fn stall_strategy() -> impl Strategy<Value = Stall> {
@@ -1757,7 +1921,22 @@ mod runner_property_tests {
     /// instead, so both sides of the deadline are covered across the cases.
     fn crosses_deadline(stall: Stall, at: DelayAt, size: DelaySize) -> bool {
         size == DelaySize::Past
-            && matches!(at, DelayAt::Wait | DelayAt::AfterReap)
+            && at == DelayAt::Wait
+            && matches!(
+                stall,
+                Stall::Complete | Stall::NonZero | Stall::StdinWriteError | Stall::WaitError
+            )
+    }
+
+    /// Whether the deadline fires AFTER the fake has already reaped the child
+    /// (the `AfterReap` placement with a past-deadline delay): the command ran
+    /// and EXITED, so after the flip removal the runner must return the
+    /// closure's REAL result — never a deadline `Timeout`. This is the property
+    /// half of the `-1`-meaning fix: a deadline that did not interrupt a
+    /// running command is not a timeout.
+    fn deadline_fires_after_reap(stall: Stall, at: DelayAt, size: DelaySize) -> bool {
+        size == DelaySize::Past
+            && at == DelayAt::AfterReap
             && matches!(
                 stall,
                 Stall::Complete | Stall::NonZero | Stall::StdinWriteError | Stall::WaitError
@@ -1814,6 +1993,14 @@ mod runner_property_tests {
                 "a past-deadline wait delay must let the deadline win ({label}), got: {outcome:?}"
             );
         }
+        if deadline_fires_after_reap(stall, at, size) {
+            assert!(
+                !matches!(outcome, Err(RunError::Timeout { .. })),
+                "a deadline that fired after the child was already reaped must NOT report a \
+                 timeout — the command ran and exited and only its drain outlasted the deadline \
+                 ({label}), got: {outcome:?}"
+            );
+        }
     }
 
     /// The extended seam's new outcomes, driven deterministically: the property
@@ -1860,7 +2047,12 @@ mod runner_property_tests {
         // Split the handle exactly as the runner does: the kill request (the
         // deadline path) and the wait closure (the wait thread). The pid is
         // the parent's own, read synchronously at spawn.
-        let SpawnedChild { pid, kill, wait } = child;
+        let SpawnedChild {
+            pid,
+            reaped: _,
+            kill,
+            wait,
+        } = child;
 
         // The runner's deadline path: request the kill through the OWNED
         // handle.

@@ -221,11 +221,37 @@ pub struct RemoteMeta {
     pub mode: u32,
 }
 
+/// The typed cause of an [`ExecOutcome`] whose command did not complete
+/// normally, carried as a TYPE rather than re-derived from the `stderr`
+/// string. Bounding the post-exit output drain made the runner's `-1`
+/// sentinel mean TWO different things, so the cause must be explicit: a
+/// consumer (and the manifest classifier) has to tell "the deadline killed a
+/// running command" from "the command ran and exited, and only the drain
+/// outlasted the deadline".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutCause {
+    /// The deadline fired while the command's child was still running: it was
+    /// killed and reaped, so no far-side exit status exists.
+    CommandStillRunning,
+    /// The command RAN and EXITED; only the bounded post-exit output drain
+    /// outlasted the deadline (a process that outlived the child still held a
+    /// pipe open), so the drain gave up and the exit status could not be
+    /// collected. The failure is NOT "the transport failed before the command
+    /// started".
+    OutputDrainOutlastedDeadline,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecOutcome {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// `Some` when this outcome came from the deadline path (the runner's
+    /// `-1` sentinel): the typed cause distinguishes a deadline kill from a
+    /// drain that outlasted an already-exited command. `None` for a normally
+    /// exited command. A signal-killed child also reports `exit_code == -1`
+    /// with `None`, so a consumer must NOT infer "deadline" from `-1` alone.
+    pub timeout_cause: Option<TimeoutCause>,
 }
 
 impl ExecOutcome {
@@ -246,13 +272,16 @@ impl ExecOutcome {
 pub trait Exec: Send + Sync {
     /// Execute `argv` (no shell) bounded by `timeout`, returning the
     /// outcome. A conforming implementation never leaves a live process
-    /// behind and never blocks past `timeout`.
+    /// behind. `timeout` bounds the CHILD's lifetime; the mandatory post-exit
+    /// drain may add its own bounded tail (see [`ExecOutcome::timeout_cause`]),
+    /// so a call may return a little after `timeout` — never unbounded.
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
 }
 
 /// The REAL exec: [`ChildRunner`] through the outcome mapping the transport
 /// always applied (a timed-out child surfaces as `exit_code: -1` with the
-/// runner's stderr; a kill/reap failure is an error, never a fake success).
+/// runner's stderr and [`TimeoutCause::CommandStillRunning`]; a kill/reap
+/// failure is an error, never a fake success).
 impl Exec for ChildRunner {
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
         match ChildRunner::exec(self, argv, timeout) {
@@ -264,11 +293,17 @@ impl Exec for ChildRunner {
                 exit_code,
                 stdout,
                 stderr,
+                timeout_cause: None,
             }),
             Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
                 exit_code: -1,
                 stdout: String::new(),
                 stderr,
+                // The local runner's `TimedOut` is produced ONLY when the
+                // child was still running at the deadline (its post-exit
+                // drain reports `Background`, never a timeout), so the cause
+                // is unambiguous.
+                timeout_cause: Some(TimeoutCause::CommandStillRunning),
             }),
             Err(e) => Err(Error::transport(e.to_string())),
         }

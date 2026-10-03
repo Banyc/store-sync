@@ -26,7 +26,7 @@ use crate::manifest::{
     canonicalize_remote_entries_destination, canonicalize_tree, canonicalize_tree_destination,
     remote_tree_verify_script,
 };
-use crate::transport::{ExecOutcome, Remote};
+use crate::transport::{ExecOutcome, Remote, TimeoutCause};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
@@ -187,7 +187,10 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// vocabulary is present, the exit status and preserved stderr are reported
 /// as an UNDETERMINED failure rather than being blamed on any layer. Only the
 /// shell's "could not start perl" statuses (126/127) suggest that `perl` may
-/// be absent.
+/// be absent, and even those are VETOED by a positive script `die` diagnostic:
+/// on Linux 126/127 are real errno values (ENOKEY / EKEYEXPIRED) that a
+/// far-side `die` propagates, so the script's own anchored words outrank the
+/// bare status.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     let root = remote.root();
     if remote.is_local() {
@@ -270,21 +273,32 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
 /// The command is `ssh … exec -- perl -e <script> <root>`, so a non-zero exit
 /// can come from any of several layers, and they are not interchangeable:
 ///
-/// * the TRANSPORT failed before the command ran — the runner reports `-1`
-///   when it killed the child at the deadline (no far-side exit status can be
-///   negative, so `-1` is conclusive on its own); `ssh` also reserves exit
-///   status 255 for its own failures (connection refused/timed out,
-///   authentication, host-key verification, the `ControlMaster` control
-///   socket), but a far-side `perl` `die` propagates 255 too, so 255 selects
-///   this branch ONLY with an EVIDENCE-BACKED transport diagnostic at the
-///   start of a stderr line. Exit 255 alone names no layer and is never
-///   reported as transport;
+/// * the TRANSPORT failed before the command ran — the runner reports the
+///   typed [`TimeoutCause::CommandStillRunning`] when it killed the child at
+///   the deadline while the far-side command was still running (no far-side
+///   exit status can be negative, and a signal-killed child also reports
+///   `-1`, so the `-1` STATUS alone is not the authority — the typed cause
+///   is); `ssh` also reserves exit status 255 for its own failures
+///   (connection refused/timed out, authentication, host-key verification,
+///   the `ControlMaster` control socket), but a far-side `perl` `die`
+///   propagates 255 too, so 255 selects this branch ONLY with an
+///   EVIDENCE-BACKED transport diagnostic at the start of a stderr line. Exit
+///   255 alone names no layer and is never reported as transport;
 /// * the far-side `perl` could not be STARTED — the remote shell's 126/127
 ///   ("found but not executable" / "not found"), which is the only layer that
-///   is actually a statement about `perl`;
+///   is actually a statement about `perl`. A POSITIVE anchored script `die`
+///   diagnostic OUTRANKS this bare status: on Linux 126/127 are real errno
+///   values (ENOKEY / EKEYEXPIRED) that keyring-backed trees return, and the
+///   script's `die` propagates `$!`, so a genuine script failure can carry
+///   those statuses;
 /// * `perl` ran and the script exited non-zero — recognised by the script's
 ///   OWN closed `die` prefix at the start of a stderr line (a missing root,
 ///   an unreadable directory, a name that cannot cross the wire, ...);
+/// * the far-side command RAN and EXITED, but only its bounded post-exit
+///   output DRAIN outlasted the runner's deadline (the typed
+///   [`TimeoutCause::OutputDrainOutlastedDeadline`]), so the far-side exit
+///   status could not be collected. This is NOT the transport-before-command
+///   layer — the command started and finished;
 /// * NONE of the above is established — the exit status and preserved stderr
 ///   are reported as UNDETERMINED, naming no layer. This is the honest
 ///   outcome for a status no rule covers (200, a signal-killed `137` with
@@ -310,6 +324,29 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     } else {
         stderr
     };
+    // The typed cause is the authority, and this one is decisive: the command
+    // RAN and EXITED and only its bounded post-exit output drain outlasted the
+    // deadline. Naming the transport-before-command layer here would be false
+    // — the exact misclassification the bounded drain introduced when it gave
+    // the runner's `-1` a second meaning.
+    if out.timeout_cause == Some(TimeoutCause::OutputDrainOutlastedDeadline) {
+        return Error::transport(format!(
+            "remote tree verification at {} could not collect the far-side manifest command's \
+             output: the command ran and exited, but a process that outlived it held its output \
+             pipes open past the post-exit drain bound, so the runner gave up on the drain and no \
+             exit status was collected (exit {}): {}",
+            root.display(),
+            out.exit_code,
+            stderr
+        ));
+    }
+    // F1: the far-side script's own anchored `die` diagnostic is EVIDENCE
+    // about the layer and VETOES the bare 126/127 STATUS (the veto lives in
+    // [`perl_could_not_start`]): on Linux 126/127 are real errno values
+    // (ENOKEY / EKEYEXPIRED) that keyring-backed trees return and the script's
+    // `die` propagates `$!`. Verified in the `perl_could_not_start` branch
+    // below, then reported by [`far_side_script_failed`] after the transport
+    // rule (a script diagnostic is not transport evidence).
     if perl_could_not_start(out) {
         return Error::transport(format!(
             "remote tree verification at {} could not start the far-side `perl` (exit {}): {} \
@@ -354,6 +391,17 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
 /// Whether `out` reports that the far-side `perl` program itself could not be
 /// started (as opposed to running and exiting non-zero).
 fn perl_could_not_start(out: &ExecOutcome) -> bool {
+    // F1 VETO: an anchored script `die` diagnostic means `perl` RAN, so the
+    // not-started statuses below cannot be a statement about starting `perl`.
+    // This is load-bearing on Linux, where 126/127 are real errno values
+    // (ENOKEY / EKEYEXPIRED) that keyring-backed trees return and the script's
+    // `die` propagates `$!`; the same stderr at any other status already
+    // classifies as the script, so the STATUS is what would misroute it. The
+    // veto lives HERE (the rule's own authority), not only in the caller's
+    // branch order, so the rule cannot be broken by reordering.
+    if far_side_script_failed(out) {
+        return false;
+    }
     // EVIDENCE-BACKED (POSIX shells; measured on macOS and Linux): 126 = found
     // but not executable, 127 = not found. The remote command is
     // `exec -- perl -e …`, so both statuses name the `perl` program. The
@@ -381,32 +429,56 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
 /// Whether `out` reports a failure of the TRANSPORT layer, before the far-side
 /// command could run at all.
 ///
-/// Evidence, not a guess from the exit status: the runner's own timeout
-/// sentinel is conclusive on its own, but `ssh` exit status 255 is NOT,
-/// because a far-side `perl` `die` propagates the same status (perl exits 255
-/// when `$!` is 0) — the crate's own manifest script does exactly that for a
-/// non-NFC name and for a hex-encoded name/target refusal. Exit 255
-/// therefore selects this branch only with a positive transport diagnostic at
-/// the START of a stderr line.
+/// Evidence, not a guess from the exit status: the runner's TYPED
+/// [`TimeoutCause::CommandStillRunning`] is conclusive on its own (the deadline
+/// killed a running child, so no far-side command produced the outcome), but
+/// `ssh` exit status 255 is NOT, because a far-side `perl` `die` propagates the
+/// same status (perl exits 255 when `$!` is 0) — the crate's own manifest
+/// script does exactly that for a non-NFC name and for a hex-encoded
+/// name/target refusal. Exit 255 therefore selects this branch only with a
+/// positive transport diagnostic at the START of a stderr line. A bare
+/// `exit_code == -1` selects nothing: the typed cause must say
+/// `CommandStillRunning` (a signal-killed child also reports `-1`, and a drain
+/// that outlasted an exited command is its own cause).
 ///
-/// ANCHORING BOUND (measured with the real script): line-anchoring closes the
-/// far-side-text spoof COMPLETELY. The script can echo arbitrary name text
-/// raw (only a non-NFC name WITHOUT LF/CR/TAB is echoed raw; a name with any
-/// of those is hex-encoded instead), and it always echoes it AFTER its own
-/// closed `die` prefix (`entry name under …`), so a crafted name — or a ROOT
-/// DIRECTORY named `Host key verification failed store` — cannot place a
-/// marker at a line start. The one residual is NOT far-side text: the script
-/// echoes the root ARGUMENT raw in `not a directory: $root`, so a
-/// CALLER-SUPPLIED root path containing a raw LF could start a marker line.
-/// That path is chosen by the local caller, never by the far side, so it is
-/// not a spoofing channel from the tree being described.
+/// ANCHORING BOUND (measured with the real script): line-anchoring closes
+/// every FAR-SIDE-TREE spoof. A non-NFC entry name is echoed raw, but always
+/// AFTER the script's own closed `die` prefix (`entry name under …`), and a
+/// name containing LF/CR/TAB is hex-encoded rather than echoed, so a crafted
+/// ENTRY name — or a ROOT DIRECTORY named `Host key verification failed store`
+/// — cannot place a marker at a line start.
+///
+/// The reachable at-255 residual is NOT far-side tree text: the script
+/// interpolates `$dir` and `$p` into its own `die` lines (e.g.
+/// `entry name under $dir is not NFC-normalized: $n`, `lstat $p: $!`), so a
+/// ROOT DIRECTORY whose own name contains a raw LF can start a marker line.
+/// MEASURED with the real script: a root directory named
+/// `x\nssh: connect to host evil port 1: Connection refused\ny` holding any
+/// non-NFC entry exits 255 and puts `ssh: connect to host evil port 1:
+/// Connection refused` at the start of a line, which classifies as transport.
+/// (The earlier documented example — `not a directory: $root` echoing the root
+/// raw — was WRONG: measured, that spelling exits 2 and correctly lands in the
+/// script branch, because `perl -e`'s module loading leaves `$!` = ENOENT.)
+/// The root is chosen by the CALLER, never by the tree being described, and
+/// [`crate::transport::SshTransport::new`] validates only ABSOLUTENESS and the
+/// presence of a normal component below the filesystem root — it does not
+/// reject a raw LF — so the crate RELIES ON THE CALLER for a root the wire can
+/// represent. The severity is unchanged: caller-chosen, not far-side text.
 fn transport_failed_before_the_command(out: &ExecOutcome) -> bool {
-    // The runner's timeout/no-status sentinel: THIS process killed the child
-    // at the deadline, so no far-side command produced the outcome. No
-    // far-side process can exit with a negative status, so -1 is conclusive
-    // by construction and needs no textual corroboration.
-    if out.exit_code == -1 {
-        return true;
+    // The TYPED cause is the authority for the deadline cases. The bare
+    // `exit_code == -1` sentinel is ambiguous after the post-exit drain was
+    // bounded: the same status also covers a signal-killed child and a
+    // command that exited while its output drain outlasted the deadline.
+    match out.timeout_cause {
+        // The runner killed the child at the deadline while the far-side
+        // command was still running, so no far-side command produced this
+        // outcome. The typed cause needs no textual corroboration.
+        Some(TimeoutCause::CommandStillRunning) => return true,
+        // The command RAN and EXITED; only its drain outlasted the deadline.
+        // This is NOT the transport-before-command layer (its own branch in
+        // [`remote_manifest_failure`] reports it).
+        Some(TimeoutCause::OutputDrainOutlastedDeadline) => return false,
+        None => {}
     }
     // `ssh` exits 255 for its own failures, but the far-side perl `die` does
     // too, so 255 alone proves nothing. Require positive transport evidence.
@@ -746,6 +818,7 @@ mod tests {
             stderr:
                 "unix_listener: cannot bind to path /tmp/dmux/mux-123: No such file or directory"
                     .to_string(),
+            timeout_cause: None,
         };
         let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
         assert!(
@@ -771,6 +844,7 @@ mod tests {
             exit_code: 127,
             stdout: String::new(),
             stderr: "perl: command not found".to_string(),
+            timeout_cause: None,
         };
         let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
         assert!(
@@ -820,6 +894,7 @@ mod tests {
                 exit_code: 255,
                 stdout: String::new(),
                 stderr: stderr.to_string(),
+                timeout_cause: None,
             };
             let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
             assert!(
@@ -860,6 +935,7 @@ mod tests {
             exit_code: 13,
             stdout: String::new(),
             stderr: "opendir /srv/store/sub: Permission denied".to_string(),
+            timeout_cause: None,
         };
         let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
         assert!(
@@ -894,6 +970,7 @@ mod tests {
                 exit_code: 255,
                 stdout: String::new(),
                 stderr: stderr.to_string(),
+                timeout_cause: None,
             };
             let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
             assert!(
@@ -926,6 +1003,7 @@ mod tests {
                 exit_code: code,
                 stdout: String::new(),
                 stderr: stderr.to_string(),
+                timeout_cause: None,
             };
             let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
             assert!(
@@ -948,6 +1026,7 @@ mod tests {
             exit_code: 2,
             stdout: String::new(),
             stderr: "not a directory: /srv/store".to_string(),
+            timeout_cause: None,
         };
         let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
         assert!(
@@ -993,6 +1072,7 @@ mod tests {
                 exit_code: 255,
                 stdout: String::new(),
                 stderr: stderr.to_string(),
+                timeout_cause: None,
             };
             let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
             assert!(
@@ -1072,6 +1152,7 @@ mod tests {
                 exit_code: code,
                 stdout: String::new(),
                 stderr: stderr.to_string(),
+                timeout_cause: None,
             };
             let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
             assert!(
@@ -1138,6 +1219,7 @@ mod tests {
                 exit_code: 255,
                 stdout: String::new(),
                 stderr,
+                timeout_cause: None,
             };
             let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
             assert!(
@@ -1162,6 +1244,7 @@ mod tests {
             exit_code: 255,
             stdout: String::new(),
             stderr: stderr.to_string(),
+            timeout_cause: None,
         };
         let msg =
             remote_manifest_failure(Path::new("/tmp/Host key verification failed store"), &out)
@@ -1252,6 +1335,7 @@ mod tests {
             exit_code: status.code().unwrap_or(-1),
             stdout: std::fs::read_to_string(&out_path).unwrap_or_default(),
             stderr: std::fs::read_to_string(&err_path).unwrap_or_default(),
+            timeout_cause: None,
         })
     }
 
@@ -1266,6 +1350,7 @@ mod tests {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            timeout_cause: None,
         })
     }
 
@@ -1419,5 +1504,246 @@ mod tests {
             "the raw name is echoed verbatim: {out:?}"
         );
         assert_script_layer(&out);
+    }
+
+    // -----------------------------------------------------------------------
+    // F1: the 126/127 status is ambiguous and must not outrank the script's
+    // own anchored `die` vocabulary.
+    // -----------------------------------------------------------------------
+
+    /// F1: a genuine far-side SCRIPT failure whose `$!` is 126/127 is reported
+    /// as the far-side script, not as a missing interpreter. On Linux 127 =
+    /// EKEYEXPIRED and 126 = ENOKEY are REAL errno values that keyring-backed
+    /// trees (fscrypt, AFS) return, and the script's `die` propagates `$!`, so
+    /// the bare status proves nothing about starting `perl`. The decisive
+    /// cross-check is that the SAME stderr at exit 5 already classified as the
+    /// script — the STATUS ALONE was the misrouting signal.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the 127/126 inputs
+    /// returned "remote tree verification at /srv/store could not start the
+    /// far-side `perl` (exit 127): open /srv/store/x: Key has expired (is perl
+    /// installed on the remote host?)".
+    #[test]
+    fn f1_a_script_die_that_propagates_126_or_127_is_the_far_side_script() {
+        for (code, stderr) in [
+            (127, "open /srv/store/x: Key has expired"),
+            (126, "open /srv/store/x: Required key not available"),
+        ] {
+            let out = ExecOutcome {
+                exit_code: code,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                timeout_cause: None,
+            };
+            let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+            assert!(
+                msg.contains("failed inside the far-side manifest script"),
+                "a script `die` at {code} must be the script layer, got: {msg}"
+            );
+            assert!(
+                !msg.contains("is perl installed"),
+                "exit {code} must not suggest perl is missing when the script ran: {msg}"
+            );
+            assert!(
+                !msg.contains("transport-level failure"),
+                "a script `die` is not transport: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("exit {code}")) && msg.contains(stderr),
+                "the status and stderr survive: {msg}"
+            );
+        }
+        // The decisive cross-check: the SAME stderr at exit 5 is the script, so
+        // only the status could have misrouted the 126/127 cases above.
+        let out = ExecOutcome {
+            exit_code: 5,
+            stdout: String::new(),
+            stderr: "open /srv/store/x: Key has expired".to_string(),
+            timeout_cause: None,
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("failed inside the far-side manifest script"),
+            "the same stderr at exit 5 is the script: {msg}"
+        );
+    }
+
+    /// F1 ground truth from the REAL interpreter, not from reasoning: perl's
+    /// `die` propagates `$!` as the exit status, so `$! = 127` exits 127 with
+    /// the script's own `open …` diagnostic on stderr. Measured on macOS perl
+    /// 5.34.1 (`open /srv/store/x: 127`, no errno string) and Linux perl
+    /// 5.40.1 (`open /srv/store/x: Key has expired`); BOTH start with the
+    /// script's `open ` die prefix, so both must classify as the script.
+    #[test]
+    fn f1_a_real_interpreter_die_at_127_is_the_far_side_script() {
+        if !perl_on_path() {
+            announce_skip("perl is not on PATH, so the real `$!`-propagation probe cannot run");
+            return;
+        }
+        let out = std::process::Command::new("perl")
+            .args(["-e", "$!=shift; die qq{open /srv/store/x: $!\\n}", "127"])
+            .output()
+            .expect("perl must run");
+        let outcome = ExecOutcome {
+            exit_code: out.status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            timeout_cause: None,
+        };
+        assert_eq!(
+            outcome.exit_code, 127,
+            "the interpreter must propagate `$!` as the exit status: {outcome:?}"
+        );
+        assert!(
+            outcome.stderr.starts_with("open "),
+            "the script's own `open ` die prefix must be preserved: {outcome:?}"
+        );
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &outcome).to_string();
+        assert!(
+            msg.contains("failed inside the far-side manifest script"),
+            "real interpreter output at 127 must be the script, got: {msg}"
+        );
+        assert!(!msg.contains("is perl installed"), "{msg}");
+    }
+
+    /// F1: the veto is safe only because the script's closed `die` vocabulary
+    /// and the perl-not-found markers are DISJOINT. Every die prefix is a bare
+    /// word (`open `, `lstat `, …); every not-found marker begins `perl:`, so
+    /// neither appears at the start of the other's line. The enumeration is
+    /// the verification of the reordering claim, not a hand-wave.
+    #[test]
+    fn the_script_die_vocabulary_and_the_perl_not_found_markers_do_not_collide() {
+        const PERL_NOT_FOUND: &[&str] = &[
+            "perl: command not found",
+            "perl: not found",
+            "perl: No such file",
+        ];
+        for prefix in SCRIPT_DIE_PREFIXES {
+            assert!(
+                !prefix.starts_with("perl:"),
+                "a die prefix must not begin `perl:` (it would collide with the not-found markers): {prefix:?}"
+            );
+            for marker in PERL_NOT_FOUND {
+                assert!(
+                    !marker.starts_with(prefix),
+                    "the not-found marker {marker:?} must not start with the die prefix {prefix:?}"
+                );
+                assert!(
+                    !prefix.starts_with(marker),
+                    "the die prefix {prefix:?} must not start with the not-found marker {marker:?}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F2: the runner's `-1` is ambiguous, so the TYPED cause is the authority.
+    // -----------------------------------------------------------------------
+
+    /// F2: the classifier must read the typed [`TimeoutCause`], never the bare
+    /// `exit_code == -1` (which a signal-killed child also produces). The drain
+    /// case must NOT be blamed on the transport-before-command layer.
+    ///
+    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the drain input
+    /// returned "remote tree verification at /srv/store could not run: the
+    /// transport failed before the far-side command started (exit -1): … left
+    /// processes holding its output pipes open (this is a transport-level
+    /// failure — connection, …)"; the bare `-1` input returned the same
+    /// transport-before-command message.
+    #[test]
+    fn f2_the_typed_cause_not_the_status_alone_classifies_the_deadline() {
+        // (a) The deadline killed a RUNNING command: transport-before-command.
+        let killed = ExecOutcome {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "timed out after 200ms".to_string(),
+            timeout_cause: Some(TimeoutCause::CommandStillRunning),
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &killed).to_string();
+        assert!(
+            msg.contains("transport failed before the far-side command started"),
+            "a deadline kill while running is the transport-before-command layer: {msg}"
+        );
+
+        // (b) The command RAN and EXITED; only its drain outlasted: NOT that
+        // layer, and it must name what actually happened.
+        let drained = ExecOutcome {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "command [\"perl\", …] left processes holding its output pipes open"
+                .to_string(),
+            timeout_cause: Some(TimeoutCause::OutputDrainOutlastedDeadline),
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &drained).to_string();
+        assert!(
+            msg.contains("the command ran and exited"),
+            "the drain case must say the command ran and exited: {msg}"
+        );
+        assert!(
+            !msg.contains("failed before the far-side command started")
+                && !msg.contains("transport-level failure"),
+            "the drain case must not assert the transport-before-command layer: {msg}"
+        );
+        assert!(!msg.contains("is perl installed"), "{msg}");
+
+        // (c) `-1` with NO typed cause is a signal-killed local child, not a
+        // deadline: the layer is undetermined, never transport.
+        let signalled = ExecOutcome {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+            timeout_cause: None,
+        };
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &signalled).to_string();
+        assert!(
+            msg.contains("undetermined"),
+            "a bare -1 is undetermined, not the transport layer: {msg}"
+        );
+        assert!(
+            !msg.contains("transport failed before the far-side command started"),
+            "a bare -1 must not name the transport layer: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F3: the reachable at-255 spoof vector is a ROOT name carrying a raw LF.
+    // -----------------------------------------------------------------------
+
+    /// F3: the documented residual is NOT `not a directory: $root` (measured:
+    /// that spelling exits 2 and lands in the script branch). The reachable
+    /// at-255 vector is the script interpolating `$dir` into its own `die`
+    /// line: a ROOT DIRECTORY whose name embeds an LF and an ssh marker starts
+    /// a marker line once `$dir` is interpolated, and any non-NFC entry makes
+    /// the run exit 255. This test drives the REAL script on exactly that root
+    /// and pins both the status and the classification.
+    #[cfg(unix)]
+    #[test]
+    fn f3_the_real_at_255_spoof_vector_is_a_root_name_containing_a_raw_lf() {
+        if !perl_on_path() {
+            announce_skip("perl is not on PATH, so the real at-255 vector cannot be measured");
+            return;
+        }
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+        let root = dir
+            .path()
+            .join("x\nssh: connect to host evil port 1: Connection refused\ny");
+        fs::create_dir_all(&root).unwrap();
+        // Any non-NFC entry triggers the `entry name under $dir …` die, whose
+        // `$dir` carries the root's LF.
+        fs::create_dir(root.join("e\u{301}")).unwrap();
+        let out = real_script_outcome(&root).unwrap();
+        assert_eq!(out.exit_code, 255, "the vector must reach 255: {out:?}");
+        assert!(
+            out.stderr
+                .lines()
+                .any(|line| line == "ssh: connect to host evil port 1: Connection refused"),
+            "the root's raw LF must put the ssh marker at a LINE START: {out:?}"
+        );
+        let msg = remote_manifest_failure(Path::new("/srv/store"), &out).to_string();
+        assert!(
+            msg.contains("transport-level failure"),
+            "the documented residual: a CALLER-chosen root can start a marker line and \
+             classify as transport: {msg}"
+        );
     }
 }

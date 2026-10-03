@@ -128,7 +128,7 @@ pub use unix::{RealKill, kill_process_group};
 // and the bounded post-exit drain) is re-exported so the SSH runner's Unix
 // seam reuses ONE implementation instead of keeping a divergent copy.
 #[cfg(unix)]
-pub(crate) use unix::{DrainState, drain_available, drain_to_eof, set_nonblocking};
+pub(crate) use unix::{DrainState, OwnedChild, drain_available, drain_to_eof, set_nonblocking};
 #[cfg(windows)]
 pub use windows::RealKill;
 
@@ -318,7 +318,7 @@ impl ChildRunner {
         }
     }
 
-    /// Execute `argv` (no shell) bounded by `timeout`. Returns
+    /// Execute `argv` (no shell) bounding the CHILD by `timeout`. Returns
     /// [`RunOutcome::Exited`] when the child finishes in time (exit code +
     /// captured stdout/stderr) AND (on Unix) left no members of its process
     /// group behind (commands are FOREGROUND-ONLY), [`RunOutcome::TimedOut`]
@@ -327,8 +327,13 @@ impl ChildRunner {
     /// termination kill, or the reap failed — a failed timeout kill never
     /// yields a successful timeout outcome, and a command that exited but
     /// left background processes in its group is a violation, never a
-    /// successful outcome. The platform-specific lifecycle (process groups,
-    /// the foreground-only check, the pipe drain) lives in the [`unix`] /
+    /// successful outcome. `timeout` is ADDITIVE with the termination and
+    /// bounded-drain tail (TERM grace + the post-exit drain), so a timed-out
+    /// call returns up to about `timeout + 2.2 s` later, never at `timeout`
+    /// exactly; a command that exits inside `timeout` still reports its real
+    /// result (a pipe-holding leftover is [`RunError::Background`], never a
+    /// deadline flip). The platform-specific lifecycle (process groups, the
+    /// foreground-only check, the pipe drain) lives in the [`unix`] /
     /// [`windows`] submodules.
     pub fn exec(
         &self,

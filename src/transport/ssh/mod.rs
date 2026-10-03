@@ -25,7 +25,8 @@ use std::time::Duration;
 use super::{
     ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Layout, OpenedEntry,
     OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict, RootedRelativePath,
-    has_normal_component_below_root, provision_receiver_id, verified_to_verdict, verify_existing,
+    TimeoutCause, has_normal_component_below_root, provision_receiver_id, verified_to_verdict,
+    verify_existing,
 };
 use hostkey::{pin_known_hosts, simple_hash};
 use runner::{
@@ -513,8 +514,9 @@ impl SshTransport {
     /// `--`, so OpenSSH cannot interpret any part of our data as options or as
     /// the connection target. Runs through the shared bounded runner: once
     /// connected, a remote command that hangs is killed after
-    /// `SSH_COMMAND_TIMEOUT_SECS` (nothing is unbounded after connection
-    /// establishment).
+    /// `SSH_COMMAND_TIMEOUT_SECS`, and the call returns within that deadline
+    /// PLUS the additive termination/drain tail (~2.2 s; see
+    /// [`SshRunner::run`]) — bounded, but not at the deadline exactly.
     pub(crate) fn run_remote(&self, command: &str) -> Result<std::process::Output> {
         self.run_remote_op(OpKind::Remote, command)
     }
@@ -2003,24 +2005,42 @@ impl Remote for SshTransport {
                 exit_code: out.status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                // A normally-exited command: any `-1` here is a signal-killed
+                // child (`status.code()` is `None`), NOT a deadline. The cause
+                // is left `None` so that case is never blamed on the deadline.
+                timeout_cause: None,
             }),
             Err(RunError::Spawn(m)) => Err(Error::transport(m)),
             Err(RunError::StdinWrite(m)) => Err(Error::transport(m)),
             Err(RunError::Wait(m)) => Err(Error::transport(m)),
-            Err(RunError::Background(m)) => Err(Error::transport(m)),
+            // The command RAN and EXITED; a process that outlived it held its
+            // pipes open past the post-exit drain bound. This is carried as an
+            // OUTCOME (not a bare transport error) so the manifest classifier
+            // can tell it from "the command was killed at the deadline" — the
+            // ambiguity the bounded drain introduced. `exit_code == -1` means
+            // "no exit status could be collected", never "the command did not
+            // run".
+            Err(RunError::Background(m)) => Ok(crate::transport::ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: m,
+                timeout_cause: Some(TimeoutCause::OutputDrainOutlastedDeadline),
+            }),
             Err(RunError::Timeout {
                 after,
                 leftover_pipes,
             }) => Ok(crate::transport::ExecOutcome {
                 // Outcome classification is preserved EXACTLY: the timeout
-                // still reports exit_code == -1; only the message gains the
-                // actionable leftover-pipe fact when the drain gave up.
+                // still reports exit_code == -1; the typed cause records that
+                // the deadline killed a RUNNING command (the leftover-pipe
+                // note is a secondary message, never the carrier of the fact).
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: format!(
                     "timed out after {after:?}{}",
                     leftover_pipe_note(&leftover_pipes)
                 ),
+                timeout_cause: Some(TimeoutCause::CommandStillRunning),
             }),
         }
     }

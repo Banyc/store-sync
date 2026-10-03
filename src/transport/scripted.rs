@@ -109,6 +109,7 @@ impl Exec for ScriptedExec {
             exit_code: out.exit_code,
             stdout: out.stdout.clone(),
             stderr: out.stderr.clone(),
+            timeout_cause: None,
         })
     }
 }

@@ -242,26 +242,58 @@ impl KillSeam for RealKill {
     }
 }
 
-/// The runner's policy knobs: termination timing, the reap bound, the kill
-/// seam, and (tests only) the spawn/reap observers that record the lifecycle
-/// in the parent. Construct via [`RunnerConfig::production`]; tests build
-struct OwnedChild {
-    child: Child,
+/// An owned child with a drop backstop, shared by BOTH real runners so the
+/// "every error path leaves no uncollected child" contract has ONE
+/// implementation. The local runner owns one directly; the SSH runner's Unix
+/// seam owns one inside its shared slot (the same type, the same `Drop`), so a
+/// `drain_available`/`try_wait` error that returns early from the wait closure
+/// cannot abandon a live `Child` (whose own `Drop` neither waits nor kills).
+///
+/// The handle is shared EXCLUSIVELY between a runner's deadline/kill path and
+/// its wait path. A child that exited is consumed by [`OwnedChild::wait`] (or
+/// marked with [`OwnedChild::mark_reaped`] when the reap already happened
+/// through `try_wait`), after which nothing may signal anything (a pid the OS
+/// recycled after the reap can never be hit — the drop backstop returns early).
+pub(crate) struct OwnedChild {
+    /// The owned child. `pub(crate)` so the SSH seam's wait closure can drain
+    /// its pipes and poll it; the handle is never signalled directly — the
+    /// kill path goes through [`KillSeam`] / `killpg` so a group, not a bare
+    /// pid, is signalled.
+    pub(crate) child: Child,
     kill: Arc<dyn KillSeam>,
-    /// Set by the single successful `try_wait`: from then on the exit status
-    /// is consumed and nothing may signal anything (a pid the OS recycled
+    /// Set once the exit status is consumed (or the OS has already reaped the
+    /// child): from then on nothing may signal anything (a pid the OS recycled
     /// after the reap can never be hit — the drop backstop returns early).
     reaped: bool,
 }
 
 impl OwnedChild {
+    /// Wrap a freshly spawned child with the drop backstop under the kill
+    /// `seam`. The child is assumed to be spawned into its OWN process group
+    /// (pgid == pid) by the caller, so the backstop's `kill_group` terminates
+    /// its whole group.
+    pub(crate) fn new(child: Child, kill: Arc<dyn KillSeam>) -> Self {
+        OwnedChild {
+            child,
+            kill,
+            reaped: false,
+        }
+    }
+
     /// Reap the child (a blocking wait on an already-exited zombie returns
     /// immediately with its status) and mark the handle reaped: from here on
     /// nothing may signal anything — the pid is released by this call.
-    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
         let st = self.child.wait()?;
         self.reaped = true;
         Ok(st)
+    }
+
+    /// Mark the handle collected after a `try_wait`/`waitid` peek ALREADY
+    /// reaped the child, so the kill and drop backstops never signal the
+    /// released pid.
+    pub(crate) fn mark_reaped(&mut self) {
+        self.reaped = true;
     }
 }
 
@@ -326,11 +358,7 @@ pub(crate) fn exec(
     let child = cmd
         .spawn()
         .map_err(|e| RunError::Spawn(format!("spawn {argv:?}: {e}")))?;
-    let mut owned = OwnedChild {
-        child,
-        kill: config.kill.clone(),
-        reaped: false,
-    };
+    let mut owned = OwnedChild::new(child, config.kill.clone());
     let pid = owned.child.id();
     let pgid = pid as i32;
     // The parent records the pid synchronously at spawn time — before the
@@ -610,21 +638,36 @@ pub(crate) enum DrainState {
     /// `read` returned 0: every write end closed — no pipe-holding
     /// descendant remains.
     Eof,
-    /// The drain bound expired with the pipe still open (poll timed out or
-    /// the deadline passed between reads): a live writer holds the pipe.
+    /// The drain gave up with the pipe still open: the deadline passed (in
+    /// ANY arm — a continuously-readable writer included), OR the
+    /// [`MAX_DRAIN_BYTES`] cap was reached. Either way a live writer is
+    /// holding the pipe — a contract violation the caller reports, never a
+    /// silent clean outcome.
     BoundExpired,
 }
 
-/// Drain a child pipe to EOF, bounded: reads never block (non-blocking read
-/// ends), and between reads `poll` waits only up to `bound` — a grandchild
-/// that outlives the direct child and keeps a pipe open cannot hang the
-/// outcome. Returns [`DrainState::Eof`] when the pipe reached EOF within the
-/// bound (no live holder remains) and [`DrainState::BoundExpired`] when the
-/// bound expired with the pipe still open (a live holder — a contract
-/// violation the caller reports, never a silent clean outcome). `pub(crate)`:
-/// shared with the SSH runner's Unix seam, so the bound that makes the
-/// deadline truly bound the operation has ONE implementation
-/// ([`super::KILL_REAP_BOUND`] is the production value both pass).
+/// The cap on how many bytes ONE bounded post-exit drain may append. The
+/// child is already reaped, so the post-exit tail is whatever its pipes still
+/// hold — normally at most the pipe capacity plus the last race window. A
+/// writer that keeps producing past this cap is a runaway descendant holding
+/// the pipe open, so the drain gives up and the caller reports the
+/// violation; the buffered growth is bounded WITHOUT silently truncating a
+/// successfully drained result (the caller sees [`DrainState::BoundExpired`],
+/// never a quietly shortened buffer).
+pub(crate) const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Drain a child pipe to EOF, bounded in BOTH time and size: reads never
+/// block (non-blocking read ends), the absolute `bound` deadline is consulted
+/// on EVERY loop iteration (a writer that keeps the pipe continuously
+/// readable can no longer spin in the `Ok(n)` arm), and at most
+/// [`MAX_DRAIN_BYTES`] may be appended. Returns [`DrainState::Eof`] when the
+/// pipe reached EOF within both bounds (no live holder remains) and
+/// [`DrainState::BoundExpired`] when either bound was reached with the pipe
+/// still open (a live holder — a contract violation the caller reports, never
+/// a silent clean outcome). `pub(crate)`: shared with the SSH runner's Unix
+/// seam, so the bound that makes the deadline truly bound the operation has
+/// ONE implementation ([`super::KILL_REAP_BOUND`] is the production value
+/// both pass).
 pub(crate) fn drain_to_eof<R>(
     stream: &mut Option<R>,
     buf: &mut Vec<u8>,
@@ -637,16 +680,33 @@ where
         return Ok(DrainState::Eof);
     };
     let deadline = Instant::now() + bound;
+    // The bytes THIS drain appended, so the cap bounds the drain's growth
+    // and never discards output the running phase already buffered.
+    let start_len = buf.len();
     let mut chunk = [0u8; 8192];
     loop {
+        // Consult the ABSOLUTE deadline on EVERY arm, before the read: the
+        // former shape checked it only in the `WouldBlock` arm, so a writer
+        // that kept the pipe continuously readable kept the loop in `Ok(n)`
+        // and grew `buf` without bound.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(DrainState::BoundExpired);
+        }
         match stream.read(&mut chunk) {
             Ok(0) => return Ok(DrainState::Eof),
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+            Ok(n) => {
+                let appended = buf.len() - start_len;
+                let room = MAX_DRAIN_BYTES.saturating_sub(appended);
+                if room == 0 {
+                    // The cap was reached: a live writer is still producing.
+                    // Give up (the caller reports the violation) rather than
+                    // grow memory or silently truncate.
                     return Ok(DrainState::BoundExpired);
                 }
+                buf.extend_from_slice(&chunk[..n.min(room)]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
                 let mut pfd = libc::pollfd {
                     fd: stream.as_raw_fd(),
@@ -691,6 +751,113 @@ mod tests {
         assert!(
             !macos_status_is_not_live(99),
             "an unknown status defaults to LIVE, so a leftover cannot escape"
+        );
+    }
+}
+
+/// F5: the bounded drain must consult its deadline on EVERY arm and bound the
+/// buffered growth.
+#[cfg(all(test, unix))]
+mod drain_tests {
+    use super::{DrainState, MAX_DRAIN_BYTES, drain_to_eof};
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::time::{Duration, Instant};
+
+    /// A `Read` that is ALWAYS readable: every `read` returns data, so the
+    /// drain loop can never reach its `WouldBlock` arm. Before the fix the
+    /// deadline was consulted ONLY in that arm, so this stream drove the loop
+    /// in `Ok(n)` forever and grew the buffer without bound (the test would
+    /// hang). A descriptor is still required by `AsRawFd`; `/dev/null`'s is
+    /// never read (the override never delegates).
+    struct EndlessRead {
+        fd: RawFd,
+    }
+
+    impl Read for EndlessRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len();
+            buf[..n].fill(0x5A);
+            Ok(n)
+        }
+    }
+
+    impl AsRawFd for EndlessRead {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    /// The pre-fix shape: a writer that keeps the pipe continuously readable
+    /// spun in the `Ok(n)` arm, so the absolute deadline was never consulted
+    /// and `buf` grew without bound. With the deadline checked in EVERY arm
+    /// and the [`MAX_DRAIN_BYTES`] cap, the drain returns promptly with
+    /// [`DrainState::BoundExpired`] and a bounded buffer instead of hanging.
+    /// (Verified before the fix: this test hangs — the drain never returns.)
+    #[test]
+    fn drain_to_eof_bounds_a_continuously_readable_writer() {
+        let dev_null = std::fs::File::open("/dev/null").unwrap();
+        let mut stream = Some(EndlessRead {
+            fd: dev_null.as_raw_fd(),
+        });
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        let state = drain_to_eof(&mut stream, &mut buf, Duration::from_secs(30)).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            state,
+            DrainState::BoundExpired,
+            "a continuously-readable writer must hit the size bound"
+        );
+        assert_eq!(
+            buf.len(),
+            MAX_DRAIN_BYTES,
+            "the buffered growth must stop at the cap, not grow without bound"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the size bound must return promptly, not wait out the 30s deadline: {elapsed:?}"
+        );
+    }
+
+    /// The deadline is consulted even when the pipe is continuously readable:
+    /// a stream that yields a LITTLE data per read (so the size cap is not the
+    /// thing that stops it) must still return [`DrainState::BoundExpired`] near
+    /// the deadline. Before the fix this also hung, because `Ok(n)` never
+    /// re-checked the clock.
+    #[test]
+    fn drain_to_eof_consults_the_deadline_in_the_data_arm() {
+        struct TrickleRead {
+            fd: RawFd,
+        }
+        impl Read for TrickleRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(1);
+                buf[..n].fill(0x5A);
+                Ok(n)
+            }
+        }
+        impl AsRawFd for TrickleRead {
+            fn as_raw_fd(&self) -> RawFd {
+                self.fd
+            }
+        }
+        let dev_null = std::fs::File::open("/dev/null").unwrap();
+        let mut stream = Some(TrickleRead {
+            fd: dev_null.as_raw_fd(),
+        });
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        let state = drain_to_eof(&mut stream, &mut buf, Duration::from_millis(50)).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(state, DrainState::BoundExpired);
+        assert!(
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(5),
+            "the deadline must stop a continuously-readable trickle near the bound: {elapsed:?}"
+        );
+        assert!(
+            buf.len() < MAX_DRAIN_BYTES,
+            "the size cap was not the stopper"
         );
     }
 }

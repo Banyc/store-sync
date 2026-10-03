@@ -12,6 +12,7 @@
 use super::*;
 use std::io::Read;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -41,6 +42,10 @@ pub(crate) fn spawn(
     // terminates the OWNED child. A kill on a slot the wait thread already
     // reaped (None) is a no-op by construction.
     let child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+    // The typed "the child has already been reaped" fact the runner's deadline
+    // path reads to tell a deadline kill from a drain that merely outlasted a
+    // completed command (see `SpawnedChild::reaped`).
+    let reaped = Arc::new(AtomicBool::new(false));
     let kill_child = child.clone();
     let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
         let mut guard = kill_child.lock().unwrap();
@@ -55,6 +60,7 @@ pub(crate) fn spawn(
         child.kill()
     });
     let wait_child = child.clone();
+    let wait_reaped = reaped.clone();
     let wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send> =
         Box::new(move || {
             use std::io::Write;
@@ -100,7 +106,9 @@ pub(crate) fn spawn(
                 }
                 if let Some((_c, status)) = exited {
                     // The child is reaped; its handles are closed, so the
-                    // reader threads EOF and send their buffers.
+                    // reader threads EOF and send their buffers. Arm the typed
+                    // deadline fact before the buffers are collected.
+                    wait_reaped.store(true, Ordering::SeqCst);
                     let stdout = stdout_rx
                         .recv()
                         .map_err(|_| RunError::Wait("stdout reader failed".into()))?;
@@ -122,7 +130,12 @@ pub(crate) fn spawn(
                 Ok(()) => wait_res,
             }
         });
-    Ok(SpawnedChild { pid, kill, wait })
+    Ok(SpawnedChild {
+        pid,
+        reaped,
+        kill,
+        wait,
+    })
 }
 
 /// Spawn a thread that reads `stream` to EOF into a buffer and sends it on
