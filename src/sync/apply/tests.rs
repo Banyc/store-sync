@@ -1,7 +1,13 @@
+// Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
+// Windows; do not let them fail a `-D warnings` Windows gate.
+#![cfg_attr(not(unix), allow(dead_code))]
 use super::Extraneous::{Delete, Keep};
 use super::*;
 use crate::env::SysEnv;
 use crate::manifest::canonicalize_tree;
+// `Residue` is used only by the stranded-aside reproductions below, which
+// need `symlink`/mode semantics: Unix-only.
+#[cfg(unix)]
 use crate::sync::Residue;
 use crate::test_support::fixture_tmpdir;
 use crate::transport::{

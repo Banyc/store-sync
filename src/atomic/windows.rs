@@ -844,10 +844,12 @@ pub enum CompareReplace {
 /// now gone is a change it must re-read and re-decide. A read that fails for
 /// any OTHER reason still propagates.
 ///
-/// This port is TYPE-CHECKED ONLY in this repository — it is compiled by
-/// `cargo check --target x86_64-pc-windows-msvc --lib` and never executed
-/// here — so the absent-vs-error split above is a compile-time claim, not an
-/// observed one.
+/// This port is TYPE-CHECKED ONLY in this repository — the whole target,
+/// library AND tests, is compiled by `cargo check --all-targets --target
+/// x86_64-pc-windows-msvc` and never executed here — so the absent-vs-error
+/// split above is a compile-time claim, not an observed one. (The Windows
+/// unit tests in this file are compiled by that gate; the Unix-only
+/// reproductions elsewhere are `#[cfg(unix)]` and are not.)
 pub fn write_atomic_if_match_fd(
     root: &RootDir,
     rel: &RootedRelativePath,
@@ -1397,7 +1399,14 @@ mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, path_kind_fd, write_atomic_replace,
     };
+    use crate::relpath::RootedRelativePath;
     use std::path::{Path, PathBuf};
+
+    /// Validate an ordinary test path through the SAME boundary every caller
+    /// must use: the `_fd` primitives accept only a `RootedRelativePath`.
+    fn rp(s: &str) -> RootedRelativePath {
+        RootedRelativePath::parse(Path::new(s)).expect("an ordinary test path parses")
+    }
 
     /// The entry names directly under `dir`, sorted.
     fn entry_names(dir: &Path) -> Vec<String> {
@@ -1427,14 +1436,14 @@ mod tests {
         std::fs::write(dir.path().join("file"), b"x").unwrap();
         std::fs::create_dir(dir.path().join("dir")).unwrap();
         assert_eq!(
-            path_kind_fd(&root, Path::new("file")).unwrap(),
+            path_kind_fd(&root, &rp("file")).unwrap(),
             Some(PathKind::File)
         );
         assert_eq!(
-            path_kind_fd(&root, Path::new("dir")).unwrap(),
+            path_kind_fd(&root, &rp("dir")).unwrap(),
             Some(PathKind::Dir)
         );
-        assert_eq!(path_kind_fd(&root, Path::new("missing")).unwrap(), None);
+        assert_eq!(path_kind_fd(&root, &rp("missing")).unwrap(), None);
     }
 
     /// A symlink is `Symlink` — never its target's kind — when Windows lets
@@ -1451,18 +1460,21 @@ mod tests {
             return;
         }
         assert_eq!(
-            path_kind_fd(&root, Path::new("dirlink")).unwrap(),
+            path_kind_fd(&root, &rp("dirlink")).unwrap(),
             Some(PathKind::Symlink),
             "a symlink TO A DIRECTORY must still be Symlink, never Dir"
         );
     }
 
     /// An absolute path, a `..` walk, a `.`, and the empty path are refused
-    /// by the ROOT-RELATIVE guard, exactly as the other `_fd` primitives
-    /// refuse them.
+    /// by the VALIDATED BOUNDARY ([`RootedRelativePath::parse`]) — the ONE
+    /// place a root-relative spelling is checked now that the primitives take
+    /// the type. The `_fd` primitive can no longer be handed such a spelling
+    /// at all, so the refusal is asserted where it happens (the Windows
+    /// spellings `C:\outside` and `..\secret` ARE separators here).
     #[test]
     fn path_kind_fd_refuses_escaping_spellings() {
-        let (dir, root) = owned_root();
+        let (dir, _root) = owned_root();
         let absolute = dir.path().join("outside").as_os_str().to_os_string();
         for spelling in [
             PathBuf::from("C:\\outside"),
@@ -1473,11 +1485,11 @@ mod tests {
             PathBuf::new(),
             PathBuf::from(&absolute),
         ] {
-            let err = path_kind_fd(&root, &spelling)
+            let err = RootedRelativePath::parse(&spelling)
                 .expect_err("an escaping or empty spelling must be refused");
             assert!(
-                matches!(err, Error::Store { .. }) && err.to_string().contains("normal component"),
-                "{spelling:?} must be refused by the root-relative guard, got: {err}"
+                matches!(err, Error::Transport { .. }),
+                "{spelling:?} must be refused by the validated boundary, got: {err}"
             );
         }
     }

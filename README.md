@@ -237,6 +237,14 @@ Linux and macOS are supported and exercised. The far side of a remote transfer
 may be GNU or BSD userland; both are exercised. The Windows implementation
 type-checks but is not exercised, and is described as unverified.
 
+The Windows check compiles the WHOLE target, tests included:
+`cargo check --all-targets --target x86_64-pc-windows-msvc`. A signature change
+to a Windows code path — production or test — therefore fails this gate instead
+of staying invisible until someone builds on Windows. The tests cannot EXECUTE
+on this host, so the reproductions that need a Unix filesystem primitive
+(`O_NOFOLLOW`, `flock`, `pipe`/`poll`, `symlink`, mode bits, `mkfifo`, raw fds)
+are `#[cfg(unix)]`; the rest of the suite is compiled for Windows.
+
 ## Assumptions the logic rests on
 
 Restrictions the crate does not enforce, because it cannot. Each buys a

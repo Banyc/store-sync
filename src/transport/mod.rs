@@ -1235,6 +1235,7 @@ pub(crate) struct CreateNewFault {
     armed: std::sync::atomic::AtomicBool,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl CreateNewFault {
     /// Arm a one-shot fault for `step`. Test-only (production never arms a
     /// fault); the type itself stays plain `pub(crate)` because the
@@ -1714,6 +1715,7 @@ pub(crate) enum VerifySwapBoundary {
 /// `O_NOFOLLOW` open must reject it), a DIRECTORY, or a DIFFERENT-INODE
 /// regular file (the pre-staged `swap_target`, moved onto the destination).
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VerifySwapKind {
     Symlink,
@@ -1740,6 +1742,7 @@ pub(crate) struct VerifySwap {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 impl VerifySwap {
     pub(crate) fn new(
         boundary: VerifySwapBoundary,
@@ -1777,6 +1780,9 @@ impl VerifySwap {
         let _ = std::fs::rename(p, &backup);
         match self.kind {
             VerifySwapKind::Symlink => {
+                // unix-only: symlink(2) has no portable Windows equivalent here,
+                // and only the Unix-gated boundary proptest arms this kind.
+                #[cfg(unix)]
                 let _ = std::os::unix::fs::symlink(&self.swap_target, p);
             }
             VerifySwapKind::Directory => {
@@ -3075,7 +3081,13 @@ impl LocalTransport {
 
 #[cfg(test)]
 mod tests {
+    // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
+    // Windows; do not let them fail a `-D warnings` Windows gate.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
+    // Modes and (device, inode)/nlink are Unix filesystem properties: the
+    // tests that read them are `#[cfg(unix)]`, so the import is too.
+    #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
@@ -3134,6 +3146,8 @@ mod tests {
     /// PLATFORM: a non-UTF-8 name cannot be created on APFS, so this SKIPS on
     /// macOS (announcing `STOREKIT_SKIP`); the reproduction requires a
     /// Linux/BSD filesystem.
+    // unix-only: builds a non-UTF-8 name with OsStringExt::from_vec.
+    #[cfg(unix)]
     #[test]
     fn local_list_refuses_a_non_utf8_entry_name() {
         use std::os::unix::ffi::OsStringExt;
@@ -3196,6 +3210,8 @@ mod tests {
     /// side must match these exact bytes (see `parse_readlink_output_strips_`
     /// `exactly_one_newline` in the ssh suite); the pre-fix `.trim()` there
     /// returned `"x"` for this local `"x "`.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn local_read_link_returns_the_target_bytes_verbatim() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -3813,6 +3829,8 @@ mod tests {
     /// verdict). The TYPED verdict survives the trait boundary — no bool
     /// collapse. The installed record carries the canonical final mode, not
     /// the process umask.
+    // unix-only: asserts Unix mode bits (MetadataExt).
+    #[cfg(unix)]
     #[test]
     fn try_write_new_durable_install_and_conflict_contract() {
         use std::os::unix::fs::MetadataExt;
@@ -4314,6 +4332,8 @@ mod tests {
             ..ProptestConfig::default()
         })]
 
+        // unix-only: asserts Unix mode bits (PermissionsExt::from_mode).
+        #[cfg(unix)]
         #[test]
         fn durable_create_new_crash_failure_model(
             content in prop::collection::vec(any::<u8>(), 0..128),
@@ -4702,6 +4722,8 @@ mod tests {
             ..ProptestConfig::default()
         })]
 
+        // unix-only: asserts Unix mode bits (PermissionsExt::from_mode).
+        #[cfg(unix)]
         #[test]
         fn try_write_new_verdict_matrix(
             content in prop::collection::vec(any::<u8>(), 0..128),
@@ -4939,6 +4961,8 @@ mod tests {
             ..ProptestConfig::default()
         })]
 
+        // unix-only: asserts Unix mode bits and uses O_NOFOLLOW/open semantics.
+        #[cfg(unix)]
         #[test]
         fn verify_existing_swap_at_every_boundary(
             (boundary, kind) in swap_case(),

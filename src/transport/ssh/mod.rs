@@ -2844,12 +2844,18 @@ impl Remote for SshTransport {
 
 #[cfg(test)]
 mod tests_ssh {
+    // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
+    // Windows; do not let them fail a `-D warnings` Windows gate.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
     use crate::transport::ssh::runner::SSH_COMMAND_TIMEOUT_SECS;
     #[cfg(test)]
     use proptest::prelude::*;
     #[cfg(test)]
     use proptest::test_runner::RngSeed;
+    // Modes and nlink are Unix filesystem properties: the tests that read
+    // them are `#[cfg(unix)]`, so the import is too.
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
@@ -3275,6 +3281,8 @@ mod tests_ssh {
     /// BSD alike. It also pins that hidden entries are covered and `.`/`..` are
     /// never emitted, which the previous shape-only test asserted by string
     /// matching.
+    // unix-only: sets a mode with PermissionsExt::from_mode.
+    #[cfg(unix)]
     #[test]
     fn list_script_reports_the_real_mode_on_bsd_userland() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -3387,6 +3395,8 @@ mod tests_ssh {
     /// exiting 0 for a NON-EMPTY directory — `Ok(vec![])` where the local view
     /// returned `Permission denied`. The listing must now FAIL. A `chmod 111`
     /// directory has no read bit, so `opendir` itself must fail loudly.
+    // unix-only: sets mode 0o000 with PermissionsExt::from_mode.
+    #[cfg(unix)]
     #[test]
     fn list_script_unreadable_directory_is_an_error_not_an_empty_listing() {
         for (mode, needle) in [(0o400u32, "lstat"), (0o111u32, "opendir")] {
@@ -3426,6 +3436,8 @@ mod tests_ssh {
     /// (proved on GNU and BSD with `timeout 3` → rc 124); `sysopen` with
     /// `O_NONBLOCK` returns immediately and the non-regular entry is refused.
     /// Both primitives share the pattern, so both are pinned.
+    // unix-only: needs a FIFO (the mkfifo(1) utility).
+    #[cfg(unix)]
     #[test]
     fn fsync_primitives_refuse_a_fifo_without_blocking() {
         for (prim, name) in [(PERL_FSYNC_DIR, "dir"), (PERL_FSYNC_FILE, "file")] {
@@ -3487,6 +3499,8 @@ mod tests_ssh {
     /// DEFECT 5, at the TREE level: `find -type d -o -type f` (like the local
     /// walk's `symlink_metadata`) never selects a FIFO, so the tree walk
     /// terminates AND succeeds — no entry ever opens it.
+    // unix-only: needs a FIFO (the mkfifo(1) utility).
+    #[cfg(unix)]
     #[test]
     fn fsync_tree_cmd_skips_a_fifo_and_terminates() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -3515,6 +3529,8 @@ mod tests_ssh {
     /// removal destroyed the caller's only copy. This runs the LITERAL script
     /// under `/bin/sh`; pre-fix the dangling entry is absent, so the assertion
     /// FAILS.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn list_script_lists_a_dangling_symlink() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -3700,6 +3716,8 @@ mod tests_ssh {
     /// same bytes for the same link. Pre-fix `.trim()` returned `"x"` for a
     /// local `"x "`, so an SSH destination/source failed post-transfer
     /// verification on a legitimate link.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn local_and_ssh_readlink_agree_on_whitespace_targets() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -3724,6 +3742,8 @@ mod tests_ssh {
     /// manifest walk (which uses `lstat` and therefore includes it). This is
     /// the cross-view pin for the defect: pre-fix `list` omitted the entry
     /// while the manifest kept it, so the assertion on `list` FAILS.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn list_and_manifest_agree_on_a_dangling_symlink() {
         if !perl_available() {
@@ -3791,6 +3811,8 @@ mod tests_ssh {
     /// the recursive `rm -rf`, and destroyed the caller's only copy with
     /// `residue` empty. This asserts the precondition the gate consumes and
     /// FAILS pre-fix (the reserved child is absent from the listing).
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn list_reports_a_reserved_dangling_symlink_for_the_residue_gate() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4314,6 +4336,8 @@ mod tests_ssh {
     /// `mv` rejects it and the command exits 64, so this test FAILED with
     /// `mv: illegal option -- T` + usage. On Linux/GNU it passed, which is
     /// exactly the silent platform divergence this pins.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn rename_replaces_a_symlink_to_a_directory() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4711,6 +4735,8 @@ mod tests_ssh {
     /// The tests assert only the state transitions, never elapsed
     /// milliseconds, so this needn't match the 2 s production constant; the
     /// outer harness cap below is meaningfully longer.
+    // unix-only: only the flock/pipe/poll sidecar reproductions use them.
+    #[cfg(unix)]
     const SIDECAR_FLOCK_TEST_DEADLINE: Duration = Duration::from_millis(500);
 
     /// The outer cap on every parent-side bounded wait (contention signal,
@@ -4718,11 +4744,15 @@ mod tests_ssh {
     /// so the outcome is decided by the sidecar's OWN deadline — a harness
     /// timeout would be a test failure, never the thing under test. 5 s also
     /// leaves room for a wedged child to be killed and reaped.
+    // unix-only: only the flock/pipe/poll sidecar reproductions use them.
+    #[cfg(unix)]
     const SIDECAR_FLOCK_TEST_OUTER_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// The typed sidecar exit contract, classified from the child's
     /// stdout/stderr per the real sidecar protocol (`OK` / `sidecar contended`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    // unix-only: part of the flock/pipe/poll sidecar contract.
+    #[cfg(unix)]
     enum SidecarErrorCode {
         /// Exit 0 with `OK` on stdout: the sidecar acquired the flock.
         Success,
@@ -4737,6 +4767,8 @@ mod tests_ssh {
     // The variant payloads exist for `{:?}` diagnostics in assertion
     // messages; equality is by variant, so the fields are never destructured.
     #[allow(dead_code)]
+    // unix-only: part of the flock/pipe/poll sidecar contract.
+    #[cfg(unix)]
     enum TestError {
         /// The outer cap elapsed before the child reported its contention
         /// signal.
@@ -4765,29 +4797,39 @@ mod tests_ssh {
     /// `std::io::Error` no longer carries a `PartialEq` impl on this
     /// toolchain. `std::mem::discriminant` keeps the comparison meaningful
     /// exactly where it is used.
+    // unix-only: part of the flock/pipe/poll sidecar contract.
+    #[cfg(unix)]
     impl PartialEq for TestError {
         fn eq(&self, other: &Self) -> bool {
             std::mem::discriminant(self) == std::mem::discriminant(other)
         }
     }
 
+    // unix-only: part of the flock/pipe/poll sidecar contract.
+    #[cfg(unix)]
     impl From<std::io::Error> for TestError {
         fn from(err: std::io::Error) -> Self {
             TestError::Io(err)
         }
     }
 
+    // unix-only: part of the flock/pipe/poll sidecar contract.
+    #[cfg(unix)]
     type TestOutcome = std::result::Result<SidecarErrorCode, TestError>;
 
     /// A Rust-side exclusive flock holder: opens the lock path read-write
     /// (creating it like the real sidecar's mutex file) and takes `LOCK_EX`;
     /// the `Drop` releases the lock deterministically — including on a test
     /// panic — instead of a `sleep`-timed release.
+    // unix-only: flock(2) + AsRawFd.
+    #[cfg(unix)]
     struct HolderGuard {
         file: std::fs::File,
     }
 
     /// Acquire the flock on `path` exclusively, creating the file if needed.
+    // unix-only: flock(2) + AsRawFd.
+    #[cfg(unix)]
     fn acquire_exclusive_lock(path: &Path) -> HolderGuard {
         use std::os::unix::io::AsRawFd;
         let file = std::fs::OpenOptions::new()
@@ -4807,6 +4849,8 @@ mod tests_ssh {
         HolderGuard { file }
     }
 
+    // unix-only: flock(2) + AsRawFd.
+    #[cfg(unix)]
     impl Drop for HolderGuard {
         fn drop(&mut self) {
             use std::os::unix::io::AsRawFd;
@@ -4818,6 +4862,8 @@ mod tests_ssh {
     /// An instrumented sidecar child plus the read end of the contention
     /// pipe its perl holds (via `DEPLOY_TEST_CONTENDED_FD`, a raw `pipe(2)`
     /// write end inherited without `FD_CLOEXEC`).
+    // unix-only: pipe(2) + from_raw_fd + poll(2).
+    #[cfg(unix)]
     struct InstrumentedSidecar {
         child: std::process::Child,
         contention_rx: std::fs::File,
@@ -4827,6 +4873,8 @@ mod tests_ssh {
     /// prelude (test deadline, production interval) preceded by the caller
     /// side's `$fh` open and followed by the `OK` success line — the shape
     /// of every real sidecar command.
+    // unix-only: called only by the flock/pipe/poll sidecar helpers.
+    #[cfg(unix)]
     fn sidecar_flock_script(deadline: Duration) -> String {
         let prelude = sidecar_flock_prelude(deadline.as_secs_f64(), SIDECAR_FLOCK_INTERVAL_SECS);
         format!(
@@ -4841,6 +4889,8 @@ mod tests_ssh {
     /// spawn, so the read end sees EOF the moment the child exits; the child
     /// writes `CONTENDED` to that fd exactly once (the prelude deletes the
     /// env key after the first signal).
+    // unix-only: pipe(2) + from_raw_fd.
+    #[cfg(unix)]
     fn spawn_instrumented_sidecar(path: &Path, deadline: Duration) -> InstrumentedSidecar {
         use std::os::unix::io::FromRawFd;
         let mut fds = [0i32; 2];
@@ -4880,6 +4930,8 @@ mod tests_ssh {
         }
     }
 
+    // unix-only: poll(2) + AsRawFd.
+    #[cfg(unix)]
     impl InstrumentedSidecar {
         /// Block until the child reports its first CONFIRMED contention (the
         /// prelude's env-gated signal, fired exactly once after the first
@@ -4931,6 +4983,8 @@ mod tests_ssh {
     /// does not wake at all); a still-open write end with no data never
     /// wakes the parent. `wait()` then reaps immediately and the (now-EOF)
     /// streams are drained. No timer-based polling, no unbounded `wait()`.
+    // unix-only: poll(2) + AsRawFd.
+    #[cfg(unix)]
     fn bounded_wait_for_child(child: &mut std::process::Child, outer: Duration) -> TestOutcome {
         use std::os::unix::io::AsRawFd;
         let stdout_fd = child
@@ -4962,6 +5016,8 @@ mod tests_ssh {
     /// Drain the child's (now-EOF) stdout/stderr: the child has exited, so
     /// both pipes are already closed by the kernel — no locking dance needed,
     /// and the per-sidecar output is a few bytes, far below pipe capacity.
+    // unix-only: called only by the flock/pipe/poll sidecar helpers.
+    #[cfg(unix)]
     fn drain_output(child: &mut std::process::Child) -> (String, String) {
         use std::io::Read;
         let mut stdout = String::new();
@@ -4976,6 +5032,8 @@ mod tests_ssh {
     }
 
     /// Classify the child's exit against the sidecar protocol.
+    // unix-only: called only by the flock/pipe/poll sidecar helpers.
+    #[cfg(unix)]
     fn classify_sidecar_exit(
         status: std::process::ExitStatus,
         stdout: String,
@@ -4994,6 +5052,8 @@ mod tests_ssh {
     /// `DEPLOY_TEST_CONTENDED_FD` env is explicitly removed, so the signal
     /// block is inert — against a fresh lock path, which is immediately
     /// acquirable.
+    // unix-only: uses bounded_wait_for_child (poll(2)).
+    #[cfg(unix)]
     fn run_sidecar_with_deadline(
         path: &Path,
         deadline: Duration,
@@ -5017,6 +5077,8 @@ mod tests_ssh {
 
     /// Test 1 (uncontended): a fresh lock path with NO holder — the sidecar
     /// acquires immediately and reports OK.
+    // unix-only: flock/pipe/poll sidecar reproduction.
+    #[cfg(unix)]
     #[test]
     fn sidecar_flock_uncontended_acquisition_succeeds() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -5034,6 +5096,8 @@ mod tests_ssh {
     /// is released only during cleanup, AFTER the assertion — so the
     /// assertion runs against a still-held lock; the guard also drops on a
     /// panic.
+    // unix-only: flock/pipe/poll sidecar reproduction.
+    #[cfg(unix)]
     #[test]
     fn sidecar_flock_contention_times_out_while_retained() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -5054,6 +5118,8 @@ mod tests_ssh {
 
     /// Test 3 (confirmed contention, holder RELEASED): the sidecar must
     /// acquire the freed lock and report OK.
+    // unix-only: flock/pipe/poll sidecar reproduction.
+    #[cfg(unix)]
     #[test]
     fn sidecar_flock_contention_succeeds_after_release() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -5139,6 +5205,8 @@ mod tests_ssh {
     }
 
     /// Create a FIFO with the POSIX `mkfifo` utility (portable on GNU and BSD).
+    // unix-only: runs the mkfifo(1) utility.
+    #[cfg(unix)]
     fn mkfifo(path: &Path) {
         let status = std::process::Command::new("mkfifo")
             .arg(path)
@@ -5286,6 +5354,8 @@ mod tests_ssh {
     // 2) in the same name space. A fresh invocation must allocate a DIFFERENT
     // temp name, never touch the stale temp or the installed destination, and
     // remove only its own temp.
+    // unix-only: reads nlink (hard links) via MetadataExt.
+    #[cfg(unix)]
     #[test]
     fn try_write_new_recovers_from_stale_hardlinked_temp() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -5418,6 +5488,8 @@ mod tests_ssh {
     /// The final chmod step is EXECUTED before the install: under a
     /// restrictive umask the published record still carries the intended
     /// mode, never the umask-derived one.
+    // unix-only: reads mode bits via MetadataExt.
+    #[cfg(unix)]
     #[test]
     fn try_write_new_installs_final_mode_not_umask() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();

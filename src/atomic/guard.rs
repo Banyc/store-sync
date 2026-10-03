@@ -438,7 +438,11 @@ impl<'a> GuardedRel<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardedRel, OwnedLockRecord};
+    use super::GuardedRel;
+    // `OwnedLockRecord` is exercised only by the identity/fold tests below,
+    // which need a real (device, inode) pair: a Unix filesystem property.
+    #[cfg(unix)]
+    use super::OwnedLockRecord;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 

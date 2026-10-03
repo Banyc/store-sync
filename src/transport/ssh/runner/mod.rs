@@ -270,6 +270,7 @@ impl SshRunner {
     /// property test can drive the deadline/kill/reap logic against a fake
     /// without any real subprocess or wall-clock waits.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn with_seam(
         seam: Arc<dyn SshRunnerSeam>,
         connect_deadline: Duration,
@@ -288,6 +289,7 @@ impl SshRunner {
     /// deadline clock starts) — the parent-side replacement for a
     /// child-written pidfile, which races the deadline kill.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn with_spawn_observer(mut self, observer: Arc<dyn Fn(u32) + Send + Sync>) -> Self {
         self.spawn_observer = Some(observer);
         self
@@ -458,7 +460,12 @@ impl SshRunner {
 /// runner's deadline logic is exercised end to end while the fake simulates
 /// the stall points at the spawn boundary and RECORDS the full
 /// spawn/kill/reap call log.
+// unix-only: the fake runner fabricates `std::process::ExitStatus` from a raw
+// Unix wait status (`ExitStatusExt::from_raw`, `code << 8`), which has no
+// equivalent encoding on Windows. `#[cfg(test)]` leads so the
+// production-source audit in `atomic::guard` strips this test module.
 #[cfg(test)]
+#[cfg(unix)]
 mod runner_property_tests {
     use super::*;
     use crate::error::Error;

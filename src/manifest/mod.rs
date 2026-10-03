@@ -1861,15 +1861,24 @@ pub fn entry_paths(meta: &TreeMetadata) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
+    // Windows; do not let them fail a `-D warnings` Windows gate.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
-    use crate::test_support::{fixture_env, fixture_tmpdir, proptest_cases};
+    use crate::test_support::{fixture_env, fixture_tmpdir};
+    // Used only by the `#[cfg(unix)]` mutation proptest below.
+    #[cfg(unix)]
+    use crate::test_support::proptest_cases;
     use proptest::prelude::*;
+    #[cfg(unix)]
     use proptest::test_runner::RngSeed;
 
     /// Build a RICH tree (a file, a nested file, and a symlink) so every
     /// entry-field mutation class has a target entry to mutate. The symlink
     /// target is resolved relative to the tree ROOT (the canonicalizer's
     /// in-root rule), so `sub/link -> file.txt` stays inside the root.
+    // unix-only: the fixture's symlink is created with symlink(2).
+    #[cfg(unix)]
     fn build_tree(root: &Path) {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("file.txt"), b"content").unwrap();
@@ -1972,6 +1981,8 @@ mod tests {
     /// [`canonicalize_remote_entries`] assembles the digest from it. This
     /// pins the equivalence on a RICH tree (a file, a nested file, and a
     /// symlink) — a divergence would falsely quarantine valid remote trees.
+    // unix-only: build_tree builds a symlink fixture (symlink(2)).
+    #[cfg(unix)]
     #[test]
     fn remote_verify_script_digest_matches_local_canonicalization() {
         skip_without_perl!("remote_verify_script_digest_matches_local_canonicalization");
@@ -2340,6 +2351,8 @@ mod tests {
     /// A subdirectory the walk cannot OPEN must exit non-zero rather than
     /// silently print a listing of the entries it happened to reach: a
     /// permission failure is not an empty (or short) tree.
+    // unix-only: needs mode 0o000 (PermissionsExt) to make a dir unreadable.
+    #[cfg(unix)]
     #[test]
     fn remote_script_rejects_an_unreadable_subdirectory() {
         use std::os::unix::fs::PermissionsExt;
@@ -2409,6 +2422,8 @@ mod tests {
     /// assembler rejects it too, and the script never `open`s the FIFO
     /// (which would block until the exec timeout). This pins the
     /// convergence of the two paths on special files.
+    // unix-only: needs a FIFO (mkfifo(2)); Windows has no mkfifo.
+    #[cfg(unix)]
     #[test]
     fn special_files_rejected_by_both_canonicalizers() {
         skip_without_perl!("special_files_rejected_by_both_canonicalizers");
@@ -2669,6 +2684,8 @@ mod tests {
     /// DESTINATION-tolerant form records each in `unsupported` while keeping
     /// it in the manifest under its live kind — the capability a
     /// caller-sanctioned deletion needs.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn destination_tolerant_canonicalizer_records_unrepresentable_local_entries() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -2739,6 +2756,8 @@ mod tests {
 
     /// F2 (destination tolerance, REMOTE): the same tolerance through the
     /// far-side wire assembler — and the refusals it must NOT tolerate.
+    // unix-only: builds symlink + FIFO fixtures (symlink(2), mkfifo(2)).
+    #[cfg(unix)]
     #[test]
     fn destination_tolerant_remote_assembler_records_unrepresentable_entries() {
         skip_without_perl!("destination_tolerant_remote_assembler_records_unrepresentable_entries");
@@ -2787,6 +2806,8 @@ mod tests {
     /// the directory CONTAINING the link (its own parent, per POSIX) and then
     /// tests containment in the root. An escaping link would let a
     /// manifest describe bytes outside the tree.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn escaping_symlink_rejected_by_both_canonicalizers() {
         skip_without_perl!("escaping_symlink_rejected_by_both_canonicalizers");
@@ -2821,6 +2842,8 @@ mod tests {
     /// and back down (`dir/sub/up -> ../../file`). The targets are stored
     /// VERBATIM as link data. This test FAILS against the pre-fix code, whose
     /// root-based base refused `dir/up -> ../other` as an "escaping symlink".
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn relative_symlink_targets_resolve_against_the_links_directory() {
         skip_without_perl!("relative_symlink_targets_resolve_against_the_links_directory");
@@ -2875,6 +2898,8 @@ mod tests {
     /// own directory, an ABSOLUTE target and a target that genuinely leaves the
     /// root stay refused by BOTH canonicalizers. `dir/escape -> ../../outside`
     /// resolves to `<root>/../outside`, which is outside `<root>`.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn absolute_and_escaping_symlink_targets_stay_refused() {
         skip_without_perl!("absolute_and_escaping_symlink_targets_stay_refused");
@@ -2918,6 +2943,8 @@ mod tests {
     /// kernel resolves against, while the containment walk itself is
     /// root-relative and does not depend on the root's spelling (which is what
     /// lets the wire assembler reach the same verdict).
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn in_root_target_accepted_when_the_root_is_a_symlink() {
         skip_without_perl!("in_root_target_accepted_when_the_root_is_a_symlink");
@@ -2963,6 +2990,8 @@ mod tests {
     /// a symlink, and BOTH canonicalizers refuse it. Before the fix the local
     /// walk and the wire assembler both ACCEPTED this tree, and
     /// `read(dst/dir/link/secret)` returned the outside file.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn symlink_target_through_a_symlink_component_is_refused_by_both_canonicalizers() {
         skip_without_perl!(
@@ -3010,6 +3039,8 @@ mod tests {
     /// lexical test accepted the tree with a WRONG answer; the physical rule
     /// refuses it (the `dir/sub` component is a symlink) rather than record a
     /// containment answer that does not match the kernel.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn symlink_target_through_a_symlink_component_is_refused_even_when_it_stays_lexically_in_root()
     {
@@ -3048,6 +3079,8 @@ mod tests {
     /// `<root>/other-link`. The rule is fail-closed even when the followed link
     /// happens to stay inside (as here, `other-link -> other`): the walk cannot
     /// know where the follow ends without following it, and the kernel WILL.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn symlink_target_ending_at_a_symlink_is_refused_by_both_canonicalizers() {
         skip_without_perl!("symlink_target_ending_at_a_symlink_is_refused_by_both_canonicalizers");
@@ -3088,6 +3121,8 @@ mod tests {
     /// re-enters only by spelling the root's own name is REFUSED by both. Before
     /// the fix `dir/link -> ../../real/other` was accepted locally and refused
     /// on the wire.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn symlinked_root_verdict_agrees_between_the_canonicalizers() {
         skip_without_perl!("symlinked_root_verdict_agrees_between_the_canonicalizers");
@@ -3193,6 +3228,9 @@ mod tests {
     /// Whether `symlink("")` is representable here: APFS stores it (a dangling
     /// link with an empty target), Linux refuses it with `ENOENT`. Probed with
     /// a REAL create, never a platform guess.
+    // unix-only: probes with symlink(2), which is not available by default
+    // on Windows.
+    #[cfg(unix)]
     fn filesystem_stores_an_empty_symlink_target() -> bool {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         std::os::unix::fs::symlink("", dir.path().join("empty-target-probe")).is_ok()
@@ -3214,6 +3252,8 @@ mod tests {
     /// is the erring direction this fix chooses, and it keeps the two views in
     /// agreement. The live-escape premise is asserted only where the filesystem
     /// really folds.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn case_folded_symlink_component_is_refused_by_both_canonicalizers() {
         skip_without_perl!("case_folded_symlink_component_is_refused_by_both_canonicalizers");
@@ -3255,6 +3295,8 @@ mod tests {
     /// the on-disk (NFC) symlink and `dir/link -> cafe\u{301}/../../outside`
     /// spells it decomposed, so an exact-string lookup misses while the kernel
     /// (APFS folds normalization) resolves through the link. Both views refuse.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn nfd_target_spelling_reaching_an_nfc_symlink_component_is_refused_by_both() {
         skip_without_perl!(
@@ -3299,6 +3341,8 @@ mod tests {
     /// the fold resolves `Sub` to `sub`, which is not a symlink, so the target
     /// is lawful. This is the tree that "exercises the fold" without an
     /// escape.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn fold_equal_non_symlink_component_is_accepted_by_both_and_manifests_agree() {
         skip_without_perl!(
@@ -3340,6 +3384,8 @@ mod tests {
     /// over a fold-equal one, so the fold never refuses a lawful tree that
     /// merely has a case-variant sibling. Skipped where the filesystem folds,
     /// where the two entries cannot coexist.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn exact_entry_wins_over_a_fold_equal_symlink_on_a_case_sensitive_filesystem() {
         skip_without_perl!(
@@ -3657,6 +3703,8 @@ mod tests {
     /// accepted by both views and stored verbatim, and a target naming an exact
     /// non-symlink component is accepted even on a case-sensitive host. This is
     /// the regression guard against a fold that refuses a lawful tree.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn full_fold_keeps_an_in_root_relative_target_accepted() {
         skip_without_perl!("full_fold_keeps_an_in_root_relative_target_accepted");
@@ -3692,6 +3740,8 @@ mod tests {
     /// refused by the other. The predicate-level arm runs on every platform;
     /// the local end-to-end arm runs where the filesystem can store such a
     /// link.
+    // unix-only: builds an empty-target symlink with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn empty_symlink_target_is_refused_by_both_views() {
         // The shared validator — used by BOTH canonicalizers — refuses "".
@@ -3878,6 +3928,8 @@ mod tests {
     /// verbatim; the far side split the printed line at the tab and the pull
     /// installed a link to `a` instead of `a\tb` while reporting success. This
     /// assertion therefore FAILS against the pre-fix code.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn tab_in_symlink_target_rejected_by_local_canonicalizer() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -3931,6 +3983,8 @@ mod tests {
     /// instead of splitting the target at the tab and assembling a shorter one.
     /// Pre-fix the script exited 0 and printed `...<hash>\ta\tb`, which the
     /// assembler read as target `a` — this assertion FAILS against it.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn wire_script_refuses_tab_in_symlink_target() {
         skip_without_perl!("wire_script_refuses_tab_in_symlink_target");
@@ -4129,6 +4183,8 @@ mod tests {
     /// in-root target and a decomposed non-ASCII target still round-trip
     /// faithfully through BOTH canonicalizers, byte-for-byte (no NFC
     /// rewriting of the target DATA — only names are NFC-constrained).
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn legitimate_symlink_targets_round_trip_through_both_canonicalizers() {
         skip_without_perl!("legitimate_symlink_targets_round_trip_through_both_canonicalizers");
@@ -4178,6 +4234,8 @@ mod tests {
     /// accept exactly the same trees" invariant, and an end-to-end sync that
     /// reported `Ok`/`skipped` while the destination still held `x\r`. This
     /// assertion FAILS against the pre-fix code (`unwrap_err` on `Ok`).
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn trailing_cr_symlink_target_rejected_by_local_canonicalizer() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -4203,6 +4261,8 @@ mod tests {
     /// bytes, before printing a line that a CRLF-folding reader would misread.
     /// Pre-fix the script exited 0 and the client assembled `x` (the CR
     /// already folded away) — this assertion FAILS against it.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn wire_script_refuses_cr_in_symlink_target() {
         skip_without_perl!("wire_script_refuses_cr_in_symlink_target");
@@ -4323,6 +4383,8 @@ mod tests {
     /// LF, CR, and TAB are checked end to end on real trees. Pre-fix the local
     /// walk and the script both ACCEPTED CR in names and targets, so the CR
     /// rows FAIL against the pre-fix code.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn refused_character_set_agrees_between_local_walk_and_wire() {
         skip_without_perl!("refused_character_set_agrees_between_local_walk_and_wire");
@@ -4389,6 +4451,8 @@ mod tests {
     /// byte-for-byte through BOTH canonicalizers (the shared refused set must
     /// not reject legal link data). This guards the new refusal rules against
     /// over-reach.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn space_in_symlink_target_round_trips_through_both_canonicalizers() {
         skip_without_perl!("space_in_symlink_target_round_trips_through_both_canonicalizers");
@@ -4548,6 +4612,8 @@ mod tests {
     /// nested path's parent is already an entry of the same kind. This pins
     /// that invariant (the remote assembler's [`require_parent_closed`] gate is
     /// the only one needed).
+    // unix-only: build_tree builds a symlink fixture (symlink(2)).
+    #[cfg(unix)]
     #[test]
     fn local_walk_is_parent_closed_by_construction() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -4658,6 +4724,8 @@ mod tests {
         // symlink_target, entry count, ordering) while leaving the tree root
         // unchanged must be REJECTED; the unmutated metadata verifies and
         // returns the recomputed canonical value.
+        // unix-only: build_tree builds a symlink fixture (symlink(2)).
+        #[cfg(unix)]
         #[test]
         fn mutated_metadata_is_rejected(m in mutation()) {
             let dir = fixture_tmpdir(&fixture_env()).unwrap();

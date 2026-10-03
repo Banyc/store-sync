@@ -833,6 +833,9 @@ fn manifest_entry_equal(a: &TreeEntry, b: &TreeEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
+    // Windows; do not let them fail a `-D warnings` Windows gate.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
     use crate::env::SysEnv;
     use crate::test_support::{announce_skip, fixture_tmpdir};

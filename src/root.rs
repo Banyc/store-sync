@@ -228,8 +228,13 @@ impl OwnedRoot {
 
 #[cfg(test)]
 mod tests {
+    // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
+    // Windows; do not let them fail a `-D warnings` Windows gate.
+    #![cfg_attr(not(unix), allow(dead_code))]
     use super::*;
     use proptest::prelude::*;
+    // Used only by the `#[cfg(unix)]` ownership proptest below.
+    #[cfg(unix)]
     use proptest::test_runner::RngSeed;
     use std::path::PathBuf;
 
@@ -279,6 +284,8 @@ mod tests {
             ..ProptestConfig::default()
         })]
 
+        // unix-only: the symlink-injected candidates need symlink(2).
+        #[cfg(unix)]
         #[test]
         fn overlapping_roots_are_refused_before_any_mutation(tag in "[a-z0-9]{1,8}") {
             let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -340,6 +347,8 @@ mod tests {
 
     /// A symlink root is refused at construction (the root must be a real
     /// directory, not a symlink), and the filesystem root is refused.
+    // unix-only: builds a symlink root with symlink(2).
+    #[cfg(unix)]
     #[test]
     fn symlink_and_filesystem_roots_are_refused() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
