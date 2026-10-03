@@ -35,7 +35,23 @@ installed between the check and the walk is that kind of residual.
 and `:2309` for two primitives; those lines are now doc text. A stale citation
 reads as verified, and this class has already recurred once (a `:2302` citation
 that was seven lines off). **Fixed** by citing items by NAME everywhere in
-`README.md`; line numbers are no longer used.
+`README.md`; line numbers are no longer used. The same rule covers the
+CROSS-REPO citations this log makes to `~/code/deploy`: a line number there
+drifts for reasons this crate never sees, so the entries below name the item
+(`deploy`'s transport trait declaring `exists`; its Windows port's path-based
+`write_atomic_replace`) rather than a line.
+
+**A — the extraction spec contradicted the code in four places. FIXED.**
+`EXTRACTION.md` is the plan the crate was built from, and it had not been
+revisited while the crate changed under it: its Error adaptation listed tuple
+variants that no longer exist (the variants carry `{ kind, message }`), its
+visibility adaptation said `pub(crate)` becomes `pub` for every API item (the
+surface is now deliberately SHRUNK, and a deletion is justified only by a
+consumer's need), its Windows adaptation said this machine "cannot compile" the
+Windows modules (they compile under the gate), and its Gate section listed three
+commands where the gate is now both platforms plus doc-tests and `--all-targets`
+for Windows. It is now labelled as the historical record it is, with a "since the
+extraction" note on the slice file map.
 
 **A — the design-conflict premise was FALSE for the record it described. FIXED.**
 README's design conflict (a) and the `sync` module docs claimed an in-root
@@ -176,7 +192,8 @@ real product is a smaller surface.
 
 **REVERSED under axis M.** The demotion looked safe because *this crate's* own
 production never called the path-based replace — the wrong population. A
-consumer's port does call it (deploy's `src/store/atomic/windows.rs:196`), so
+consumer's port does call it (deploy's Windows port, its path-based
+`write_atomic_replace`), so
 the name is public again (verdict **N**, named, not hidden), with its doc
 stating exactly what it is: the UNCONFINED, absolute-path form. The
 `compile_fail` doctest that proved a caller could not name it became false and
@@ -195,8 +212,7 @@ as "not present").
 
 **REVERSED under axis M.** The deletion was justified by "this crate's
 production never did" — the wrong population again. deploy's own transport
-trait DECLARES `exists` as a REQUIRED method
-(`~/code/deploy/src/remote/transport/mod.rs:326`) and its production calls it,
+trait DECLARES `exists` as a REQUIRED method and its production calls it,
 so removing the name is a build break for the consumer. It is restored as a
 DEFAULT method delegating to `metadata_opt`, with a doc that states exactly
 what a `false` discards (`absent` conflated with `the probe could not tell`).
@@ -230,18 +246,16 @@ interface, and this crate's whole purpose is to be consumed by `~/code/deploy`
 (and then `~/code/ckpt`). A consumer-fit audit against those consumers found
 both deletions were over-reach:
 
-* `Remote::exists` was REMOVED from the trait. deploy DECLARES it as a REQUIRED
-  method (`~/code/deploy/src/remote/transport/mod.rs:326`,
-  `fn exists(&self, rel: &RootedRelativePath) -> bool;`) and its production
-  calls it (`src/remote/helper/mod.rs`, `src/remote/helper/durable.rs`,
-  `src/store/local/objects.rs`). It is part of the interface this crate was
-  extracted from.
+* `Remote::exists` was REMOVED from the trait. deploy's own transport trait
+  DECLARES it as a REQUIRED method — `fn exists(&self, rel: &RootedRelativePath)
+  -> bool;` — and its production calls it (in `remote::helper`, in
+  `remote::helper::durable`, and in `store::local::objects`). It is part of the
+  interface this crate was extracted from.
 * `atomic::write_atomic_replace(&Path)` was demoted to `pub(crate)`. deploy's
-  production uses a path-based atomic replace
-  (`src/store/atomic/windows.rs:196` calls
-  `write_atomic_replace(&root.path().join(rel), ..)`; `src/store/local/mod.rs:151`
-  drives deploy's `write_atomic_replace_at`, whose confined body is
-  `write_atomic_replace_fd`).
+  production uses a path-based atomic replace: its Windows port
+  (`store::atomic::windows`) calls `write_atomic_replace(&root.path().join(rel),
+  ..)`, and `store::local` drives deploy's `write_atomic_replace_at`, whose
+  confined body is `write_atomic_replace_fd`.
 
 **Fixed:** `exists` is restored to the trait as a DEFAULT method delegating to
 `metadata_opt` (no implementor is forced to write it; an implementor may

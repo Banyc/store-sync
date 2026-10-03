@@ -47,7 +47,7 @@ named AT the item with its reach).
   ground covered THIS CRATE's production, not the CONSUMER's interface. The
   reason C was wrong, in one line: **the justification covered the crate's own
   production, not the consumer's interface** (deploy's Windows port calls the
-  path-based replace, `~/code/deploy/src/store/atomic/windows.rs:196`). It is
+  path-based `write_atomic_replace` in its own `store::atomic::windows`). It is
   PUBLIC again, and its NAME states the weakness: the UNCONFINED,
   absolute-path form, the one to avoid when the confined
   `write_atomic_replace_fd` can name the destination. `docs/CONSISTENCY.md`
@@ -56,9 +56,9 @@ named AT the item with its reach).
   (permission, transport fault) as absence. Its first resolution here was
   **C** (deleted from the trait) on the ground that the crate's own production
   and tests never needed it — the same population error: **the justification
-  covered the crate's own production, not the consumer's interface.** deploy
-  DECLARES it as a REQUIRED trait method
-  (`~/code/deploy/src/remote/transport/mod.rs:326`) and its production calls
+  covered the crate's own production, not the consumer's interface.** deploy's
+  own transport trait DECLARES `exists` as a REQUIRED method and its production
+  calls
   it. It is a DEFAULT method again, delegating to `metadata_opt` (so no
   implementor is forced to write it, and an implementor may override with a
   cheaper probe), and its doc states EXACTLY what it discards — a `false`
