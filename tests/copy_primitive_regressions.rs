@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use storekit::RootedRelativePath;
+use storekit::StoreKind;
 use storekit::atomic::{RootDir, copy_dir_recursive_fd, remove_dir_all_fd};
 use storekit::manifest::canonicalize_tree;
 
@@ -101,6 +102,13 @@ fn a_trailing_separator_does_not_let_a_symlink_source_be_followed() {
     assert!(
         msg.contains("is a symlink") && msg.contains("refusing to follow"),
         "the refusal must name the symlink source, got: {msg}"
+    );
+    // Constraint #4: the caller branches on the TYPED condition, so it does
+    // not depend on the message shape.
+    assert_eq!(
+        err.store_reason(),
+        Some(StoreKind::CopySourceIsSymlink),
+        "a symlink source is its OWN typed store condition, got: {err:?}"
     );
     assert!(
         !base.path().join("dst").exists(),

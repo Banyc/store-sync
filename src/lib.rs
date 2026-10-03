@@ -60,7 +60,7 @@ mod fifo_regression;
 #[doc(hidden)]
 pub use ::serde as __serde;
 
-pub use error::{Error, Result};
+pub use error::{Error, MaterializationKind, ReservedKind, Result, StoreKind, TransportKind};
 pub use relpath::RootedRelativePath;
 pub use reserved::{
     APPLICATION_LOCK_NAME, ASIDE_PREFIX, OPERATION_LOCK_SUFFIX, RESIDUE_BELOW,

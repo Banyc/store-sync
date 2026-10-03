@@ -61,7 +61,7 @@
 //! after it lands.
 
 use crate::atomic::{self, PathKind, RootDir};
-use crate::error::{Error, ReservedKind, Result};
+use crate::error::{Error, ReservedKind, Result, StoreKind};
 use crate::relpath::RootedRelativePath;
 use std::path::{Path, PathBuf};
 
@@ -114,11 +114,14 @@ impl Residue {
                 aside.display(),
                 root.display()
             ))),
-            Some(PathKind::Other) => Err(Error::store(format!(
-                "the residue at {} is not a regular file, a directory, or a symlink, so it cannot \
+            Some(PathKind::Other) => Err(Error::store_kind(
+                StoreKind::ResidueNotAnEntry,
+                format!(
+                    "the residue at {} is not a regular file, a directory, or a symlink, so it cannot \
                  be recovered or discarded by name",
-                aside.display()
-            ))),
+                    aside.display()
+                ),
+            )),
             Some(_) => Ok(Residue { root, aside }),
         }
     }
@@ -321,6 +324,25 @@ mod tests {
         write(&root.join(".sync-aside.999.0"), b"stranded");
         let residue = Residue::detect(root, Path::new(".sync-aside.999.0")).unwrap();
         assert_eq!(residue.aside(), Path::new(".sync-aside.999.0"));
+    }
+
+    /// Constraint #4: a residue that is a non-regular entry (a socket, FIFO, or
+    /// device) is refused with its OWN typed store kind, so a recovery caller
+    /// can tell `ResidueNotAnEntry` from `NotFound` from `NotResidue` without
+    /// matching the message.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_residue_is_the_typed_residue_not_an_entry_kind() {
+        let dir = tmpdir();
+        let root = dir.path();
+        let name = ".sync-aside.999.0";
+        let _listener = std::os::unix::net::UnixListener::bind(root.join(name)).unwrap();
+        let err = Residue::detect(root, Path::new(name)).unwrap_err();
+        assert_eq!(
+            err.store_reason(),
+            Some(StoreKind::ResidueNotAnEntry),
+            "{err:?}"
+        );
     }
 
     /// Recover restores the original byte-identically and removes the aside; a

@@ -80,7 +80,7 @@ pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerCo
 pub use ssh::SshTransport;
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TransportKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -816,10 +816,18 @@ pub(crate) fn read_receiver_id<R: Remote + ?Sized>(
     marker: &RootedRelativePath,
 ) -> Result<ReceiverId> {
     read_receiver_id_opt(remote, marker)?.ok_or_else(|| {
-        Error::transport(format!(
-            "deploy_dir {}: no receiver-id marker ({marker} was never provisioned)",
-            remote.root().display()
-        ))
+        // The marker is CONFIRMED absent: the far side has no store yet. This
+        // is the TYPED absent-marker condition, not a transport failure, so a
+        // caller can tell "no store yet (provision it)" from "the host is
+        // unreachable (retry)" without string-matching. The class stays
+        // transport and the text is unchanged.
+        Error::transport_kind(
+            TransportKind::ReceiverIdMarkerAbsent,
+            format!(
+                "deploy_dir {}: no receiver-id marker ({marker} was never provisioned)",
+                remote.root().display()
+            ),
+        )
     })
 }
 
@@ -837,10 +845,13 @@ pub(crate) fn read_receiver_id_opt<R: Remote + ?Sized>(
     }
     let data = remote.read(marker)?;
     let s = std::str::from_utf8(&data).map_err(|e| {
-        Error::transport(format!(
-            "deploy_dir {}: the receiver-id marker is not valid UTF-8: {e}",
-            remote.root().display()
-        ))
+        Error::transport_kind(
+            TransportKind::ReceiverIdMarkerMalformed,
+            format!(
+                "deploy_dir {}: the receiver-id marker is not valid UTF-8: {e}",
+                remote.root().display()
+            ),
+        )
     })?;
     // FAIL CLOSED, ACTIONABLY. The refusal keeps its `transport` class (a
     // marker that is present but not this crate's format is a
@@ -851,9 +862,23 @@ pub(crate) fn read_receiver_id_opt<R: Remote + ?Sized>(
     // `recv-<uuid-v7>` — or a tampered/foreign file), and the fact that no
     // adoption exists, so an operator does not have to read this source to
     // diagnose it.
-    ReceiverId::parse(s.trim())
+    let trimmed = s.trim();
+    // The DISTINCTION the doctrine names: a marker in the SOURCE TOOL's
+    // legacy `recv-<uuid-v7>` format is a recognizable migration situation,
+    // while arbitrary garbage is a corrupted/foreign file. The message names
+    // both causes; the KIND says which one this content is, so an operator
+    // does not have to read the text to know whether to migrate or
+    // investigate.
+    let kind = if looks_like_legacy_receiver_marker(trimmed) {
+        TransportKind::ReceiverIdMarkerLegacyFormat
+    } else {
+        TransportKind::ReceiverIdMarkerMalformed
+    };
+    ReceiverId::parse(trimmed)
         .map_err(|e| {
-            Error::transport(format!(
+            Error::transport_kind(
+                kind,
+                format!(
                 "deploy_dir {}: refusing the receiver-id marker at {marker}: its content is not a \
                  {RECEIVER_ID_LEN}-character lowercase-hex receiver id ({e}). This is a FAIL-CLOSED \
                  refusal — a marker this crate did not write, such as a legacy `recv-<uuid-v7>` \
@@ -862,9 +887,33 @@ pub(crate) fn read_receiver_id_opt<R: Remote + ?Sized>(
                  foreign format would misidentify the deploy_dir. Point the store at a deploy_dir \
                  this crate provisioned, or re-provision a fresh one.",
                 remote.root().display()
-            ))
+            ),
+            )
         })
         .map(Some)
+}
+
+/// Whether `content` has the SOURCE TOOL's legacy receiver-marker shape:
+/// `recv-` followed by a dashed UUID (`8-4-4-4-12` lowercase hex). This is a
+/// CONSERVATIVE shape test, not a UUID validator: it exists only to tell a
+/// recognizable legacy marker from an arbitrary corrupted/foreign file, and a
+/// near-miss is reported as corrupted rather than claimed as legacy.
+fn looks_like_legacy_receiver_marker(content: &str) -> bool {
+    let Some(rest) = content.strip_prefix("recv-") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    const DASHES: [usize; 4] = [8, 13, 18, 23];
+    bytes.iter().enumerate().all(|(i, b)| {
+        if DASHES.contains(&i) {
+            *b == b'-'
+        } else {
+            b.is_ascii_hexdigit() && !b.is_ascii_uppercase()
+        }
+    })
 }
 
 /// Provision the immutable receiver-id marker at `marker`: create it ONCE
@@ -1986,10 +2035,13 @@ impl LocalTransport {
         {
             crate::atomic::ReplaceOutcome::ReplacedDurable => {}
             crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
-                return Err(Error::transport(format!(
-                    "write {}: the entry is visible but its durability is unconfirmed: {error}",
-                    rel.display()
-                )));
+                return Err(Error::transport_kind(
+                    TransportKind::DurabilityUnconfirmed,
+                    format!(
+                        "write {}: the entry is visible but its durability is unconfirmed: {error}",
+                        rel.display()
+                    ),
+                ));
             }
         }
         if mode != 0 {
@@ -3288,7 +3340,7 @@ mod tests {
         let err = read_receiver_id(&t, &marker)
             .expect_err("a legacy recv-<uuid-v7> marker must fail closed");
         assert!(
-            matches!(err, Error::Transport(_)),
+            matches!(err, Error::Transport { .. }),
             "the marker refusal keeps the transport error class, got: {err:?}"
         );
         let msg = err.to_string();
@@ -3300,6 +3352,14 @@ mod tests {
             msg.contains("predates this crate") && msg.contains("recv-<uuid-v7>"),
             "the error must name the likely legacy cause, got: {msg}"
         );
+        // THE TYPED DISTINCTION the doctrine names: this marker is the LEGACY
+        // shape, not an arbitrary corruption — a caller branches on the kind,
+        // not on the message.
+        assert_eq!(
+            err.transport_reason(),
+            Some(TransportKind::ReceiverIdMarkerLegacyFormat),
+            "a `recv-<uuid-v7>` marker is the typed LEGACY condition, got: {err:?}"
+        );
         // A VALID marker still reads back (the actionable refusal did not
         // break the success path).
         let good = ReceiverId::generate().expect("entropy for a receiver id");
@@ -3307,6 +3367,74 @@ mod tests {
         assert_eq!(
             read_receiver_id(&t, &marker).expect("a valid marker still reads"),
             good
+        );
+    }
+
+    /// Constraint #4, the receiver-marker conditions: a LEGACY marker, a
+    /// CORRUPTED marker, and an ABSENT marker are three separate typed
+    /// conditions, so a caller can tell "migrate this legacy marker" from
+    /// "investigate this corrupted file" from "the store was never
+    /// provisioned" without reading any message. This is the mutation control
+    /// for the legacy/corrupt split: the three kinds must be distinct, and the
+    /// corrupt input must NOT be reported as legacy.
+    #[test]
+    fn receiver_marker_conditions_are_typed_and_distinct() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let marker = RootedRelativePath::parse(Path::new("receiver-marker")).unwrap();
+        let layout = Layout {
+            receiver_marker: Some(marker.clone()),
+            ..Layout::empty()
+        };
+        // NOTE: deliberately NOT `provision_layout()` — provisioning CREATES the
+        // marker, and the absent case must observe a store that was never
+        // provisioned.
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("markers"), layout)
+            .unwrap();
+
+        // ABSENT: the marker was never provisioned — "no store yet".
+        let absent = read_receiver_id(&t, &marker).expect_err("an absent marker must fail closed");
+        assert_eq!(
+            absent.transport_reason(),
+            Some(TransportKind::ReceiverIdMarkerAbsent),
+            "an absent marker is the typed absent condition, got: {absent:?}"
+        );
+
+        // LEGACY: the source tool's `recv-<uuid-v7>` shape.
+        t.write(
+            &marker,
+            b"recv-0190f3c2-7a1e-7b3c-8d4f-0123456789ab\n",
+            0o644,
+        )
+        .unwrap();
+        let legacy = read_receiver_id(&t, &marker).expect_err("a legacy marker must fail closed");
+
+        // CORRUPTED: present, but neither this crate's format nor the legacy
+        // shape (a near-miss of the legacy shape must NOT be claimed as
+        // legacy).
+        t.write(&marker, b"recv-not-a-uuid\n", 0o644).unwrap();
+        let corrupt =
+            read_receiver_id(&t, &marker).expect_err("a corrupted marker must fail closed");
+
+        let kinds = [legacy.transport_reason(), corrupt.transport_reason()];
+        assert_eq!(
+            kinds[0],
+            Some(TransportKind::ReceiverIdMarkerLegacyFormat),
+            "{legacy:?}"
+        );
+        assert_eq!(
+            kinds[1],
+            Some(TransportKind::ReceiverIdMarkerMalformed),
+            "a near-miss of the legacy shape is CORRUPTED, not legacy: {corrupt:?}"
+        );
+        assert_ne!(
+            kinds[0], kinds[1],
+            "legacy and corrupted markers must have DISTINCT kinds (the mutation this control \
+             detects)"
+        );
+        assert_ne!(
+            kinds[1],
+            Some(TransportKind::ReceiverIdMarkerAbsent),
+            "a corrupted marker is not absence"
         );
     }
 

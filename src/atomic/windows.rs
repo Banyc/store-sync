@@ -296,22 +296,32 @@ fn rel_join(root: &RootDir, rel: &Path) -> Result<PathBuf> {
 fn refuse_unlandable_name<'a>(name: &'a std::ffi::OsStr, parent: &Path) -> Result<&'a str> {
     let shown = parent.join(name);
     let Some(name_str) = name.to_str() else {
-        return Err(Error::store(format!(
-            "refusing to copy {}: the entry name is not valid UTF-8, and the crate's manifests \
+        return Err(Error::store_kind(
+            StoreKind::CopyUnlandableName,
+            format!(
+                "refusing to copy {}: the entry name is not valid UTF-8, and the crate's manifests \
              require NFC/UTF-8 names",
-            shown.display()
-        )));
+                shown.display()
+            ),
+        ));
     };
-    crate::manifest::validate_entry_path(name_str)
-        .map_err(|e| Error::store(format!("refusing to copy {}: {e}", shown.display())))?;
+    crate::manifest::validate_entry_path(name_str).map_err(|e| {
+        Error::store_kind(
+            StoreKind::CopyUnlandableName,
+            format!("refusing to copy {}: {e}", shown.display()),
+        )
+    })?;
     if crate::reserved::is_unaddressable_name(name_str) {
-        return Err(Error::store(format!(
-            "refusing to copy {}: the name {name_str:?} is unaddressable in this crate (a reserved \
+        return Err(Error::store_kind(
+            StoreKind::CopyUnlandableName,
+            format!(
+                "refusing to copy {}: the name {name_str:?} is unaddressable in this crate (a reserved \
              spelling, the application lock record, or one of the crate's own temp shapes). The \
              documented recovery sweep removes every temp-shaped name, so a copy must never land \
              such a name",
-            shown.display()
-        )));
+                shown.display()
+            ),
+        ));
     }
     Ok(name_str)
 }
@@ -443,15 +453,18 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 
     if anchor_id == src_id || anchor_inside_source || source_inside_destination || spelling_overlap
     {
-        return Err(Error::store(format!(
-            "copy_dir_recursive_fd: refusing to copy {} to {} — the source and the destination \
+        return Err(Error::store_kind(
+            StoreKind::CopyOverlap,
+            format!(
+                "copy_dir_recursive_fd: refusing to copy {} to {} — the source and the destination \
              overlap (the destination is inside the source, the source is inside the destination, \
              or they are the same directory), so the walk would copy the tree into itself without \
              bound; the primary decision is by directory IDENTITY (volume serial, file index), so a \
              junction alias of one spelling cannot evade it",
-            src.display(),
-            dst_abs.display()
-        )));
+                src.display(),
+                dst_abs.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -537,17 +550,23 @@ pub fn copy_dir_recursive_fd(
     let src_meta = std::fs::symlink_metadata(&src)
         .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
     if src_meta.file_type().is_symlink() {
-        return Err(Error::store(format!(
-            "copy_dir_recursive_fd: source {} is a symlink (refusing to follow a symlink \
+        return Err(Error::store_kind(
+            StoreKind::CopySourceIsSymlink,
+            format!(
+                "copy_dir_recursive_fd: source {} is a symlink (refusing to follow a symlink \
              source)",
-            src.display()
-        )));
+                src.display()
+            ),
+        ));
     }
     if !src_meta.is_dir() {
-        return Err(Error::store(format!(
-            "copy_dir_recursive_fd: source {} is not a directory",
-            src.display()
-        )));
+        return Err(Error::store_kind(
+            StoreKind::CopySourceNotADirectory,
+            format!(
+                "copy_dir_recursive_fd: source {} is not a directory",
+                src.display()
+            ),
+        ));
     }
     let root_mode = crate::platform::metadata_mode(&src_meta);
     refuse_reserved_creation(dst_rel)?;
@@ -654,32 +673,38 @@ pub fn copy_dir_recursive_fd(
             let link = std::fs::read_link(&child_src)
                 .map_err(|e| Error::store(format!("readlink {}: {e}", child_src.display())))?;
             let link_str = link.to_str().ok_or_else(|| {
-                Error::store(format!(
-                    "refusing to copy symlink {}: its target is not valid UTF-8",
-                    child_src.display()
-                ))
+                Error::store_kind(
+                    StoreKind::CopySymlinkTarget,
+                    format!(
+                        "refusing to copy symlink {}: its target is not valid UTF-8",
+                        child_src.display()
+                    ),
+                )
             })?;
             crate::manifest::validate_symlink_target(&child_rel.to_string_lossy(), link_str)
                 .map_err(|e| {
-                    Error::store(format!(
-                        "refusing to copy symlink {}: {e}",
-                        child_src.display()
-                    ))
+                    Error::store_kind(
+                        StoreKind::CopySymlinkTarget,
+                        format!("refusing to copy symlink {}: {e}", child_src.display()),
+                    )
                 })?;
             if let Err(refusal) = crate::manifest::check_relative_symlink_target_indexed(
                 &child_rel,
                 &link,
                 &containment_index,
             ) {
-                return Err(Error::store(format!(
-                    "refusing to copy symlink {}: {}",
-                    child_src.display(),
-                    crate::manifest::symlink_target_refusal_message(
-                        refusal,
-                        &child_src.display().to_string(),
-                        &link.to_string_lossy(),
-                    )
-                )));
+                return Err(Error::store_kind(
+                    StoreKind::CopySymlinkTarget,
+                    format!(
+                        "refusing to copy symlink {}: {}",
+                        child_src.display(),
+                        crate::manifest::symlink_target_refusal_message(
+                            refusal,
+                            &child_src.display().to_string(),
+                            &link.to_string_lossy(),
+                        )
+                    ),
+                ));
             }
             symlink_new_fd(root, &link, &child_rel)?;
         } else if ft.is_file() {
@@ -694,10 +719,13 @@ pub fn copy_dir_recursive_fd(
             crate::platform::chmod(&rel_join(root, &child_rel)?, mode)
                 .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
         } else {
-            return Err(Error::store(format!(
-                "refusing to copy {}: it is not a regular file, directory, or symlink",
-                child_src.display()
-            )));
+            return Err(Error::store_kind(
+                StoreKind::CopySourceNotRegular,
+                format!(
+                    "refusing to copy {}: it is not a regular file, directory, or symlink",
+                    child_src.display()
+                ),
+            ));
         }
     }
     dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
@@ -1442,7 +1470,7 @@ mod tests {
             let err = path_kind_fd(&root, &spelling)
                 .expect_err("an escaping or empty spelling must be refused");
             assert!(
-                matches!(err, Error::Store(_)) && err.to_string().contains("normal component"),
+                matches!(err, Error::Store { .. }) && err.to_string().contains("normal component"),
                 "{spelling:?} must be refused by the root-relative guard, got: {err}"
             );
         }
@@ -1466,7 +1494,7 @@ mod tests {
                 (s == stage).then(|| Error::store(format!("injected {stage:?} fault")))
             })
             .unwrap_err();
-            assert!(matches!(err, Error::Store(_)), "{stage:?}: got {err:?}");
+            assert!(matches!(err, Error::Store { .. }), "{stage:?}: got {err:?}");
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 b"OLD".to_vec(),
@@ -1495,7 +1523,7 @@ mod tests {
         assert!(matches!(
             outcome,
             ReplaceOutcome::ReplacedDurabilityUnknown {
-                error: Error::Store(_)
+                error: Error::Store { .. }
             }
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"NEW".to_vec());

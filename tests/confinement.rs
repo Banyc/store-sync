@@ -63,7 +63,7 @@ fn outside_dir(base: &Path) -> PathBuf {
 /// case at hand.
 fn assert_open_refusal(err: &Error, needle: &str) {
     assert!(
-        matches!(err, Error::Store(_)),
+        matches!(err, Error::Store { .. }),
         "the refusal must be a store error, got: {err:?}"
     );
     let text = err.to_string();

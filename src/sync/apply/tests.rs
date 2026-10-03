@@ -2890,7 +2890,10 @@ fn a_failed_write_is_reported_never_a_success() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(
         dst.join("d").is_dir(),
         "the parent was created before the write"
@@ -2932,7 +2935,10 @@ fn the_report_covers_a_failure_after_a_file_was_written() {
     // The first write (`d/a`) succeeds; the second (`d/b`) fails.
     remote.fail_nth_write = Some(2);
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert_eq!(err.report().applied, vec!["d/a".to_string()]);
     assert_report_names(err.report(), "d/a");
     // The created directory whose `finalize` never ran is NAMED too.
@@ -3250,7 +3256,10 @@ fn a_failed_write_restores_the_parent_and_reports_transient_dirs_honestly() {
     remote.fail_writes = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert_eq!(
         mode_of(&dst.join("d")),
         0o555,
@@ -3426,7 +3435,10 @@ fn a_failed_sync_leaves_extraneous_entries_present() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(
         dst.join("extra").exists(),
         "a failed sync must not delete sanctioned extraneous entries"
@@ -3472,7 +3484,7 @@ fn push_over_a_missing_source_root_is_an_error() {
     let remote = RecordingRemote::over(transport(&dst), true);
     let err = owned(Direction::Push, &missing, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "a missing source root is a materialization error, got {err:?}"
     );
     assert!(!missing.exists());
@@ -3526,8 +3538,15 @@ fn syncing_two_empty_directories_is_a_no_op() {
 /// both roots, no transport call ran, and the tree is byte-identical.
 fn assert_overlapping_roots_refused(err: &SyncError, local: &Path, remote_path: &Path) {
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "an overlapping-root refusal is a materialization error, got {err:?}"
+    );
+    // Constraint #4: the overlap is its OWN typed condition, so a caller
+    // branches on the kind rather than the message.
+    assert_eq!(
+        err.error().materialization_reason(),
+        Some(crate::error::MaterializationKind::RootsOverlap),
+        "an overlapping-root refusal carries the typed overlap kind, got {err:?}"
     );
     let message = err.error().to_string();
     assert!(
@@ -3538,6 +3557,27 @@ fn assert_overlapping_roots_refused(err: &SyncError, local: &Path, remote_path: 
         message.contains(&local.display().to_string())
             && message.contains(&remote_path.display().to_string()),
         "the refusal names BOTH roots ({local:?} and {remote_path:?}): {message}"
+    );
+}
+
+/// Constraint #4: the visible-but-not-durable store error is its OWN typed
+/// condition, so a caller can tell "the publish committed but may not survive a
+/// crash" (retrying may be wrong) from a plain store failure. `LocalSide`'s
+/// write path has no fault seam, so this drives the ONE conversion at the
+/// [`ReplaceOutcome`] boundary directly — the outcome itself is produced and
+/// tested at the atomic layer.
+#[test]
+fn durability_unconfirmed_is_a_typed_store_kind() {
+    let rel = RootedRelativePath::parse(Path::new("state/f")).unwrap();
+    let err = LocalSide::durability_unconfirmed(&rel, Error::store("injected dir fsync fault"));
+    assert_eq!(
+        err.store_reason(),
+        Some(StoreKind::DurabilityUnconfirmed),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("its durability is unconfirmed"),
+        "the historical message is preserved: {err}"
     );
 }
 
@@ -3994,7 +4034,7 @@ fn root_spelling_normalizes_and_refuses_a_symlinked_root() {
         assert!(
             matches!(
                 LocalSide::open(spelling, false),
-                Err(Error::Materialization(_))
+                Err(Error::Materialization { .. })
             ),
             "{spelling:?} must refuse a symlinked root"
         );
@@ -4019,7 +4059,7 @@ fn parent_component_symlink_refuses_a_local_symlink_target_read() {
     let err = local
         .read_link(&RootedRelativePath::parse(Path::new("sub/link")).unwrap())
         .expect_err("a parent-component symlink must refuse the target read");
-    assert!(matches!(err, Error::Store(_)), "got {err:?}");
+    assert!(matches!(err, Error::Store { .. }), "got {err:?}");
     assert!(!err.to_string().contains(OUTSIDE_TARGET), "got {err}");
     assert_eq!(
         local
@@ -4319,7 +4359,10 @@ fn a_failed_file_replacement_of_a_directory_leaves_the_subtree_byte_identical() 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(dst.join("p").is_dir(), "the directory survives the failure");
     assert_eq!(read(&dst.join("p/keep")), b"keep");
     assert_eq!(
@@ -4360,7 +4403,10 @@ fn a_failed_file_replacement_of_a_directory_leaves_the_subtree_byte_identical_on
     let mut remote = RecordingRemote::over(transport(&remote_root), true);
     remote.fail_reads = true;
     let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(
         local.join("p").is_dir(),
         "the directory survives the failure"
@@ -4432,7 +4478,10 @@ fn a_failed_symlink_replacement_of_a_directory_leaves_the_subtree_byte_identical
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_symlink = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(dst.join("p").is_dir());
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -4456,7 +4505,10 @@ fn a_failed_directory_replacement_of_a_file_leaves_the_entry_byte_identical() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_create_dir_all = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(dst.join("p").is_file(), "the file survives the failure");
     assert_eq!(read(&dst.join("p")), b"old");
     assert_eq!(canonicalize_tree(&dst).unwrap(), before);
@@ -4686,7 +4738,7 @@ fn manifest_refuses_a_pinned_root_that_disappeared() {
     let side = LocalSide::open(&root, true).unwrap();
     fs::remove_dir_all(&root).unwrap();
     assert!(
-        matches!(side.manifest(), Err(Error::Materialization(_))),
+        matches!(side.manifest(), Err(Error::Materialization { .. })),
         "a pinned root that disappeared is an error, not an empty tree"
     );
 }
@@ -4911,7 +4963,7 @@ fn a_racily_created_non_empty_destination_root_is_not_adopted() {
     // A racer creates a NON-EMPTY directory at the path.
     write(&root.join("racer"), b"x");
     assert!(
-        matches!(side.root_for_mutation(), Err(Error::Materialization(_))),
+        matches!(side.root_for_mutation(), Err(Error::Materialization { .. })),
         "a non-empty racer-created root must be refused, not adopted"
     );
 
@@ -5848,7 +5900,10 @@ fn a_failed_pull_replacement_of_a_symlink_leaves_it_byte_identical() {
     let mut remote = RecordingRemote::over(transport(&remote_root), true);
     remote.fail_reads = true;
     let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Keep).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(
         fs::symlink_metadata(local.join("f")).unwrap().is_symlink(),
         "the original symlink is restored"
@@ -5933,7 +5988,10 @@ fn a_failed_replacement_of_a_read_only_subtree_leaves_it_byte_identical() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
         before,
@@ -5955,7 +6013,10 @@ fn a_failed_replacement_of_a_read_only_subtree_leaves_it_byte_identical() {
     let mut remote = RecordingRemote::over(transport(&remote_root), true);
     remote.fail_reads = true;
     let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert_eq!(
         canonicalize_tree(&local).unwrap(),
         before_local,
@@ -6977,7 +7038,10 @@ fn a_partially_created_directory_replacement_is_rolled_back() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_create_dir_all_after_create = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(dst.join("p").is_file(), "the file is restored");
     assert_eq!(read(&dst.join("p")), b"old");
     assert_eq!(
@@ -7091,7 +7155,10 @@ fn a_transport_that_publishes_an_entry_and_then_fails_names_and_counts_it() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_write_after_write = true;
     let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     // The entry IS on disk: the mutation happened before the error.
     assert_eq!(read(&dst.join("p")), b"new");
     // ...so the report must NAME it (the highest-precedence `indeterminate`)
@@ -8416,7 +8483,10 @@ fn an_unreadable_far_side_root_is_an_error_and_destroys_nothing() {
         timeout_cause: None,
     });
     let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(
         err.error().to_string().contains("Permission denied"),
         "the far-side failure is reported: {err:?}"
@@ -8770,7 +8840,7 @@ fn a_decomposed_source_name_is_refused_at_manifest_time_and_mutates_nothing() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "a canonicalization refusal is a materialization error, not a source-read \
          failure: {err:?}"
     );
@@ -8825,7 +8895,7 @@ fn a_decomposed_destination_name_is_refused_instead_of_landing_a_second_entry() 
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "a canonicalization refusal is a materialization error: {err:?}"
     );
     assert_eq!(
@@ -8879,7 +8949,7 @@ fn delete_extraneous_never_silently_spares_a_decomposed_destination_entry() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "a canonicalization refusal is a materialization error: {err:?}"
     );
     assert_eq!(
@@ -8971,7 +9041,7 @@ fn a_tab_in_a_source_symlink_target_is_refused_at_manifest_time() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "a canonicalization refusal is a materialization error: {err:?}"
     );
     assert_eq!(
@@ -9017,7 +9087,10 @@ fn a_tab_in_a_remote_symlink_target_is_refused_not_installed_truncated() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_) | Error::Transport(_)),
+        matches!(
+            err.error(),
+            Error::Materialization { .. } | Error::Transport { .. }
+        ),
         "the refusal is a manifest-time error (the far-side walk or the \
          assembler), never a post-mutation verification failure: {err:?}"
     );
@@ -9056,7 +9129,10 @@ fn a_tab_in_a_remote_destination_symlink_target_is_refused_not_read_as_same() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_) | Error::Transport(_)),
+        matches!(
+            err.error(),
+            Error::Materialization { .. } | Error::Transport { .. }
+        ),
         "the refusal is a manifest-time error: {err:?}"
     );
     assert_eq!(err.report().transfers, 0, "{err:?}");
@@ -9099,7 +9175,7 @@ fn a_non_utf8_symlink_target_is_refused_at_manifest_time_and_mutates_nothing() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "a canonicalization refusal is a materialization error, not the \
          post-mutation verification failure a rewritten target produced: {err:?}"
     );
@@ -9160,7 +9236,10 @@ fn a_non_utf8_remote_destination_name_is_refused_instead_of_silently_spared() {
         Err(err) => err,
     };
     assert!(
-        matches!(err.error(), Error::Materialization(_) | Error::Transport(_)),
+        matches!(
+            err.error(),
+            Error::Materialization { .. } | Error::Transport { .. }
+        ),
         "the refusal is a manifest-time error: {err:?}"
     );
     assert_eq!(err.report().transfers, 0, "{err:?}");
@@ -12128,7 +12207,7 @@ fn an_error_exit_releases_the_destination_lock() {
     )
     .expect_err("a missing source root must fail the run");
     assert!(
-        matches!(err.error(), Error::Materialization(_)),
+        matches!(err.error(), Error::Materialization { .. }),
         "got {err:?}"
     );
     assert!(
@@ -12155,7 +12234,10 @@ fn an_error_exit_releases_the_destination_lock() {
         Keep,
     )
     .expect_err("a non-directory destination root must fail the run");
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     assert!(
         lock_after.exists(),
         "the lock record must have been created (and held) before the destination manifest failed"
@@ -12437,7 +12519,10 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
     owned_recorder.exec_failure = Some(broken_exec());
     let err = owned(Direction::Pull, &local, &owned_recorder, &ReplaceAll, Keep)
         .expect_err("the far-side manifest command failed");
-    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(err.error(), Error::Transport { .. }),
+        "got {err:?}"
+    );
     // The entry point prepares the transport identity, and the source
     // manifest primitive now SELF-PREPARES too (the D3 fix), so a PULL records
     // exactly two preparations. What matters is unchanged: EVERY prepare call

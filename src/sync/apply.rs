@@ -893,7 +893,7 @@
 //! source".
 
 use crate::atomic::ReplaceOutcome;
-use crate::error::{Error, Result};
+use crate::error::{Error, MaterializationKind, Result, StoreKind};
 use crate::lock::FileLock;
 use crate::manifest::{
     DestinationTree, SymlinkContainmentIndex, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
@@ -7567,13 +7567,16 @@ fn refuse_overlapping_roots(local: &LocalSide, remote: &dyn Remote) -> Result<()
         } else {
             (local.root_path.as_path(), remote.root())
         };
-        return Err(Error::materialization(format!(
-            "refusing to sync {} and {}: the root {} is an ancestor of {}, so the run would copy a tree into its own subtree (and, with Extraneous::Delete, destroy the source); the two roots must be disjoint",
-            local.root_path.display(),
-            remote.root().display(),
-            outer.display(),
-            inner.display(),
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::RootsOverlap,
+            format!(
+                "refusing to sync {} and {}: the root {} is an ancestor of {}, so the run would copy a tree into its own subtree (and, with Extraneous::Delete, destroy the source); the two roots must be disjoint",
+                local.root_path.display(),
+                remote.root().display(),
+                outer.display(),
+                inner.display(),
+            ),
+        ));
     }
     Ok(())
 }
@@ -8178,10 +8181,7 @@ impl LocalSide {
         )? {
             ReplaceOutcome::ReplacedDurable => {}
             ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
-                return Err(Error::store(format!(
-                    "write {}: the entry is visible but its durability is unconfirmed: {error}",
-                    rel.display()
-                )));
+                return Err(Self::durability_unconfirmed(rel, error));
             }
         }
         self.set_mode(rel, mode, EntryKind::File)
@@ -8221,10 +8221,7 @@ impl LocalSide {
             crate::atomic::CompareReplace::Replaced(
                 ReplaceOutcome::ReplacedDurabilityUnknown { error },
             ) => {
-                return Err(Error::store(format!(
-                    "write {}: the entry is visible but its durability is unconfirmed: {error}",
-                    rel.display()
-                )));
+                return Err(Self::durability_unconfirmed(rel, error));
             }
         }
         self.set_mode(rel, mode, EntryKind::File)?;
@@ -8233,6 +8230,21 @@ impl LocalSide {
 
     fn set_mode(&self, rel: &RootedRelativePath, mode: Mode, kind: EntryKind) -> Result<()> {
         set_local_mode(self.root_for_mutation()?, &self.root_path, rel, mode, kind)
+    }
+
+    /// The ONE construction of the visible-but-not-durable store error from a
+    /// [`ReplaceOutcome::ReplacedDurabilityUnknown`]: the publish committed and
+    /// the PREVIOUS content is gone, but the parent-directory fsync failed, so
+    /// the caller must not read it as either a plain failure or a success. A
+    /// caller branches on [`StoreKind::DurabilityUnconfirmed`].
+    fn durability_unconfirmed(rel: &RootedRelativePath, error: Error) -> Error {
+        Error::store_kind(
+            StoreKind::DurabilityUnconfirmed,
+            format!(
+                "write {}: the entry is visible but its durability is unconfirmed: {error}",
+                rel.display()
+            ),
+        )
     }
 
     /// The current mode of an existing local directory, resolved

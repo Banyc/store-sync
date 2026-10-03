@@ -33,7 +33,7 @@
 //! deleting a stranded original or writing into the crate's reserved
 //! namespace.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TransportKind};
 use crate::manifest::{
     DestinationTree, TreeEntry, TreeMetadata, canonicalize_remote_entries,
     canonicalize_remote_entries_destination, canonicalize_tree, canonicalize_tree_destination,
@@ -247,10 +247,13 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
         // as "nothing is there" and destroy it.
         return match std::fs::symlink_metadata(root) {
             Ok(meta) if meta.is_dir() => canonicalize_tree(root),
-            Ok(_) => Err(Error::transport(format!(
-                "local remote root {} is not a directory; refusing to describe it as a tree",
-                root.display()
-            ))),
+            Ok(_) => Err(Error::transport_kind(
+                TransportKind::RootNotADirectory,
+                format!(
+                    "local remote root {} is not a directory; refusing to describe it as a tree",
+                    root.display()
+                ),
+            )),
             // An ABSENT root is the TYPED absence condition, consistent with
             // the remote branch and `Remote::metadata_opt`; every other I/O
             // failure stays a transport error. An absent far side must not
@@ -311,10 +314,13 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
     if remote.is_local() {
         return match std::fs::symlink_metadata(root) {
             Ok(meta) if meta.is_dir() => canonicalize_tree_destination(root),
-            Ok(_) => Err(Error::transport(format!(
-                "local remote root {} is not a directory; refusing to describe it as a tree",
-                root.display()
-            ))),
+            Ok(_) => Err(Error::transport_kind(
+                TransportKind::RootNotADirectory,
+                format!(
+                    "local remote root {} is not a directory; refusing to describe it as a tree",
+                    root.display()
+                ),
+            )),
             // An ABSENT root is the TYPED absence condition (see
             // [`remote_manifest`]); every other I/O failure stays a transport
             // error.
@@ -479,16 +485,19 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     // and the `Background` error carries only the message, so the status was
     // discarded and `exit_code` is the `-1` sentinel.
     if out.timeout_cause == Some(TimeoutCause::OutputDrainGaveUp) {
-        return Error::transport(format!(
-            "remote tree verification at {} could not report the far-side manifest command's \
-             output: the command ran and exited, but a process that outlived it held its output \
-             pipes open past the post-exit drain bound, so the runner gave up on the drain and the \
-             exit status it had already collected was discarded (the reported exit {} is the \
-             sentinel): {}",
-            root.display(),
-            out.exit_code,
-            stderr
-        ));
+        return Error::transport_kind(
+            TransportKind::OutputDrainGaveUp,
+            format!(
+                "remote tree verification at {} could not report the far-side manifest command's \
+                 output: the command ran and exited, but a process that outlived it held its output \
+                 pipes open past the post-exit drain bound, so the runner gave up on the drain and the \
+                 exit status it had already collected was discarded (the reported exit {} is the \
+                 sentinel): {}",
+                root.display(),
+                out.exit_code,
+                stderr
+            ),
+        );
     }
     // F1: the far-side script's own anchored `die` diagnostic is EVIDENCE
     // about the layer and VETOES the bare 126/127 STATUS (the veto lives in
@@ -498,44 +507,56 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     // below, then reported by [`far_side_script_failed`] after the transport
     // rule (a script diagnostic is not transport evidence).
     if perl_could_not_start(out) {
-        return Error::transport(format!(
-            "remote tree verification at {} could not start the far-side `perl` (exit {}): {} \
-             (is perl installed on the remote host?)",
-            root.display(),
-            out.exit_code,
-            stderr
-        ));
+        return Error::transport_kind(
+            TransportKind::InterpreterMissing,
+            format!(
+                "remote tree verification at {} could not start the far-side `perl` (exit {}): {} \
+                 (is perl installed on the remote host?)",
+                root.display(),
+                out.exit_code,
+                stderr
+            ),
+        );
     }
     if transport_failed_before_the_command(out) {
-        return Error::transport(format!(
-            "remote tree verification at {} could not run: the transport failed before the \
-             far-side command started (exit {}): {} (this is a transport-level failure — \
-             connection, authentication, host key, or the ssh control socket)",
-            root.display(),
-            out.exit_code,
-            stderr
-        ));
+        return Error::transport_kind(
+            TransportKind::BeforeCommand,
+            format!(
+                "remote tree verification at {} could not run: the transport failed before the \
+                 far-side command started (exit {}): {} (this is a transport-level failure — \
+                 connection, authentication, host key, or the ssh control socket)",
+                root.display(),
+                out.exit_code,
+                stderr
+            ),
+        );
     }
     if far_side_script_failed(out) {
-        return Error::transport(format!(
-            "remote tree verification at {} failed inside the far-side manifest script (exit {}): {}",
-            root.display(),
-            out.exit_code,
-            stderr
-        ));
+        return Error::transport_kind(
+            TransportKind::FarSideScript,
+            format!(
+                "remote tree verification at {} failed inside the far-side manifest script (exit {}): {}",
+                root.display(),
+                out.exit_code,
+                stderr
+            ),
+        );
     }
     // No rule establishes the layer: report only what is KNOWN. Naming the
     // transport, the shell, or the script here would assert a layer the
     // evidence does not support — the defect this branch replaces.
-    Error::transport(format!(
-        "remote tree verification at {} failed: the remote manifest command exited {} with {} \
-         (the exit status and stderr are preserved verbatim; the available evidence does not \
-         establish which layer produced this failure, so it is reported as undetermined rather \
-         than attributed to one)",
-        root.display(),
-        out.exit_code,
-        stderr
-    ))
+    Error::transport_kind(
+        TransportKind::Undetermined,
+        format!(
+            "remote tree verification at {} failed: the remote manifest command exited {} with {} \
+             (the exit status and stderr are preserved verbatim; the available evidence does not \
+             establish which layer produced this failure, so it is reported as undetermined rather \
+             than attributed to one)",
+            root.display(),
+            out.exit_code,
+            stderr
+        ),
+    )
 }
 
 /// Whether `out` reports that the far-side `perl` program itself could not be
@@ -1157,9 +1178,18 @@ mod tests {
         let file = dir.path().join("not-a-dir");
         write(&file, b"x");
         let tf = LocalTransport::new(&SysEnv::from_process(), file, Layout::empty()).unwrap();
+        let err = remote_manifest(&tf).expect_err("a file root must be refused");
         assert!(
-            matches!(remote_manifest(&tf), Err(Error::Transport(_))),
+            matches!(err, Error::Transport { .. }),
             "a non-directory local remote root must be a transport error"
+        );
+        // ... and the TYPED reason names the condition, so a caller can tell
+        // "the root is a file" from "the host is unreachable" without reading
+        // the message.
+        assert_eq!(
+            err.transport_reason(),
+            Some(TransportKind::RootNotADirectory),
+            "a non-directory root is its OWN typed condition: {err:?}"
         );
     }
 
@@ -1211,7 +1241,7 @@ mod tests {
         };
         let transport_err = remote_manifest_failure(Path::new("/srv/store"), &unreachable);
         assert!(
-            matches!(transport_err, Error::Transport(_)),
+            matches!(transport_err, Error::Transport { .. }),
             "an unreachable host must stay a transport error: {transport_err:?}"
         );
     }
@@ -2180,6 +2210,158 @@ mod tests {
             msg.contains("transport-level failure"),
             "the documented residual: a CALLER-chosen root can start a marker line and \
              classify as transport: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Constraint #4: every condition a caller must branch on is a TYPED value.
+    // The manifest-failure classifier has several layers, and the tests above
+    // tell them apart by MESSAGE SUBSTRING. These tests branch on the typed
+    // `Error::transport_reason()` instead, which is what a consumer can do
+    // without depending on message shape, and they prove the kinds are
+    // PAIRWISE DISTINCT.
+    // -----------------------------------------------------------------------
+
+    /// Each manifest-failure layer is its own `TransportKind`, asserted by
+    /// branching on the typed reason. No message text is consulted.
+    #[test]
+    fn manifest_failure_layers_are_typed_kinds() {
+        let cases: Vec<(TransportKind, ExecOutcome)> = vec![
+            (
+                TransportKind::InterpreterMissing,
+                ExecOutcome {
+                    exit_code: 127,
+                    stdout: String::new(),
+                    stderr: "perl: command not found".to_string(),
+                    timeout_cause: None,
+                },
+            ),
+            (
+                TransportKind::FarSideScript,
+                ExecOutcome {
+                    exit_code: 2,
+                    stdout: String::new(),
+                    stderr: "not a directory: /srv/store".to_string(),
+                    timeout_cause: None,
+                },
+            ),
+            (
+                TransportKind::BeforeCommand,
+                ExecOutcome {
+                    exit_code: 255,
+                    stdout: String::new(),
+                    stderr: "unix_listener: cannot bind to path /tmp/dmux/mux-1: No such file or \
+                         directory"
+                        .to_string(),
+                    timeout_cause: None,
+                },
+            ),
+            (
+                TransportKind::OutputDrainGaveUp,
+                ExecOutcome {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "command [\"perl\"] left processes holding its output pipes open"
+                        .to_string(),
+                    timeout_cause: Some(TimeoutCause::OutputDrainGaveUp),
+                },
+            ),
+            (
+                TransportKind::Undetermined,
+                ExecOutcome {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    timeout_cause: None,
+                },
+            ),
+        ];
+        for (expected, out) in cases {
+            let err = remote_manifest_failure(Path::new("/srv/store"), &out);
+            assert_eq!(
+                err.transport_reason(),
+                Some(expected),
+                "the layer must be the typed {expected:?}, got: {err:?}"
+            );
+        }
+        // An ABSENT root is not a transport failure at all, so it carries no
+        // transport kind — the distinction the consumer audit needed.
+        let absent = ExecOutcome {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: "absent: /srv/store".to_string(),
+            timeout_cause: None,
+        };
+        let err = remote_manifest_failure(Path::new("/srv/store"), &absent);
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        assert_eq!(err.transport_reason(), None, "absent root is not transport");
+    }
+
+    /// THE MUTATION CONTROL. The layer kinds must be PAIRWISE DISTINCT and none
+    /// may be `Unclassified`: collapsing two layers onto one kind (the
+    /// mutation this control detects) fails here while every message-substring
+    /// test above would still pass. The first case is the exact doctrine
+    /// defect — an unreachable host reported as a far-side script failure.
+    #[test]
+    fn manifest_failure_layer_kinds_are_pairwise_distinct() {
+        let outcomes = [
+            ExecOutcome {
+                exit_code: 127,
+                stdout: String::new(),
+                stderr: "perl: command not found".to_string(),
+                timeout_cause: None,
+            },
+            ExecOutcome {
+                exit_code: 2,
+                stdout: String::new(),
+                stderr: "not a directory: /srv/store".to_string(),
+                timeout_cause: None,
+            },
+            ExecOutcome {
+                exit_code: 255,
+                stdout: String::new(),
+                stderr: "kex_exchange_identification: read: Connection reset by peer".to_string(),
+                timeout_cause: None,
+            },
+            ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "command [\"perl\"] left processes holding its output pipes open"
+                    .to_string(),
+                timeout_cause: Some(TimeoutCause::OutputDrainGaveUp),
+            },
+            ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+                timeout_cause: None,
+            },
+        ];
+        let kinds: Vec<TransportKind> = outcomes
+            .iter()
+            .map(|out| {
+                remote_manifest_failure(Path::new("/srv/store"), out)
+                    .transport_reason()
+                    .expect("every layer above carries a typed kind")
+            })
+            .collect();
+        let mut deduped = kinds.clone();
+        deduped.sort_by_key(|k| format!("{k:?}"));
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            kinds.len(),
+            "each manifest-failure layer must have its OWN kind; a collapse is the mutation this \
+             control detects: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&TransportKind::Unclassified),
+            "no classified layer may be Unclassified: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&TransportKind::BeforeCommand)
+                && kinds.contains(&TransportKind::FarSideScript),
+            "the unreachable host and the far-side script must be separate kinds: {kinds:?}"
         );
     }
 }

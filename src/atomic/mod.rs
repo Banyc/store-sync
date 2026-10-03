@@ -117,7 +117,7 @@
 //! `rename` does not overwrite), and no Unix mode bits. The rest of the
 //! crate calls the re-exported surface below and never sees the switch.
 
-use crate::error::{Error, ReservedKind, Result};
+use crate::error::{Error, ReservedKind, Result, StoreKind};
 use crate::relpath::RootedRelativePath;
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -1071,7 +1071,7 @@ mod tests {
             (stage == ReplaceStage::Rename).then(|| Error::store("injected rename fault"))
         })
         .unwrap_err();
-        assert!(matches!(err, Error::Store(_)));
+        assert!(matches!(err, Error::Store { .. }));
         assert_eq!(std::fs::read(&path).unwrap(), b"OLD".to_vec());
     }
 
@@ -1089,7 +1089,7 @@ mod tests {
         assert!(matches!(
             outcome,
             ReplaceOutcome::ReplacedDurabilityUnknown {
-                error: Error::Store(_)
+                error: Error::Store { .. }
             }
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"NEW".to_vec());
@@ -1130,7 +1130,7 @@ mod tests {
                 (s == stage).then(|| Error::store("injected fault"))
             })
             .unwrap_err();
-            assert!(matches!(err, Error::Store(_)));
+            assert!(matches!(err, Error::Store { .. }));
             assert_eq!(std::fs::read(&path).unwrap(), b"OLD".to_vec());
         }
         let (_dir, path) = marker_path();
@@ -1198,7 +1198,7 @@ mod tests {
             let err = RootedRelativePath::parse(Path::new(bad))
                 .expect_err("an escaping, empty, or dot-segment spelling must be refused");
             assert!(
-                matches!(err, Error::Transport(_)),
+                matches!(err, Error::Transport { .. }),
                 "{bad:?} must be a transport (path) error, got {err:?}"
             );
         }

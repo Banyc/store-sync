@@ -298,7 +298,7 @@
 //! preserved must apply them out of band after the sync.
 
 use crate::digest::sha256_bytes;
-use crate::error::{Error, Result};
+use crate::error::{Error, MaterializationKind, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -708,9 +708,12 @@ fn canonical_entry_path(rel: &Path) -> Result<String> {
         match comp {
             Component::Normal(name) => {
                 let Some(name) = name.to_str() else {
-                    return Err(Error::materialization(format!(
-                        "manifest requires NFC/UTF-8 names, but this entry's name is not valid UTF-8: {rel:?}"
-                    )));
+                    return Err(Error::materialization_kind(
+                        MaterializationKind::NotUtf8,
+                        format!(
+                            "manifest requires NFC/UTF-8 names, but this entry's name is not valid UTF-8: {rel:?}"
+                        ),
+                    ));
                 };
                 if count > 0 {
                     out.push('/');
@@ -719,16 +722,18 @@ fn canonical_entry_path(rel: &Path) -> Result<String> {
                 count += 1;
             }
             _ => {
-                return Err(Error::materialization(format!(
-                    "path has a non-normal component: {rel:?}"
-                )));
+                return Err(Error::materialization_kind(
+                    MaterializationKind::UnrepresentableName,
+                    format!("path has a non-normal component: {rel:?}"),
+                ));
             }
         }
     }
     if count == 0 {
-        return Err(Error::materialization(format!(
-            "path has no components: {rel:?}"
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableName,
+            format!("path has no components: {rel:?}"),
+        ));
     }
     Ok(out)
 }
@@ -792,20 +797,25 @@ fn unrepresentable_char_name(c: char) -> &'static str {
 /// path that does not exist on a normalization-sensitive filesystem.
 pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
     if let Some(c) = first_unrepresentable_char(path) {
-        return Err(Error::materialization(format!(
-            "path contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {path}",
-            unrepresentable_char_name(c)
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableName,
+            format!(
+                "path contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {path}",
+                unrepresentable_char_name(c)
+            ),
+        ));
     }
     if path.starts_with('/') {
-        return Err(Error::materialization(format!(
-            "absolute path not allowed: {path}"
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableName,
+            format!("absolute path not allowed: {path}"),
+        ));
     }
     if !has_only_normal_components(path) {
-        return Err(Error::materialization(format!(
-            "path contains a traversal or empty component: {path}"
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableName,
+            format!("path contains a traversal or empty component: {path}"),
+        ));
     }
     // NAME_MAX is asserted in prose (see [`crate::atomic::NAME_MAX`]) AND
     // enforced here, at the wire/local boundary: a component longer than any
@@ -816,17 +826,23 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
         .split('/')
         .find(|component| component.len() > crate::atomic::NAME_MAX)
     {
-        return Err(Error::materialization(format!(
-            "path component exceeds the {}-byte filesystem name bound: {component:?} ({} bytes) in {path}",
-            crate::atomic::NAME_MAX,
-            component.len()
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableName,
+            format!(
+                "path component exceeds the {}-byte filesystem name bound: {component:?} ({} bytes) in {path}",
+                crate::atomic::NAME_MAX,
+                component.len()
+            ),
+        ));
     }
     let nfc: String = path.nfc().collect();
     if nfc != path {
-        return Err(Error::materialization(format!(
-            "manifest requires NFC/UTF-8 names, but this entry path is not NFC-normalized: {path}"
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableName,
+            format!(
+                "manifest requires NFC/UTF-8 names, but this entry path is not NFC-normalized: {path}"
+            ),
+        ));
     }
     Ok(path.to_string())
 }
@@ -853,15 +869,21 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
 /// different path). `entry_path` names the offending entry in every error.
 pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
     if target.is_empty() {
-        return Err(Error::materialization(format!(
-            "symlink target of entry {entry_path} is empty; an empty relative target cannot be a faithful address and the kernel refuses it",
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableSymlinkTarget,
+            format!(
+                "symlink target of entry {entry_path} is empty; an empty relative target cannot be a faithful address and the kernel refuses it",
+            ),
+        ));
     }
     if let Some(c) = first_unrepresentable_char(target) {
-        return Err(Error::materialization(format!(
-            "symlink target of entry {entry_path} contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {target:?}",
-            unrepresentable_char_name(c)
-        )));
+        return Err(Error::materialization_kind(
+            MaterializationKind::UnrepresentableSymlinkTarget,
+            format!(
+                "symlink target of entry {entry_path} contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {target:?}",
+                unrepresentable_char_name(c)
+            ),
+        ));
     }
     Ok(target.to_string())
 }
@@ -1006,9 +1028,10 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
         // filesystem.
         let entry_path = validate_entry_path(&joined)?;
         if !seen.insert(entry_path.clone()) {
-            return Err(Error::materialization(format!(
-                "duplicate normalized path: {entry_path}"
-            )));
+            return Err(Error::materialization_kind(
+                MaterializationKind::DuplicatePath,
+                format!("duplicate normalized path: {entry_path}"),
+            ));
         }
 
         let meta = std::fs::symlink_metadata(path)
@@ -1040,7 +1063,12 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
             if target.is_absolute() {
                 let reason = format!("absolute symlink not allowed: {}", path.display());
                 match policy {
-                    UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                    UnsupportedPolicy::Refuse => {
+                        return Err(Error::materialization_kind(
+                            MaterializationKind::AbsoluteSymlink,
+                            reason,
+                        ));
+                    }
                     UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
                 }
             }
@@ -1061,9 +1089,12 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
             // this entry on refusal; the hash binds the RAW bytes.
             let target_bytes = target.into_os_string().into_encoded_bytes();
             let target_str = std::str::from_utf8(&target_bytes).map_err(|_| {
-                Error::materialization(format!(
-                    "manifest requires UTF-8 symlink targets, but the target of entry {entry_path} is not valid UTF-8 (raw bytes: {target_bytes:?})"
-                ))
+                Error::materialization_kind(
+                    MaterializationKind::NotUtf8,
+                    format!(
+                        "manifest requires UTF-8 symlink targets, but the target of entry {entry_path} is not valid UTF-8 (raw bytes: {target_bytes:?})"
+                    ),
+                )
             })?;
             symlink_target = Some(validate_symlink_target(&entry_path, target_str)?);
             content_sha256 = Some(sha256_bytes(&target_bytes));
@@ -1076,7 +1107,12 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                 if meta.nlink() > 1 {
                     let reason = format!("hard links not allowed: {}", path.display());
                     match policy {
-                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Refuse => {
+                            return Err(Error::materialization_kind(
+                                MaterializationKind::HardLink,
+                                reason,
+                            ));
+                        }
                         UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
                     }
                 }
@@ -1085,10 +1121,10 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                 .map_err(|e| Error::materialization(format!("read {}: {e}", path.display())))?;
             content_sha256 = Some(sha256_bytes(&data));
         } else {
-            return Err(Error::materialization(format!(
-                "unsupported file type at {}",
-                path.display()
-            )));
+            return Err(Error::materialization_kind(
+                MaterializationKind::SpecialFile,
+                format!("unsupported file type at {}", path.display()),
+            ));
         }
 
         if let Some(reason) = unsupported_reason.take() {
@@ -1145,7 +1181,12 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                     target,
                 );
                 match policy {
-                    UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                    UnsupportedPolicy::Refuse => {
+                        return Err(Error::materialization_kind(
+                            MaterializationKind::EscapingSymlink,
+                            reason,
+                        ));
+                    }
                     UnsupportedPolicy::Tolerate => containment_unsupported.push(UnsupportedEntry {
                         path: entry.path.clone(),
                         reason,
@@ -1285,16 +1326,22 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
         };
         match kinds.get(parent) {
             None => {
-                return Err(Error::materialization(format!(
-                    "manifest is not parent-closed: entry {:?} has no entry for its parent directory {:?}; every parent must be listed as a `dir` entry so a parent's spelling is verified instead of being implicitly created",
-                    entry.path, parent
-                )));
+                return Err(Error::materialization_kind(
+                    MaterializationKind::ParentNotClosed,
+                    format!(
+                        "manifest is not parent-closed: entry {:?} has no entry for its parent directory {:?}; every parent must be listed as a `dir` entry so a parent's spelling is verified instead of being implicitly created",
+                        entry.path, parent
+                    ),
+                ));
             }
             Some(kind) if *kind != "dir" => {
-                return Err(Error::materialization(format!(
-                    "manifest has a non-directory parent: entry {:?} is under {:?}, which is a {:?}, not a `dir`",
-                    entry.path, parent, kind
-                )));
+                return Err(Error::materialization_kind(
+                    MaterializationKind::ParentNotClosed,
+                    format!(
+                        "manifest has a non-directory parent: entry {:?} is under {:?}, which is a {:?}, not a `dir`",
+                        entry.path, parent, kind
+                    ),
+                ));
             }
             Some(_) => {}
         }
@@ -1456,9 +1503,10 @@ fn canonicalize_remote_entries_with(
         // trees.
         let entry_path = validate_entry_path(path)?;
         if !seen.insert(entry_path.clone()) {
-            return Err(Error::materialization(format!(
-                "duplicate normalized path: {entry_path}"
-            )));
+            return Err(Error::materialization_kind(
+                MaterializationKind::DuplicatePath,
+                format!("duplicate normalized path: {entry_path}"),
+            ));
         }
 
         let mode = u32::from_str_radix(mode_hex, 16).map_err(|_| {
@@ -1480,7 +1528,12 @@ fn canonicalize_remote_entries_with(
                 if n > 1 {
                     let reason = format!("hard links not allowed: {entry_path}");
                     match policy {
-                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Refuse => {
+                            return Err(Error::materialization_kind(
+                                MaterializationKind::HardLink,
+                                reason,
+                            ));
+                        }
                         UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
                             path: entry_path.clone(),
                             reason,
@@ -1532,7 +1585,12 @@ fn canonicalize_remote_entries_with(
                 if Path::new(&symlink_target).is_absolute() {
                     let reason = format!("absolute symlink not allowed: {entry_path}");
                     match policy {
-                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Refuse => {
+                            return Err(Error::materialization_kind(
+                                MaterializationKind::AbsoluteSymlink,
+                                reason,
+                            ));
+                        }
                         UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
                             path: entry_path.clone(),
                             reason,
@@ -1560,9 +1618,10 @@ fn canonicalize_remote_entries_with(
                 }
             }
             other => {
-                return Err(Error::materialization(format!(
-                    "unsupported file type at {entry_path}: {other:?}"
-                )));
+                return Err(Error::materialization_kind(
+                    MaterializationKind::SpecialFile,
+                    format!("unsupported file type at {entry_path}: {other:?}"),
+                ));
             }
         };
         entries.push(entry);
@@ -1600,7 +1659,12 @@ fn canonicalize_remote_entries_with(
             let reason =
                 symlink_target_refusal_message(refusal, &entry.path, &target.to_string_lossy());
             match policy {
-                UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                UnsupportedPolicy::Refuse => {
+                    return Err(Error::materialization_kind(
+                        MaterializationKind::EscapingSymlink,
+                        reason,
+                    ));
+                }
                 UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
                     path: entry.path.clone(),
                     reason,
@@ -2343,6 +2407,164 @@ mod tests {
         assert!(
             remote_err.to_string().contains("hard links not allowed"),
             "remote assembler must reject the hard link, got: {remote_err}"
+        );
+    }
+
+    /// Constraint #4: the strict canonicalizer's distinct refusals carry
+    /// DISTINCT typed reasons, so a caller (or the destination-tolerant form
+    /// deciding what to RECORD) can tell an absolute symlink from an escaping
+    /// symlink from a hard link from a special file from an unrepresentable
+    /// name without reading the message. This is also the mutation control:
+    /// collapsing any two of these refusals onto one kind fails the
+    /// distinctness assertion even though the messages would still differ.
+    #[cfg(unix)]
+    #[test]
+    fn strict_canonicalizer_refusals_carry_distinct_typed_kinds() {
+        use crate::error::MaterializationKind;
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+
+        // An absolute symlink.
+        let abs = dir.path().join("abs");
+        std::fs::create_dir_all(&abs).unwrap();
+        std::os::unix::fs::symlink("/opt/app/v1", abs.join("l")).unwrap();
+        let e = canonicalize_tree(&abs).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::AbsoluteSymlink),
+            "{e:?}"
+        );
+
+        // An escaping relative symlink.
+        let esc = dir.path().join("esc");
+        std::fs::create_dir_all(&esc).unwrap();
+        std::os::unix::fs::symlink("../../etc/passwd", esc.join("l")).unwrap();
+        let e = canonicalize_tree(&esc).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::EscapingSymlink),
+            "{e:?}"
+        );
+
+        // A hard link.
+        let hard = dir.path().join("hard");
+        std::fs::create_dir_all(&hard).unwrap();
+        std::fs::write(hard.join("a"), b"x").unwrap();
+        std::fs::hard_link(hard.join("a"), hard.join("b")).unwrap();
+        let e = canonicalize_tree(&hard).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::HardLink),
+            "{e:?}"
+        );
+
+        // A special file: a socket, which `stat` classifies without blocking.
+        let special = dir.path().join("special");
+        std::fs::create_dir_all(&special).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(special.join("sock")).unwrap();
+        let e = canonicalize_tree(&special).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::SpecialFile),
+            "{e:?}"
+        );
+
+        // A wire-unrepresentable name: a newline is legal on disk, refused on
+        // the manifest wire.
+        let nl = dir.path().join("nl");
+        std::fs::create_dir_all(&nl).unwrap();
+        std::fs::write(nl.join("a\nb"), b"x").unwrap();
+        let e = canonicalize_tree(&nl).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::UnrepresentableName),
+            "{e:?}"
+        );
+
+        // MUTATION CONTROL: the address-fidelity refusals are four DIFFERENT
+        // kinds and the wire refusal is a fifth.
+        let kinds = [
+            MaterializationKind::AbsoluteSymlink,
+            MaterializationKind::EscapingSymlink,
+            MaterializationKind::HardLink,
+            MaterializationKind::SpecialFile,
+            MaterializationKind::UnrepresentableName,
+        ];
+        let mut deduped = kinds.to_vec();
+        deduped.sort_by_key(|k| format!("{k:?}"));
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            kinds.len(),
+            "each refusal must have its OWN kind: {kinds:?}"
+        );
+    }
+
+    /// Constraint #4: the WIRE-validation refusals are also typed, so a caller
+    /// can tell a malformed far-side frame (a bug) from a tree the crate
+    /// cannot represent from a duplicate path from a non-parent-closed
+    /// manifest by the kind, not the message. Branches only on
+    /// `materialization_reason()`.
+    #[test]
+    fn wire_validation_refusals_carry_typed_kinds() {
+        use crate::error::MaterializationKind;
+        let root = Path::new("/srv/store");
+        let h = "0".repeat(64);
+
+        // A duplicate normalized path.
+        let dup = format!("f\tf\t81a4\t1\t{h}\t\nf\tf\t81a4\t1\t{h}\t\n");
+        let e = canonicalize_remote_entries(&dup, root).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::DuplicatePath),
+            "{e:?}"
+        );
+
+        // A manifest that is not parent-closed.
+        let unclosed = format!("d/x\tf\t81a4\t1\t{h}\t\n");
+        let e = canonicalize_remote_entries(&unclosed, root).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::ParentNotClosed),
+            "{e:?}"
+        );
+
+        // A symlink target carrying a wire-unrepresentable NUL.
+        let nul_target = format!("l\tl\t1ff\t1\t{h}\tx{}y", '\u{0}');
+        let e = canonicalize_remote_entries(&nul_target, root).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::UnrepresentableSymlinkTarget),
+            "{e:?}"
+        );
+    }
+
+    /// Constraint #4: a symlink TARGET that is valid on disk but not UTF-8 is
+    /// its OWN typed refusal ([`MaterializationKind::NotUtf8`]), distinct from
+    /// a wire-unrepresentable name. A non-UTF-8 NAME is refused by the
+    /// filesystem on macOS, but a non-UTF-8 symlink TARGET is storable, so this
+    /// runs on the audit host (it skips, visibly, where even the target is
+    /// refused).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_symlink_target_is_the_typed_not_utf8_kind() {
+        use crate::error::MaterializationKind;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        let bad = std::ffi::OsStr::from_bytes(&[0xff]);
+        if let Err(e) = std::os::unix::fs::symlink(bad, root.join("l")) {
+            announce_skip(&format!(
+                "the filesystem refuses a non-UTF-8 symlink target ({e}), so this reproduction \
+                 cannot run here"
+            ));
+            return;
+        }
+        let e = canonicalize_tree(&root).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::NotUtf8),
+            "{e:?}"
         );
     }
 

@@ -18,7 +18,7 @@ mod hostkey;
 mod runner;
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TransportKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1163,11 +1163,14 @@ impl SshTransport {
 /// where the previous content is intact; it stays `ssh upload failed`.
 fn upload_failure(rel: &Path, code: Option<i32>, stderr: &str) -> Error {
     if code == Some(SSH_UPLOAD_POST_RENAME_EXIT) {
-        Error::transport(format!(
-            "write {}: the entry is visible but its durability is unconfirmed: \
-             ssh upload parent-directory fsync failed: {stderr}",
-            rel.display()
-        ))
+        Error::transport_kind(
+            TransportKind::DurabilityUnconfirmed,
+            format!(
+                "write {}: the entry is visible but its durability is unconfirmed: \
+                 ssh upload parent-directory fsync failed: {stderr}",
+                rel.display()
+            ),
+        )
     } else {
         Error::transport(format!("ssh upload failed: {stderr}"))
     }
@@ -5541,6 +5544,14 @@ mod tests_ssh {
         assert!(
             msg.contains("the entry is visible but its durability is unconfirmed"),
             "a post-rename fsync failure must report visible-but-unconfirmed durability, got: {msg}"
+        );
+        // Constraint #4: visible-but-unconfirmed durability is its OWN typed
+        // condition, so a caller can distinguish "retrying may be wrong" from
+        // "the write failed" without matching the message.
+        assert_eq!(
+            err.transport_reason(),
+            Some(TransportKind::DurabilityUnconfirmed),
+            "a post-rename fsync failure carries the typed durability kind, got: {err:?}"
         );
         // THE COMMIT POINT ALREADY HAPPENED: the bytes are visible.
         assert_eq!(
