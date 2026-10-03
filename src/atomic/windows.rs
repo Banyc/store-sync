@@ -315,10 +315,104 @@ fn refuse_unlandable_name<'a>(name: &'a std::ffi::OsStr, parent: &Path) -> Resul
     Ok(name_str)
 }
 
-/// The Windows twin of the Unix overlap refusal, using the platform's
-/// case-INSENSITIVE comparison: a Windows filesystem folds case, so `Tree` and
-/// `tree` are one directory and a case-only difference must not evade the
-/// check.
+/// The `(volume serial, file index)` identity of a DIRECTORY at `path`,
+/// FOLLOWING reparse points: a junction or directory-symlink alias must report
+/// its TARGET's identity, which is the whole point of an identity-based overlap
+/// decision. Unix reaches the same pair through
+/// `atomic::guard::fd_entry_identity`; Windows has no directory descriptor, so
+/// this opens the path with `FILE_FLAG_BACKUP_SEMANTICS` (required to open a
+/// directory) and WITHOUT `FILE_FLAG_OPEN_REPARSE_POINT`.
+fn directory_identity(path: &Path) -> Result<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+    const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|e| Error::store(format!("open {} for its identity: {e}", path.display())))?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        return Err(Error::store(format!(
+            "GetFileInformationByHandle {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let index = ((info.nFileIndexHigh as u64) << 32) | u64::from(info.nFileIndexLow);
+    Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+/// The bound on an ancestry walk (see the Unix port's `MAX_ANCESTRY`).
+const MAX_ANCESTRY: usize = 1 << 16;
+
+/// Whether `from` IS `target` or is INSIDE it, by walking `from`'s parents and
+/// comparing directory identities. Fails CLOSED on an identity error.
+fn path_chain_contains(from: &Path, target: (u64, u64)) -> Result<bool> {
+    let mut cur = from.to_path_buf();
+    for _ in 0..MAX_ANCESTRY {
+        if directory_identity(&cur)? == target {
+            return Ok(true);
+        }
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent.to_path_buf(),
+            _ => return Ok(false),
+        }
+    }
+    Err(Error::store(format!(
+        "copy_dir_recursive_fd: could not determine the directory ancestry within {MAX_ANCESTRY} \
+         levels; refusing to guess whether the source and the destination overlap"
+    )))
+}
+
+/// The deepest existing directory on `dst_abs`, never walking above `root`.
+fn deepest_existing_dir(dst_abs: &Path, root: &Path) -> Result<PathBuf> {
+    let mut cur = dst_abs.to_path_buf();
+    loop {
+        match std::fs::metadata(&cur) {
+            Ok(meta) if meta.is_dir() => return Ok(cur),
+            Ok(_) => {
+                return Err(Error::store(format!(
+                    "copy_dir_recursive_fd: destination {} resolves to a non-directory",
+                    cur.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if cur == root {
+                    return Err(Error::store(format!(
+                        "copy_dir_recursive_fd: the owned root {} does not exist",
+                        root.display()
+                    )));
+                }
+                match cur.parent() {
+                    Some(parent) if parent.starts_with(root) => cur = parent.to_path_buf(),
+                    _ => {
+                        return Err(Error::store(format!(
+                            "copy_dir_recursive_fd: destination {} left the owned root",
+                            dst_abs.display()
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(Error::store(format!("stat {}: {e}", cur.display())));
+            }
+        }
+    }
+}
+
+/// The Windows twin of the Unix overlap refusal, decided by directory IDENTITY
+/// (following reparse points) with the platform's case-INSENSITIVE path
+/// comparison kept as a cheap SECONDARY guard. The identity pair is what catches
+/// a JUNCTION alias of the root, which a spelling comparison (canonicalize +
+/// case fold) can miss exactly as the Unix spelling comparison missed a
+/// bind-mount or firmlink alias; the fold still catches a case-only difference
+/// on a filesystem that reports distinct identities for one directory.
 fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
     fn key(p: &Path) -> Vec<String> {
         p.components()
@@ -330,14 +424,30 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
     let dst_abs = root_c.join(dst_rel);
     let src_c = std::fs::canonicalize(src)
         .map_err(|e| Error::store(format!("canonicalize source {}: {e}", src.display())))?;
+
+    let src_id = directory_identity(src)?;
+    let anchor = deepest_existing_dir(&dst_abs, &root_c)?;
+    let anchor_id = directory_identity(&anchor)?;
+    let anchor_inside_source = path_chain_contains(&anchor, src_id)?;
+    let dst_exists = anchor == dst_abs;
+    let source_inside_destination = if dst_exists {
+        path_chain_contains(src, anchor_id)?
+    } else {
+        false
+    };
+
     let (d, s) = (key(&dst_abs), key(&src_c));
     let prefix = |a: &[String], b: &[String]| b.len() >= a.len() && a == &b[..a.len()];
-    if d == s || prefix(&s, &d) || prefix(&d, &s) {
+    let spelling_overlap = d == s || prefix(&s, &d) || prefix(&d, &s);
+
+    if anchor_id == src_id || anchor_inside_source || source_inside_destination || spelling_overlap
+    {
         return Err(Error::store(format!(
             "copy_dir_recursive_fd: refusing to copy {} to {} — the source and the destination \
              overlap (the destination is inside the source, the source is inside the destination, \
              or they are the same directory), so the walk would copy the tree into itself without \
-             bound",
+             bound; the primary decision is by directory IDENTITY (volume serial, file index), so a \
+             junction alias of one spelling cannot evade it",
             src.display(),
             dst_abs.display()
         )));
@@ -356,13 +466,23 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 /// is created, exactly as the Unix port does.
 ///
 /// OVERLAP: a source/destination overlap is refused by
-/// [`refuse_overlapping_copy`] (case-insensitively) before anything is
-/// created, so the walk cannot copy a tree into itself without bound.
+/// [`refuse_overlapping_copy`] before anything is created, decided primarily
+/// by directory IDENTITY `(volume serial, file index)` FOLLOWING reparse
+/// points — so a JUNCTION alias of the root cannot evade it the way a spelling
+/// comparison can — with the case-INSENSITIVE path comparison kept as a
+/// secondary guard. The source SPELLING is normalized first (`normalize_root`)
+/// and a symlink source is refused, exactly as on Unix.
 ///
 /// SYMLINKS: the crate's OWN target rules are reused
 /// ([`crate::manifest::validate_symlink_target`] and
 /// [`crate::manifest::check_relative_symlink_target`]), and a link is copied
 /// as a link, never followed.
+///
+/// ALL-OR-NOTHING LANDING: a copied entry never replaces a pre-existing
+/// destination entry. A copied file uses `create_new` (`O_EXCL` semantics), a
+/// copied directory `create_dir` (`mkdir` `EEXIST`), and a copied symlink
+/// [`symlink_new_fd`] (`symlink` `EEXIST`); the old entry is left untouched in
+/// every case.
 ///
 /// HARD LINKS are NOT detected on this port (Windows exposes no stable
 /// `nlink` through `std::fs`), and the crate's own Windows manifest cannot
@@ -387,14 +507,14 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 /// `O_NOFOLLOW`, so a symlink injected into a destination component IS
 /// followed (`rel_join` only refuses absolute/`..`/`.` spellings). This is
 /// the same weakness every other `_fd` primitive of the Windows port carries.
-/// A pre-existing destination file at a copied file's name is overwritten
-/// (`std::fs::copy`), where the Unix port refuses it with `O_EXCL`; the
-/// caller is expected to pass a fresh destination.
+/// Modes are a no-op on this port (`crate::platform::chmod`), so the Unix
+/// port's undo journal has nothing to undo here and the source cannot be
+/// mutated through a mode.
 pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
     // Every destination mutation routes through the SAME guarded rel-path
-    // primitives the rest of the port uses (`create_dir_fd`, `write_file_fd`,
-    // `symlink_fd`), so the ONE reserved-spelling gate runs here too rather
-    // than a raw `std::fs` call bypassing it.
+    // primitives the rest of the port uses (`create_dir_fd`,
+    // `write_file_new_fd`, `symlink_new_fd`), so the ONE reserved-spelling gate
+    // runs here too rather than a raw `std::fs` call bypassing it.
     fn open_frame(src: &Path) -> Result<std::vec::IntoIter<std::fs::DirEntry>> {
         let entries = std::fs::read_dir(src)
             .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
@@ -403,8 +523,20 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
         Ok(entries.into_iter())
     }
 
-    let src_meta = std::fs::symlink_metadata(src)
+    // Normalize the source SPELLING first, exactly as the Unix port does: a
+    // trailing separator makes the platform resolve the final component as an
+    // INTERMEDIATE one, so a symlink source would be followed. Then refuse a
+    // symlink source and a non-directory source with distinct messages.
+    let src = normalize_root(src);
+    let src_meta = std::fs::symlink_metadata(&src)
         .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
+    if src_meta.file_type().is_symlink() {
+        return Err(Error::store(format!(
+            "copy_dir_recursive_fd: source {} is a symlink (refusing to follow a symlink \
+             source)",
+            src.display()
+        )));
+    }
     if !src_meta.is_dir() {
         return Err(Error::store(format!(
             "copy_dir_recursive_fd: source {} is not a directory",
@@ -413,7 +545,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     }
     let root_mode = crate::platform::metadata_mode(&src_meta);
     refuse_reserved_creation(dst_rel)?;
-    refuse_overlapping_copy(root, src, dst_rel)?;
+    refuse_overlapping_copy(root, &src, dst_rel)?;
     // See the Unix port: a symlink target that walks OUT of the copied subtree
     // is judged against the destination root, exactly as `canonicalize_tree`
     // will judge the result.
@@ -429,7 +561,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     // and collapsed every error to `Absent`). The destination walk is skipped
     // when the source holds no symlink; an enumeration failure is an `Err`
     // (fail closed).
-    let source_entries = crate::manifest::live_entry_kinds(src)?;
+    let source_entries = crate::manifest::live_entry_kinds(&src)?;
     let has_source_symlink = source_entries.iter().any(|(_, is_link)| *is_link);
     let dst_entries: Vec<(String, bool)> = if has_source_symlink {
         crate::manifest::live_entry_kinds(&dst_root_abs)?
@@ -478,7 +610,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     let mut stack: Vec<Frame> = vec![Frame {
         dst_rel: dst_rel.to_path_buf(),
         src_shown: src.to_path_buf(),
-        entries: open_frame(src)?,
+        entries: open_frame(&src)?,
     }];
     while let Some(top) = stack.last_mut() {
         let Some(entry) = top.entries.next() else {
@@ -538,7 +670,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                     )
                 )));
             }
-            symlink_fd(root, &link, &child_rel)?;
+            symlink_new_fd(root, &link, &child_rel)?;
         } else if ft.is_file() {
             // MEMORY BOUND (see the primitive's doc): read whole.
             let bytes = std::fs::read(&child_src)
@@ -547,7 +679,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                 &std::fs::metadata(&child_src)
                     .map_err(|e| Error::store(format!("stat {}: {e}", child_src.display())))?,
             );
-            write_file_fd(root, &child_rel, &bytes)?;
+            write_file_new_fd(root, &child_rel, &bytes)?;
             crate::platform::chmod(&rel_join(root, &child_rel)?, mode)
                 .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
         } else {
@@ -568,7 +700,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     // held a symlink, since only then was a containment verdict made. The
     // window between this check and the `symlink_fd` calls is NOT closed.
     if has_source_symlink {
-        let after = crate::manifest::live_entry_kinds(src)?;
+        let after = crate::manifest::live_entry_kinds(&src)?;
         if after != source_entries {
             return Err(Error::store(format!(
                 "copy_dir_recursive_fd: the source {} changed shape while it was being copied \
@@ -816,6 +948,35 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("symlink {}: {e}", rel.display())))
 }
 
+/// Land a freshly-COPIED symlink WITHOUT replacing anything: the copy's
+/// all-or-nothing rule (see the Unix [`symlink_new_fd`]). The public
+/// [`symlink_fd`] removes any existing entry first because its callers want
+/// replace semantics; the copy must not, so a pre-existing destination entry
+/// is REFUSED and left untouched. `std::fs::symlink` itself fails on an
+/// existing name, but the explicit probe names the clash in the error.
+fn symlink_new_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    let link = rel_join(root, rel)?;
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    match std::fs::symlink_metadata(&link) {
+        Ok(_) => {
+            return Err(Error::store(format!(
+                "copy_dir_recursive_fd: refusing to replace the existing destination entry {} with \
+                 a copied symlink — a copy is all-or-nothing, so a copied symlink refuses a \
+                 pre-existing entry",
+                rel.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::store(format!("stat {}: {e}", rel.display()))),
+    }
+    crate::platform::symlink(target, &link)
+        .map_err(|e| Error::store(format!("symlink {}: {e}", rel.display())))
+}
+
 /// Refuse a recursive removal whose tree CONTAINS a lock-record spelling at any
 /// depth.
 ///
@@ -1021,6 +1182,30 @@ pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
     refuse_lock_record_mutation(rel)?;
     std::fs::write(rel_join(root, rel)?, bytes)
+        .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))
+}
+
+/// CREATE-NEW-ONLY sibling of [`write_file_fd`] for the copy's all-or-nothing
+/// landing rule: a pre-existing destination entry is REFUSED (`create_new` is
+/// `O_EXCL`), never truncated, matching the Unix port's
+/// `O_WRONLY | O_CREAT | O_EXCL`. The parent always exists (the walk created
+/// it), so no parent creation is attempted here.
+fn write_file_new_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    refuse_lock_record_mutation(rel)?;
+    let path = rel_join(root, rel)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| {
+            Error::store(format!(
+                "copy_dir_recursive_fd: refusing to replace the existing destination entry {} with \
+                 a copied file: {e}",
+                rel.display()
+            ))
+        })?;
+    file.write_all(bytes)
         .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))
 }
 

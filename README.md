@@ -395,8 +395,43 @@ deltas from `deploy`'s originals (each documented on the primitive itself):
   open, so a FIFO cannot block the copy, and a HARD LINK is refused rather
   than silently duplicated into an independent regular file.
 * A source/destination OVERLAP (either inside the other, or equal) is refused
-  before anything is created, so a destination inside the source cannot be
-  re-yielded by the source read and recurse without bound.
+  before anything is created, decided by directory IDENTITY (`(st_dev, st_ino)`
+  on Unix, volume serial + file index on Windows), not by path spelling, so a
+  Linux `mount --bind` alias, a macOS firmlink, a Windows junction, or a
+  case-fold-equal `dst_rel` can no longer be created INSIDE the source and run
+  the walk without bound. The destination ANCHOR (the deepest existing
+directory on `dst_rel`) is compared with the opened source; a component that
+  cannot be opened as a directory, and any identity-probe failure, refuse (fail
+  closed). The one case identity cannot catch (two paths onto one tree that
+  report DIFFERENT device numbers) is documented rather than hidden.
+* A FAILED COPY RESTORES EVERY MODE IT CHANGED (an RAII journal): a
+  pre-existing destination directory goes back to its original mode and a
+  directory the call created goes back to the removable `0o700`, so a failed
+  copy can never leave the SOURCE mutated (the fold-equal case), nor leave a
+  destination the CALL CREATED that the crate's own `remove_dir_all_fd` cannot
+  remove. A pre-existing destination keeps its own mode. On success the exact
+  modes are applied and the journal is disarmed.
+* SYMLINK LANDING IS ALL-OR-NOTHING, like the file (`O_EXCL`) and directory
+  (`mkdirat`) rules: a copied symlink over a pre-existing file, directory, or
+  symlink is REFUSED (`symlinkat` `EEXIST`) and the old entry is left intact,
+  where the public `symlink_fd`'s replace semantics used to unlink and destroy
+  a live destination file. A copied file uses create-new and a copied directory
+  `mkdirat`, so all six kind pairs refuse rather than replace.
+* The SOURCE spelling is normalized (`normalize_root`) and its FINAL component
+  must not be a symlink, so a trailing-separator symlink source (`link/`) is
+  refused instead of followed — POSIX resolves a trailing separator as an
+  intermediate component, whose `lstat` reports a directory.
+* The descriptor bound is stated and MEASURED: the walk holds one source
+  descriptor per level, and a destination mutation holds O(1) because the
+  ancestor chain is re-opened one component at a time (depth 256 succeeds at
+  `RLIMIT_NOFILE=262`); the TIME cost is O(depth) `openat` calls per
+  destination entry. `dir_entry_names` buffers a directory's whole name list
+  (measured ~50 B/entry); the widest directory, not the depth, bounds that
+  heap.
+* FIDELITY IS TO THE MANIFEST MODEL: content, modes (with the special bits),
+  and symlink targets — the fields `canonicalize_tree` digests — are faithful,
+  so a copied tree passes the digest. mtime/atime/xattrs/ACLs/ownership are NOT
+  carried; a caller that needs them restores them.
 * A symlink's TARGET is judged by the crate's own containment rule through the
   SAME indexed authority the two manifest views use
   (`manifest::SymlinkContainmentIndex` + `check_relative_symlink_target_indexed`,
@@ -412,7 +447,15 @@ deltas from `deploy`'s originals (each documented on the primitive itself):
 * NOT atomic, NOT durable, and PARTIAL ON FAILURE: there is no temp directory
   and no final rename, so entries appear in place, an error mid-walk leaves a
   partial destination tree, and nothing is fsynced; a caller that needs more
-  copies into a staging path it owns and renames it into place.
+  copies into a staging path it owns and renames it into place. A partial
+  destination the call CREATED is removable with `remove_dir_all_fd` (the modes
+  were restored); a pre-existing one keeps its own mode. The empty ancestors
+  the call created are kept so that documented cleanup keeps working.
+* The `dst_rel` PATH is exempt from the documented recovery sweep (a
+  temp-shaped staging component like `.staged.tmp.1.2/root` is needed by
+  `deploy`), but a temp-shaped ENTRY name is refused — so a caller that leaves
+  a copy AT a temp-shaped destination loses the whole tree to the sweep and
+  must rename it into place.
 * The destination side is descriptor-confined (a symlinked component is
   refused); the source side is a path-based READ, exactly as the original. The
   Windows port is path-based with the port's documented weaker guarantee, and

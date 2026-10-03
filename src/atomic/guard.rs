@@ -75,18 +75,18 @@ use std::path::{Component, Path, PathBuf};
 /// same identity ARE one entry; two spellings with different identities are
 /// DISTINCT entries even when a case/dot fold maps one onto the other.
 #[cfg(unix)]
-type EntryIdentity = (u64, u64);
+pub(crate) type EntryIdentity = (u64, u64);
 #[cfg(windows)]
-type EntryIdentity = (u64, u64);
+pub(crate) type EntryIdentity = (u64, u64);
 #[cfg(not(any(unix, windows)))]
-type EntryIdentity = (u64, u64);
+pub(crate) type EntryIdentity = (u64, u64);
 
 /// Resolve `path` to its on-disk identity WITHOUT following a final symlink
 /// (`lstat`, and `FILE_FLAG_OPEN_REPARSE_POINT` on Windows): a symlink is its
 /// own entry, matching the crate's `O_NOFOLLOW` confinement. `Ok(None)` is a
 /// confirmed absence; any other error is returned so a caller can fail closed.
 #[cfg(unix)]
-fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
+pub(crate) fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some((meta.dev(), meta.ino()))),
@@ -96,7 +96,7 @@ fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
 }
 
 #[cfg(windows)]
-fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
+pub(crate) fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -125,7 +125,7 @@ fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn entry_identity(_path: &Path) -> std::io::Result<Option<EntryIdentity>> {
+pub(crate) fn entry_identity(_path: &Path) -> std::io::Result<Option<EntryIdentity>> {
     // Neither supported port of the substrate is selected, so no identity is
     // available and ownership falls back to byte-exact spelling.
     Ok(None)
@@ -1144,7 +1144,14 @@ mod tests {
             ("symlinkat", 1),
             ("linkat", 1),
             ("mkdirat", 3),
-            ("openat", 5),
+            // FIVE until the copy's identity-based overlap refusal added TWO
+            // read-only component opens (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`):
+            // one in `open_destination_anchor` (the deepest existing directory
+            // on `dst_rel`, resolved from the owned root descriptor) and one in
+            // `dir_chain_contains` (the `..` ancestry step). Neither can CREATE,
+            // REPLACE, or TRUNCATE an entry, so neither needs the lock-record
+            // guard; both are reviewed and pinned here.
+            ("openat", 7),
             ("unlink", 0),
             ("rename", 0),
             ("symlink", 0),

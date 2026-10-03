@@ -780,11 +780,11 @@ fn symlinkat_fd(dir_fd: &OwnedFd, target: &Path, name: &OsStr) -> Result<()> {
 
 /// Open-or-create a directory component relative to `cur` (O_DIRECTORY |
 /// O_NOFOLLOW; created with 0o700 when missing, tolerating a racing
-/// creation). A symlink at the component is refused (ELOOP); a
-/// non-directory is refused (ENOTDIR). The component is guarded: creating a
-/// directory whose name is a lock-record spelling would occupy the record's
-/// path.
-fn open_or_create_dir(cur: &OwnedFd, comp: &[u8]) -> Result<OwnedFd> {
+/// creation), reporting whether THIS call created the component. A symlink at
+/// the component is refused (ELOOP); a non-directory is refused (ENOTDIR). The
+/// component is guarded: creating a directory whose name is a lock-record
+/// spelling would occupy the record's path.
+fn open_or_create_dir(cur: &OwnedFd, comp: &[u8]) -> Result<(OwnedFd, bool)> {
     // OPEN-OR-CREATE only: a residue spelling is permitted (the openat cannot
     // destroy; a fresh create is not a destruction), and the lock authority
     // still runs.
@@ -799,7 +799,7 @@ fn open_or_create_dir(cur: &OwnedFd, comp: &[u8]) -> Result<OwnedFd> {
         )
     };
     if fd >= 0 {
-        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, false));
     }
     let e = std::io::Error::last_os_error();
     if e.kind() != std::io::ErrorKind::NotFound {
@@ -826,7 +826,7 @@ fn open_or_create_dir(cur: &OwnedFd, comp: &[u8]) -> Result<OwnedFd> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd2) })
+    Ok((unsafe { OwnedFd::from_raw_fd(fd2) }, true))
 }
 
 /// Read a whole file through an already-open descriptor.
@@ -880,6 +880,15 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 /// from inside [`for_each_dir_entry`]'s callback, holding a live `DIR*`
 /// across a recursive call; collecting the names first preserves the order
 /// but lets the walk own its iteration explicitly, on the heap.
+///
+/// COST: O(entries) heap for the WIDEST directory of the walk (measured ~50 B
+/// per name, so 200 000 entries is ~13.7 MB and ~7.9 s to collect in one
+/// process), freed when the frame drops. This is a stated cost, not a leak:
+/// the alternative (a live `DIR*` per level) holds a descriptor AND a `DIR`
+/// buffer per level and cannot be resumed after an error part-way through one
+/// directory's iteration. No cap is imposed; a caller with a directory of
+/// millions of entries should stream it through its own walk rather than the
+/// tree copy.
 fn dir_entry_names(dir_fd: &OwnedFd) -> Result<Vec<Vec<u8>>> {
     let mut names = Vec::new();
     for_each_dir_entry(dir_fd, |name| {
@@ -1312,7 +1321,7 @@ pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
     for (i, comp) in comps.iter().enumerate() {
         let is_last = i == comps.len() - 1;
-        let dir = open_or_create_dir(&cur, comp)?;
+        let (dir, _created) = open_or_create_dir(&cur, comp)?;
         if is_last {
             let f = std::fs::File::from(
                 dir.try_clone()
@@ -1775,6 +1784,33 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
     fsync_dir_fd(&parent_fd)
 }
 
+/// Land a freshly-COPIED symlink WITHOUT replacing anything: the destination
+/// name must be free, so the copy is all-or-nothing exactly as its file
+/// (`O_CREAT|O_EXCL`) and directory (`mkdirat` `EEXIST`) rules are. The PUBLIC
+/// [`symlink_fd`] unlinks first because its callers WANT replace semantics;
+/// the copy must not, so it uses this instead. `symlinkat` itself refuses an
+/// existing name with `EEXIST`, so the refusal is ATOMIC (not a check-then-
+/// create race); the `fstatat` probe in front of it exists only to name the
+/// clash in the error.
+fn symlink_new_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    match fstatat_stat_io(&parent_fd, name.as_bytes()) {
+        Ok(_) => {
+            return Err(Error::store(format!(
+                "copy_dir_recursive_fd: refusing to replace the existing destination entry {} with \
+                 a copied symlink — a copy is all-or-nothing (a copied file is refused with \
+                 `O_EXCL`, a copied directory with `mkdirat` `EEXIST`), so a copied symlink refuses \
+                 a pre-existing entry too",
+                rel.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::store(format!("fstatat {}: {e}", rel.display()))),
+    }
+    symlinkat_fd(&parent_fd, target, name)?;
+    fsync_dir_fd(&parent_fd)
+}
+
 /// The canonical filesystem path pinned by an owned-root DESCRIPTOR.
 ///
 /// The Unix [`RootDir`] stores only a descriptor, so the copy's overlap check
@@ -1811,34 +1847,177 @@ fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
     }
 }
 
-/// Refuse a copy whose SOURCE and DESTINATION overlap.
+/// Refuse a copy whose SOURCE and DESTINATION overlap, deciding OVERLAP BY
+/// IDENTITY rather than by spelling.
 ///
-/// The destination root is `<owned root>/dst_rel` (a lexical join of the
-/// canonical root and validated `Normal` components; a symlink component is
-/// refused later by the guarded create); the source is canonicalized. The
-/// three overlap cases — the destination inside the source, the source inside
-/// the destination, and the two being the same directory — are all refused by
-/// construction, with the condition named in the error. This primitive has NO
-/// final rename, so entries appear IN PLACE: an overlap cannot be neutralized
-/// by a rename fence, and the destination directory is created before the
-/// source is read, so `read_dir(src)` would re-yield the destination and
-/// recurse without bound.
-fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
-    let dst_abs = owned_root_self_path(root)?.join(dst_rel);
-    let src_c = std::fs::canonicalize(src)
-        .map_err(|e| Error::store(format!("canonicalize source {}: {e}", src.display())))?;
-    if src_c == dst_abs || dst_abs.starts_with(&src_c) || src_c.starts_with(&dst_abs) {
+/// The old check compared `canonicalize(src)` against a lexical join of the
+/// owned root's resolved self-path and `dst_rel`. Two spellings of ONE
+/// directory that `realpath(3)` does not unify evade that comparison — a Linux
+/// `mount --bind` alias of the root, or a macOS firmlink spelling — and the
+/// destination is then created INSIDE the source, whose `read_dir` re-yields it
+/// and the walk recurses without bound (reproduced: 57 `sub/.../sub` levels to
+/// `EMFILE` on Linux, `ENAMETOOLONG` on macOS). A case-fold-equal `dst_rel` on
+/// a case-insensitive filesystem (macOS APFS) evades it too, and the copy then
+/// MUTATES ITS OWN SOURCE.
+///
+/// THE RULE: open the source directory and the DESTINATION ANCHOR — the deepest
+/// existing directory on `dst_rel`, resolved component-wise from the owned root
+/// descriptor — and compare their `(st_dev, st_ino)` identities (the crate's
+/// ONE identity pair, resolved by [`fd_entry_identity`]). Refuse when
+///
+/// * the anchor IS the source (they are the same directory — this is the
+///   bind-mount, firmlink, and case-fold case), or
+/// * the anchor is at or INSIDE the source (creating `dst_rel` would put it in
+///   the source subtree, which is what runs the walk away), or
+/// * the whole `dst_rel` already exists AND is at or above the source (the
+///   source is inside the destination).
+///
+/// The second and third arms walk the directory's own `..` chain, comparing
+/// identities at each step, so they too are spelling-blind. A component that
+/// exists but cannot be opened as a directory (a symlink, a non-directory) is a
+/// fail-CLOSED refusal, and any identity probe failure refuses rather than
+/// guessing: an overlap that cannot be ruled out is not allowed through.
+///
+/// WHAT IT STILL CANNOT CATCH: two distinct paths onto the SAME tree that
+/// report DIFFERENT `(st_dev, st_ino)` pairs. On Linux a bind mount of a
+/// directory reports the SAME device and inode as the original (bind mounts do
+/// not change `st_dev`), and on macOS a firmlink likewise resolves to the same
+/// inode, so both are caught. It would NOT catch an alias that presents a
+/// different device number for the same underlying directory (some overlay or
+/// network filesystems report a per-mount device); such an alias would have to
+/// be reproduced on that filesystem to be seen, and this primitive documents
+/// the limit rather than pretending to close it. A `btrfs` subvolume or a
+/// `mount --bind` across a bind of a bind still report one inode.
+fn refuse_overlapping_copy(
+    root: &RootDir,
+    src: &Path,
+    src_fd: &OwnedFd,
+    dst_rel: &Path,
+) -> Result<()> {
+    let src_id = fd_entry_identity(src_fd)
+        .map_err(|e| Error::store(format!("identity of the source {}: {e}", src.display())))?;
+    let (anchor_fd, dst_exists) = open_destination_anchor(root, dst_rel)?;
+    let anchor_id = fd_entry_identity(&anchor_fd).map_err(|e| {
+        Error::store(format!(
+            "identity of the destination {}: {e}",
+            dst_rel.display()
+        ))
+    })?;
+    let anchor_inside_source = dir_chain_contains(&anchor_fd, src_id)?;
+    // Only an EXISTING destination can contain the source: a destination that
+    // does not exist cannot be an ancestor of an existing source directory.
+    let source_inside_destination = if dst_exists {
+        dir_chain_contains(src_fd, anchor_id)?
+    } else {
+        false
+    };
+    if anchor_id == src_id || anchor_inside_source || source_inside_destination {
+        let dst_shown = owned_root_self_path(root)
+            .map(|root_path| root_path.join(dst_rel).display().to_string())
+            .unwrap_or_else(|_| dst_rel.display().to_string());
         return Err(Error::store(format!(
             "copy_dir_recursive_fd: refusing to copy {} to {} — the source and the destination \
              overlap (the destination is inside the source, the source is inside the destination, \
              or they are the same directory), so the walk would copy the tree into itself without \
-             bound",
+             bound; the decision is made by directory IDENTITY (device, inode), not by spelling, so \
+             a bind-mount, firmlink, or case-fold alias of one spelling cannot evade it",
             src.display(),
-            dst_abs.display()
+            dst_shown
         )));
     }
     Ok(())
 }
+
+/// Open the DEEPEST EXISTING directory on the destination path `dst_rel`,
+/// component-wise from the owned root descriptor with `O_NOFOLLOW`, and report
+/// whether the WHOLE path resolved to an existing directory. A component that
+/// exists but is not a directory (a symlink or a regular file) is REFUSED (fail
+/// closed): it is never a directory the copy could write into, and the guarded
+/// create would refuse it too.
+fn open_destination_anchor(root: &RootDir, dst_rel: &Path) -> Result<(OwnedFd, bool)> {
+    let comps = rel_components(dst_rel)
+        .map_err(|e| Error::store(format!("refusing path {}: {e}", dst_rel.display())))?;
+    let mut cur: OwnedFd = root
+        .as_fd()
+        .try_clone()
+        .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
+    let mut complete = true;
+    for comp in comps {
+        let c = CString::new(comp).map_err(|_| Error::store("path component with NUL"))?;
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd >= 0 {
+            cur = unsafe { OwnedFd::from_raw_fd(fd) };
+        } else {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::NotFound {
+                complete = false;
+                break;
+            }
+            return Err(Error::store(format!(
+                "copy_dir_recursive_fd: openat {}: {e}",
+                dst_rel.display()
+            )));
+        }
+    }
+    Ok((cur, complete))
+}
+
+/// Whether the directory `from` IS `target` or is INSIDE it, by walking `from`'s
+/// own `..` chain and comparing `(st_dev, st_ino)` identities. The walk stops at
+/// the filesystem root (where `..` resolves to the same entry); a chain longer
+/// than [`MAX_ANCESTRY`] is a fail-CLOSED error rather than an unbounded walk.
+fn dir_chain_contains(from: &OwnedFd, target: (u64, u64)) -> Result<bool> {
+    let mut cur: OwnedFd = from
+        .try_clone()
+        .map_err(|e| Error::store(format!("dup dir: {e}")))?;
+    for _ in 0..MAX_ANCESTRY {
+        let id = fd_entry_identity(&cur)
+            .map_err(|e| Error::store(format!("identity while walking the ancestry: {e}")))?;
+        if id == target {
+            return Ok(true);
+        }
+        let c = CString::new("..").expect("no NUL in ..");
+        let parent = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if parent < 0 {
+            return Err(Error::store(format!(
+                "copy_dir_recursive_fd: openat ..: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let parent = unsafe { OwnedFd::from_raw_fd(parent) };
+        let parent_id = fd_entry_identity(&parent)
+            .map_err(|e| Error::store(format!("identity of the parent directory: {e}")))?;
+        if parent_id == id {
+            // Reached the filesystem root: its `..` is itself.
+            return Ok(false);
+        }
+        cur = parent;
+    }
+    Err(Error::store(format!(
+        "copy_dir_recursive_fd: could not determine the directory ancestry within {MAX_ANCESTRY} \
+         levels; refusing to guess whether the source and the destination overlap"
+    )))
+}
+
+/// The bound on an ancestry walk. A directory chain on the supported platforms
+/// is limited by `PATH_MAX` in practice (each component costs at least two
+/// bytes), so this is far above any reachable depth while still bounding a
+/// filesystem that answered `..` with a different entry forever.
+const MAX_ANCESTRY: usize = 1 << 16;
 
 /// The ONE name gate the copy applies to every entry name BEFORE it lands:
 /// the crate's name authority ([`crate::manifest::validate_entry_path`], the
@@ -1875,6 +2054,141 @@ fn refuse_unlandable_name<'a>(name: &'a [u8], parent: &Path) -> Result<&'a str> 
         )));
     }
     Ok(name_str)
+}
+
+/// The mode bits of an OPENED directory (`fstat`), so a caller never re-resolves
+/// a path to read a mode it already holds a descriptor for.
+fn mode_of_opened_dir(fd: &OwnedFd) -> Result<u32> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(Error::store(format!(
+            "fstat the opened directory: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok((st.st_mode as u32) & 0o7777)
+}
+
+/// The on-disk identity `(st_dev, st_ino)` of an OPENED directory (`fstat`),
+/// through the crate's ONE identity type
+/// ([`crate::atomic::guard::EntryIdentity`], the same pair [`entry_identity`]
+/// resolves for a path). Resolving an fd avoids re-resolving a spelling, so the
+/// copy's overlap decision cannot be raced by a spelling swap between the probe
+/// and the walk. Implemented HERE (not in `guard`) because `libc` may only be
+/// referenced from the Unix funnel.
+fn fd_entry_identity(fd: &OwnedFd) -> std::io::Result<crate::atomic::guard::EntryIdentity> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
+/// Create `dst_rel` and every missing ancestor under the owned root
+/// (component-wise, `O_NOFOLLOW`, through the shared directory-creation
+/// authority [`open_or_create_dir`]), and report:
+///
+/// * the mode of the FINAL component if it ALREADY EXISTED (so the undo journal
+///   can put it back), and
+/// * the root-relative paths of the components THIS call created (shallowest
+///   first), so the journal knows which directories are the call's own.
+///
+/// A pre-existing FINAL directory is reported with its ORIGINAL mode and is
+/// NOT chmodded here; the caller records that mode in its undo journal before
+/// widening the directory. The ancestors are created at the store-private
+/// `0o700`; a created final is chmodded to `0o700` for the same reason
+/// [`ensure_private_dir_fd`] does (the `mkdirat` mode is subject to the process
+/// umask).
+fn create_destination_chain(root: &RootDir, dst_rel: &Path) -> Result<(Option<u32>, Vec<PathBuf>)> {
+    let comps = rel_components(dst_rel)
+        .map_err(|e| Error::store(format!("refusing path {}: {e}", dst_rel.display())))?;
+    let mut cur: OwnedFd = root
+        .as_fd()
+        .try_clone()
+        .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
+    let mut created: Vec<PathBuf> = Vec::new();
+    let mut prefix = PathBuf::new();
+    let mut final_preexisting_mode = None;
+    for (i, comp) in comps.iter().enumerate() {
+        let is_last = i + 1 == comps.len();
+        prefix.push(std::ffi::OsStr::from_bytes(comp));
+        let (dir, was_created) = open_or_create_dir(&cur, comp)?;
+        if was_created {
+            created.push(prefix.clone());
+            if is_last {
+                std::fs::File::from(
+                    dir.try_clone()
+                        .map_err(|e| Error::store(format!("dup dir: {e}")))?,
+                )
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::store(format!("chmod {}: {e}", prefix.display())))?;
+            }
+        } else if is_last {
+            final_preexisting_mode = Some(mode_of_opened_dir(&dir)?);
+        }
+        cur = dir;
+    }
+    Ok((final_preexisting_mode, created))
+}
+
+/// The copy's UNDO JOURNAL for destination directory modes (I2/I3). Every
+/// directory whose mode the call changes — or creates — is recorded with the
+/// mode to restore if the call FAILS, and `Drop` restores them deepest-first.
+/// This is what makes a FAILED copy leave a destination the crate can remove
+/// itself ([`remove_dir_all_fd`]) instead of a `0o200` directory nothing can
+/// open, and what keeps a fold-equal source's own mode byte-identical after a
+/// failed copy.
+///
+/// `Drop` is the right shape: the copy has many `?` returns, and a guard makes
+/// the restore run on EVERY one without each error path remembering to. A
+/// successful copy DISARMS the journal once the exact final modes are applied,
+/// so the guard never fights the finalize.
+struct CopyUndo<'a> {
+    root: &'a RootDir,
+    /// `(rel, mode_to_restore_on_failure)`: a directory the call CREATED
+    /// restores to the removable `0o700`; one that PRE-EXISTED restores to its
+    /// original mode.
+    modes: Vec<(PathBuf, u32)>,
+    armed: bool,
+}
+
+impl<'a> CopyUndo<'a> {
+    fn new(root: &'a RootDir) -> Self {
+        Self {
+            root,
+            modes: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// Record the mode to restore for `rel` if the call fails. The FIRST record
+    /// for a path wins, so a later re-plan cannot overwrite the true original.
+    fn plan(&mut self, rel: &Path, restore_mode: u32) {
+        if !self.modes.iter().any(|(planned, _)| planned == rel) {
+            self.modes.push((rel.to_path_buf(), restore_mode));
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CopyUndo<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut modes = std::mem::take(&mut self.modes);
+        // Deepest-first, so a parent widened for its children is restored after
+        // them. Best-effort: the call is already returning an error, and a
+        // concurrent removal may make a restore fail — the original error is
+        // what the caller must see.
+        modes.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
+        for (rel, mode) in modes {
+            let _ = set_dir_mode_fd(self.root, &rel, mode);
+        }
+    }
 }
 
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` on `name` relative to `dir_fd`, returning the
@@ -1945,25 +2259,40 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// CONFINEMENT: the destination resolves component-wise from the owned root
 /// descriptor with `O_NOFOLLOW`, so a symlink injected into any destination
 /// component is REFUSED (ELOOP), never followed — the copy can never be
-/// redirected outside the root. The SOURCE is opened ONCE as a descriptor
-/// (the caller's own `src`, deliberately an arbitrary possibly-out-of-root
-/// path) and the walk then reads it with `fstatat`/`readlinkat`/`openat`
-/// RELATIVE to that descriptor, so an intermediate symlink in the caller's
-/// `src` SPELLING is followed exactly once (that is a read, never a mutation,
-/// confined to the caller's own source). Opening the source entries through
-/// the descriptor also means no entry is reached by a path longer than one
-/// component, so a deep source tree is not bounded by `PATH_MAX`. The crate's
-/// guarded, classified open ([`openat_readable_regular`]) is what reads a
-/// regular file: `O_NONBLOCK` plus an `fstat` of the OPENED inode, so a FIFO,
-/// socket, or device is REFUSED rather than opened.
+/// redirected outside the root. The SOURCE spelling is NORMALIZED first
+/// (`normalize_root`, the crate's own normalizer: trailing/repeated separators
+/// and `.` noise are erased) and its FINAL component must not be a symlink — a
+/// trailing separator would otherwise make POSIX resolve the final component as
+/// an intermediate one, and `lstat("link/")` would FOLLOW the link the refusal
+/// exists to stop. The source is then opened ONCE as a descriptor (the caller's
+/// own `src`, deliberately an arbitrary possibly-out-of-root path) and the walk
+/// reads it with `fstatat`/`readlinkat`/`openat` RELATIVE to that descriptor,
+/// so an INTERMEDIATE symlink in the caller's `src` SPELLING is followed
+/// exactly once (a read, never a mutation, confined to the caller's own
+/// source). Opening the source entries through the descriptor also means no
+/// entry is reached by a path longer than one component, so a deep source tree
+/// is not bounded by `PATH_MAX`. The crate's guarded, classified open
+/// ([`openat_readable_regular`]) is what reads a regular file: `O_NONBLOCK`
+/// plus an `fstat` of the OPENED inode, so a FIFO, socket, or device is
+/// REFUSED rather than opened.
 ///
 /// ITERATIVE, NEVER RECURSIVE. The walk keeps an explicit heap `Vec` of open
 /// frames instead of one Rust frame per directory level (the source tool's
 /// original recursed); a deep tree therefore cannot exhaust the C stack and
-/// ABORT the host process. The only remaining bound is the process descriptor
-/// limit (one descriptor per level on the source side, none held on the
-/// destination side beyond the per-frame open), which surfaces as a clean
-/// `Err`, never an abort. This is why the re-added form is the iterative one.
+/// ABORT the host process. The descriptor bound is ~ONE PER LEVEL of source
+/// depth, plus O(1) transient descriptors per destination mutation:
+/// `parent_fd_of`/`openat_no_follow` re-resolve the whole ancestor chain, but
+/// they do it ONE COMPONENT AT A TIME and drop each intermediate descriptor
+/// before the next `openat`, so a mutation holds ONE destination descriptor at
+/// the instant of the syscall, never `depth` of them. MEASURED (Linux, depth
+/// 256): the copy succeeds at `RLIMIT_NOFILE=262` and fails at 260, i.e. peak
+/// ~= depth + 6 — NOT the ~`2 * depth` a first reading of the re-opening might
+/// suggest. The bound surfaces as a clean `Err`, never an abort. The COST that
+/// does grow with depth is TIME: each destination entry re-resolves its parent
+/// chain from the root, so it costs O(depth) `openat` calls (a directory also
+/// pays one O(depth) pass in the deepest-first finalize); the source side stays
+/// O(1) per entry. This is a deliberate, stated cost, not a hidden one. This is
+/// why the re-added form is the iterative one.
 ///
 /// MODE FIDELITY: directory and file modes are copied EXACTLY from the source
 /// (including the setuid/setgid/sticky bits — a mode-shifted copy would fail
@@ -1974,6 +2303,27 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// each directory at its final mode before copying into it, so a read-only
 /// source directory failed with `EACCES`; keeping the exact final modes while
 /// fixing that is a deliberate, documented difference.)
+///
+/// A FAILED COPY RESTORES EVERY MODE IT CHANGED ([`CopyUndo`], an RAII
+/// journal): the widened walk modes are for the walk only, so an error return
+/// puts a PRE-EXISTING destination directory back to its original mode and a
+/// directory the call CREATED back to the removable `0o700`. A destination
+/// that is (or aliases) the source can therefore never be left mutated by a
+/// failed copy, and a destination the call CREATED is always removable with
+/// the crate's own [`remove_dir_all_fd`] — no `chmod` first. A PRE-EXISTING
+/// destination keeps ITS OWN mode (the caller's choice, which the call does not
+/// second-guess); a caller merging into a read-only directory owns its
+/// removability. On SUCCESS the exact modes are applied and the journal is
+/// disarmed.
+///
+/// FIDELITY IS TO THE MANIFEST MODEL, NOT TO EVERY INODE ATTRIBUTE. The copy
+/// carries content, modes (including the special bits), and symlink targets —
+/// exactly what [`crate::manifest::canonicalize_tree`] records and the digest
+/// covers — so a copied tree is BYTE-FAITHFUL to the manifest model. It does
+/// NOT carry mtime, atime, xattrs, ACLs, ownership, or file flags; a caller
+/// that needs those (e.g. to preserve a build cache's timestamps) must restore
+/// them itself. The cron/manifest of this crate never compares them, so the
+/// copy cannot fail a digest check for their absence.
 ///
 /// NAMES: every entry name is validated BEFORE any destination mutation by
 /// [`refuse_unlandable_name`], which applies the crate's ONE name authority
@@ -1992,18 +2342,49 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// directory/file creates and the mutating `openat`), so a lock-record
 /// spelling cannot be created by any route.
 ///
+/// THE DESTINATION PATH IS EXEMPT FROM THE RECOVERY SWEEP; A TEMP-SHAPED ENTRY
+/// NAME IS NOT. `dst_rel` may itself contain a TEMP-shaped component (the
+/// staging shape `deploy` needs, e.g. `.staged.tmp.1.2/root`):
+/// [`refuse_reserved_creation`] refuses only RESIDUE spellings (an
+/// unaddressable name that is not a crate temp), and the guarded create
+/// tolerates a temp spelling because it merely CREATES a fresh entry. The
+/// caller must therefore RENAME the finished tree into its real name: a copy
+/// left sitting at a temp-shaped destination is matched by the documented
+/// recovery sweep ([`crate::atomic::is_crate_temp_name`]) and the WHOLE tree
+/// under it is swept. A copied ENTRY name is the opposite: a temp-shaped entry
+/// name would be a live file the sweep destroys, so [`refuse_unlandable_name`]
+/// REFUSES it. Memory: [`dir_entry_names`] buffers EVERY entry name of a
+/// directory into a `Vec` before iterating (measured ~50 B/entry: 200 000
+/// entries took 7.86 s in one process and ~13.7 MB), so the walk's peak heap is
+/// O(entries) in the widest directory, not O(depth). No cap is imposed: a cap
+/// would be an arbitrary refusal of a legal tree, and the cost is linear and
+/// freed as each frame drops.
+///
 /// HARD LINKS are REFUSED (a regular file with `st_nlink > 1`): the crate's
 /// own `canonicalize_tree` refuses hard links by rule, so silently
 /// duplicating one into an independent regular file would materialize a tree
 /// the crate cannot canonicalize. A caller that must copy such a tree
 /// pre-checks and dereferences them itself.
 ///
-/// OVERLAP is refused by construction ([`refuse_overlapping_copy`]): when the
-/// canonicalized source and the resolved destination root are equal, or either
-/// contains the other, the call fails before creating anything. Without this,
-/// a destination created INSIDE the source would be re-yielded by the source
-/// `read_dir` and the walk would recurse without bound (the reproduction ran
-/// to `ENAMETOOLONG` at depth 236 on macOS and 1017 on Linux).
+/// OVERLAP is refused BEFORE anything is created, and the decision is made by
+/// directory IDENTITY, not by path spelling ([`refuse_overlapping_copy`]): the
+/// source directory and the DESTINATION ANCHOR (the deepest existing directory
+/// on `dst_rel`, resolved component-wise from the owned root descriptor) are
+/// compared by `(st_dev, st_ino)`, and the call refuses when they are the same
+/// directory, when the anchor is inside the source, or when an EXISTING
+/// destination is above the source. A spelling-based comparison is bypassable
+/// by any two spellings `realpath` does not unify — a Linux `mount --bind`
+/// alias, a macOS firmlink, a case-fold-equal `dst_rel` on a folding
+/// filesystem — and each of those made the destination be created INSIDE the
+/// source, whose `read_dir` re-yielded it and ran the walk without bound
+/// (reproduced: 57 `sub/.../sub` levels to `EMFILE` at `RLIMIT_NOFILE=64` on
+/// Linux, `ENAMETOOLONG` on macOS). Identity also closes the fold-equal case
+/// that MUTATED THE SOURCE's mode. What identity still cannot catch: two
+/// spellings that report DIFFERENT `(st_dev, st_ino)` pairs for one underlying
+/// directory (some overlay/network filesystems); a bind mount and a firmlink
+/// both report the SAME pair, so they are caught. A component that cannot be
+/// opened as a directory, or any identity-probe failure, refuses (fail
+/// closed).
 ///
 /// NOT ATOMIC, NOT DURABLE, PARTIAL ON FAILURE: there is no temp directory and
 /// no final rename, so entries appear at their destination in `read_dir`
@@ -2011,16 +2392,35 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// primitive does not fsync. A caller that needs either guarantee must copy
 /// into a fresh staging path it owns and rename it into place itself, and must
 /// treat ANY `Err` as "the destination may hold a partial subtree at
-/// `dst_rel`" — inspect or remove that subtree before retrying (the crate
-/// contributes no resumability). Use [`fsync_tree_recursive_fd`] to make a
-/// completed copy durable.
+/// `dst_rel`". A destination the call CREATED is removable with the crate's own
+/// [`remove_dir_all_fd`]: the undo journal restores every mode the call changed
+/// before the error return. A PRE-EXISTING destination keeps its own mode, so a
+/// caller merging into a read-only directory owns its removability. A partial
+/// tree is also never mistakable for a complete one — it is missing entries, so
+/// `canonicalize_tree` on it either errors or yields a different digest. Use
+/// [`fsync_tree_recursive_fd`] to make a completed copy durable.
 ///
-/// SYMLINKS are recreated as symlinks (the link's own target is copied,
-/// never followed), replacing any existing destination entry at that name,
-/// exactly as the source tool's original did. A pre-existing destination FILE
-/// at a copied file's name is refused (`O_EXCL`), matching the original; the
-/// caller is expected to pass a fresh destination (the source tool removes a
-/// stale staging directory first).
+/// ANCESTORS CREATED FOR `dst_rel` ARE KEPT, and they are the call's own
+/// artifacts: they are created at the store-private `0o700` and remain after
+/// a failure so the documented cleanup spelling keeps working
+/// ([`remove_dir_all_fd`] requires the parent chain to exist). A caller that
+/// wants a pristine prefix removes them itself with [`remove_dir_fd`]
+/// (non-recursive, so it can never delete a concurrent user's content).
+///
+/// SYMLINKS are recreated as symlinks (the link's own target is copied, never
+/// followed). The copy is ALL-OR-NOTHING for EVERY kind pair, matching the
+/// file (`O_CREAT|O_EXCL`) and directory (`mkdirat`) rules: an entry the copy
+/// would land on a PRE-EXISTING destination name is REFUSED and the old entry
+/// is left byte-identical. Concretely: file over file / dir / symlink, and
+/// dir over file / dir / symlink, are all refused by `O_EXCL`/`mkdirat`; a
+/// SYMLINK over file, dir, or symlink is refused by [`symlink_new_fd`]
+/// (`symlinkat` `EEXIST`), never by unlinking the old entry. The public
+/// [`symlink_fd`] keeps its replace semantics for callers that want them; the
+/// copy does not, and there is deliberately NO overwrite FLAG — a copy into a
+/// fresh staging path is the documented contract, so an enum choice would only
+/// invite a caller to destroy a live entry. The caller is expected to pass a
+/// fresh destination (the source tool removes a stale staging directory
+/// first).
 ///
 /// SYMLINK CONTAINMENT uses the SAME ONE AUTHORITY as the two manifest views:
 /// the copy builds a [`crate::manifest::SymlinkContainmentIndex`] from a
@@ -2031,10 +2431,15 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// post-copy view: a destination-only symlink at a component a copied link
 /// walks through is REFUSED (the run may not install a link whose kernel
 /// resolution leaves the root, even when the escaping component is a
-/// destination entry the run did not create). This primitive therefore
-/// TOLERATES an existing `dst_rel` (it merges into it) but never tolerates a
-/// surviving destination symlink on a copied link's path. A source entry
-/// SHADOWS a destination entry at the same path. When the source holds no
+/// destination entry the run did not create). This primitive TOLERATES an
+/// existing `dst_rel` DIRECTORY (it reuses and finalizes it, leaving a
+/// pre-existing entry's content untouched) but refuses every colliding
+/// destination entry (see the SYMLINKS landing rule) and never tolerates a
+/// surviving destination symlink on a copied link's path. For the CONTAINMENT
+/// verdict a source entry SHADOWS a destination entry at the same path (the
+/// source's kind is what the post-copy tree will hold there); the LANDING
+/// rules above are separate and refuse a pre-existing destination entry
+/// outright. When the source holds no
 /// symlink the rule is never consulted and the destination is not enumerated.
 /// If a tree cannot be enumerated (a walk or `stat` error), the copy fails
 /// CLOSED rather than guessing.
@@ -2084,16 +2489,38 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
         names: std::vec::IntoIter<Vec<u8>>,
     }
 
-    let src_meta = std::fs::symlink_metadata(src)
+    // NORMALIZE the source SPELLING first. A trailing separator (or a repeated
+    // one) makes POSIX resolve the final component as an INTERMEDIATE one, so
+    // `lstat("link/")` FOLLOWS the link and reports a directory — the very
+    // symlink the refusal below exists to stop. `normalize_root` is the crate's
+    // own spelling normalizer (the same one `RootDir` opening applies to the
+    // destination side), so `link/` and `link` take one path.
+    let src = normalize_root(src);
+    let src_meta = std::fs::symlink_metadata(&src)
         .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
+    if src_meta.file_type().is_symlink() {
+        return Err(Error::store(format!(
+            "copy_dir_recursive_fd: source {} is a symlink (refusing to follow a symlink \
+             source)",
+            src.display()
+        )));
+    }
     if !src_meta.is_dir() {
         return Err(Error::store(format!(
-            "copy_dir_recursive_fd: source {} is not a directory (refusing to follow a \
-             symlink source)",
+            "copy_dir_recursive_fd: source {} is not a directory",
             src.display()
         )));
     }
     let root_mode = src_meta.permissions().mode() & 0o7777;
+
+    // Open the source ONCE, as a descriptor: the identity that decides overlap
+    // is then the SAME directory the walk reads, so a concurrent spelling swap
+    // cannot make the two disagree. An INTERMEDIATE symlink in the caller's
+    // spelling is followed here (a read of the caller's own source, never a
+    // mutation); the FINAL component was just proven not to be one.
+    let src_root_fd: OwnedFd = std::fs::File::open(&src)
+        .map_err(|e| Error::store(format!("open dir {}: {e}", src.display())))?
+        .into();
 
     // Run the ONE gate on the WHOLE destination path BEFORE creating
     // anything, so a residue-spelled component is refused with no partial
@@ -2102,7 +2529,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     refuse_reserved_creation(dst_rel)?;
 
     // Refuse an overlapping source/destination BEFORE creating anything.
-    refuse_overlapping_copy(root, src, dst_rel)?;
+    refuse_overlapping_copy(root, &src, &src_root_fd, dst_rel)?;
     // The resolved destination root, used to judge a symlink target whose
     // spelled walk leaves the copied SUBTREE (`../foo`): inside the subtree the
     // SOURCE tree answers whether a component is a symlink (it mirrors the
@@ -2127,14 +2554,16 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     // The source is enumerated with `WalkDir` (no follow) and the destination
     // root likewise; a source-relative path is relocated under `dst_rel`. A
     // destination entry at a path the source also provides is SHADOWED by the
-    // source (the source is installed over it, or already matches it) and does
-    // not constrain the link; a destination-only entry survives (`Extraneous::
-    // Keep` is not a parameter of this primitive) and does. The destination
+    // source FOR THE CONTAINMENT VERDICT (the source's kind is what the
+    // post-copy tree will hold there); the LANDING rules are separate and
+    // refuse a pre-existing destination entry outright. A destination-only
+    // entry survives (`Extraneous::Keep` is not a parameter of this primitive)
+    // and does constrain the link. The destination
     // walk is skipped when the source holds NO symlink, because the rule is
     // consulted only for symlinks. An enumeration failure is an `Err` (fail
     // closed): an entry the walk could not describe could be a symlink the rule
     // must see.
-    let source_entries = crate::manifest::live_entry_kinds(src)?;
+    let source_entries = crate::manifest::live_entry_kinds(&src)?;
     let has_source_symlink = source_entries.iter().any(|(_, is_link)| *is_link);
     let dst_entries: Vec<(String, bool)> = if has_source_symlink {
         crate::manifest::live_entry_kinds(&dst_root_abs)?
@@ -2174,16 +2603,21 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     );
 
     // Create the destination chain (guarded, component-wise O_NOFOLLOW) and
-    // widen the FINAL directory during the walk; the exact mode is restored
-    // deepest-first below.
-    ensure_private_dir_fd(root, dst_rel)?;
+    // record an UNDO JOURNAL of every directory mode this call changes, so a
+    // failure restores them (I2/I3). A PRE-EXISTING final directory is added
+    // to the journal with its ORIGINAL mode before it is widened, so a failed
+    // copy puts it back exactly; a directory this call CREATED is added with
+    // the removable 0o700.
+    let (final_preexisting_mode, _created_ancestors) = create_destination_chain(root, dst_rel)?;
+    let mut undo = CopyUndo::new(root);
+    undo.plan(dst_rel, final_preexisting_mode.unwrap_or(0o700));
+    // Widen the FINAL directory during the walk so a read-only SOURCE root can
+    // receive children; the journal restores the original mode on failure and
+    // the finalize applies the source's exact mode on success.
     set_dir_mode_fd(root, dst_rel, (root_mode | 0o200) & 0o7777)?;
 
     // `(dst_rel, final_mode)` for the deepest-first finalize.
     let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
-    let src_root_fd: OwnedFd = std::fs::File::open(src)
-        .map_err(|e| Error::store(format!("open dir {}: {e}", src.display())))?
-        .into();
     let names = dir_entry_names(&src_root_fd)?;
     let mut stack: Vec<Frame> = vec![Frame {
         dst_rel: dst_rel.to_path_buf(),
@@ -2211,8 +2645,12 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
             PathKind::Dir => {
                 // Guarded create (mkdir semantics, refusing a residue/lock
                 // spelling), then widen during the walk so a read-only source
-                // directory can receive children.
+                // directory can receive children. The created directory is
+                // the call's own, so the undo journal restores it to 0o700 on a
+                // failure (making the partial tree removable) and the finalize
+                // gives it the source's exact mode on success.
                 create_dir_fd(root, &child_rel)?;
+                undo.plan(&child_rel, 0o700);
                 set_dir_mode_fd(root, &child_rel, (mode | 0o200) & 0o7777)?;
                 dirs.push((child_rel.clone(), mode));
                 let child_fd = openat_no_follow_io(
@@ -2267,9 +2705,12 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                         )
                     )));
                 }
-                // The ONE symlink authority: guards the whole path and the
-                // final name, replaces an existing entry, fsyncs the parent.
-                symlink_fd(root, &link, &child_rel)?;
+                // ALL-OR-NOTHING symlink landing: the ONE symlink authority
+                // without its replace half, so a copied symlink refuses a
+                // pre-existing destination entry exactly as the file and
+                // directory rules do (a source symlink must not silently
+                // UNLINK and replace a live destination file).
+                symlink_new_fd(root, &link, &child_rel)?;
                 None
             }
             kind @ (PathKind::File | PathKind::Other) => {
@@ -2324,12 +2765,17 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     }
 
     // Restore every directory's exact mode, deepest-first, then the root of
-    // the copy last (it is the shallowest).
+    // the copy last (it is the shallowest). The pre-existing final directory's
+    // original mode was saved in the journal, so on SUCCESS it takes the
+    // source's mode exactly as before.
     dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
     for (rel, mode) in dirs {
         set_dir_mode_fd(root, &rel, mode)?;
     }
     set_dir_mode_fd(root, dst_rel, root_mode)?;
+    // The exact modes are in place; an error from here on leaves them intended,
+    // so the undo journal must not fight the finalize.
+    undo.disarm();
 
     // SOURCE-QUIESCENCE DETECTION (the copy's analogue of `sync`'s end-of-run
     // source re-read). The containment verdict for every copied link was made
@@ -2343,7 +2789,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     // containment verdict was made). The window between this check and the
     // `symlinkat` syscalls is NOT closed — see the primitive doc.
     if has_source_symlink {
-        let after = crate::manifest::live_entry_kinds(src)?;
+        let after = crate::manifest::live_entry_kinds(&src)?;
         if after != source_entries {
             return Err(Error::store(format!(
                 "copy_dir_recursive_fd: the source {} changed shape while it was being copied \
@@ -4450,9 +4896,20 @@ mod tests {
             matches!(err, Error::Store(_)),
             "the refusal must be a store error, got: {err:?}"
         );
+        let msg = err.to_string();
+        // Named condition, not merely "some openat failed": the component-wise
+        // `O_NOFOLLOW` open raises ELOOP on the injected symlink.
         assert!(
-            err.to_string().contains("openat"),
-            "the refusal must name the component-wise open, got: {err}"
+            msg.contains("openat") && msg.contains("escape/nested"),
+            "the refusal must name the component-wise open of the offending path, got: {msg}"
+        );
+        assert!(
+            msg.contains("Too many levels of symbolic links")
+                || msg.contains("ELOOP")
+                || msg.contains("Not a directory"),
+            "the refusal must name the SYMLINK refusal the component-wise O_NOFOLLOW open raises \
+             (ELOOP on Linux; macOS classifies the O_NOFOLLOW|O_DIRECTORY refusal as ENOTDIR, \
+             which is `open_or_create_dir`'s documented non-directory arm), got: {msg}"
         );
         assert!(
             !outside.join("nested").exists(),
@@ -4494,9 +4951,19 @@ mod tests {
         std::os::unix::fs::symlink("real", base.path().join("root/alias")).unwrap();
         let err = fsync_tree_recursive_fd(&root, Path::new("alias/f"))
             .expect_err("a symlink component must be refused");
+        let msg = err.to_string();
+        // The named condition: ELOOP from the component-wise `O_NOFOLLOW` open,
+        // not merely the presence of the word "openat".
         assert!(
-            err.to_string().contains("openat"),
-            "the refusal must name the component-wise open, got: {err}"
+            msg.contains("openat") && msg.contains("alias/f"),
+            "the refusal must name the component-wise open of the offending path, got: {msg}"
+        );
+        assert!(
+            msg.contains("Too many levels of symbolic links")
+                || msg.contains("ELOOP")
+                || msg.contains("Not a directory"),
+            "the refusal must name the SYMLINK refusal of the component-wise O_NOFOLLOW open \
+             (ELOOP on Linux; ENOTDIR on macOS), got: {msg}"
         );
     }
 
