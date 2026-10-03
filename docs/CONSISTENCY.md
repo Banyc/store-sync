@@ -26,6 +26,7 @@ installed between the check and the walk is that kind of residual.
 | I | an audit pin ↔ the actual count | the funnel `openat` count |
 | J | the `unix` ↔ `windows` twin surface | a public function present on one platform only |
 | K | the revision you are READING ↔ the revision you BELIEVE you are reading | a `pub fn` count and a gate read from a checkout still parented to the previous tip |
+| L | the platform you COMPILE ↔ the platform you claim to support | a call site inside `#[cfg(target_os = "linux")]` that a macOS-only gate never compiles, so a signature change silently missed it |
 
 ## Findings
 
@@ -111,6 +112,17 @@ tree lacked `src/relpath.rs` entirely. The change's own `jj diff --stat`
 contradicted the reading, and re-parenting the checkout showed the agent's
 numbers were right. This is the checkout sibling of the stale-binary rule: a
 green gate and a bad count are both only meaningful for a NAMED revision.
+
+**L — a signature change missed a platform-gated call site. FIXED.** API
+constraint #1 made every root-relative mutation take `RootedRelativePath`. The
+macOS gate was green and stayed green; the Linux gate failed to **compile the
+integration tests**, because the bind-mount regression lives in a
+`#[cfg(target_os = "linux")]` block that macOS never compiles and it still
+passed a `&Path`. The instance was one line; the class is that a platform-gated
+call site is only ever built on ONE platform, so a signature change is
+half-checked until the other gate runs. The fix is not a rule about care — it is
+the Linux gate itself, which compiles what macOS cannot, which is why "a green
+gate on one platform is not evidence for another" is mechanical here.
 
 **E — the accepted set and the operations over it.** `validate_rel` accepts
 `a/./b`, `a/b/` and `a//b`; `RootedRelativePath::parse` refuses a literal `.`

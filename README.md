@@ -567,3 +567,9 @@ implied to be checked.
   reports on a tree that no longer exists, so name the revision a gate or a
   count was taken from — a number measured against the wrong tree reads exactly
   like a real one.
+- **A signature change is not verified until every supported platform has
+  COMPILED it.** A call site inside a `#[cfg(...)]` block is invisible to the
+  other platform's gate: a test gated to Linux is never built by a macOS run, so
+  a changed parameter type can compile clean there and fail to compile on the
+  other host. A green gate on one platform is not evidence for the other — it is
+  not even evidence that the other platform BUILDS.

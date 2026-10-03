@@ -568,7 +568,11 @@ fn bind_mount_child() {
     // instead of filling the disk.
     let root = RootDir::open(&alias).unwrap();
     let saved = set_nofile_soft(64).unwrap();
-    let result = copy_dir_recursive_fd(&root, &root_path, Path::new("sub"));
+    let result = copy_dir_recursive_fd(
+        &root,
+        &root_path,
+        &RootedRelativePath::parse(Path::new("sub")).expect("a plain name is a valid path"),
+    );
     restore_nofile(saved).unwrap();
     let err = result.expect_err("a bind-mounted alias of the root must be refused by identity");
     assert!(
