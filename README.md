@@ -503,4 +503,47 @@ implied to be checked.
   the layout lock's and refuses every alias that is a distinct entry.
 - Refusing a case beats transforming it; deleting a capability beats shipping a
   broken one.
-- State every bound with the reason it holds.
+- State every bound with the reason it holds, and every cost with its number.
+  A cost asserted without a measurement is a guess wearing a number's clothes.
+- **A guarantee belongs at ONE authority every path passes through.** And the
+  corollary that cost three separate fixes: *co-location is not co-application*.
+  Two authorities applied at the same call sites diverge by one line each
+  (a guarded `renameat_paths` beside an unguarded `renameat_fd`; a lock-record
+  check beside a missing residue check). When two must both apply, they are ONE
+  function, so that carrying one and skipping the other is not expressible.
+- **A residual must be scoped to exactly the operation it justifies.** A stated
+  limit, an exemption or a sanctioned break that is broader than its reason
+  reads as a documented guarantee while acting as a hole. "The sanctioned lock
+  protocol" excused a method that accepted any path; check each residual's reach
+  against its justification, not its wording.
+- **Agreement between views is not soundness.** Unifying two views onto one rule
+  makes a wrong rule *consistent*, not correct — and consistency is what makes it
+  harder to see. Prove the shared rule against the world; do not infer it from
+  the views agreeing with each other.
+- **A safety argument must cover the part of the input whose treatment changed,**
+  not the part that was already correct. An argument about the link's parent
+  components says nothing about the target's components, and the target is the
+  half the change altered.
+- **A fold that feeds a decision which GRANTS must be at least as broad as the
+  host's fold.** The rule above (a fold is for denial) has this corollary: reuse
+  a denial-grade fold for a permission decision and over-refusal silently becomes
+  under-refusal. `str::to_lowercase` is a lowering, not a case fold.
+- **A bound that is not injective converts a loud failure into a silent alias.**
+  Check that a bounded derivation is a bijection on the inputs it accepts.
+- **Pin the MAPPING, not just the mechanism.** A test that the machinery runs is
+  not a test that it maps correctly; an inverted mapping once passed every test
+  in the suite.
+- **A bound test must measure the quantity that can regress** — not a proxy that
+  happens to move with it (a count is blind to a quadratic).
+- **When a fix changes what a signal MEANS, revisit every consumer of it.**
+- **Whatever the address model accepts, every operation must be total over it.**
+  If parsing admits a shape, every primitive that receives it must have a defined
+  answer — otherwise the boundary is the bug.
+- **A value feeding a length-limited resource must be bounded**, with the limit
+  named and the overflow refused.
+- **A primitive re-added from legacy code re-imports that legacy's hazards**
+  unless each one is re-closed against the authorities the codebase has built
+  since. It arrived with a FIFO hang, an unbounded recursion and a data-loss
+  route that the newer substrate already knew how to refuse.
+- **A test that cannot fail is worse than no test**, and a pre-fix proof that was
+  not RUN is not a proof. Record which of the two you have.
