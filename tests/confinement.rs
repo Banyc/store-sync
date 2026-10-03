@@ -20,8 +20,10 @@ use std::path::{Path, PathBuf};
 
 use store_sync::Error;
 use store_sync::atomic::{
-    RootDir, path_state_fd, read_fd, write_atomic_cas_fd, write_atomic_replace_fd, write_file_fd,
+    RootDir, path_state_fd, read_fd, renameat_paths, write_atomic_cas_fd, write_atomic_replace,
+    write_atomic_replace_fd, write_file_fd,
 };
+use store_sync::lock::FileLock;
 use store_sync::root::{EndpointKey, OwnedRoot};
 
 /// Known content of the outside file an injected symlink points at; a leak of
@@ -250,4 +252,81 @@ fn root_dir_open_refuses_a_symlink_root_but_opens_the_real_directory() {
         Err(e) => e,
     };
     assert_open_refusal(&err, "open root");
+}
+
+/// F-A1 (production-lib reproduction): the PATH-BASED
+/// `atomic::write_atomic_replace` had NO lock-record guard. Pre-fix a holder
+/// held `operation.lock`, the path-based replace renamed a fresh inode OVER
+/// the record, and a second acquisition then flocked the NEW inode while the
+/// first holder still held the old one — TWO simultaneous holders. The replace
+/// is now refused, the inode is unchanged, and the second acquisition
+/// contends.
+#[test]
+fn path_based_write_atomic_replace_cannot_swap_the_lock_record_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("operation.lock");
+    let holder = FileLock::acquire(&record, "A").expect("A acquires the record");
+    let ino_a = std::fs::metadata(&record).unwrap().ino();
+    let err = write_atomic_replace(&record, b"evil", &mut |_| None)
+        .expect_err("a path-based replace of the lock record must be refused");
+    assert!(
+        matches!(err, Error::Conflict(_)),
+        "the refusal must be a conflict, got: {err:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().ino(),
+        ino_a,
+        "the record must keep its stable inode"
+    );
+    let err2 = match FileLock::acquire(&record, "C") {
+        Ok(_) => panic!("C must not acquire while A holds the record"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err2, Error::LockContended(_)),
+        "C must be refused with the typed contention signal: {err2:?}"
+    );
+    drop(holder);
+}
+
+/// F-A2 (production-lib reproduction): `renameat_paths` guarded only the
+/// endpoints' FINAL components, so renaming a directory CONTAINING the record
+/// moved the record with its inode and freed the old path; a second
+/// acquisition at the old path then created a DIFFERENT inode — TWO holders.
+/// The source SUBTREE is now walked and the rename is refused, so the record's
+/// path cannot move.
+#[test]
+fn renameat_paths_cannot_move_an_ancestor_of_the_lock_record() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (owned, root) = open_root(tmp.path(), "confinement-f-a2");
+    std::fs::create_dir_all(owned.canonical().join("state")).unwrap();
+    let record = owned.canonical().join("state/operation.lock");
+    let holder = FileLock::acquire(&record, "A").expect("A acquires the record");
+    let ino_a = std::fs::metadata(&record).unwrap().ino();
+    let err = renameat_paths(&root, Path::new("state"), Path::new("state2"))
+        .expect_err("renaming an ancestor of the lock record must be refused");
+    assert!(
+        matches!(err, Error::Conflict(_)),
+        "the ancestor refusal must be a conflict, got: {err:?}"
+    );
+    assert!(
+        record.exists(),
+        "the record must survive the refused ancestor rename"
+    );
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().ino(),
+        ino_a,
+        "the record must keep its stable inode"
+    );
+    let err2 = match FileLock::acquire(&record, "C") {
+        Ok(_) => panic!("C must not acquire while A holds the record"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err2, Error::LockContended(_)),
+        "C must be refused with the typed contention signal: {err2:?}"
+    );
+    drop(holder);
 }

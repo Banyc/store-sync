@@ -185,21 +185,40 @@ fn absent_or_store(e: std::io::Error, path: &Path) -> Result<bool> {
 /// that is even one byte longer makes a legal destination untransferable.
 pub const NAME_MAX: usize = 255;
 
+/// The number of bytes [`bounded_temp_trunk`] reserves so its two branches
+/// cannot collide. The truncated branch's trunk is at least
+/// `NAME_MAX - overhead - 3` bytes (3 is the most a UTF-8 boundary back-off
+/// can shorten a 4-byte character), while the verbatim branch is taken only
+/// when the trunk fits in `NAME_MAX - overhead - SLACK`; with `SLACK = 4` the
+/// two length ranges are DISJOINT, so no verbatim name can ever equal a
+/// truncated one (F-C).
+const BOUNDED_TRUNK_BRANCH_SLACK: usize = 4;
+
 /// Derive the BOUNDED trunk of a temp name from a destination `name`, so
 /// `.TRUNK<SUFFIX>` never exceeds [`NAME_MAX`] bytes.
 ///
-/// When the destination's name already leaves room for `suffix`, the trunk
-/// IS the name VERBATIM, so the historical spelling `.name.tmp.<pid>.<n>` is
-/// preserved for every name that fits. When it does not fit, the trunk is a
-/// byte-truncated prefix of the name plus the SHA-256 of the FULL name: the
-/// prefix keeps the temp recognizable next to its destination and the hash
-/// keeps two DISTINCT long names distinct (a truncation alone could collapse
-/// them), while the total length is exactly [`NAME_MAX`]. Truncation stops on
-/// a UTF-8 boundary — the names the crate carries are the manifest's UTF-8
-/// names.
+/// When the destination's name already leaves room for `suffix` AND the
+/// branch slack, the trunk IS the name VERBATIM, so the historical spelling
+/// `.name.tmp.<pid>.<n>` is preserved for every name that fits. When it does
+/// not fit, the trunk is a byte-truncated prefix of the name plus the SHA-256
+/// of the FULL name: the prefix keeps the temp recognizable next to its
+/// destination and the hash keeps two DISTINCT long names distinct (a
+/// truncation alone could collapse them). Truncation stops on a UTF-8
+/// boundary — the names the crate carries are the manifest's UTF-8 names.
+///
+/// The derivation is INJECTIVE by construction (F-C): the verbatim branch is
+/// restricted to trunks of at most `NAME_MAX - overhead - SLACK` bytes, while
+/// the truncated branch always emits at least `NAME_MAX - overhead - 3`
+/// bytes, so a name returned verbatim can never be the truncation of a
+/// different name (the pre-fix bound returned the name verbatim whenever it
+/// merely fit, so a 240-byte name's 239-byte hash-truncated trunk was itself
+/// returned verbatim by the next call — two distinct destinations shared one
+/// lock record). Within the truncated branch two distinct names collide only
+/// if their SHA-256 digests collide, and the digest is taken over the FULL
+/// name, so the branch stays injective.
 pub(crate) fn bounded_temp_trunk(name: &str, suffix: &str) -> String {
     let overhead = 1 + suffix.len();
-    if overhead + name.len() <= NAME_MAX {
+    if overhead + name.len() + BOUNDED_TRUNK_BRANCH_SLACK <= NAME_MAX {
         return name.to_string();
     }
     let hash = crate::digest::sha256_bytes(name.as_bytes());
@@ -308,15 +327,37 @@ fn is_crate_temp_tail(marker: &str, trunk: &str, tail: &str) -> bool {
     false
 }
 
-/// Whether `name` is one of the crate's own TEMP names: it begins with the
-/// authority's leading dot and ends with a marker ([`TEMP_SUFFIX_MARKER`] or
-/// [`CLAIM_SUFFIX_MARKER`]) followed by a tail [`is_crate_temp_tail`] accepts.
+/// The crate's temp-SHAPE grammar: whether `name` is spelled exactly like one
+/// of the crate's own temp names. This is the ONE authority for the shape; it
+/// is exposed through the public recovery recognizer
+/// [`is_crate_temp_name`] AND consulted by the id/name rule
+/// ([`crate::id::valid_name`], via
+/// [`crate::reserved::is_unaddressable_name`]), so an id the crate accepts can
+/// never look like one of its own temps (F-B: the documented recovery sweep
+/// that removes every [`is_crate_temp_name`] match is safe BY CONSTRUCTION —
+/// no addressable content can match).
 ///
 /// The leading dot is PART of the shape, not a heuristic: every generator
 /// emits it ([`temp_name_string`] and the far-side templates all spell
 /// `.<trunk><marker><tail>`), so a name the id rule accepts but no generator
 /// can produce — `report.tmp.123.4` — is NOT a crate temp and is never offered
 /// to the recovery sweep.
+pub(crate) fn is_crate_temp_shape(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    [TEMP_SUFFIX_MARKER, CLAIM_SUFFIX_MARKER]
+        .iter()
+        .any(|marker| match rest.rsplit_once(marker) {
+            Some((trunk, tail)) => is_crate_temp_tail(marker, trunk, tail),
+            None => false,
+        })
+}
+
+/// Whether `name` is one of the crate's own TEMP names. This is the public
+/// recovery recognizer; it answers with the shape grammar
+/// [`is_crate_temp_shape`], which the id/name rule consults too, so a
+/// `true` answer here is never a name [`crate::id::valid_name`] accepts.
 ///
 /// This is how a caller tells a CRASHED TEMP from a HELD-ASIDE. Both can sit
 /// in the RESERVED `.sync-aside.` namespace (`crate::reserved`), because a temp
@@ -343,15 +384,7 @@ fn is_crate_temp_tail(marker: &str, trunk: &str, tail: &str) -> bool {
 /// claim-ASIDE (no authority marker) HOLDS a stranded original and must NOT be
 /// removed by this predicate — inspect it first.
 pub fn is_crate_temp_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix('.') else {
-        return false;
-    };
-    [TEMP_SUFFIX_MARKER, CLAIM_SUFFIX_MARKER]
-        .iter()
-        .any(|marker| match rest.rsplit_once(marker) {
-            Some((trunk, tail)) => is_crate_temp_tail(marker, trunk, tail),
-            None => false,
-        })
+    is_crate_temp_shape(name)
 }
 
 /// Unique temp-file name for an atomic replace of `path`: same directory,
@@ -611,8 +644,8 @@ impl RootDir {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplaceOutcome, ReplaceStage, is_crate_temp_name, normalize_root, temp_name_for,
-        validate_rel, write_atomic_replace,
+        NAME_MAX, ReplaceOutcome, ReplaceStage, bounded_temp_trunk, is_crate_temp_name,
+        normalize_root, temp_name_for, validate_rel, write_atomic_replace,
     };
     use crate::error::Error;
     use crate::test_support::{fixture_env, fixture_tmpdir, proptest_cases, slow_tests_enabled};
@@ -742,6 +775,153 @@ mod tests {
                 "{near_miss:?} is an addressable id, so the recovery sweep must not delete it"
             );
         }
+    }
+
+    /// F-B PROPERTY: the recovery recognizer and the id rule can NEVER both
+    /// accept a name. `is_crate_temp_name` is documented as the predicate a
+    /// consumer's recovery sweep REMOVES every match of, so a name the id rule
+    /// also accepts would let the documented sweep DELETE addressable content.
+    /// The property is asserted over every shape the crate's generators produce
+    /// (local replace, far-side sidecar/`mktemp`, claim), the DOTTED
+    /// near-misses (the recognizer matches them, so the id rule must refuse
+    /// them), and the DOTLESS near-misses (the id rule accepts them, so the
+    /// recognizer must not match them).
+    ///
+    /// LOAD-BEARING BY MUTATION: broadening `is_crate_temp_name` to match a
+    /// dotless name the id rule accepts (for example `notes.tmp.1.0`) fails the
+    /// dotless cases below, because the id rule's temp refusal consults the
+    /// SHAPE grammar ([`super::is_crate_temp_shape`]) rather than the public
+    /// recognizer this test calls.
+    #[test]
+    fn no_name_is_both_a_crate_temp_and_an_addressable_id() {
+        // Every shape the crate's OWN generators produce.
+        let generated: Vec<String> = [
+            "record.json",
+            "sync-aside.foo",
+            "report",
+            ".operation.lock",
+            "nested/entry",
+        ]
+        .iter()
+        .map(|dest| {
+            temp_name_for(std::path::Path::new(dest))
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+        // Far-side and claim shapes: sidecar `<pid>.<time>.<rand>`, `mktemp`
+        // six-alphanumeric, lock sidecar one `<pid>`, local claim
+        // `<pid>.<counter>`.
+        let far_side = [
+            ".op.json.tmp.1234.1700000000.42",
+            ".op.json.tmp.abc123",
+            ".operation.lock.tmp.4242",
+            ".sync-aside.1234.claim.7.0",
+        ];
+
+        // Dotted near-misses: the recognizer matches them, so the id rule must
+        // refuse them (F-B).
+        let dotted = [
+            ".notes.tmp.1.0",
+            ".a.tmp.1.0",
+            ".report.tmp.1.0",
+            ".a.claim.1.0",
+            ".a.tmp.aB3xY9",
+            ".operation.lock.tmp.1",
+            ".op.json.tmp.1.2.3",
+            ".report.tmp.123.4",
+        ];
+
+        // Dotless near-misses: the id rule ACCEPTS them, so the recognizer must
+        // NOT match them.
+        let dotless = [
+            "notes.tmp.1.0",
+            "report.tmp.123.4",
+            "report.tmp.123.4.5",
+            "report.tmp.aB3xY9",
+        ];
+
+        for name in generated
+            .iter()
+            .map(String::as_str)
+            .chain(far_side)
+            .chain(dotted)
+            .chain(dotless)
+        {
+            assert!(
+                !(is_crate_temp_name(name) && crate::id::valid_name(name)),
+                "{name:?} must never be BOTH a crate temp and an addressable id: the documented \
+                 recovery sweep would delete addressable content"
+            );
+        }
+        // The premise is non-vacuous in BOTH directions.
+        for name in far_side.iter().copied().chain(dotted) {
+            assert!(
+                is_crate_temp_name(name),
+                "premise: {name:?} is a crate temp"
+            );
+            assert!(
+                !crate::id::valid_name(name),
+                "premise: the id rule refuses the temp shape {name:?}"
+            );
+        }
+        for name in dotless {
+            assert!(
+                !is_crate_temp_name(name),
+                "premise: {name:?} is not a crate temp"
+            );
+            assert!(
+                crate::id::valid_name(name),
+                "premise: {name:?} is addressable"
+            );
+        }
+    }
+
+    /// F-C: `bounded_temp_trunk` must be INJECTIVE. Pre-fix it returned the
+    /// name VERBATIM whenever it merely fit, so `trunk(trunk(B)) == trunk(B)`
+    /// for a long `B`: a 240-byte name forces the hash branch and its 239-byte
+    /// trunk then fit verbatim, so two DISTINCT sibling destinations shared one
+    /// lock record. The fix reserves branch slack so no verbatim trunk can
+    /// equal a truncated one, and the hash keeps same-prefix long names
+    /// distinct.
+    ///
+    /// LOAD-BEARING BY MUTATION: removing the hash from the truncation (keeping
+    /// only the prefix) makes the same-prefix pair collide and fails this test.
+    #[test]
+    fn bounded_temp_trunk_is_injective() {
+        let suffix = ".operation.lock"; // 15 bytes; `.` + suffix = overhead 16
+        // The F-C collision: a 240-byte name forces the hash branch; its trunk
+        // is then tested again and must not be returned verbatim.
+        let long = "b".repeat(240);
+        let trunk_long = bounded_temp_trunk(&long, suffix);
+        assert!(
+            trunk_long.len() >= NAME_MAX - 16 - 3,
+            "the truncated trunk must occupy the reserved branch range, got {} bytes",
+            trunk_long.len()
+        );
+        assert_ne!(
+            bounded_temp_trunk(&trunk_long, suffix),
+            trunk_long,
+            "a truncated trunk must NOT be returned verbatim by a second call"
+        );
+        // Two long names with the SAME first 174 bytes differ only in their
+        // tails: only the hash can keep them apart.
+        let same_prefix_a = format!("{}{}", "c".repeat(174), "x".repeat(66));
+        let same_prefix_b = format!("{}{}", "c".repeat(174), "y".repeat(66));
+        assert_eq!(same_prefix_a.len(), 240);
+        assert_eq!(same_prefix_b.len(), 240);
+        assert_ne!(
+            bounded_temp_trunk(&same_prefix_a, suffix),
+            bounded_temp_trunk(&same_prefix_b, suffix),
+            "long names with the same prefix must stay distinct (the hash is the distinguisher)"
+        );
+        // A name that fits verbatim cannot collide with any truncated trunk:
+        // the two branches occupy disjoint length ranges.
+        let verbatim = "v".repeat(100);
+        assert_eq!(bounded_temp_trunk(&verbatim, suffix), verbatim);
     }
 
     /// COMMIT POINT 1 (the rename): a fault at the rename stage is a

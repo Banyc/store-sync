@@ -130,6 +130,13 @@ pub fn write_atomic_replace(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    // The PATH-BASED replace DESTROYS the target entry's inode (the temp is
+    // renamed OVER it), so it belongs on the guarded list exactly like the
+    // `_fd` replace (F-A1): replacing the lock record would swap its inode
+    // and let a later acquisition flock a fresh inode while a live holder
+    // still holds the old one. The guard consults the ONE authority and the
+    // FULL path (see [`refuse_lock_record_mutation`]).
+    refuse_lock_record_mutation(path)?;
     if let Some(parent) = path.parent() {
         // DURABLE creation of the parent chain: every directory created here
         // has its own entry fsynced into its parent BEFORE the temp write and
@@ -1311,27 +1318,98 @@ pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// [`replace_core`] (both atomic replaces and the compare-and-swap replace),
 /// [`write_atomic_cas_fd`], [`write_file_fd`], [`remove_file_fd`],
 /// [`remove_dir_all_fd`] together with every entry its walk
-/// ([`remove_dir_contents_fd`]) unlinks or rmdirs, [`remove_dir_all_path`], and
-/// BOTH ends of [`renameat_paths`]. The guarantee is therefore structural for
-/// every caller that mutates through the substrate.
+/// ([`remove_dir_contents_fd`]) unlinks or rmdirs, [`remove_dir_all_path`], the
+/// PATH-BASED [`write_atomic_replace`] (F-A1), and EVERY component of BOTH ends
+/// of [`renameat_paths`].
+///
+/// The check consults EVERY component of `rel` (not only the final one), so a
+/// path that NAMES or descends THROUGH a lock record is refused. A record can
+/// also sit UNDER a directory a caller moves or removes; that case is caught by
+/// [`refuse_lock_record_in_moved_subtree`] (rename) and by the per-entry guard
+/// inside [`remove_dir_contents_fd`] (removal), so the guarantee is structural
+/// for every caller that mutates through the substrate.
 ///
 /// HONEST RESIDUAL: the confinement is the SUBSTRATE's, not the filesystem's.
 /// A caller that unlinks, replaces, or renames the record with `std::fs` (or a
 /// foreign tool, or another process) acts outside the substrate and is NOT
-/// stopped; and the PATH-BASED free functions that take an arbitrary path and
+/// stopped; the PATH-BASED free functions that take an arbitrary path and
 /// never destroy an inode (`set_private`, the `ensure_private_dir*` helpers)
-/// leave the record addressable by design. The record is unaddressable to THIS
-/// crate's primitives, not immovable on the machine.
+/// leave the record addressable by design; and `copy_dir_recursive`
+/// (test-only) is an unguarded path-based copy. The record is unaddressable to
+/// THIS crate's primitives, not immovable on the machine.
 fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
-    if let Some(name) = rel.file_name().and_then(|name| name.to_str())
-        && crate::reserved::is_lock_record_name(name)
-    {
+    // EVERY component, not only the final one (F-A2): a path that NAMES a
+    // lock record in any position is refused, so a mutation that descends
+    // through a record spelling can never be a route around the guard.
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        if !name
+            .to_str()
+            .is_some_and(crate::reserved::is_lock_record_name)
+        {
+            continue;
+        }
         return Err(Error::conflict(format!(
-            "refusing to mutate the crate's lock record {}: the record's stable inode is what makes \
-             two simultaneous holders impossible, so removing, replacing, or renaming it would \
-             admit a second holder",
+            "refusing to mutate the crate's lock record in {}: the record's stable inode is what \
+             makes two simultaneous holders impossible, so removing, replacing, or renaming it \
+             would admit a second holder",
             rel.display()
         )));
+    }
+    Ok(())
+}
+
+/// Refuse a mutation that would MOVE OR DESTROY a subtree containing a
+/// lock-record entry: walk the subtree rooted at `root`/`rel` — descriptor-
+/// relative, classifying each entry with `fstatat(AT_SYMLINK_NOFOLLOW)` so a
+/// symlink is never followed — and refuse if ANY entry's name is a lock-record
+/// spelling (F-A2).
+///
+/// `refuse_lock_record_mutation` guards the path the caller NAMES; it cannot
+/// see a record UNDER a directory the caller moves or removes. A `renameat` of
+/// an ancestor moves the record's inode with the directory, freeing the old
+/// path so a successor acquisition creates a SECOND inode — two simultaneous
+/// holders. The removal walks ([`remove_dir_contents_fd`]) already consult the
+/// guard at every unlink; this is the same check made BEFORE a rename, so the
+/// guarantee lives at the ONE authority rather than at each call site.
+///
+/// This is a DESCRIPTOR-RELATIVE read-only walk (the same component-wise
+/// `O_NOFOLLOW` resolution as the removal walk). It is not O(1): the check is
+/// bounded by the number of entries the rename already moves. A non-directory
+/// or absent `rel` needs no walk (there is no subtree to move into or out of
+/// it), and a symlink is never descended.
+fn refuse_lock_record_in_moved_subtree(root: &RootDir, rel: &Path) -> Result<()> {
+    match path_kind_fd(root, rel)? {
+        Some(PathKind::Dir) => {}
+        _ => return Ok(()),
+    }
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    let dir_fd = openat_no_follow(
+        &parent_fd,
+        Path::new(name),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
+    let mut stack: Vec<(OwnedFd, PathBuf)> = vec![(dir_fd, rel.to_path_buf())];
+    while let Some((dir_fd, dir_rel)) = stack.pop() {
+        for entry in dir_entry_names(&dir_fd)? {
+            let child_name = std::ffi::OsStr::from_bytes(&entry);
+            let child_rel = dir_rel.join(child_name);
+            refuse_lock_record_mutation(&child_rel)?;
+            let mode = fstatat_mode_io(&dir_fd, &entry)
+                .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
+            if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                let sub = openat_no_follow(
+                    &dir_fd,
+                    Path::new(child_name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?;
+                stack.push((sub, child_rel));
+            }
+        }
     }
     Ok(())
 }
@@ -1351,6 +1429,14 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
     // successor acquires, and renaming ONTO it replaces the record's entry.
     refuse_lock_record_mutation(from)?;
     refuse_lock_record_mutation(to)?;
+    // F-A2: the endpoints' names are not enough. A rename MOVES the source
+    // entry, so if `from` is a directory CONTAINING the record (directly or at
+    // any depth) the record's inode moves with it and the old path is freed.
+    // Walk the source subtree (the moved tree) and refuse. `to` needs no walk:
+    // a rename can only REPLACE `to` (the path guard catches a record AT `to`),
+    // and a rename onto an existing directory requires it to be empty, so a
+    // record inside `to` makes the rename fail on its own.
+    refuse_lock_record_in_moved_subtree(root, from)?;
     let (from_fd, from_name) = parent_fd_of(root.as_fd(), from)?;
     let (to_fd, to_name) = parent_fd_of(root.as_fd(), to)?;
     renameat_fd(&from_fd, from_name, &to_fd, to_name)
@@ -1784,9 +1870,9 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, path_kind_fd, read_dir_fd, read_fd,
-        read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_file_fd, replace_order_probe,
-        set_private_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
-        write_file_fd,
+        read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_file_fd, renameat_paths,
+        replace_order_probe, set_private_fd, write_atomic_cas_fd, write_atomic_replace,
+        write_atomic_replace_fd, write_file_fd,
     };
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -2742,6 +2828,98 @@ mod tests {
             "C must be refused with the typed contention signal: {err2:?}"
         );
         drop(holder);
+    }
+
+    /// F-A1: the PATH-BASED `write_atomic_replace` had NO lock-record guard.
+    /// Pre-fix it renamed a fresh inode over the record: A held
+    /// `operation.lock`, a path-based replace swapped the inode, and C then
+    /// acquired the NEW inode while A still held the old one — two simultaneous
+    /// holders. The replace is now refused, the inode is A's, and C is
+    /// contended.
+    #[test]
+    fn path_based_replace_of_the_lock_record_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operation.lock");
+        let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
+        let inode_a = std::fs::metadata(&path).unwrap().ino();
+        let err = write_atomic_replace(&path, b"evil", &mut |_| None)
+            .expect_err("a path-based replace of the lock record must be refused");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the refusal is a conflict: {err:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_a,
+            "the record must keep its stable inode"
+        );
+        let err2 = match crate::lock::FileLock::acquire(&path, "op-C") {
+            Ok(_) => panic!("C must not acquire while A holds the record"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err2, Error::LockContended(_)),
+            "C must be refused with the typed contention signal: {err2:?}"
+        );
+        drop(holder);
+    }
+
+    /// F-A2: renaming an ANCESTOR of the lock record MOVES the record with its
+    /// directory (the inode follows), freeing the old path. Pre-fix the guard
+    /// checked only the endpoints' final components, so
+    /// `renameat_paths(root, "state", "state2")` succeeded and a second
+    /// acquisition at `state/operation.lock` created a NEW inode — two
+    /// simultaneous holders. The source SUBTREE is now walked and the rename is
+    /// refused; the record keeps its inode and C is contended.
+    #[test]
+    fn renaming_an_ancestor_of_the_lock_record_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, root) = owned_root();
+        std::fs::create_dir_all(dir.path().join("state/inner")).unwrap();
+        // The record sits TWO levels down, so a DIRECT-child check would miss
+        // it: the walk must be transitive.
+        let path = dir.path().join("state/inner/operation.lock");
+        let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
+        let inode_a = std::fs::metadata(&path).unwrap().ino();
+        let err = renameat_paths(&root, Path::new("state"), Path::new("state2"))
+            .expect_err("renaming an ancestor of the lock record must be refused");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the ancestor refusal is a conflict: {err:?}"
+        );
+        assert!(
+            path.exists(),
+            "the record must survive the refused ancestor rename"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_a,
+            "the record must keep its stable inode"
+        );
+        let err2 = match crate::lock::FileLock::acquire(&path, "op-C") {
+            Ok(_) => panic!("C must not acquire while A holds the record"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err2, Error::LockContended(_)),
+            "C must be refused with the typed contention signal: {err2:?}"
+        );
+        drop(holder);
+    }
+
+    /// F-A2 control: renaming a directory that holds NO lock record (and whose
+    /// siblings are ordinary) is still allowed, so the subtree guard does not
+    /// refuse every directory rename.
+    #[test]
+    fn renaming_a_record_free_directory_still_works() {
+        let (dir, root) = owned_root();
+        std::fs::create_dir_all(dir.path().join("state/inner")).unwrap();
+        std::fs::write(dir.path().join("state/inner/data"), b"x").unwrap();
+        renameat_paths(&root, Path::new("state"), Path::new("state2"))
+            .expect("a record-free directory rename must still succeed");
+        assert!(dir.path().join("state2/inner/data").exists());
+        assert!(!dir.path().join("state").exists());
     }
 
     /// F7: `set_private_fd` used to admit a DIRECTORY (`O_RDONLY` on a

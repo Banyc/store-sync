@@ -165,14 +165,21 @@ simplification; removing one means adding back the logic it removes.
   *Buys:* path-shaped operations need no segmented traversal. This limit DOES
   apply to the manifest walk: `canonicalize_tree` (`crate::manifest`) uses
   `WalkDir` plus `symlink_metadata`/`read` on accumulated PATHS, so a tree
-  deeper than the platform's path limit (about depth 512 with macOS
-  `PATH_MAX` 1024, about depth 2500 with Linux `PATH_MAX` 4096) is refused with
-  `ENAMETOOLONG` at the first path that overflows. A descriptor-relative
-  manifest walk would lift this; it is not implemented, and this bullet is the
-  statement of the real limit. The descriptor-relative REMOVAL walk
-  (`crate::atomic::remove_dir_contents_fd`) holds one descriptor per level and
-  is NOT limited by the path limit, so removal supports deeper trees than the
-  walk that describes them.
+  deeper than the platform's path limit is refused with `ENAMETOOLONG` at the
+  first path that overflows. With 1-byte components the path grows 2 bytes per
+  level, so the bound is `floor((PATH_MAX - 1 - base_len)/2)`: about depth 512
+  with macOS `PATH_MAX` 1024 and about depth 2041 with Linux `PATH_MAX` 4096
+  (the 4096 bound is 2047 at a 1-byte base; measured 478 on a 59-byte macOS
+  base and 2040 on a 15-byte Linux base, each one level above the point where
+  `ENAMETOOLONG` first lands). A
+  descriptor-relative manifest walk would lift this; it is not implemented, and
+  this bullet is the statement of the real limit. The descriptor-relative
+  REMOVAL walk (`crate::atomic::remove_dir_contents_fd`) holds one descriptor
+  per level and is NOT limited by the path limit, so removal supports deeper
+  trees than the walk that describes them — but that advantage is itself
+  bounded by the descriptor limit, the assumption bullet above ("the process's
+  descriptor limit exceeds the tree's depth"), which is the real ceiling on
+  removal depth.
 - **Metadata beyond name, kind, mode, content and symlink target is outside the
   model.** *Buys:* a small manifest, and no extended-attribute, ACL, ownership,
   timestamp or sparseness machinery.

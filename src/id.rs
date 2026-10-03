@@ -132,8 +132,13 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// or can ALIAS the crate's own bookkeeping ([`crate::reserved::is_unaddressable_name`]):
 /// the claim-aside namespace `.sync-aside.`, the operation-lock record spelling
 /// `.<name>.operation.lock`, the application-store lock record `operation.lock`,
-/// and any CASE ALIAS of those (on a case-insensitive filesystem
-/// `.SYNC-ASIDE.1` IS `.sync-aside.1`).
+/// any CASE ALIAS of those (on a case-insensitive filesystem
+/// `.SYNC-ASIDE.1` IS `.sync-aside.1`), and any of the crate's own TEMP shapes
+/// ([`crate::atomic::is_crate_temp_name`]). The temp shapes are refused because
+/// the crate owns that namespace: a consumer's documented recovery sweep
+/// REMOVES every [`crate::atomic::is_crate_temp_name`] match, so an id that
+/// looked like a temp would be addressable content the sweep silently deletes
+/// (F-B).
 ///
 /// A name becomes a directory/file component UNCHANGED (the store stores
 /// validated names VERBATIM), so the rule must make the valid set INJECTIVE

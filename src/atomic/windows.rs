@@ -52,6 +52,12 @@ pub fn write_atomic_replace(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    // F-A1: the PATH-BASED replace removes the target entry before the rename
+    // (Windows `rename` does not overwrite), so it DESTROYS the target's inode
+    // exactly like the Unix port; consult the ONE guard authority and the FULL
+    // path (see [`refuse_lock_record_mutation`]). Type-checked only here (this
+    // port is never executed in this repository).
+    refuse_lock_record_mutation(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
@@ -414,13 +420,21 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// lock-record spellings (see the Unix port for the full rationale and for the
 /// list of mutating primitives that consult it).
 fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
-    if let Some(name) = rel.file_name().and_then(|name| name.to_str())
-        && crate::reserved::is_lock_record_name(name)
-    {
+    // EVERY component, not only the final one (F-A2; see the Unix port).
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        if !name
+            .to_str()
+            .is_some_and(crate::reserved::is_lock_record_name)
+        {
+            continue;
+        }
         return Err(Error::conflict(format!(
-            "refusing to mutate the crate's lock record {}: the record's stable inode is what makes \
-             two simultaneous holders impossible, so removing, replacing, or renaming it would \
-             admit a second holder",
+            "refusing to mutate the crate's lock record in {}: the record's stable inode is what \
+             makes two simultaneous holders impossible, so removing, replacing, or renaming it \
+             would admit a second holder",
             rel.display()
         )));
     }
@@ -477,6 +491,10 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
     refuse_lock_record_mutation(to)?;
     let from = rel_join(root, from)?;
     let to = rel_join(root, to)?;
+    // F-A2: renaming a directory that CONTAINS the record moves the record's
+    // inode and frees the old path. Windows delegates the walk to the same
+    // tree guard the recursive removal uses (type-checked only here).
+    refuse_lock_record_in_tree(&from)?;
     let _ = std::fs::remove_file(&to);
     std::fs::rename(&from, &to).map_err(|e| {
         Error::store(format!(

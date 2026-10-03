@@ -5198,6 +5198,40 @@ fn the_derived_lock_record_name_is_bounded_to_name_max() {
     drop(held);
 }
 
+/// F-C: two DISTINCT sibling destinations must derive DISTINCT lock records.
+/// Pre-fix `bounded_temp_trunk` returned a name VERBATIM whenever it merely
+/// fit, so a 240-byte destination derived a 239-byte hash-truncated trunk and a
+/// destination NAMED that trunk then returned it verbatim — `trunk(trunk(B))
+/// == trunk(B)`. Both destinations derived the SAME record, so two independent
+/// `sync::push`es contended spuriously (and a hard `ENAMETOOLONG` became a
+/// silent lock alias). The branches now occupy disjoint length ranges.
+///
+/// LOAD-BEARING BY MUTATION: removing the hash from the truncation makes the
+/// two records equal and fails this test.
+#[cfg(unix)]
+#[test]
+fn distinct_destinations_never_share_a_lock_record() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let long_root = dir.path().join("b".repeat(240));
+    let long_record = destination_lock_path(&long_root).expect("a record for the long root");
+    let trunk = long_record
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("the record names UTF-8")
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(OPERATION_LOCK_SUFFIX))
+        .expect("the record is `.<trunk>.operation.lock`")
+        .to_string();
+    let alias_root = dir.path().join(&trunk);
+    let alias_record =
+        destination_lock_path(&alias_root).expect("a record for the trunk-named root");
+    assert_ne!(
+        long_record, alias_record,
+        "the long destination and the destination NAMED its truncated trunk must NOT share a lock \
+         record"
+    );
+}
+
 /// B2: a run REFUSED for an unrepresentable SOURCE must create NOTHING. The
 /// pre-fix order provisioned the destination (creating the root) and took the
 /// destination lock (creating the sibling record) BEFORE the source manifest
