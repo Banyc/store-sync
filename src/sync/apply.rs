@@ -14,10 +14,18 @@
 //! * directories are created before their children (the diff is path-ordered,
 //!   and a parent path is a proper prefix so it sorts first); modes and
 //!   symlinks are transferred faithfully; a symlink is never followed;
-//! * the PULL direction writes through this crate's durable, fd-confined
-//!   primitives (`crate::atomic`) so an interrupted pull cannot leave a torn
-//!   entry; the PUSH direction writes through [`Remote::write`],
-//!   [`Remote::create_dir_all`], [`Remote::symlink`], and [`Remote::set_mode`];
+//! * BOTH directions write a regular file ATOMICALLY and DURABLY. A PULL
+//!   writes through this crate's durable, fd-confined primitive
+//!   ([`crate::atomic::write_atomic_replace_fd`]) so an interrupted pull cannot
+//!   leave a torn entry; a PUSH into a LOCAL destination
+//!   ([`crate::transport::LocalTransport`]) routes through the SAME primitive,
+//!   and a PUSH into a REMOTE one through the far-side temp-and-rename the SSH
+//!   transport emits, so an interrupted push cannot destroy the previous
+//!   snapshot either. The exact discipline, by direction and destination kind,
+//!   is stated in [`crate::manifest`]'s "Durability and atomicity of a written
+//!   entry". A directory and a symlink are still created through
+//!   [`Remote::create_dir_all`] / [`Remote::symlink`] and modes through
+//!   [`Remote::set_mode`];
 //! * after applying, every written entry is re-read and its hash, its symlink
 //!   target, and the MODE of every path this sync touched are checked against
 //!   the source — a mismatch is an ERROR, never a silent success.
@@ -205,8 +213,18 @@
 //! whose only child is an aside is never mistaken for an empty one. Same-kind
 //! file overwrites are already atomic (temp + rename) and are not claimed.
 //!
-//! The `.sync-aside.` prefix is a RESERVED namespace. Before the diff, every
-//! manifest entry with a reserved component is stripped from BOTH sides. A
+//! The RESERVED namespace is defined ONCE by [`crate::reserved`] and has TWO
+//! families: the `.sync-aside.` claim-aside prefix AND the operation-lock
+//! record spelling `.<name>.operation.lock` (the sibling
+//! [`destination_lock_path`] derives, the SAME rule [`crate::id::valid_name`]
+//! refuses). Reserving the lock spelling is what keeps a nested store's held
+//! record — `snapshots/.001.operation.lock`, which lies INSIDE a parent store's
+//! judged tree — out of the diff: a sanctioned parent sync must never transfer
+//! it and never destroy it, because [`crate::lock::FileLock`]'s STABLE-INODE
+//! discipline requires the record to be created once and never removed (a
+//! removed record lets two live holders win the same logical lock). Before the
+//! diff, every manifest entry with a reserved component is stripped from BOTH
+//! sides. A
 //! DESTINATION reserved entry is abandoned residue: it is reduced to its topmost
 //! path in [`SyncReport::residue`], NEVER transferred (a pull must not copy a
 //! stranded aside into the other tree), and NEVER removed — not even by
@@ -878,8 +896,10 @@ use std::path::{Component, Path, PathBuf};
 type Mode = u32;
 /// The RESERVED claim-aside namespace: any manifest path with a component whose
 /// file name starts with this prefix belongs to the claim-by-rename machinery,
-/// never to the caller's tree.
-const ASIDE_PREFIX: &str = ".sync-aside.";
+/// never to the caller's tree. Defined ONCE by [`crate::reserved`], which also
+/// owns the operation-lock record spelling `.<name>.operation.lock`; the sync's
+/// reserved-path check and the id rule share that one authority.
+const ASIDE_PREFIX: &str = crate::reserved::ASIDE_PREFIX;
 /// Owner traverse (`x`), needed to resolve an entry inside a directory.
 const OWNER_TRAVERSE: Mode = 0o100;
 /// Owner write (`w`), needed to create or unlink an entry inside a directory.
@@ -905,14 +925,24 @@ pub enum Direction {
 /// `Extraneous::Delete` say what they do.
 ///
 /// KNOWN COST: the choice is ALL-OR-NOTHING — there is no per-path delete
-/// policy. [`Extraneous::Delete`] removes EVERY destination-only entry, so a
-/// caller that wants to keep one path cannot express "delete these but not
-/// that" through this policy; it must [`Extraneous::Keep`] everything and
-/// remove the unwanted paths out of band, or make the kept path part of the
-/// source. A per-path policy is not offered because the deletion sanction is
-/// DERIVED from the diff (one classification per path), and a partly-deleted
-/// destination would make the report's [`SyncReport::extraneous`] list
-/// ambiguous about which paths survived.
+/// policy. [`Extraneous::Delete`] removes EVERY destination-only entry the
+/// diff classified [`EntryDiff::Extraneous`] (reserved spellings are stripped
+/// before the diff and are therefore never "destination-only entries"; an
+/// entry whose removable ancestor a conflict left alone is reported in
+/// [`SyncReport::conflicts`] instead), so a caller that wants to keep one path
+/// cannot express "delete these but not that" through this policy. The
+/// concrete case: with snapshots 001, 002 and 003 present and only 001 and 003
+/// in the source, `Delete` cannot PRUNE EXACTLY 002 — it deletes every other
+/// destination-only path too, and `Keep` deletes none. The sanctioned route is
+/// to [`Extraneous::Keep`] everything, then remove the unwanted paths OUT OF
+/// BAND through the destination's own removal primitives
+/// ([`crate::transport::Remote::remove_file`] /
+/// [`crate::transport::Remote::remove_dir_all`], or `std::fs` for a local
+/// root), or to make every path the caller wants kept part of the source
+/// before the run. A per-path policy is not offered because the deletion
+/// sanction is DERIVED from the diff (one classification per path), and a
+/// partly-deleted destination would make the report's
+/// [`SyncReport::extraneous`] list ambiguous about which paths survived.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Extraneous {
     /// Leave every destination-only entry in place and report it in
@@ -950,6 +980,32 @@ pub enum EntryPolicy {
     /// the destination is a prefix of the source, write nothing when the
     /// source is a prefix of the destination, and report a conflict when the
     /// two diverge.
+    ///
+    /// KNOWN COST: an append is O(TOTAL SIZE), not O(appended bytes). There is
+    /// no [`Remote::append`](crate::transport::Remote) primitive, so the append
+    /// is realized as a compare-and-replace of the WHOLE file: appending 32
+    /// bytes to a 1 MiB log reads the whole destination to test the prefix
+    /// relation, then reads the whole source and writes the whole result —
+    /// measured at ~3.1 MB read and ~1 MB written for that 32-byte append. A
+    /// caller appending many small records should batch them, or keep the log
+    /// out of the synced tree and ship it as a whole object.
+    ///
+    /// THE COMPARE-AND-APPEND. A write is performed only if the destination
+    /// still holds the exact bytes the prefix test read, so a writer that
+    /// changed the entry in the read→write window is not silently overwritten:
+    /// the run re-reads, applies the rule to the new content when it still
+    /// admits one, and otherwise reports a [`ConflictReason::Diverged`]
+    /// conflict (bounded retries, then the conflict). On a LOCAL confined
+    /// destination the comparison and the install share ONE descriptor (an
+    /// fd-bound atomic compare-and-replace), so the residual window is the
+    /// `renameat` itself. What it STILL CANNOT do: a REMOTE destination has
+    /// neither a lock nor a server-side compare — the live bytes are re-read
+    /// through the transport and THEN written through it, so a writer that
+    /// changes the entry during that write (after the compare) is lost; and
+    /// even locally a writer that wins the window between the final comparison
+    /// and the `renameat` is lost. Every one of those residuals is NARROWER
+    /// than the pre-fix whole-file overwrite, and a change that lands before
+    /// the comparison is never lost silently.
     AppendTail,
 }
 
@@ -1174,9 +1230,9 @@ pub struct SyncReport {
     /// residue, reduced to its TOPMOST such path. There are exactly TWO kinds,
     /// and the lists state EXISTENCE for both:
     ///
-    /// * a STRANDED CLAIM-ASIDE — a name in the RESERVED `.sync-aside.`
-    ///   namespace, the last component of the reported path (the aside holds
-    ///   the stranded subtree, so nothing below it is named); or
+    /// * a STRANDED CLAIM-ASIDE — a name in the RESERVED claim-aside
+    ///   namespace `.sync-aside.`, the last component of the reported path (the
+    ///   aside holds the stranded subtree, so nothing below it is named); or
     /// * an ORDINARY destination path this run refused to remove or displace —
     ///   a live entry no manifest spelling addresses, found while walking a
     ///   directory under this sync's own [`Claim`], or a writer's live entry
@@ -1196,14 +1252,39 @@ pub struct SyncReport {
     /// [`RootedRelativePath`](crate::transport::RootedRelativePath) parsed from
     /// the reported path; for a local destination, `std::fs::remove_file` /
     /// `std::fs::remove_dir_all` on the path joined under the local root. The
-    /// RESERVED `.sync-aside.` namespace is described in this module's
-    /// "Kind-changing replacement, the reserved namespace, and residue"
-    /// section (and defined by `ASIDE_PREFIX`): a reported path whose last
-    /// component is in that namespace is the sync's OWN stranded claim-aside
-    /// and HOLDS THE ORIGINAL ENTRY, so inspect it before discarding it; the
-    /// other kind is a foreign destination path the run refused to destroy.
+    /// RESERVED namespace — the `.sync-aside.` claim-aside prefix OR the
+    /// operation-lock record spelling `.<name>.operation.lock`, both defined by
+    /// the ONE authority [`crate::reserved`] (`ASIDE_PREFIX` names the first) —
+    /// is described in this module's "Kind-changing replacement, the reserved
+    /// namespace, and residue" section: a reported path whose last component is
+    /// a claim-aside is the sync's OWN stranded aside and HOLDS THE ORIGINAL
+    /// ENTRY, so inspect it before discarding it; a reported path whose last
+    /// component is a lock record is the caller's own lock and MUST BE LEFT to
+    /// the holder (removing it breaks the stable-inode exclusion); the other
+    /// kind is a foreign destination path the run refused to destroy.
     /// The sync itself never removes either one, so recovery is always the
     /// caller's explicit act.
+    ///
+    /// **Which root the spelling is relative to.** Every path in this list —
+    /// and in [`SyncReport::indeterminate`], [`SyncReport::extraneous`], and
+    /// every other list — is spelled relative to THE RUN'S DESTINATION ROOT:
+    /// [`Remote::root`](crate::transport::Remote::root) when the destination
+    /// was a [`crate::transport::Remote`] (a push), the local root for a pull.
+    /// A per-subtree transport (one whose root names a single snapshot
+    /// directory) therefore reports paths relative to THAT subtree, so a caller
+    /// MUST resolve them against the root of the transport it passed to the
+    /// run, never against a store or snapshot base it happens to hold
+    /// elsewhere.
+    ///
+    /// **The crate's OWN stale temp is NOT residue.** A replace that fails in
+    /// place leaves no temp, but a temp a CRASHED writer left behind is a
+    /// dot-prefixed `.name.tmp.<pid>.<n>` entry whose name is public through
+    /// [`crate::atomic::temp_name_for`]. That spelling is NOT reserved, so the
+    /// entry is reported as [`SyncReport::extraneous`] — and [`Extraneous::Keep`],
+    /// the default, leaves it in place forever. It holds no original entry, so
+    /// recovery is a plain removal of each `extraneous` path whose last
+    /// component matches the temp pattern; a caller that owns the destination
+    /// and wants the tree clean should sweep that pattern after a crashed run.
     ///
     /// Reserved residue is
     /// stripped from the destination manifest BEFORE the diff, so it is NEVER
@@ -1840,14 +1921,27 @@ fn run_entry(
              remote request or took the destination lock",
         )));
     }
-    // (3) Now establish ownership, holding it for the whole run.
+    // (3) READ THE SOURCE MANIFEST, STRICTLY, BEFORE ESTABLISHING OWNERSHIP.
+    // `source.manifest()` refuses an unrepresentable source entry (a hard link,
+    // an absolute or escaping symlink) HERE — before the destination lock
+    // record is created and before `run` provisions the destination root. The
+    // old order provisioned and locked first, so a run refused for its SOURCE
+    // had already created the destination root and the sibling lock record. A
+    // refusal creates nothing. The manifest is read once and handed to `run` as
+    // the plan (`run` re-reads it at the END for the source-quiescence check,
+    // so the two samples still detect a source that moved during the run).
+    let source_meta = match source.manifest() {
+        Ok(meta) => meta,
+        Err(error) => return Err(SyncError::from(error)),
+    };
+    // (4) Now establish ownership, holding it for the whole run.
     let ownership = match requested {
         RequestedOwnership::Locked => {
             lock_destination(direction, dest_is_local, &dest_root).map_err(SyncError::from)?
         }
         RequestedOwnership::Unowned => DestinationOwnership::Unowned,
     };
-    run(&source, &dest, policy, extraneous, ownership)
+    run(&source, &dest, policy, extraneous, ownership, source_meta)
 }
 
 /// [`sync`] in [`Direction::Push`], without removing extraneous entries. The
@@ -2391,6 +2485,7 @@ fn run(
     policy: &dyn Policy,
     extraneous: Extraneous,
     ownership: DestinationOwnership,
+    source_meta: TreeMetadata,
 ) -> SyncResult {
     // Hold the destination's operation lock for the WHOLE run: `_lock` lives
     // until this function returns, so the flock is released only after the last
@@ -2399,6 +2494,14 @@ fn run(
         DestinationOwnership::Locked(lock) => Some(lock),
         DestinationOwnership::Unowned => None,
     };
+    // The RAW source manifest the plan is made against, kept for the
+    // SOURCE-quiescence check at the END of the run. It was read by the ENTRY
+    // POINT, BEFORE the destination lock was taken and before the destination
+    // was provisioned, so a run refused for an unrepresentable SOURCE has
+    // created nothing. It must be the manifest BEFORE the reserved-namespace
+    // strip below, so a change to a reserved spelling is not hidden from the
+    // comparison.
+    let source_plan = source_meta.clone();
     // PROVISION A REMOTE DESTINATION BEFORE ITS MANIFEST IS READ. The
     // destination of a PUSH is a `Side::Remote`; its `provision_layout`
     // creates the destination ROOT and the caller's bootstrap directories
@@ -2415,20 +2518,12 @@ fn run(
         && let Err(error) = remote.provision_layout()
     {
         return Err(SyncError::from(error.with_context(
-            "provisioning the destination layout failed before the destination manifest was \
-             read (the destination root and the caller's bootstrap directories are created at \
-             the start of a push)",
+            "provisioning the destination layout failed after the source manifest and the \
+             destination lock were taken, and before the destination manifest was read (the \
+             destination root and the caller's bootstrap directories are created at the start \
+             of a push)",
         )));
     }
-    let source_meta = match source.manifest() {
-        Ok(meta) => meta,
-        Err(error) => return Err(SyncError::from(error)),
-    };
-    // The RAW source manifest the plan is made against, kept for the
-    // SOURCE-quiescence check at the END of the run. It must be the manifest
-    // BEFORE the reserved-namespace strip below, so a change to a reserved
-    // spelling is not hidden from the comparison.
-    let source_plan = source_meta.clone();
     // The destination manifest is built TOLERANTLY: an entry the address
     // -fidelity rules refuse (an absolute/escaping symlink, a hard link) is
     // recorded in `dest_unsupported` and still present in the manifest under
@@ -4757,6 +4852,48 @@ impl Applier<'_, '_> {
         dest_kind: Option<EntryKind>,
         expected: &str,
     ) -> Result<()> {
+        // THE COMPARE-AND-APPEND LOOP. The destination is RE-READ and the rule
+        // re-decided after every mismatch, so a concurrent writer that changed
+        // the entry between our read and our write is never overwritten
+        // silently: either the new content still admits the prefix rule (and
+        // the write is retried against the bytes we just read), or the run
+        // reports a `Diverged` conflict. The bound keeps a relentless writer
+        // from spinning the run forever; an exhausted loop is a conflict, NEVER
+        // a silent write — the one outcome the old unconditional whole-file
+        // write produced.
+        const APPEND_RETRIES: usize = 8;
+        for attempt in 0..=APPEND_RETRIES {
+            match self.append_attempt(entry, dest_entry, rel, dest_kind, expected)? {
+                AppendAttempt::Done => return Ok(()),
+                AppendAttempt::Changed => {
+                    if attempt == APPEND_RETRIES {
+                        self.conflict(
+                            &entry.path,
+                            EntryKind::File,
+                            EntryPolicy::AppendTail,
+                            ConflictReason::Diverged,
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        unreachable!("the bounded append loop returns on its last iteration")
+    }
+
+    /// One compare-and-append attempt: read the live destination, apply the
+    /// prefix rule, and — when a write is due — perform it as a CHECKED write
+    /// against the exact bytes just read. A live destination that no longer
+    /// matches those bytes reports [`AppendAttempt::Changed`] and the caller
+    /// re-reads.
+    fn append_attempt(
+        &mut self,
+        entry: &TreeEntry,
+        dest_entry: Option<&TreeEntry>,
+        rel: &RootedRelativePath,
+        dest_kind: Option<EntryKind>,
+        expected: &str,
+    ) -> Result<AppendAttempt> {
         // THE LIVE KIND DECIDES THE APPEND ROUTE ([`Applier::live_dest_kind`]),
         // never the snapshot: a destination the snapshot called a FILE but that
         // is now a DIRECTORY or SYMLINK takes the non-file arm (a conflict)
@@ -4769,7 +4906,7 @@ impl Applier<'_, '_> {
             // empty file instead of reporting it skipped.
             None => {
                 let source_bytes = self.source.read(rel)?;
-                return self.append_write(entry, rel, dest_kind, &source_bytes, expected);
+                return self.append_write(entry, rel, dest_kind, None, &source_bytes, expected);
             }
             Some(EntryKind::File) => self.dest.read(rel)?,
             Some(_) => {
@@ -4785,23 +4922,33 @@ impl Applier<'_, '_> {
                     EntryPolicy::AppendTail,
                     ConflictReason::AppendNotAFile,
                 );
-                return Ok(());
+                return Ok(AppendAttempt::Done);
             }
         };
         let source_bytes = self.source.read(rel)?;
         if dest_bytes == source_bytes {
             // Identical bytes: the append-only rule writes nothing. A differing
             // mode is still applied — the rule constrains BYTES, not modes.
-            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)
+            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)?;
+            Ok(AppendAttempt::Done)
         } else if source_bytes.starts_with(&dest_bytes) {
             // The destination is a prefix: write the whole source through the
-            // durable replace primitive (same observable result as appending
-            // the tail, never a truncation).
-            self.append_write(entry, rel, dest_kind, &source_bytes, expected)
+            // durable compare-and-replace primitive (same observable result as
+            // appending the tail, never a truncation), EXPECTING the exact
+            // bytes just read.
+            self.append_write(
+                entry,
+                rel,
+                dest_kind,
+                Some(&dest_bytes),
+                &source_bytes,
+                expected,
+            )
         } else if dest_bytes.starts_with(&source_bytes) {
             // The source is a prefix: append-only writes NO BYTES, but a
             // differing mode is still applied.
-            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)
+            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)?;
+            Ok(AppendAttempt::Done)
         } else {
             self.conflict(
                 &entry.path,
@@ -4809,7 +4956,7 @@ impl Applier<'_, '_> {
                 EntryPolicy::AppendTail,
                 ConflictReason::Diverged,
             );
-            Ok(())
+            Ok(AppendAttempt::Done)
         }
     }
 
@@ -4886,9 +5033,10 @@ impl Applier<'_, '_> {
         entry: &TreeEntry,
         rel: &RootedRelativePath,
         dest_kind: Option<EntryKind>,
+        expected_bytes: Option<&[u8]>,
         source_bytes: &[u8],
         expected: &str,
-    ) -> Result<()> {
+    ) -> Result<AppendAttempt> {
         // This append DOES write into the parent, so the block applies here
         // (it is deferred out of `transfer` because a no-write append of the
         // same path must not be blocked).
@@ -4899,7 +5047,7 @@ impl Applier<'_, '_> {
                 EntryPolicy::AppendTail,
                 ConflictReason::ParentRefused,
             );
-            return Ok(());
+            return Ok(AppendAttempt::Done);
         }
         let mode = parse_mode(&entry.mode)?;
         self.widen_ancestors(&entry.path, ParentNeed::Private)?;
@@ -4912,8 +5060,16 @@ impl Applier<'_, '_> {
         self.make_overwritable(&entry.path, rel)?;
         self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
         self.begin_mutation(&entry.path, MutationKind::Content);
-        match self.dest.write_file(rel, source_bytes, mode) {
-            Ok(()) => {
+        // THE CHECKED WRITE: install `source_bytes` only if the live destination
+        // still holds `expected_bytes` (or is still absent when that is `None`).
+        // A mismatch means a concurrent writer changed the destination after we
+        // read it: NOTHING was written, so the attempt is resolved (no
+        // indeterminate entry) and the caller re-reads.
+        match self
+            .dest
+            .write_file_if_match(rel, expected_bytes, source_bytes, mode)
+        {
+            Ok(CheckedWrite::Written) => {
                 self.commit_mutation(&entry.path, MutationKind::Content);
                 // Record the outcome BEFORE the fallible mode READ, so a read
                 // failure names the path.
@@ -4925,7 +5081,14 @@ impl Applier<'_, '_> {
                     kind: EntryKind::File,
                     expected_sha256: expected.to_string(),
                 });
-                Ok(())
+                Ok(AppendAttempt::Done)
+            }
+            Ok(CheckedWrite::Mismatch) => {
+                // The primitive returned a DEFINITE "nothing written" verdict,
+                // so the path's state is known and the in-flight attempt is
+                // resolved; the mutation COUNT stays (a call was attempted).
+                self.commit_mutation(&entry.path, MutationKind::Content);
+                Ok(AppendAttempt::Changed)
             }
             Err(error) => Err(error),
         }
@@ -6336,23 +6499,22 @@ fn aside_name() -> OsString {
     ))
 }
 
-/// Whether a single file name is in the RESERVED claim-aside namespace
-/// ([`ASIDE_PREFIX`]).
+/// Whether a single file name is in one of the crate's RESERVED spellings — the
+/// claim-aside namespace ([`ASIDE_PREFIX`]) OR the operation-lock record
+/// spelling `.<name>.operation.lock`. Delegates to the ONE authority in
+/// [`crate::reserved`], which [`crate::id::valid_name`] also consults, so a
+/// spelling refused as an id is exactly a spelling this sync strips from the
+/// manifests (and therefore can never transfer or destroy).
 fn is_reserved_name(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| name.starts_with(ASIDE_PREFIX))
+    name.to_str().is_some_and(crate::reserved::is_reserved_name)
 }
 
 /// Whether ANY component of a canonical manifest path is reserved. A reserved
 /// DIRECTORY makes every entry below it reserved too (the aside holds the whole
-/// stranded subtree).
+/// stranded subtree). Component splitting lives in [`crate::reserved`], shared
+/// with the public predicate.
 fn is_reserved_path(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|component| match component {
-            Component::Normal(name) => is_reserved_name(name),
-            _ => false,
-        })
+    crate::reserved::is_reserved_path(path)
 }
 
 /// Join a manifest-style parent path and a child name into a manifest-style
@@ -6809,6 +6971,24 @@ fn refuse_overlapping_roots(local: &LocalSide, remote: &dyn Remote) -> Result<()
 
 /// One side of a transfer: the local tree (addressed through the fd-confined
 /// durable primitives) or the remote (addressed through [`Remote`]).
+/// The verdict of a checked write ([`Side::write_file_if_match`]): whether the
+/// entry was written, or the live destination no longer matched what the
+/// caller had read and NOTHING was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckedWrite {
+    Written,
+    Mismatch,
+}
+
+/// The result of one compare-and-append attempt ([`Applier::append_attempt`]):
+/// whether the append is settled, or the destination changed under the read
+/// and the caller must re-read and re-decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppendAttempt {
+    Done,
+    Changed,
+}
+
 enum Side<'a> {
     Local(&'a LocalSide),
     Remote(&'a dyn Remote),
@@ -6895,6 +7075,57 @@ impl Side<'_> {
         match self {
             Side::Local(local) => local.write_file(rel, bytes, mode),
             Side::Remote(remote) => remote.write(rel, bytes, mode),
+        }
+    }
+
+    /// The COMPARE-AND-WRITE: install `bytes` with `mode` only if the live
+    /// destination still matches `expected`. `expected` is `None` when the
+    /// caller read the destination as ABSENT (then a live entry that appeared
+    /// in the window is a mismatch). `Mismatch` means the destination changed
+    /// between the caller's read and this call and NOTHING was written — it is
+    /// never an error and never a silent overwrite.
+    ///
+    /// The confined local destination resolves this through the fd-bound
+    /// atomic compare-and-replace ([`crate::atomic::write_atomic_if_match_fd`]):
+    /// the live entry is opened `O_NOFOLLOW` and compared through the SAME
+    /// descriptor the replace uses, so the window is only the `renameat`
+    /// itself. An UNCONFINED destination (a remote transport, including a
+    /// local `LocalTransport`) has no such descriptor and no server-side CAS:
+    /// the live content is re-read through the transport and compared, then
+    /// written through it. That still NARROWS the window from the whole upload
+    /// to the write, but a writer inside the transport write is not detected —
+    /// the documented residual of a destination the crate cannot lock.
+    fn write_file_if_match(
+        &self,
+        rel: &RootedRelativePath,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+        mode: Mode,
+    ) -> Result<CheckedWrite> {
+        match self {
+            Side::Local(local) => local.write_file_if_match(rel, expected, bytes, mode),
+            Side::Remote(remote) => {
+                match expected {
+                    Some(exp) => match remote.read(rel) {
+                        Ok(live) if live == exp => {}
+                        // A live entry that is ABSENT, or a READ that fails
+                        // with `NotFound`, is a mismatch (the destination the
+                        // caller read is gone). A symlink/directory read is an
+                        // ordinary `Err` and propagates: it is not a mismatch
+                        // the retry loop should paper over.
+                        Ok(_) => return Ok(CheckedWrite::Mismatch),
+                        Err(Error::NotFound(_)) => return Ok(CheckedWrite::Mismatch),
+                        Err(e) => return Err(e),
+                    },
+                    None => {
+                        if remote.metadata_opt(rel)?.is_some() {
+                            return Ok(CheckedWrite::Mismatch);
+                        }
+                    }
+                }
+                remote.write(rel, bytes, mode)?;
+                Ok(CheckedWrite::Written)
+            }
         }
     }
 
@@ -7310,6 +7541,50 @@ impl LocalSide {
             }
         }
         self.set_mode(rel, mode, EntryKind::File)
+    }
+
+    /// The confined compare-and-write (see [`Side::write_file_if_match`]). The
+    /// existing-file case goes through the fd-bound atomic compare-and-replace,
+    /// whose comparison and install share the ONE opened descriptor; the
+    /// absent case re-checks absence live and then creates through the ordinary
+    /// atomic replace.
+    fn write_file_if_match(
+        &self,
+        rel: &RootedRelativePath,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+        mode: Mode,
+    ) -> Result<CheckedWrite> {
+        let Some(expected) = expected else {
+            // The caller read the destination as ABSENT: it must still be
+            // absent, or the destination changed in the window and NOTHING may
+            // be written.
+            if crate::atomic::path_kind_fd(self.root_for_mutation()?, rel.as_path())?.is_some() {
+                return Ok(CheckedWrite::Mismatch);
+            }
+            self.write_file(rel, bytes, mode)?;
+            return Ok(CheckedWrite::Written);
+        };
+        match crate::atomic::write_atomic_if_match_fd(
+            self.root_for_mutation()?,
+            rel.as_path(),
+            expected,
+            bytes,
+            &mut |_| None,
+        )? {
+            crate::atomic::CompareReplace::Mismatch => return Ok(CheckedWrite::Mismatch),
+            crate::atomic::CompareReplace::Replaced(ReplaceOutcome::ReplacedDurable) => {}
+            crate::atomic::CompareReplace::Replaced(
+                ReplaceOutcome::ReplacedDurabilityUnknown { error },
+            ) => {
+                return Err(Error::store(format!(
+                    "write {}: the entry is visible but its durability is unconfirmed: {error}",
+                    rel.display()
+                )));
+            }
+        }
+        self.set_mode(rel, mode, EntryKind::File)?;
+        Ok(CheckedWrite::Written)
     }
 
     fn set_mode(&self, rel: &RootedRelativePath, mode: Mode, kind: EntryKind) -> Result<()> {

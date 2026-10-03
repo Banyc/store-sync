@@ -52,7 +52,20 @@ As a DESTINATION member, an absolute/escaping symlink or a hard link is not
 refused: the destination manifest records it, the diff reports it extraneous,
 and `Extraneous::Delete` removes it. It is never TRANSFERRED — a source entry
 at the same path is refused before any mutation. `Extraneous` is all-or-nothing
-(no per-path delete policy).
+(no per-path delete policy): `Delete` cannot PRUNE EXACTLY one destination-only
+path (for example snapshot 002 while 001 and 003 are kept) — it removes every
+destination-only entry the diff classified extraneous, and `Keep` removes none.
+The sanctioned route for a partial retention is `Keep` everything and remove
+the unwanted paths out of band through the destination's own removal
+primitives (or make every path you want kept part of the source).
+
+A consumer can ask whether a name is reserved BEFORE it fails:
+`store_sync::is_reserved_name` (one path segment) and
+`store_sync::is_reserved_path` (a canonical manifest path) report the crate's
+reserved spellings — the `.sync-aside.` claim-aside prefix and the
+`.<name>.operation.lock` record. A reserved spelling is refused as an
+identifier, is never transferred by a sync, and is never destroyed by
+`Extraneous::Delete`.
 
 ## Fidelity scope
 
@@ -64,6 +77,50 @@ remote_manifest` true and the sync reporting no difference, so only
 xattr/ACL-aware tooling on the destination can reveal it. Authoritative
 statement: the `manifest` module documentation; the sync entry points restate
 the scope.
+
+Because the manifest carries NO TIMESTAMPS, "the newest N snapshots" must come
+from the snapshot ID's LEXICAL order (or from a timestamp record the caller
+keeps itself). The crate cannot rank two snapshots by time, and two snapshots
+that differ only in mtime compare `Same`.
+
+## This is not a backup or checkpoint format
+
+`store-sync` moves a tree faithfully WITHIN THE MANIFEST MODEL; it is **not a
+backup or checkpoint format**, and it cannot stand in for one:
+
+- A source containing a **hard link** or an **absolute (or escaping) symlink**
+  cannot be snapshotted AT ALL: the strict source manifest refuses the run, so
+  such a tree must be normalized (copy the hard-linked content, make the
+  symlink relative) before it can be pushed.
+- A **restore drops metadata with the differ blind**: `diff(snapshot, live)` is
+  EMPTY while `mtime`, xattrs and sparseness differ. Ownership,
+  `security.capability`, ACLs, timestamps, file flags and sparseness are not
+  carried, and nothing reports their loss. Apply them out of band and verify
+  with tooling that can see them.
+
+## Durability and atomicity
+
+A file a sync writes is published ATOMICALLY and DURABLY for every Unix
+reachable destination kind: a LOCAL destination (a pull, or a push whose
+transport is `LocalTransport`) uses the crate's durable atomic replace (unique
+temp + `fsync` + `rename` + parent-directory `fsync`), and a REMOTE destination
+uses the same shape on the far side (temp, payload on stdin, mode, perl
+`fsync(2)`, perl `rename(2)`, parent-directory `fsync(2)`). A write that fails
+before the rename leaves the PREVIOUS content in place and removes the temp, so
+a failed push can no longer destroy the snapshot it was replacing. The Windows
+local port's replace is the ONE non-atomic case (no directory fsync; the target
+is removed before the rename) and is unverified. The exact commit points are in
+the `manifest` module's "Durability and atomicity of a written entry".
+
+`EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append: appending 32 bytes to
+a 1 MiB log reads ~3.1 MB and writes ~1 MB, because there is no remote append
+primitive and the append is a compare-and-replace of the whole file. Batch
+small appends, or keep the log outside the synced tree and ship it whole.
+
+To make a freshly pushed SUBTREE durable, call `fsync_tree(child)` AND
+`fsync_parent(child)` on the transport rooted at the child's PARENT. A
+`RootedRelativePath` cannot be empty, so a transport rooted at the child itself
+cannot name its own root to fsync the parent directory entry.
 
 ## A fresh destination
 

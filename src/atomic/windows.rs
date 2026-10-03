@@ -282,6 +282,53 @@ pub fn write_atomic_replace_fd(
     write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
 }
 
+/// [`write_atomic_replace_fd`] for a caller that has already ensured the
+/// parent (the path-based `write_atomic_replace` runs `create_dir_all`
+/// itself; this port has no fd to chmod an existing parent through, so the
+/// two are identical here).
+pub fn write_atomic_replace_fd_under_existing_parent(
+    root: &RootDir,
+    rel: &Path,
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<ReplaceOutcome> {
+    write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
+}
+
+/// The verdict of [`write_atomic_if_match_fd`] (see the Unix port for the
+/// full contract; the Windows replace is the documented NON-atomic one).
+#[derive(Debug)]
+pub enum CompareReplace {
+    /// The live entry held the expected bytes and `bytes` were installed.
+    Replaced(ReplaceOutcome),
+    /// The live entry did NOT hold the expected bytes: nothing was written.
+    Mismatch,
+}
+
+/// PATH-BASED compare-and-replace: install `bytes` only if the entry at `rel`
+/// currently reads as `expected`. The comparison is a best-effort read
+/// followed by the non-atomic Windows replace, so a writer that changes the
+/// entry between the read and the replace is NOT detected — the documented
+/// weaker guarantee of the Windows port (no descriptor to compare through,
+/// no atomic rename). Fail closed on an unreadable entry or a symlink (the
+/// read follows it on this port).
+pub fn write_atomic_if_match_fd(
+    root: &RootDir,
+    rel: &Path,
+    expected: &[u8],
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<CompareReplace> {
+    let path = rel_join(root, rel)?;
+    match std::fs::read(&path) {
+        Ok(existing) if existing == expected => {} // still ours: replace below
+        Ok(_) => return Ok(CompareReplace::Mismatch),
+        Err(e) => return Err(Error::store(format!("read {}: {e}", path.display()))),
+    }
+    let outcome = write_atomic_replace(&path, bytes, fault)?;
+    Ok(CompareReplace::Replaced(outcome))
+}
+
 /// Path-based create-or-compare CAS: the create-new install is the
 /// atomicity primitive (a racing loser fails on AlreadyExists and can
 /// never clobber a winner); there is no parent-directory fsync durability.

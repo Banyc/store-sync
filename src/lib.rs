@@ -33,6 +33,7 @@ pub mod id;
 pub mod lock;
 pub mod manifest;
 pub mod platform;
+pub mod reserved;
 pub mod root;
 pub mod sync;
 pub mod trace;
@@ -45,3 +46,4 @@ pub(crate) mod test_support;
 mod deep_tree_regression;
 
 pub use error::{Error, Result};
+pub use reserved::{ASIDE_PREFIX, OPERATION_LOCK_SUFFIX, is_reserved_name, is_reserved_path};

@@ -812,6 +812,10 @@ enum AfterWrite {
     CreateFile(String),
     /// Overwrite the regular file at `rel` with `bytes`.
     Overwrite(String, Vec<u8>),
+    /// APPEND `bytes` to the regular file at `rel`: a writer that adds a line
+    /// between a compare-and-append's read of the destination and its write
+    /// (the A2 window). The bytes are appended, never replacing what is there.
+    Append(String, Vec<u8>),
     /// Create the parent directories of `rel` and write `bytes` there: a writer
     /// that materialises a NEW subtree (a directory plus a child no manifest
     /// spelling addresses) in one step.
@@ -865,6 +869,14 @@ impl AfterWrite {
             AfterWrite::CreateFile(rel) => write(&root.join(rel), b""),
             AfterWrite::Overwrite(rel, bytes) => {
                 fs::write(root.join(rel), bytes).unwrap();
+            }
+            AfterWrite::Append(rel, bytes) => {
+                use std::io::Write;
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(root.join(rel))
+                    .unwrap();
+                f.write_all(bytes).unwrap();
             }
             AfterWrite::WriteTree(rel, bytes) => {
                 write(&root.join(rel), bytes);
@@ -1044,6 +1056,15 @@ struct RecordingRemote {
     /// tree it planned against moved underneath it and fail closed, naming the
     /// path that changed.
     source_writer: Option<(usize, PathBuf, AfterWrite)>,
+    /// The A2 WINDOW WRITER: after the Nth (1-based) successful read OF THE
+    /// PATH named in `.0` lands, apply the `AfterWrite` to the stored
+    /// destination root. Positioned by (path, count-within-that-path) because
+    /// the destination manifest's own hash read of the same path comes FIRST —
+    /// a global read counter cannot tell the manifest read from the append's
+    /// read.
+    dest_read_writer: Option<(String, usize, AfterWrite)>,
+    /// Successful reads seen per destination path, for [`Self::dest_read_writer`].
+    dest_read_counts: Mutex<BTreeMap<String, usize>>,
     /// Successful `read` calls seen, so `pull_writer` and `source_writer` can
     /// target one by
     /// position.
@@ -1123,6 +1144,8 @@ impl RecordingRemote {
             mutate_before_first_op: None,
             pull_writer: None,
             source_writer: None,
+            dest_read_writer: None,
+            dest_read_counts: Mutex::new(BTreeMap::new()),
             reads: AtomicUsize::new(0),
             fail_nth_read: None,
             mutate_after_failed_write: None,
@@ -1320,6 +1343,20 @@ impl Remote for RecordingRemote {
             && nth == *target
         {
             action.apply(root);
+        }
+        // The A2 window writer: count reads of THIS path and fire on the
+        // requested one. The destination manifest hash read is the first read
+        // of a file, so the append's own destination read is a later count.
+        if let Some((path, target, action)) = &self.dest_read_writer {
+            let spelled = rel.as_path().to_string_lossy().into_owned();
+            if &spelled == path {
+                let mut counts = self.dest_read_counts.lock().unwrap();
+                let count = counts.entry(spelled).or_insert(0);
+                *count += 1;
+                if *count == *target {
+                    action.apply(self.inner.root());
+                }
+            }
         }
         Ok(bytes)
     }
@@ -4550,6 +4587,164 @@ fn a_no_write_append_under_a_refused_read_only_parent_is_not_parent_refused() {
         report.conflicts
     );
     assert_eq!(read(&dst2.join("d/f")), b"abc", "unchanged");
+}
+
+/// A2: the append's read→write window. A concurrent writer APPENDS to the
+/// destination between the append's destination read and its write. Pre-fix
+/// the append wrote the WHOLE source unconditionally, so the writer's bytes
+/// were overwritten, the post-transfer hash matched the source, and the run
+/// returned `Ok` with empty `conflicts` — silent loss. The compare-and-append
+/// now refuses the write (the live content no longer matches the bytes it
+/// read), re-reads, finds the streams diverged, and reports a `Diverged`
+/// conflict; the writer's bytes survive on disk.
+#[test]
+fn an_append_write_that_races_a_concurrent_appender_conflicts_and_preserves_it() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // The destination is `a\n`; our append carries `a\nb\n` (the destination
+    // is a prefix, so a write is due). The writer appends `CONCURRENT\n` right
+    // after the append's destination read.
+    write(&src.join("f"), b"a\nb\n");
+    write(&dst.join("f"), b"a\n");
+
+    let mut remote = RecordingRemote::over(transport(&dst), true);
+    // The append's own destination read is the FIRST `Remote::read` of `f`: a
+    // LOCAL remote's manifest is canonicalized in-process and never reads
+    // through the transport.
+    remote.dest_read_writer = Some((
+        "f".to_string(),
+        1,
+        AfterWrite::Append("f".to_string(), b"CONCURRENT\n".to_vec()),
+    ));
+    let policy = |path: &str, _: EntryKind| {
+        if path == "f" {
+            EntryPolicy::AppendTail
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let result = sync(Direction::Push, &src, &remote, &policy, Keep);
+    let report = match &result {
+        Ok(report) => report,
+        Err(error) => error.report(),
+    };
+
+    // THE DEFECT: a silent overwrite of the concurrent writer's bytes.
+    assert_eq!(
+        read(&dst.join("f")),
+        b"a\nCONCURRENT\n",
+        "the concurrent appender's bytes must not be overwritten: {report:?}"
+    );
+    assert!(
+        !report.applied.contains(&"f".to_string()),
+        "a raced append must NOT be reported applied: {report:?}"
+    );
+    assert!(
+        report
+            .conflicts
+            .iter()
+            .any(|c| c.path == "f" && c.reason == ConflictReason::Diverged),
+        "the raced append must be a Diverged conflict, never a silent success: {report:?}"
+    );
+    assert_report_lists_disjoint(report);
+}
+
+/// A4: a parent sync must NEVER destroy a held nested lock record. The nested
+/// store's record is `destination_lock_path(snapshots/001)` =
+/// `snapshots/.001.operation.lock`, which lies INSIDE the parent store's judged
+/// tree. Before the fix it was an ordinary destination-only entry and a
+/// sanctioned `Extraneous::Delete` removed it — breaking the STABLE-INODE
+/// discipline (the lock file is created once and never removed) so a second
+/// acquisition while the first holder was alive SUCCEEDED, giving two live
+/// holders of one logical lock. The record spelling is now reserved, so it is
+/// stripped from the diff, reported as residue, and left on disk.
+#[cfg(unix)]
+#[test]
+fn a_parent_sync_never_destroys_a_held_nested_lock_record() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // The snapshot subtree is identical on both sides, so the ONLY
+    // destination-only entry is the nested lock record.
+    write(&src.join("snapshots/001/f"), b"SNAP");
+    write(&dst.join("snapshots/001/f"), b"SNAP");
+
+    // Hold the NESTED store's record for the whole run.
+    let nested_root = dst.join("snapshots/001");
+    let lock_path =
+        destination_lock_path(&nested_root).expect("the nested record location derives");
+    assert_eq!(
+        lock_path.file_name().and_then(|n| n.to_str()),
+        Some(".001.operation.lock"),
+        "the record spelling this test pins"
+    );
+    let held = FileLock::acquire(&lock_path, "the test's nested holder").expect("hold the record");
+    assert!(lock_path.exists(), "the held record exists before the run");
+
+    // A SANCTIONED parent sync: the whole-store push with deletion enabled.
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+
+    assert!(
+        lock_path.exists(),
+        "a parent sync MUST NOT destroy a held nested lock record: {report:?}"
+    );
+    assert!(
+        report
+            .residue
+            .contains(&"snapshots/.001.operation.lock".to_string()),
+        "the surviving record must be NAMED as residue: {report:?}"
+    );
+    assert!(
+        !report
+            .extraneous
+            .contains(&"snapshots/.001.operation.lock".to_string()),
+        "a reserved record is never classified as extraneous content: {report:?}"
+    );
+    // The exclusion must still hold: a second acquisition while the first
+    // holder is alive is REFUSED (the pre-fix removal made it succeed).
+    let second = FileLock::acquire(&lock_path, "the second holder");
+    assert!(
+        second.is_err(),
+        "two live holders of the same logical lock must be impossible"
+    );
+    drop(held);
+}
+
+/// B2: a run REFUSED for an unrepresentable SOURCE must create NOTHING. The
+/// pre-fix order provisioned the destination (creating the root) and took the
+/// destination lock (creating the sibling record) BEFORE the source manifest
+/// was read, so a push of a source containing a hard link left a destination
+/// root behind — a `list_snapshots()` above it would report a snapshot that
+/// does not exist. The source manifest is now read (strictly) before ownership
+/// is established and before the destination is provisioned.
+#[cfg(unix)]
+#[test]
+fn a_refused_source_creates_no_destination_root_or_lock_record() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // A hard link is unrepresentable in the manifest model, so the STRICT
+    // source manifest refuses the run.
+    write(&src.join("hard-a"), b"PAYLOAD");
+    fs::hard_link(src.join("hard-a"), src.join("hard-b")).unwrap();
+    assert!(!dst.exists(), "the destination root starts absent");
+    let lock = destination_lock_path(&dst).expect("the record location derives");
+    assert!(!lock.exists(), "the lock record starts absent");
+
+    let result = push(&src, &transport(&dst), &ReplaceAll);
+    assert!(
+        result.is_err(),
+        "a hard-linked source must be refused: {result:?}"
+    );
+    assert!(
+        !dst.exists(),
+        "a refused run must NOT create the destination root"
+    );
+    assert!(
+        !lock.exists(),
+        "a refused run must NOT create the destination lock record"
+    );
 }
 
 /// Item 5: an extraneous removal under a refused read-only ancestor reports a
@@ -10500,27 +10695,29 @@ fn the_destination_lock_is_held_during_the_run_and_released_after() {
 
 /// An ERROR exit path releases the lock.
 ///
-/// The run fails AFTER the lock has been taken (the source root is missing, so
-/// the SOURCE manifest read fails inside `run`), and the record must then be
-/// free: a subsequent run acquires IMMEDIATELY. A leaked guard would leave the
-/// record held and the second run would fail with "held by".
+/// Two failure positions are pinned:
 ///
-/// The first assertion fails against the PRE-CHANGE behaviour (`sync` took no
-/// lock, so the record file would not exist). The second assertion is
-/// COVERAGE-ONLY against the pre-fix prefix (it passes without a lock) but is
-/// the guard against THIS change leaking a guard.
+/// * a failure BEFORE the lock (a missing SOURCE root, so the strict source
+///   manifest read fails) creates NOTHING — no destination root and no lock
+///   record. This is the corrected order: the source manifest is read before
+///   ownership is established, so a refused run leaves no residue;
+/// * a failure AFTER the lock is taken (a destination root that is not a
+///   directory, so the destination manifest read fails inside `run`) leaves
+///   the record in place and FREE: a subsequent acquisition succeeds
+///   IMMEDIATELY instead of reporting "held by".
 #[test]
 fn an_error_exit_releases_the_destination_lock() {
     let dir = fixture_tmpdir(&env()).unwrap();
-    let missing = dir.path().join("missing-source");
-    let dst = dir.path().join("dst");
-    fs::create_dir_all(&dst).unwrap();
-    let lock_path = destination_lock_path(&dst).unwrap();
 
+    // (a) FAILURE BEFORE THE LOCK: the missing source root fails the strict
+    // source manifest read, before ownership is established.
+    let missing = dir.path().join("missing-source");
+    let dst_before = dir.path().join("dst-before");
+    let lock_before = destination_lock_path(&dst_before).unwrap();
     let err = sync(
         Direction::Push,
         &missing,
-        &transport(&dst),
+        &transport(&dst_before),
         &ReplaceAll,
         Keep,
     )
@@ -10530,15 +10727,37 @@ fn an_error_exit_releases_the_destination_lock() {
         "got {err:?}"
     );
     assert!(
-        lock_path.exists(),
-        "the lock record must have been created (and held) before the source manifest failed"
+        !dst_before.exists(),
+        "a pre-lock refusal must NOT create the destination root"
+    );
+    assert!(
+        !lock_before.exists(),
+        "a pre-lock refusal must NOT create the destination lock record"
     );
 
+    // (b) FAILURE AFTER THE LOCK: the destination manifest read refuses a
+    // non-directory destination root, inside `run`, with the lock held.
     let src = dir.path().join("src");
     write(&src.join("f"), b"ok");
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
-        .expect("the lock must be released after the error exit");
-    assert!(report.applied.contains(&"f".to_string()), "{report:?}");
+    let dst_after = dir.path().join("dst-after");
+    fs::write(&dst_after, b"not a directory").unwrap();
+    let lock_after = destination_lock_path(&dst_after).unwrap();
+    let err = sync(
+        Direction::Push,
+        &src,
+        &transport(&dst_after),
+        &ReplaceAll,
+        Keep,
+    )
+    .expect_err("a non-directory destination root must fail the run");
+    assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
+    assert!(
+        lock_after.exists(),
+        "the lock record must have been created (and held) before the destination manifest failed"
+    );
+    let after = crate::lock::FileLock::acquire(&lock_after, "after-error")
+        .expect("the destination lock must be released on the error exit");
+    drop(after);
 }
 
 /// Two REAL processes against one destination never interleave: the second run

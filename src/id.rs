@@ -14,7 +14,11 @@
 //!   deliberately NO `Default` and no unchecked production constructor: an
 //!   empty identity would be a malformed durable record constructible by
 //!   anyone;
-//! * [`valid_name`] — the single-safe-segment name rule;
+//! * [`valid_name`] — the single-safe-segment name rule, which ALSO refuses
+//!   the crate's RESERVED spellings ([`crate::reserved::is_reserved_name`]): a
+//!   name the crate accepts is always a name a whole-store sync can replicate
+//!   and its sanctioned delete route can destroy. A consumer can ask the
+//!   question directly through that public predicate;
 //! * [`valid_hex_digest`] — the exactly-64-lowercase-hex sha256 rule;
 //! * [`Identifier`] — the worked example newtype built from [`valid_name`].
 
@@ -123,21 +127,31 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// The name rule shared by the identifier-like validated values AND the
 /// identity newtypes built on it (a single safe path segment): a SINGLE
 /// FILESYSTEM-SAFE ASCII path segment — non-empty, only `[a-zA-Z0-9._-]`,
-/// not a `.`/`..` traversal component, and never a leading dash. A name
-/// becomes a directory/file component UNCHANGED (the store stores validated
-/// names VERBATIM), so the rule must make the valid set INJECTIVE into the
-/// filesystem: every excluded class is exactly a class that could collide
-/// under an encoding or escape the forced namespace — separators (`/`, `\`)
-/// would nest, whitespace/control/unicode would have to be re-encoded (two
-/// distinct names collapsing onto one encoded name), `.`/`..` escape the
-/// namespace, and a leading dash invites option-parser confusion. No
-/// re-encoding is needed: the valid set is already filesystem-safe, so two
-/// distinct valid names ALWAYS map to two distinct path components.
+/// not a `.`/`..` traversal component, never a leading dash, and NEVER one of
+/// the crate's RESERVED spellings ([`crate::reserved::is_reserved_name`]): the
+/// claim-aside namespace `.sync-aside.` and the operation-lock record spelling
+/// `.<name>.operation.lock`.
+///
+/// A name becomes a directory/file component UNCHANGED (the store stores
+/// validated names VERBATIM), so the rule must make the valid set INJECTIVE
+/// into the filesystem: every excluded class is exactly a class that could
+/// collide under an encoding or escape the forced namespace — separators
+/// (`/`, `\`) would nest, whitespace/control/unicode would have to be
+/// re-encoded (two distinct names collapsing onto one encoded name), `.`/`..`
+/// escape the namespace, and a leading dash invites option-parser confusion.
+/// The RESERVED spellings are excluded for a stronger reason: a whole-store
+/// sync STRIPS them from both manifests before the diff, so an identity the
+/// crate accepted but the sync cannot transfer (and cannot destroy through
+/// its sanctioned delete route) would be a name the crate could never
+/// replicate. No re-encoding is needed: the valid set is already
+/// filesystem-safe, so two distinct valid names ALWAYS map to two distinct
+/// path components.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s != "."
         && s != ".."
+        && !crate::reserved::is_reserved_name(s)
         && s.bytes()
             .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
 }
@@ -184,12 +198,75 @@ mod tests {
             assert_eq!(ok.parse::<Identifier>().expect("from_str"), id);
         }
         for bad in [
-            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..", "α",
-            "x y", "-lead", "a b", "a\u{1f}",
+            "",
+            "   ",
+            " x",
+            "x ",
+            "\u{0}",
+            "a\nb",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "../x",
+            "x/..",
+            "α",
+            "x y",
+            "-lead",
+            "a b",
+            "a\u{1f}",
+            // The crate's own RESERVED spellings are refused: a whole-store
+            // sync strips them from both manifests, so an id the crate
+            // accepted here could never be replicated or destroyed.
+            ".sync-aside.1",
+            "..sync-aside.1.operation.lock",
+            ".001.operation.lock",
         ] {
             Identifier::parse(bad).expect_err("invalid identifier must be rejected");
             assert!(bad.parse::<Identifier>().is_err(), "{bad:?}");
         }
+        // The near-miss `operation.lock` (no leading dot) stays a VALID id:
+        // the reserved rule is the exact `.<name>.operation.lock` spelling,
+        // not any name ending in `.operation.lock`.
+        assert!(Identifier::parse("operation.lock").is_ok());
+        assert!(Identifier::parse(".sync-aside").is_ok());
+    }
+
+    /// The reserved spellings the identifier refuses are the SAME set the
+    /// crate's public reservation predicate names, and the identifier's
+    /// rejection is observable through every construction path (parse,
+    /// `FromStr`, and wire deserialization — fail closed).
+    #[test]
+    fn the_identifier_refuses_every_reserved_spelling() {
+        for reserved in [
+            ".sync-aside.1",
+            ".sync-aside.",
+            ".001.operation.lock",
+            "..sync-aside.1.operation.lock",
+        ] {
+            assert!(
+                crate::reserved::is_reserved_name(reserved),
+                "the public predicate must call {reserved:?} reserved"
+            );
+            assert!(
+                Identifier::parse(reserved).is_err(),
+                "parse must refuse the reserved spelling {reserved:?}"
+            );
+            assert!(
+                reserved.parse::<Identifier>().is_err(),
+                "FromStr must refuse the reserved spelling {reserved:?}"
+            );
+            assert!(
+                serde_json::from_str::<Identifier>(&format!("{reserved:?}")).is_err(),
+                "wire deserialization must refuse the reserved spelling {reserved:?}"
+            );
+        }
+        // A consumer can ask BEFORE failing, through the public predicate.
+        assert!(crate::reserved::is_reserved_name(".sync-aside.1"));
+        assert!(crate::reserved::is_reserved_path(
+            "snapshots/.001.operation.lock"
+        ));
+        assert!(!crate::reserved::is_reserved_name("production"));
     }
 
     /// The serde wire path routes every string through the same validation:
@@ -248,13 +325,15 @@ mod tests {
 
     /// The independent characterization of the name rule: a value is a safe
     /// filesystem ASCII single path segment iff it is non-empty, uses only
-    /// `[a-zA-Z0-9._-]`, is not a `.`/`..` traversal component, and never
-    /// starts with `-` (a leading dash invites option-parser confusion).
+    /// `[a-zA-Z0-9._-]`, is not a `.`/`..` traversal component, never starts
+    /// with `-` (a leading dash invites option-parser confusion), and is not
+    /// a RESERVED spelling ([`crate::reserved::is_reserved_name`]).
     fn is_safe_segment(s: &str) -> bool {
         !s.is_empty()
             && !s.starts_with('-')
             && s != "."
             && s != ".."
+            && !crate::reserved::is_reserved_name(s)
             && s.bytes().all(|b| {
                 matches!(
                     b,
@@ -294,6 +373,14 @@ mod tests {
                 "a..b".to_string(),
                 "a.b".to_string(),
                 "a_b-c.d9".to_string(),
+                // The RESERVED spellings: refused even though they are safe
+                // single segments, because a whole-store sync strips them.
+                ".sync-aside.1".to_string(),
+                ".sync-aside.123.0".to_string(),
+                ".001.operation.lock".to_string(),
+                // Near-misses that stay ORDINARY.
+                "operation.lock".to_string(),
+                ".sync-aside".to_string(),
             ]),
             prop::collection::vec(prop::char::any(), 0..12).prop_map(|v| v.into_iter().collect()),
         ]

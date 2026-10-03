@@ -101,18 +101,62 @@
 //! transformation that changes what the tree means is worse than a loud
 //! failure.
 //!
-//! **A push/pull asymmetry the manifest model cannot express.** Setting the
-//! model aside, the two directions mutate a destination differently, so
-//! pre-existing metadata the model does not carry fares differently across
-//! them:
+//! **Push and pull now mutate a destination the SAME way.** Both publish a
+//! written file by ATOMIC RENAME into place (a NEW inode), so the replaced
+//! file's pre-existing xattrs and owner are destroyed with the old inode in
+//! BOTH directions. (Before a push was made atomic, a push overwrote the
+//! bytes IN PLACE — the SSH transport's `cat >`, the local transport's
+//! `O_TRUNC` create — and kept the old inode; that asymmetry, and the torn
+//! destination a failed in-place push could leave, are gone.)
 //!
-//! * a **push** overwrites a file's bytes IN PLACE (the SSH transport's
-//!   `cat >`, the local transport's `O_TRUNC` create), so the destination
-//!   file keeps its inode and any PRE-EXISTING xattrs and owner survive the
-//!   overwrite;
-//! * a **pull** PUBLISHES the received file by atomic rename (a NEW inode),
-//!   so the replaced file's pre-existing xattrs and owner are destroyed
-//!   along with the old inode.
+//! **The manifest carries no TIMESTAMPS.** `TreeEntry` has no `mtime`/`atime`
+//! field, so a caller that wants "the newest N snapshots" MUST derive the
+//! order from the snapshot id's LEXICAL order (or keep its own timestamp
+//! record): the manifest (and therefore the differ) cannot rank two entries
+//! by time, and two snapshots whose only difference is a modification time
+//! compare `Same`.
+//!
+//! # Durability and atomicity of a written entry
+//!
+//! The write discipline is chosen by the DESTINATION, never by the direction.
+//! This is the statement a caller should read before relying on either:
+//!
+//! * **LOCAL destination** — a PULL's local root, OR a PUSH whose transport
+//!   declares `is_local() == true` ([`crate::transport::LocalTransport`]):
+//!   the entry is written by the crate's durable atomic replace
+//!   ([`crate::atomic::write_atomic_replace_fd`]). A UNIQUE temp is created in
+//!   the destination's own directory, chmodded private, `fsync`ed, then
+//!   `renameat` into place (COMMIT POINT 1 — the new content becomes VISIBLE),
+//!   then the PARENT DIRECTORY is `fsync`ed (COMMIT POINT 2 — the rename
+//!   becomes DURABLE). A failure BEFORE the rename is an `Err` that leaves the
+//!   PREVIOUS content wholly in place and unlinks the temp; a failure of the
+//!   parent fsync AFTER the rename is
+//!   [`crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`] — the new
+//!   content is VISIBLE but its durability is unconfirmed — NEVER a bare
+//!   `Err` (a bare `Err` would falsely claim the rename never happened).
+//! * **REMOTE destination** ([`crate::transport::SshTransport`]): the SAME
+//!   protocol on the far side, in one POSIX shell command: a `mktemp` temp in
+//!   the destination's own directory, the payload on STDIN into it, the final
+//!   mode, a portable perl `fsync(2)` of the temp, a perl `rename(2)` INTO
+//!   PLACE (overwriting the final entry atomically, never following a symlink),
+//!   then a perl `fsync(2)` of the parent directory. Every operand is
+//!   single-quoted, `--` precedes a value that may start with `-`, the parent
+//!   is computed on this host (never by a far-side `dirname`), and the payload
+//!   is never embedded in the command string. GNU and BSD userlands are both
+//!   exercised by the far-side suites. A failure before the rename leaves the
+//!   PREVIOUS content in place and removes the temp.
+//! * **WINDOWS local destination**: the PATH-BASED replace
+//!   ([`crate::atomic::write_atomic_replace`]): a temp + rename with NO
+//!   parent-directory fsync and a NON-atomic replace (Windows `rename` does
+//!   not overwrite an existing target, so the target is removed first and a
+//!   reader can observe a transient absence). This is the ONE destination kind
+//!   that cannot be made atomic and durable here; the Windows port
+//!   type-checks but is NOT exercised, so treat it as unverified.
+//!
+//! `EntryPolicy::AppendTail` adds a COMPARE before an append's write: the write
+//! happens only if the destination still holds the bytes the append read, so a
+//! concurrent modification becomes a REPORTED conflict rather than a silent
+//! overwrite (see [`crate::sync`] for what the compare can and cannot cover).
 //!
 //! A caller that needs `security.capability`, ACLs, ownership, or timestamps
 //! preserved must apply them out of band after the sync.

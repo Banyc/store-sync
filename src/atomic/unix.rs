@@ -686,15 +686,112 @@ pub fn write_atomic_replace_fd(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    match replace_core(root, rel, None, true, bytes, fault)? {
+        CoreReplace::Replaced(outcome) => Ok(outcome),
+        CoreReplace::Mismatch => unreachable!("no expected content was supplied"),
+    }
+}
+
+/// [`write_atomic_replace_fd`] for a caller that has ALREADY ensured the
+/// parent directory exists at its intended mode (`LocalTransport`'s confined
+/// write does this through `ensure_dir_confined`, which preserves an existing
+/// directory's mode). The parent chain is neither created nor chmodded here:
+/// creating it is the caller's step, and chmodding an existing parent to the
+/// store-private `0o700` would OVERRIDE a caller's mode — including a refused
+/// destination directory the applier must leave untouched. The replace is
+/// otherwise identical (temp, fsync, rename, parent fsync).
+pub fn write_atomic_replace_fd_under_existing_parent(
+    root: &RootDir,
+    rel: &Path,
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<ReplaceOutcome> {
+    match replace_core(root, rel, None, false, bytes, fault)? {
+        CoreReplace::Replaced(outcome) => Ok(outcome),
+        CoreReplace::Mismatch => unreachable!("no expected content was supplied"),
+    }
+}
+
+/// The verdict of [`write_atomic_if_match_fd`].
+#[derive(Debug)]
+pub enum CompareReplace {
+    /// The live entry still held the expected bytes (or was absent when the
+    /// caller expected absence) and `bytes` were installed by the atomic
+    /// replace; the wrapped [`ReplaceOutcome`] carries the replace's own
+    /// two-commit-point durability verdict.
+    Replaced(ReplaceOutcome),
+    /// The live entry did NOT hold the expected bytes at the moment of the
+    /// check (it was changed by another writer, or is absent, or a symlink
+    /// that was refused). NOTHING was written: the visible entry is exactly
+    /// what the other writer left. The caller must re-read and re-decide.
+    Mismatch,
+}
+
+/// Should the caller treat the live entry at `file_name` (relative to
+/// `parent_fd`) as equal to `expected`? `Ok(false)` covers a genuine
+/// [`std::io::ErrorKind::NotFound`] AND any entry that is not a readable
+/// regular file the `O_NOFOLLOW` open can hand back: a symlink is refused
+/// (`ELOOP`, propagated as an `Err` — never followed, never compared against
+/// its target), a directory fails the read, and every other failure is a real
+/// error. Fail closed: only a byte-identical regular file compares equal.
+fn live_matches(parent_fd: &OwnedFd, file_name: &OsStr, expected: &[u8]) -> Result<bool> {
+    match openat_no_follow_io(parent_fd, Path::new(file_name), libc::O_RDONLY, 0) {
+        Ok(f) => Ok(read_fd_to_end(&f)? == expected),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::store(format!(
+            "open {}: {e}",
+            Path::new(file_name).display()
+        ))),
+    }
+}
+
+/// The internal verdict of [`replace_core`].
+#[derive(Debug)]
+enum CoreReplace {
+    Replaced(ReplaceOutcome),
+    Mismatch,
+}
+
+/// The shared core of [`write_atomic_replace_fd`] and
+/// [`write_atomic_if_match_fd`]: the same atomic-replace protocol, plus an
+/// optional `expected` content the LIVE entry must still equal before anything
+/// is installed.
+///
+/// When `expected` is supplied the core is a compare-and-swap, not a blind
+/// replace: it checks the live content to bytes at TWO points — once before
+/// the temp is created (so an obviously-changed destination costs no write)
+/// and once immediately before the `renameat` (so a writer that changed the
+/// entry while the temp was being written and fsynced is still refused). The
+/// window between the SECOND check and the `renameat` is irreducible without a
+/// lock the far side does not provide; a writer inside it is lost, and the
+/// caller of [`write_atomic_if_match_fd`] is told so. A mismatch returns
+/// [`CoreReplace::Mismatch`] with the entry UNTOUCHED and the temp unlinked.
+fn replace_core(
+    root: &RootDir,
+    rel: &Path,
+    expected: Option<&[u8]>,
+    ensure_parent: bool,
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<CoreReplace> {
     // The parent directory is created if missing — the same
     // `create_dir_all(parent)` the path-based protocol runs first —
     // component-wise with O_NOFOLLOW (a symlink injected into any parent
-    // component is refused).
+    // component is refused). A caller that has already ensured the parent
+    // (`ensure_parent == false`) skips this, so no existing parent is
+    // chmodded.
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
-    if !parent_rel.as_os_str().is_empty() {
+    if ensure_parent && !parent_rel.as_os_str().is_empty() {
         ensure_private_dir_fd(root, parent_rel)?;
     }
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
+    // The FIRST compare: fail before writing a temp if the destination already
+    // moved under us.
+    if let Some(expected) = expected
+        && !live_matches(&parent_fd, file_name, expected)?
+    {
+        return Ok(CoreReplace::Mismatch);
+    }
     let tmp_name = temp_file_name(file_name);
     // Stage 1: the temp create/write. A failure (or an injected
     // [`ReplaceStage::Write`] fault) is a PRE-RENAME `Err`: the visible
@@ -755,6 +852,16 @@ pub fn write_atomic_replace_fd(
         ));
     }
     drop(f);
+    // The SECOND compare, immediately before the rename: shrink the
+    // compare-and-swap window to the `renameat` itself. A writer that changed
+    // the live entry while the temp was being written is REFUSED here, with
+    // the temp unlinked and the live entry untouched.
+    if let Some(expected) = expected
+        && !live_matches(&parent_fd, file_name, expected)?
+    {
+        let _ = unlinkat_fd(&parent_fd, &tmp_name);
+        return Ok(CoreReplace::Mismatch);
+    }
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
     // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
     // visible target is wholly OLD and the temp is unlinked.
@@ -767,12 +874,41 @@ pub fn write_atomic_replace_fd(
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
     // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace`]).
     if let Some(e) = fault(ReplaceStage::DirSync) {
-        return Ok(ReplaceOutcome::ReplacedDurabilityUnknown { error: e });
+        return Ok(CoreReplace::Replaced(
+            ReplaceOutcome::ReplacedDurabilityUnknown { error: e },
+        ));
     }
     if let Err(e) = fsync_dir_fd(&parent_fd) {
-        return Ok(ReplaceOutcome::ReplacedDurabilityUnknown { error: e });
+        return Ok(CoreReplace::Replaced(
+            ReplaceOutcome::ReplacedDurabilityUnknown { error: e },
+        ));
     }
-    Ok(ReplaceOutcome::ReplacedDurable)
+    Ok(CoreReplace::Replaced(ReplaceOutcome::ReplacedDurable))
+}
+
+/// The atomic COMPARE-AND-REPLACE: install `bytes` at `rel` only if the live
+/// entry still holds `expected`, atomically and durably, and report which
+/// happened as a [`CompareReplace`]. This is the primitive an append uses so
+/// that a concurrent writer's bytes are not silently overwritten: the caller
+/// reads the destination, decides the new content, and hands BOTH the bytes it
+/// read and the bytes to install to this call. A mismatch writes nothing.
+///
+/// The comparison is byte-exact and descriptor-bound: the live entry is
+/// opened `O_NOFOLLOW` (a symlink is REFUSED, never followed or compared
+/// against its target) and read through the SAME descriptor the compare and
+/// the install use. See [`replace_core`] for the two check points and for the
+/// residual window between the second check and the `renameat`.
+pub fn write_atomic_if_match_fd(
+    root: &RootDir,
+    rel: &Path,
+    expected: &[u8],
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<CompareReplace> {
+    match replace_core(root, rel, Some(expected), true, bytes, fault)? {
+        CoreReplace::Replaced(outcome) => Ok(CompareReplace::Replaced(outcome)),
+        CoreReplace::Mismatch => Ok(CompareReplace::Mismatch),
+    }
 }
 
 /// The descriptor-relative create-or-compare CAS: the same protocol as
@@ -1212,16 +1348,22 @@ pub fn remove_dir_all_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The descriptor-relative plain file write (create-or-truncate, 0o600):
-/// used for the staged object's `tree.json` metadata.
+/// The descriptor-relative PLAIN file write (create-or-truncate, 0o600):
+/// opens the final entry `O_WRONLY|O_CREAT|O_TRUNC` (refusing a symlink there)
+/// and writes the bytes in ONE call.
 ///
-/// This does NOT fsync the file, and it does NOT fsync the staged tree as a
-/// whole: no function in this crate fsyncs a staged tree before a publish
-/// (there is no in-crate caller of
-/// [`Remote::fsync_tree`](crate::transport::Remote::fsync_tree) either), so
-/// a caller that needs the tree durable before an install rename must
-/// arrange that itself. See the crate's fidelity-scope section in
-/// [`crate::manifest`] for the tree-durability limitation.
+/// THIS IS NOT THE SYNC WRITE PATH, and it is NOT durable: it does NOT fsync
+/// the file and it has no temp, so a failure mid-write leaves the destination
+/// TRUNCATED and TORN. A sync never calls it — a PULL and a PUSH both publish
+/// through the durable atomic replace
+/// ([`write_atomic_replace_fd`] / [`write_atomic_replace_fd_under_existing_parent`]),
+/// whose failure leaves the PREVIOUS content in place. The durable and atomic
+/// write discipline, by direction and destination kind, is stated in
+/// [`crate::manifest`]'s "Durability and atomicity of a written entry".
+///
+/// No in-crate production caller uses this primitive; it remains for the
+/// confinement tests (which exercise the create-or-truncate open's refusal of
+/// a symlink and a traversal spelling).
 pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = openat_no_follow(

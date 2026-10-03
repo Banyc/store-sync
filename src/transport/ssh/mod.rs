@@ -709,10 +709,50 @@ impl SshTransport {
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
+        // The payload is written to a UNIQUE temp file in the destination's
+        // own directory, the FINAL MODE is applied to the temp, the temp is
+        // fsynced, the temp is RENAMED into place (atomically, and without
+        // following a final-component symlink), and then the PARENT DIRECTORY
+        // is fsynced. This is the far-side realization of the same
+        // compare-free atomic replace the local path uses: a failure at ANY
+        // step before the rename leaves the PREVIOUS content visible and
+        // removes the temp, so a failed upload can no longer destroy or
+        // truncate the entry it was replacing. The rename is perl's raw
+        // `rename(2)` (ships with every reasonable remote; GNU and BSD agree)
+        // so it OVERWRITES the final entry atomically — a destination that is
+        // a DIRECTORY makes it fail loudly rather than being linked into or
+        // descended. The fsyncs are the portable perl primitives
+        // ([`PERL_FSYNC_FILE`] / [`PERL_FSYNC_DIR`]): `sync <path>` is
+        // GNU-only and a silent no-op on BSD/macOS.
+        //
+        // Every operand is a single quoted word ([`shell_quote`]); the parent
+        // is computed here (never by a remote `dirname`), and `--` keeps a
+        // leading-dash component from being read as an option. The payload is
+        // NEVER embedded in the command string — it arrives on STDIN and the
+        // remote `cat` redirects it into the temp — so arbitrary bytes
+        // round-trip exactly.
+        let basename = Path::new(&remote_path_str)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "object".to_string());
+        let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
+        // The final mode is applied to the TEMP before the rename (the same
+        // ordering `write_new_cmd` uses), so the published inode carries the
+        // caller's mode, never the remote umask. A `mode` of 0 keeps the
+        // historical "no chmod" meaning; the mktemp temp is private (0o600).
+        let chmod_step = if mode != 0 {
+            format!("chmod {:o} \"$tmp\" && ", mode & 0o7777)
+        } else {
+            String::new()
+        };
         let script = format!(
-            "mkdir -p -- {parent} && cat > {p}",
+            "mkdir -p -- {parent} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && {chmod}perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e 'exit 0 if rename($ARGV[0], $ARGV[1]); exit 1' \"$tmp\" {p}; rc=$?; if [ \"$rc\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e '{fsync_dir}' -- {parent}",
             parent = shell_quote(&parent),
+            tpl = shell_quote(&tmp_template),
+            chmod = chmod_step,
             p = shell_quote(&remote_path_str),
+            fsync_file = PERL_FSYNC_FILE,
+            fsync_dir = PERL_FSYNC_DIR,
         );
         let argv = self.ssh_command_argv(&script)?;
         // Size-aware deadline: a large upload over a slow link must not be
@@ -766,13 +806,9 @@ impl SshTransport {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        if mode != 0 {
-            self.run_remote_ok(&Self::argv_cmd(&[
-                "chmod".into(),
-                format!("{:o}", mode & 0o7777),
-                remote_path_str,
-            ]))?;
-        }
+        // The mode was applied to the temp BEFORE the rename by the remote
+        // script, so no separate chmod round trip (and no window where the
+        // published entry carries the temp's private mode) is needed.
         Ok(())
     }
 

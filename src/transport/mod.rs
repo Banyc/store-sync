@@ -354,6 +354,28 @@ pub trait Remote {
     /// Write `data` to `rel` with the final `mode`, creating or replacing the
     /// entry.
     ///
+    /// ATOMICITY AND DURABILITY, per destination kind (the authoritative
+    /// statement is [`crate::manifest`]'s "Durability and atomicity of a
+    /// written entry"):
+    ///
+    /// * [`LocalTransport`] (a LOCAL destination — a PULL, or a PUSH into a
+    ///   local path) publishes by the durable atomic replace: a unique temp in
+    ///   the destination's own directory, fsync, `renameat` into place, then a
+    ///   parent-directory fsync. A failure BEFORE the rename leaves the
+    ///   PREVIOUS content untouched and unlinks the temp; a post-rename parent
+    ///   fsync failure is reported as durability-UNKNOWN, never as a clean
+    ///   success.
+    /// * [`SshTransport`] (a REMOTE destination) publishes on the far side with
+    ///   the same shape — `mktemp` temp in the destination's own directory,
+    ///   the payload on STDIN into it, the final mode, a perl `fsync(2)` of the
+    ///   temp, a perl `rename(2)` into place, then a perl `fsync(2)` of the
+    ///   parent directory — so a failed upload can no longer truncate or
+    ///   destroy the entry it was replacing.
+    /// * the Windows local port uses a path-based, NON-atomic replace (no
+    ///   directory fsync; the target is removed before the rename). That is
+    ///   the ONE destination kind this crate cannot make atomic; the port
+    ///   type-checks but is not exercised.
+    ///
     /// FIDELITY SCOPE: this primitive carries the manifest model only — the
     /// bytes and the mode. It writes NO ownership, extended attributes
     /// (including `security.capability` and macOS `com.apple.*`), POSIX ACLs,
@@ -527,6 +549,17 @@ pub trait Remote {
     /// inner transport inherit the inner's implementation); the production
     /// transports ([`LocalTransport`], [`SshTransport`]) realize it for
     /// real.
+    ///
+    /// MAKING A FRESHLY PUSHED SUBTREE DURABLE takes TWO calls on the PARENT
+    /// transport: `fsync_tree(<child>)` makes everything UNDER the child
+    /// durable (including the child directory itself), and
+    /// `fsync_parent(<child>)` makes the PARENT directory entry that names the
+    /// child durable. A per-subtree transport cannot perform the second call
+    /// on its own root, because a [`RootedRelativePath`] must be non-empty (it
+    /// refuses the empty path), so the transport rooted AT the child cannot
+    /// name the child to fsync the grandparent. The recipe is therefore:
+    /// `parent.fsync_tree(child)` then `parent.fsync_parent(child)`, both on
+    /// the transport rooted at the child's PARENT.
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
         let _ = rel;
         Ok(())
@@ -541,6 +574,10 @@ pub trait Remote {
     /// that delegate to an inner transport inherit the inner's
     /// implementation); the production transports ([`LocalTransport`],
     /// [`SshTransport`]) realize it for real.
+    ///
+    /// See [`Remote::fsync_tree`] for the TWO-call recipe that makes a freshly
+    /// pushed subtree durable: `fsync_tree(child)` plus this method with
+    /// `child`, both on the PARENT transport.
     fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
         let _ = rel;
         Ok(())
@@ -1866,8 +1903,34 @@ impl LocalTransport {
             ))
         })?;
         self.ensure_dir_confined(&root, rel)?;
-        crate::atomic::write_file_fd(&root, rel.as_path(), data)
-            .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
+        // THE DESTINATION IS WRITTEN ATOMICALLY AND DURABLY: a unique temp in
+        // the same directory, fsynced, then renamed into place, then the
+        // parent directory fsynced — the replace has TWO commit points and a
+        // failure BEFORE the rename leaves the PREVIOUS content untouched and
+        // unlinks the temp (see [`crate::atomic::write_atomic_replace`]). The
+        // old path here (`atomic::write_file_fd`) opened the destination
+        // `O_WRONLY|O_CREAT|O_TRUNC` and did ONE `write` with no temp, no
+        // rename and no fsync, so a push into a LOCAL destination could leave
+        // the entry torn and truncated. A post-rename parent-fsync failure is
+        // EXPLICIT (`ReplacedDurabilityUnknown`): the content is visible but
+        // its durability is unconfirmed, and the caller must not read that as
+        // a clean success.
+        match crate::atomic::write_atomic_replace_fd_under_existing_parent(
+            &root,
+            rel.as_path(),
+            data,
+            &mut |_| None,
+        )
+        .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?
+        {
+            crate::atomic::ReplaceOutcome::ReplacedDurable => {}
+            crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
+                return Err(Error::transport(format!(
+                    "write {}: the entry is visible but its durability is unconfirmed: {error}",
+                    rel.display()
+                )));
+            }
+        }
         if mode != 0 {
             let fd = crate::atomic::openat_no_follow(
                 root.as_fd(),
