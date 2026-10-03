@@ -545,7 +545,10 @@ pub(crate) fn exec(
 }
 
 /// Put a child pipe read end into non-blocking mode, so reads never block and
-fn set_nonblocking<R: AsRawFd>(stream: &mut Option<R>) -> std::io::Result<()> {
+/// the bounded post-exit drain can give up on schedule. `pub(crate)` because
+/// the SSH runner's Unix seam reuses this and the bounded drain below, so the
+/// pipe-containment discipline has ONE implementation for both transports.
+pub(crate) fn set_nonblocking<R: AsRawFd>(stream: &mut Option<R>) -> std::io::Result<()> {
     let Some(stream) = stream.as_mut() else {
         return Ok(());
     };
@@ -567,8 +570,9 @@ fn set_nonblocking<R: AsRawFd>(stream: &mut Option<R>) -> std::io::Result<()> {
 /// WITHOUT blocking: `poll(2)` with a zero timeout reports readability first,
 /// then a single `read`, so the wait loop never parks on a pipe while the
 /// child is still running — a child that produces a lot of output is drained
-/// while running instead of filling its pipe and stalling.
-fn drain_available<R>(stream: &mut Option<R>, buf: &mut Vec<u8>) -> std::io::Result<()>
+/// while running instead of filling its pipe and stalling. `pub(crate)`:
+/// shared with the SSH runner's Unix seam (see [`set_nonblocking`]).
+pub(crate) fn drain_available<R>(stream: &mut Option<R>, buf: &mut Vec<u8>) -> std::io::Result<()>
 where
     R: Read + AsRawFd,
 {
@@ -602,7 +606,7 @@ where
 /// live writer STILL holds it (a descendant that escaped the group but kept
 /// the inherited stdio pipes — the pipe-EOF containment signal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainState {
+pub(crate) enum DrainState {
     /// `read` returned 0: every write end closed — no pipe-holding
     /// descendant remains.
     Eof,
@@ -617,8 +621,11 @@ enum DrainState {
 /// outcome. Returns [`DrainState::Eof`] when the pipe reached EOF within the
 /// bound (no live holder remains) and [`DrainState::BoundExpired`] when the
 /// bound expired with the pipe still open (a live holder — a contract
-/// violation the caller reports, never a silent clean outcome).
-fn drain_to_eof<R>(
+/// violation the caller reports, never a silent clean outcome). `pub(crate)`:
+/// shared with the SSH runner's Unix seam, so the bound that makes the
+/// deadline truly bound the operation has ONE implementation
+/// ([`super::KILL_REAP_BOUND`] is the production value both pass).
+pub(crate) fn drain_to_eof<R>(
     stream: &mut Option<R>,
     buf: &mut Vec<u8>,
     bound: Duration,

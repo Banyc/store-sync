@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
+use super::runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner, leftover_pipe_note};
 
 /// Build the `ssh-keyscan` argument vector (port, connect timeout, key
 /// types, bare host). The bare address is used (not `user@address`) because
@@ -104,9 +104,14 @@ pub(crate) fn pin_known_hosts(
                 Error::transport(format!("ssh-keyscan {} stdin write: {m}", address))
             }
             RunError::Wait(m) => Error::transport(format!("ssh-keyscan {} wait: {m}", address)),
-            RunError::Timeout { after } => Error::transport(format!(
-                "ssh-keyscan {} timed out after {after:?} (host unreachable?)",
-                address
+            RunError::Background(m) => Error::transport(format!("ssh-keyscan {}: {m}", address)),
+            RunError::Timeout {
+                after,
+                leftover_pipes,
+            } => Error::transport(format!(
+                "ssh-keyscan {} timed out after {after:?}{} (host unreachable?)",
+                address,
+                leftover_pipe_note(&leftover_pipes)
             )),
         })?;
     if !scan.status.success() {

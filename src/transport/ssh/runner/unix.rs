@@ -3,8 +3,10 @@
 //! single `#[cfg(unix)]` `mod` declaration in [`super`].
 
 use super::*;
-use crate::transport::runner::{TERM_TO_KILL_GRACE, kill_process_group};
-use std::os::fd::AsRawFd;
+use crate::transport::runner::{
+    DrainState, KILL_REAP_BOUND, TERM_TO_KILL_GRACE, drain_available, drain_to_eof,
+    kill_process_group, set_nonblocking,
+};
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -34,11 +36,25 @@ pub(crate) fn spawn(
     // terminates the WHOLE group (killpg), and any local helper process
     // the child spawned dies with it.
     cmd.process_group(0);
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     // The parent reads the pid synchronously at spawn time and surfaces it
     // through the runner's spawn observer: the child never needs to write
     // its own pid to a file.
     let pid = child.id();
+    // Non-blocking pipe read ends, exactly as the shared local runner does
+    // (the helpers are shared, not copied): the wait loop drains without
+    // blocking, and — the reason this matters — the post-exit drain can give
+    // up on schedule instead of parking on a pipe another process still
+    // holds open. Done here, before the wait thread exists, so a setup
+    // failure is handled while the child is still OURS: it is killed and
+    // reaped first, so even this path cannot leave a live, un-reaped child.
+    if let Err(e) =
+        set_nonblocking(&mut child.stdout).and_then(|()| set_nonblocking(&mut child.stderr))
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     // The child is shared EXCLUSIVELY between the runner's deadline path
     // and the wait thread through this slot: the wait thread polls the
     // child (`try_wait`) with the slot locked and CONSUMES it on exit
@@ -88,6 +104,9 @@ pub(crate) fn spawn(
         }
     });
     let wait_child = child.clone();
+    // Own the argv for the wait closure: the bounded-drain violation message
+    // names the command (the local runner's `{argv:?}` wording).
+    let argv = argv.to_vec();
     // The stdin payload is written from INSIDE the wait closure (which
     // the runner's deadline bounds) but WITHOUT holding the child slot:
     // the payload pipe is taken out of the child, the slot is released,
@@ -132,8 +151,10 @@ pub(crate) fn spawn(
                     let c = guard
                         .as_mut()
                         .expect("the wait thread is the sole consumer of the child slot");
-                    drain_available(&mut c.stdout, &mut stdout)?;
-                    drain_available(&mut c.stderr, &mut stderr)?;
+                    drain_available(&mut c.stdout, &mut stdout)
+                        .map_err(|e| RunError::Wait(format!("read: {e}")))?;
+                    drain_available(&mut c.stderr, &mut stderr)
+                        .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     match c.try_wait() {
                         Ok(Some(status)) => {
                             exited = guard.take().map(|c| (c, status));
@@ -143,8 +164,28 @@ pub(crate) fn spawn(
                     }
                 }
                 if let Some((mut c, status)) = exited {
-                    drain_to_eof(&mut c.stdout, &mut stdout)?;
-                    drain_to_eof(&mut c.stderr, &mut stderr)?;
+                    // BOUNDED drain (the same helper, and the same bound, the
+                    // shared local runner uses): the child is reaped and its
+                    // pipes hold the remaining output. A process that outlived
+                    // the child but still holds a pipe — the ssh mux master on
+                    // a timed-out far side, or any pipe-holding escapee — cannot
+                    // pin the operation open: the drain gives up at
+                    // [`KILL_REAP_BOUND`] and the violation is reported, never a
+                    // silent clean outcome.
+                    let stdout_drain = drain_to_eof(&mut c.stdout, &mut stdout, KILL_REAP_BOUND)
+                        .map_err(|e| RunError::Wait(format!("read: {e}")))?;
+                    if matches!(stdout_drain, DrainState::BoundExpired) {
+                        return Err(RunError::Background(format!(
+                            "command {argv:?} left processes holding its output pipes open"
+                        )));
+                    }
+                    let stderr_drain = drain_to_eof(&mut c.stderr, &mut stderr, KILL_REAP_BOUND)
+                        .map_err(|e| RunError::Wait(format!("read: {e}")))?;
+                    if matches!(stderr_drain, DrainState::BoundExpired) {
+                        return Err(RunError::Background(format!(
+                            "command {argv:?} left processes holding its error pipes open"
+                        )));
+                    }
                     break Ok(std::process::Output {
                         status,
                         stdout,
@@ -161,64 +202,4 @@ pub(crate) fn spawn(
             }
         });
     Ok(SpawnedChild { pid, kill, wait })
-}
-
-/// Drain whatever bytes a running child currently has buffered in a pipe
-/// WITHOUT blocking: `poll(2)` with a zero timeout reports readability first,
-/// then a single `read` (a pipe that became readable stays readable for the
-/// immediate read, and at EOF the read returns 0), so the wait thread's poll
-/// loop never parks on a pipe while the child is still running — the
-/// non-blocking equivalent of the concurrent drain `wait_with_output` used to
-/// perform, so a child that produces a lot of output is drained while running
-/// instead of filling its pipe and stalling.
-fn drain_available<R>(
-    stream: &mut Option<R>,
-    buf: &mut Vec<u8>,
-) -> std::result::Result<(), RunError>
-where
-    R: std::io::Read + std::os::fd::AsFd,
-{
-    let Some(stream) = stream.as_mut() else {
-        return Ok(());
-    };
-    let mut pfd = libc::pollfd {
-        fd: stream.as_fd().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `poll` on a real pipe read end this runner opened for its own
-    // child; a zero timeout never blocks and the fd is always valid here.
-    if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
-        return Ok(());
-    }
-    let mut chunk = [0u8; 8192];
-    match stream.read(&mut chunk) {
-        Ok(0) => Ok(()),
-        Ok(n) => {
-            buf.extend_from_slice(&chunk[..n]);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-        Err(e) => Err(RunError::Wait(format!("read: {e}"))),
-    }
-}
-
-/// Drain a child pipe to EOF. Called only AFTER the child exited, when its
-/// write ends are closed: the reads return the buffered data then 0, never
-/// blocking — collecting the child's full output.
-fn drain_to_eof<R: std::io::Read>(
-    stream: &mut Option<R>,
-    buf: &mut Vec<u8>,
-) -> std::result::Result<(), RunError> {
-    let Some(stream) = stream.as_mut() else {
-        return Ok(());
-    };
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => return Ok(()),
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(e) => return Err(RunError::Wait(format!("read: {e}"))),
-        }
-    }
 }

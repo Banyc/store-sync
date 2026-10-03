@@ -30,6 +30,7 @@ use super::{
 use hostkey::{pin_known_hosts, simple_hash};
 use runner::{
     OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, SshRunner,
+    leftover_pipe_note,
 };
 
 /// The framed ssh-lstat absence protocol (see [`SshTransport::metadata_opt`]):
@@ -451,9 +452,14 @@ impl SshTransport {
             RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
             RunError::StdinWrite(m) => Error::transport(format!("ssh {command}: {m}")),
             RunError::Wait(m) => Error::transport(format!("ssh {command}: {m}")),
-            RunError::Timeout { after } => {
-                Error::transport(format!("ssh command timed out after {after:?}: {command}"))
-            }
+            RunError::Background(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::Timeout {
+                after,
+                leftover_pipes,
+            } => Error::transport(format!(
+                "ssh command timed out after {after:?}{}: {command}",
+                leftover_pipe_note(&leftover_pipes)
+            )),
         })
     }
 
@@ -640,11 +646,16 @@ impl SshTransport {
                 RunError::Spawn(m) => Error::transport(format!("ssh upload spawn: {m}")),
                 RunError::StdinWrite(m) => Error::transport(format!("ssh upload stdin write: {m}")),
                 RunError::Wait(m) => Error::transport(format!("ssh upload wait: {m}")),
-                RunError::Timeout { after } => {
+                RunError::Background(m) => Error::transport(format!("ssh upload: {m}")),
+                RunError::Timeout {
+                    after,
+                    leftover_pipes,
+                } => {
                     // DIAGNOSIS, not a dead end: name the file and size, and
                     // point at the fix (slow link vs hung remote).
                     upload_timeout_error(
                         after,
+                        &leftover_pipes,
                         bytes,
                         &remote_path_str,
                         transfer_timeout,
@@ -714,17 +725,19 @@ fn upload_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> 
 /// its byte size so a stalling file is attributable.
 fn upload_timeout_error(
     after: Duration,
+    leftover_pipes: &Option<String>,
     bytes: u64,
     remote_path: &str,
     deadline: Duration,
     command_deadline: Duration,
     min_rate: u64,
 ) -> Error {
+    let leftover = leftover_pipe_note(leftover_pipes);
     if deadline > command_deadline {
         let suggested = (min_rate / 2).max(1024);
         Error::transport(format!(
-            "ssh upload timed out after {after:?}: {bytes} bytes to '{remote_path}' did not finish \
-             within the size-scaled deadline (bytes / min_rate = {bytes} / {min_rate} B/s; the \
+            "ssh upload timed out after {after:?}{leftover}: {bytes} bytes to '{remote_path}' did not \
+             finish within the size-scaled deadline (bytes / min_rate = {bytes} / {min_rate} B/s; the \
              default minimum is {SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC} B/s, overridable via \
              DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC). The link is slower than the assumed minimum — \
              retry with DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC={suggested} (half the current rate) or \
@@ -732,9 +745,9 @@ fn upload_timeout_error(
         ))
     } else {
         Error::transport(format!(
-            "ssh upload timed out after {after:?}: {bytes} bytes to '{remote_path}' did not finish \
-             within the base command deadline ({command_deadline:?}) — the remote likely stopped \
-             reading stdin (a hung remote or wedged filesystem)"
+            "ssh upload timed out after {after:?}{leftover}: {bytes} bytes to '{remote_path}' did not \
+             finish within the base command deadline ({command_deadline:?}) — the remote likely \
+             stopped reading stdin (a hung remote or wedged filesystem)"
         ))
     }
 }
@@ -1893,10 +1906,20 @@ impl Remote for SshTransport {
             Err(RunError::Spawn(m)) => Err(Error::transport(m)),
             Err(RunError::StdinWrite(m)) => Err(Error::transport(m)),
             Err(RunError::Wait(m)) => Err(Error::transport(m)),
-            Err(RunError::Timeout { after }) => Ok(crate::transport::ExecOutcome {
+            Err(RunError::Background(m)) => Err(Error::transport(m)),
+            Err(RunError::Timeout {
+                after,
+                leftover_pipes,
+            }) => Ok(crate::transport::ExecOutcome {
+                // Outcome classification is preserved EXACTLY: the timeout
+                // still reports exit_code == -1; only the message gains the
+                // actionable leftover-pipe fact when the drain gave up.
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: format!("timed out after {after:?}"),
+                stderr: format!(
+                    "timed out after {after:?}{}",
+                    leftover_pipe_note(&leftover_pipes)
+                ),
             }),
         }
     }
@@ -1966,9 +1989,14 @@ impl Remote for SshTransport {
                     Error::transport(format!("ssh try_write_new stdin write: {m}"))
                 }
                 RunError::Wait(m) => Error::transport(format!("ssh try_write_new wait: {m}")),
-                RunError::Timeout { after } => {
-                    Error::transport(format!("ssh try_write_new timed out after {after:?}"))
-                }
+                RunError::Background(m) => Error::transport(format!("ssh try_write_new: {m}")),
+                RunError::Timeout {
+                    after,
+                    leftover_pipes,
+                } => Error::transport(format!(
+                    "ssh try_write_new timed out after {after:?}{}",
+                    leftover_pipe_note(&leftover_pipes)
+                )),
             })?;
         if out.status.success() {
             // All seven steps completed: the record is installed with the
@@ -2289,6 +2317,7 @@ mod tests_ssh {
         let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
         let err = upload_timeout_error(
             Duration::from_secs(372),
+            &None,
             24 * 1024 * 1024,
             "/srv/app/app/bin/linux/armv7/proxy",
             Duration::from_secs(372),
@@ -2312,8 +2341,15 @@ mod tests_ssh {
     #[test]
     fn upload_timeout_error_distinguishes_hung_remote() {
         let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
-        let err =
-            upload_timeout_error(base, 512, "/srv/app/app/config.toml", base, base, 64 * 1024);
+        let err = upload_timeout_error(
+            base,
+            &None,
+            512,
+            "/srv/app/app/config.toml",
+            base,
+            base,
+            64 * 1024,
+        );
         let msg = err.to_string();
         assert!(msg.contains("base command deadline"));
         assert!(msg.contains("stopped reading stdin"));

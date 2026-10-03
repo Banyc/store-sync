@@ -89,8 +89,42 @@ pub(crate) enum RunError {
     StdinWrite(String),
     /// Waiting on the child failed (wait error, read error, …).
     Wait(String),
-    /// The hard deadline fired; the child was killed and reaped.
-    Timeout { after: Duration },
+    /// The output drain's bound expired while a process that outlived the
+    /// child still held a pipe open: the command left a pipe-holding process
+    /// behind. This is the shared local runner's `RunError::Background` —
+    /// same wording, same meaning. It surfaces when the operation did NOT
+    /// already time out; when it did, the same fact is carried inside
+    /// [`RunError::Timeout::leftover_pipes`] so the timeout outcome is
+    /// preserved.
+    ///
+    /// Constructed only by the Unix seam (the Windows port drains with
+    /// reader threads and documents the weaker, unbounded-drain guarantee);
+    /// the variant is matched by the shared callers on every platform, so it
+    /// is not dead code there.
+    #[cfg_attr(windows, allow(dead_code))]
+    Background(String),
+    /// The hard deadline fired; the child was killed and reaped. `leftover_pipes`
+    /// is `Some(message)` when the bounded drain ALSO gave up because a
+    /// process that outlived the child still held a pipe open — the outcome
+    /// stays a timeout (`exec` still reports `exit_code == -1`), and the
+    /// message carries the actionable fact that something outlived the
+    /// command.
+    Timeout {
+        after: Duration,
+        leftover_pipes: Option<String>,
+    },
+}
+
+/// The suffix a caller appends to a timeout message when the bounded drain
+/// also reported a pipe-holding leftover, so the actionable fact (something
+/// outlived the command) is named with the shared local runner's wording.
+/// ONE definition, used by every caller that formats a [`RunError::Timeout`]
+/// — the note can never drift from the violation it describes.
+pub(crate) fn leftover_pipe_note(leftover_pipes: &Option<String>) -> String {
+    match leftover_pipes {
+        Some(msg) => format!("; {msg}"),
+        None => String::new(),
+    }
 }
 
 /// A spawned child owned by one supervisor. The runner keeps the EXCLUSIVE
@@ -311,7 +345,19 @@ impl SshRunner {
                 // a no-op by construction.
                 let _ = kill();
                 let _ = handle.join();
-                Err(RunError::Timeout { after: deadline })
+                // The wait thread has now finished and queued its result: if
+                // it reported a pipe-holding process (the bounded drain gave
+                // up), carry that actionable fact into the timeout. The
+                // outcome classification is unchanged — a timeout is still a
+                // timeout — only the message gains the leftover fact.
+                let leftover_pipes = match rx.try_recv() {
+                    Ok(Err(RunError::Background(m))) => Some(m),
+                    _ => None,
+                };
+                Err(RunError::Timeout {
+                    after: deadline,
+                    leftover_pipes,
+                })
             }
         }
     }
@@ -1290,6 +1336,78 @@ mod runner_property_tests {
         ]
     }
 
+    /// The deadline must bound the call even when a process that outlives the
+    /// direct child still holds the child's stdout/stderr pipe open. `sh`
+    /// backgrounds a 30 s `sleep` in the SAME process group and then `exec`s
+    /// an immediate exit: the direct child is reaped almost at once, so the
+    /// deadline kill finds the child handle already CONSUMED and is a no-op,
+    /// and the background `sleep` keeps the inherited pipes open. Before the
+    /// drain was bounded, the runner's `join` then blocked until the `sleep`
+    /// died (30.0 s, measured) — the defect the real sshd reproduces via its
+    /// mux master holding the pipe. This child reproduces the MECHANISM
+    /// hermetically, so the regression is caught without an sshd on either
+    /// platform. The timeout outcome is preserved (`Exec` still maps it to
+    /// `exit_code == -1`) and the message names the leftover-pipe condition.
+    #[test]
+    fn real_runner_deadline_bounds_a_pipe_holding_background_child() {
+        let spawned = Arc::new(Mutex::new(None));
+        let runner = SshRunner::new(&crate::test_support::fixture_env()).with_spawn_observer({
+            let spawned = spawned.clone();
+            Arc::new(move |pid: u32| *spawned.lock().unwrap() = Some(pid))
+        });
+        // `(sleep 30 &)` leaves the sleep in the child's own process group
+        // with the inherited stdout/stderr pipes; `exec true` then exits at
+        // once, so the child is reaped long before the deadline.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "(sleep 30 &) ; exec true".to_string(),
+        ];
+        let deadline = Duration::from_millis(200);
+        let start = Instant::now();
+        let res = runner.run(OpKind::Exec, &argv, None, Some(deadline));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the deadline must bound the call even when a background process \
+             still holds the output pipes (took {elapsed:?}; unbounded it is 30s)"
+        );
+        match res {
+            Err(RunError::Timeout {
+                after,
+                leftover_pipes,
+            }) => {
+                assert_eq!(after, deadline, "the reported deadline is unchanged");
+                let msg = leftover_pipes.expect(
+                    "the timeout must name the leftover-pipe condition, not merely \
+                     report the elapsed deadline",
+                );
+                assert!(
+                    msg.contains("holding its output pipes open"),
+                    "the message must reuse the local runner's wording, got: {msg}"
+                );
+            }
+            other => panic!(
+                "the timeout outcome must be preserved (exit_code == -1 for exec), \
+                 got {other:?}"
+            ),
+        }
+        // The background `sleep` deliberately outlived the child: kill its
+        // process group now so the test leaves no process behind (the runner
+        // cannot — it has no portable way to signal a member of a group whose
+        // leader it already reaped, which is exactly the defect being pinned).
+        let pgid: i32 = spawned
+            .lock()
+            .unwrap()
+            .expect("the spawn observer must record the child pid (== pgid) in the parent")
+            as i32;
+        // SAFETY: the pgid is this child's own group; the background sleep is
+        // still a live member (it holds the pipe), so the id is not recycled.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+
     /// Real-runner sanity check: a REAL subprocess that stalls must be killed
     /// at the deadline AND reaped — the pid must be gone afterwards, because an
     /// un-reaped zombie would still answer `kill(pid, 0)` with success. The
@@ -1313,7 +1431,7 @@ mod runner_property_tests {
         let deadline = Duration::from_millis(100);
         let start = Instant::now();
         let res = runner.run(OpKind::Exec, &argv, None, Some(deadline));
-        assert!(matches!(res, Err(RunError::Timeout { after }) if after == deadline));
+        assert!(matches!(res, Err(RunError::Timeout { after, .. }) if after == deadline));
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "a stalled child must be killed at the deadline, not after it"
@@ -1367,7 +1485,7 @@ mod runner_property_tests {
         let start = Instant::now();
         let res = runner.run(OpKind::Upload, &argv, Some(&payload), None);
         assert!(
-            matches!(res, Err(RunError::Timeout { after }) if after == Duration::from_millis(50))
+            matches!(res, Err(RunError::Timeout { after, .. }) if after == Duration::from_millis(50))
         );
         assert!(
             start.elapsed() < Duration::from_secs(5),
