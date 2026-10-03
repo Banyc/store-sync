@@ -160,6 +160,13 @@ pub enum MaterializationKind {
     /// missing or is not a `dir` entry, so the parent's spelling would be
     /// implicitly created rather than verified.
     ParentNotClosed,
+    /// A remote listing was handed to the CHECKED assembler with a producing
+    /// walk that did NOT exit zero, so completeness is not established: the
+    /// listing may be short or empty and must not be assembled as if it
+    /// described the whole tree. Distinct from the wire-format refusals
+    /// (a malformed line, a non-UTF-8 name) because the caller's remedy is to
+    /// re-run the walk, not to fix the spelling.
+    IncompleteListing,
     /// The two sync roots overlap: one is an ancestor of the other, so the run
     /// would copy a tree into its own subtree.
     RootsOverlap,

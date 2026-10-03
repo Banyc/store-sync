@@ -1709,10 +1709,6 @@ impl Remote for RecordingRemote {
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         self.remove_dir_impl(rel, false)
     }
-    fn exists(&self, rel: &RootedRelativePath) -> bool {
-        self.maybe_swap_before_first_op();
-        self.inner.exists(rel)
-    }
     fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.metadata_calls.fetch_add(1, Ordering::SeqCst);
         self.maybe_swap_before_first_op();
@@ -1922,10 +1918,6 @@ impl Remote for PathRemote {
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         std::fs::remove_dir(self.path(rel))
             .map_err(|e| Error::transport(format!("remove_dir {}: {e}", rel.display())))
-    }
-
-    fn exists(&self, rel: &RootedRelativePath) -> bool {
-        self.path(rel).exists()
     }
 
     fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {

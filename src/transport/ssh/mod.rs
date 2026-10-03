@@ -2542,12 +2542,6 @@ impl Remote for SshTransport {
         self.run_remote_ok(&Self::argv_cmd(&["cp".into(), "-a".into(), s, d]))
     }
 
-    fn exists(&self, rel: &RootedRelativePath) -> bool {
-        let p = self.root.join(rel).to_string_lossy().into_owned();
-        let out = self.run_remote(&Self::argv_cmd(&["test".into(), "-e".into(), p]));
-        matches!(out, Ok(o) if o.status.success())
-    }
-
     fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.metadata_opt(rel)?.ok_or_else(|| {
             Error::NotFound(format!(

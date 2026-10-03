@@ -15,7 +15,11 @@
 //!   empty identity would be a malformed durable record constructible by
 //!   anyone;
 //! * [`valid_name`] — the single-safe-segment name rule, which ALSO refuses
-//!   the crate's RESERVED spellings ([`crate::reserved::is_reserved_name`]): a
+//!   the crate's UNADDRESSABLE spellings
+//!   ([`crate::reserved::is_unaddressable_name`] — the SAME authority
+//!   [`crate::reserved::is_reserved_name`] is narrower than, because it
+//!   additionally covers the application lock record, every case alias and
+//!   every crate-temp shape): a
 //!   name the crate accepts is always a name a whole-store sync can replicate
 //!   and its sanctioned delete route can destroy. A consumer can ask the
 //!   question directly through that public predicate;

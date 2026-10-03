@@ -282,7 +282,8 @@
 //!   exercised by the far-side suites. A failure before the rename leaves the
 //!   PREVIOUS content in place and removes the temp.
 //! * **WINDOWS local destination**: the PATH-BASED replace
-//!   ([`crate::atomic::write_atomic_replace`]): a temp + rename with NO
+//!   (`crate::atomic::write_atomic_replace`, crate-internal since API
+//!   constraint #8): a temp + rename with NO
 //!   parent-directory fsync and a NON-atomic replace (Windows `rename` does
 //!   not overwrite an existing target, so the target is removed first and a
 //!   reader can observe a transient absence). This is the ONE destination kind
@@ -1399,25 +1400,21 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// existing empty directory, whose empty stdout is the empty manifest — may
 /// be assembled here.
 ///
-/// # The completeness precondition is on INFORMATION this function does not
-/// carry, so a direct caller must enforce it
+/// # The completeness precondition is enforced by the CHECKED constructor
 ///
-/// This function is `pub`, but its SIGNATURE is `(&str, &Path)`: the far side's
-/// EXIT STATUS — the only evidence that the walk covered the whole tree —
-/// belongs to the `Output`/`Remote::exec` result the caller holds and is NOT
-/// passed here. The crate's own remote path
-/// ([`crate::sync::diff::remote_manifest`] and
-/// [`crate::sync::diff::remote_destination_manifest`]) checks `out.success()`
-/// and refuses a non-zero exit BEFORE calling this function, and
-/// [`remote_tree_verify_script`] is the only producer whose `die` vocabulary
-/// makes that check meaningful, so the crate can never assemble an incomplete
-/// listing. A caller that reads a listing from anywhere else (its own script, a
-/// proxy, a buffer) MUST make the same check itself, or establish completeness
-/// some other way; there is no guard inside this function that can.
+/// This raw assembler is `pub(crate)` because its SIGNATURE is `(&str, &Path)`:
+/// the far side's EXIT STATUS — the only evidence that the walk covered the
+/// whole tree — belongs to the `Output`/`Remote::exec` result the caller holds
+/// and is NOT carried here, so a caller holding only the string could assemble
+/// an incomplete listing. The public entry points are
+/// [`canonicalize_remote_entries_checked`] and
+/// [`canonicalize_remote_entries_destination_checked`], which take that status
+/// (`exited_zero`) and refuse `false` BEFORE assembly; the crate's own remote
+/// path ([`crate::sync::diff::remote_manifest`] and
+/// [`crate::sync::diff::remote_destination_manifest`]) reaches this assembler
+/// ONLY through them, passing `out.success()` at the call site.
 ///
-/// What an INCOMPLETE listing does, stated precisely, because the previous
-/// revision of this doc overstated it as an outright unsupported precondition
-/// without saying what happens when it is violated: an omitted entry makes the
+/// What an INCOMPLETE listing does, stated precisely: an omitted entry makes the
 /// manifest MIS-DESCRIBE the tree — the omitted path is absent from the diff,
 /// so a source-only entry is not transferred and a destination-only one is not
 /// classified — but it does NOT create an escape. Every entry the listing DOES
@@ -1431,16 +1428,36 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// non-escaping manifest that mis-describes the tree — a correctness/
 /// completeness bug at the caller, never a containment hole here.
 ///
-/// A CHEAP GUARD, if one is wanted: the completeness evidence is the exit
-/// status, so the honest fix is a fallible constructor that takes the status
-/// (e.g. `canonicalize_remote_entries_checked(output, root, exited_zero: bool)`)
-/// and refuses `false`, letting the crate's own path stop threading the check
-/// by hand. A completeness TERMINATOR on the wire would also work but CHANGES
+/// A completeness TERMINATOR on the wire would also close this, but it CHANGES
 /// THE WIRE FORMAT (the far side would print a final sentinel line), so it is
-/// deliberately NOT done here: this change does not alter the format, and the
-/// crate's own path already refuses a non-zero exit before assembly.
-pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
+/// deliberately NOT done here: the exit status already carries the evidence.
+pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
     Ok(canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Refuse)?.meta)
+}
+
+/// The CHECKED constructor for a remote SOURCE listing: it takes the far-side
+/// walk's exit status (`exited_zero`) and REFUSES `false` before assembling, so
+/// the crate's completeness precondition is enforced by the entry point rather
+/// than left to a paragraph. `exited_zero` is
+/// [`crate::transport::ExecOutcome::success`]; `true` says the walk covered the
+/// whole tree (an existing EMPTY directory included — its empty stdout is the
+/// empty manifest), `false` says it did not, so a short or empty listing must
+/// not be assembled. The refusal is typed
+/// ([`MaterializationKind::IncompleteListing`]) so a caller can tell it from a
+/// wire-format refusal, whose remedy is different.
+///
+/// This is the ONLY public assembler for the wire format: there is no public
+/// path that reaches the raw `(&str, &Path)` form, so a caller cannot assemble
+/// a listing while forgetting the completeness evidence. A caller whose listing
+/// did not come with an exit status must still establish completeness some
+/// other way and pass that decision as `exited_zero`.
+pub fn canonicalize_remote_entries_checked(
+    output: &str,
+    root: &Path,
+    exited_zero: bool,
+) -> Result<TreeMetadata> {
+    require_complete_walk(exited_zero)?;
+    canonicalize_remote_entries(output, root)
 }
 
 /// The destination-tolerant form of [`canonicalize_remote_entries`]: the same
@@ -1449,11 +1466,43 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
 /// under their live kind) instead of failing the whole assembly. A
 /// special-file line (`o`) is still refused: the applier's live-kind authority
 /// has no primitive for it, so the crate cannot remove it safely.
-pub fn canonicalize_remote_entries_destination(
+pub(crate) fn canonicalize_remote_entries_destination(
     output: &str,
     root: &Path,
 ) -> Result<DestinationTree> {
     canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Tolerate)
+}
+
+/// The DESTINATION-side checked constructor: [`canonicalize_remote_entries_checked`]
+/// with the destination tolerance of [`canonicalize_remote_entries_destination`].
+/// The completeness precondition is enforced identically, so a tolerated
+/// destination listing cannot be assembled from a walk that did not cover the
+/// tree either.
+pub fn canonicalize_remote_entries_destination_checked(
+    output: &str,
+    root: &Path,
+    exited_zero: bool,
+) -> Result<DestinationTree> {
+    require_complete_walk(exited_zero)?;
+    canonicalize_remote_entries_destination(output, root)
+}
+
+/// Refuse to assemble a listing whose producing walk did not exit zero. The
+/// typed reason distinguishes this completeness refusal from a wire-format
+/// refusal and names what the caller must do instead.
+fn require_complete_walk(exited_zero: bool) -> Result<()> {
+    if exited_zero {
+        return Ok(());
+    }
+    Err(Error::materialization_kind(
+        MaterializationKind::IncompleteListing,
+        "refusing to assemble a remote listing whose walk did not exit zero: the \
+         far side signals an absent, non-directory, or unreadable root (or any \
+         other incomplete walk) with a non-zero exit, so a short or empty \
+         listing here may MIS-DESCRIBE the tree; re-run the walk and refuse its \
+         non-zero exit, or pass true only when completeness is established"
+            .to_string(),
+    ))
 }
 
 fn canonicalize_remote_entries_with(
@@ -2547,6 +2596,40 @@ mod tests {
         assert_eq!(
             e.materialization_reason(),
             Some(MaterializationKind::UnrepresentableSymlinkTarget),
+            "{e:?}"
+        );
+    }
+
+    /// Constraint #8: the CHECKED assembler makes the completeness
+    /// precondition un-missable. Before it, any caller holding only the
+    /// listing string could assemble an INCOMPLETE walk — an empty listing
+    /// from a `die`-ing walk would be accepted as the empty manifest. The
+    /// checked constructor refuses a non-zero exit with the typed
+    /// completeness kind, BEFORE assembly, while a zero exit with empty
+    /// output IS the empty manifest.
+    #[test]
+    fn checked_assembler_refuses_a_nonzero_walk_exit() {
+        use crate::error::MaterializationKind;
+        let root = Path::new("/srv/store");
+
+        // A walk that did not exit zero: the (short or empty) listing must
+        // NOT be assembled.
+        let e = canonicalize_remote_entries_checked("", root, false).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::IncompleteListing),
+            "the completeness refusal must be its own typed kind: {e:?}"
+        );
+
+        // A complete walk over an EMPTY directory IS the empty manifest.
+        let meta = canonicalize_remote_entries_checked("", root, true).unwrap();
+        assert!(meta.entries.is_empty(), "empty listing, empty manifest");
+
+        // The destination-tolerant form enforces the SAME precondition.
+        let e = canonicalize_remote_entries_destination_checked("", root, false).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::IncompleteListing),
             "{e:?}"
         );
     }

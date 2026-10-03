@@ -28,7 +28,9 @@
 //! NOT COVERED by that component confinement: the module's PATH-BASED free
 //! functions take an ordinary [`Path`] and resolve it with
 //! `std::fs`/`std::fs::Permissions`, so an INTERMEDIATE symlink in that path
-//! IS followed. They are [`set_private`], [`write_atomic_replace`],
+//! IS followed. They are `set_private` and `write_atomic_replace` (both
+//! TEST-ONLY on Unix; `set_private` serves the unconfined replace, and no
+//! Unix production body needs either),
 //! [`sync_parent_dir`], [`ensure_private_dir_durable`], and
 //! [`copy_dir_recursive`]. The component confinement claimed below belongs to
 //! the `_fd` surface only, never to these.
@@ -120,20 +122,36 @@ fn probe_fsync_replace_parent() {
 #[cfg(not(test))]
 fn probe_fsync_replace_parent() {}
 
+/// TEST-ONLY on Unix, like the unconfined replace it serves: this PATH-BASED
+/// helper takes an ordinary path, so an intermediate symlink is followed.
+#[cfg(test)]
 pub(crate) fn set_private(path: &Path) -> Result<()> {
     refuse_reserved_mutation(path, Sanction::None)?;
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms)
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
 }
-/// The path-based durable atomic replace: write a UNIQUE hidden temp in the
-/// target's directory, fsync it, chmod it 0o600, rename it into place
+/// The PATH-BASED, UNCONFINED durable atomic replace: write a UNIQUE hidden
+/// temp in the target's directory, fsync it, chmod it 0o600, rename it into
+/// place
 /// (COMMIT POINT 1), then fsync the parent directory (COMMIT POINT 2). A
 /// failure BEFORE the rename is an `Err`, leaves the OLD content visible, and
 /// UNLINKS the temp (best-effort — a cleanup failure is reported together
 /// with the original failure, never swallowed); see [`ReplaceOutcome`] for
 /// the two commit points.
-pub fn write_atomic_replace(
+///
+/// TEST-ONLY on Unix (API constraint #8): this PATH-BASED replace takes a raw
+/// `&Path` rather than the crate's validated [`crate::RootedRelativePath`],
+/// and it resolves every component by that path, so an intermediate symlink is
+/// FOLLOWED — it is NOT component-confined. It is `pub(crate)` and `#[cfg(test)]`
+/// because no Unix production body needs it, so a caller cannot reach the
+/// unconfined mutation while believing it is the crate's default; the
+/// confined, public form is [`write_atomic_replace_fd`], and
+/// [`crate::atomic::COMPONENT_CONFINED`] describes the platform split. The
+/// Windows port keeps a `pub(crate)` body because its fd surface is
+/// path-based throughout.
+#[cfg(test)]
+pub(crate) fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
@@ -949,7 +967,7 @@ fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Er
 }
 
 /// The descriptor-relative atomic replace: the same four-stage protocol as
-/// [`write_atomic_replace`], but the path resolves COMPONENT-WISE relative
+/// `write_atomic_replace`, but the path resolves COMPONENT-WISE relative
 /// to `root` with `openat(O_NOFOLLOW)`. Every PARENT component is refused
 /// (ELOOP) if it is a symlink; the FINAL entry is NOT opened — the install
 /// is a `renameat` into the descriptor-relative parent, which replaces the
@@ -1177,7 +1195,7 @@ fn replace_core(
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
-    // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace`]).
+    // the rename. FAIL-CLOSED but EXPLICIT (see `write_atomic_replace`).
     if let Some(e) = fault(ReplaceStage::DirSync) {
         return Ok(CoreReplace::Replaced(
             ReplaceOutcome::ReplacedDurabilityUnknown { error: e },

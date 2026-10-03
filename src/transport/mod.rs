@@ -33,8 +33,8 @@
 //! never followed, with NO check-then-act window — the same guarantee the
 //! crate's fd-confined `Side::Local` destination gives. That includes the
 //! READS used as verification sources — `read`, `read_link`, and `metadata_opt`
-//! (and therefore `metadata`, and `kind_opt`/`mode_opt` over a [`Remote`]), plus
-//! `exists` — so a content/kind/mode verdict can never be computed from an
+//! (and therefore `metadata`, and `kind_opt`/`mode_opt` over a [`Remote`]) —
+//! so a content/kind/mode verdict can never be computed from an
 //! object outside the pinned root.
 //!
 //! The operations that are NOT component-wise confined are named precisely, and
@@ -428,8 +428,8 @@ pub trait Remote {
     /// failure, a failed parent-dir sync, a transport fault — never a
     /// verdict). This is
     /// the non-racy primitive used for lock acquisition:
-    /// `exists`-then-`write` would let two controllers both observe "no lock"
-    /// and both proceed.
+    /// a check-then-write (`metadata_opt`-then-`write`) would let two
+    /// controllers both observe "no lock" and both proceed.
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict>;
     /// [`Remote::try_write_new`] with a CALLER-CHOSEN content equivalence for
     /// the EEXIST verification: `Semantic` (JSON parse-equal, byte-exact
@@ -600,7 +600,11 @@ pub trait Remote {
     /// directory. The DEFAULT is a no-op (test wrappers that delegate to an
     /// inner transport inherit the inner's implementation); the production
     /// transports ([`LocalTransport`], [`SshTransport`]) realize it for
-    /// real.
+    /// real. STATED RESIDUAL (API constraint #8): the reach of the no-op
+    /// default is any `Remote` implementation that neither overrides this nor
+    /// delegates to one that does, so a PRODUCTION transport that omits the
+    /// override makes nothing durable SILENTLY; a caller that needs durability
+    /// from a transport it did not write must confirm the override.
     ///
     /// MAKING A FRESHLY PUSHED SUBTREE DURABLE takes TWO calls on the PARENT
     /// transport: `fsync_tree(<child>)` makes everything UNDER the child
@@ -625,7 +629,10 @@ pub trait Remote {
     /// durability is unconfirmed). The DEFAULT is a no-op (test wrappers
     /// that delegate to an inner transport inherit the inner's
     /// implementation); the production transports ([`LocalTransport`],
-    /// [`SshTransport`]) realize it for real.
+    /// [`SshTransport`]) realize it for real. STATED RESIDUAL (API constraint
+    /// #8): as for [`Remote::fsync_tree`], the reach of the no-op default is
+    /// any implementation that does not override it or delegate to one that
+    /// does.
     ///
     /// See [`Remote::fsync_tree`] for the TWO-call recipe that makes a freshly
     /// pushed subtree durable: `fsync_tree(child)` plus this method with
@@ -646,7 +653,17 @@ pub trait Remote {
     /// (mismatch — a successor's lock is never removed, never replaced).
     /// The DEFAULT implementation is the NON-ATOMIC read-compare-remove
     /// fallback: adequate for single-process test wrappers that never race
-    /// the lock, and only those; production must override it.
+    /// the lock, and only those; production must override it. STATED RESIDUAL
+    /// (API constraint #8): the reach of the non-atomic default is any
+    /// `Remote` implementation that does not override it, so a production
+    /// transport that omits the override gets a compare-and-delete with no
+    /// claim step — two contenders can both observe a match. The crate's own
+    /// production path is additionally BOUNDED to the ONE lock record the
+    /// layout OWNS: `LocalTransport::remove_file_if` mints an
+    /// identity-checked `OwnedLockRecord` capability, so a public caller
+    /// cannot use it to break a lock record the protocol does not own, and
+    /// REFUSES (a typed conflict error, before any mutation) any other
+    /// lock-record spelling.
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
         // Typed absence probe first: a transport failure is an `Err`, never
         // a silent `Absent`.
@@ -661,13 +678,14 @@ pub trait Remote {
             Ok(RemoveIfVerdict::Mismatch)
         }
     }
-    fn exists(&self, rel: &RootedRelativePath) -> bool;
     fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta>;
-    /// The TYPED replacement for the `exists`/`metadata` pair: `Ok(Some(meta))`
+    /// The TYPED existence probe: `Ok(Some(meta))`
     /// when the entry exists, `Ok(None)` ONLY for a CONFIRMED `NotFound`, and
     /// `Err` for every other failure (permission, transport fault, ...). A
-    /// failed read is NEVER indistinguishable from absence — callers must
-    /// never consult `exists` (a `bool` that swallows errors) to disambiguate.
+    /// failed read is NEVER indistinguishable from absence. This is the ONLY
+    /// existence primitive on the trait: an error-swallowing `bool` check
+    /// (`exists`) would report a permission or transport failure as ABSENT,
+    /// so it is not part of the surface at all.
     fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
         match self.metadata(rel) {
             Ok(m) => Ok(Some(m)),
@@ -676,6 +694,23 @@ pub trait Remote {
         }
     }
     /// Execute a command vector (no shell). Returns the outcome.
+    ///
+    /// THE RAW COMMAND SEAM — a STATED RESIDUAL (API constraint #8). This is
+    /// the ONE public path that runs a command the crate did not build, and it
+    /// is deliberately unconstrained: it does NOT take the destination's
+    /// operation lock, does NOT verify or confine the paths the command
+    /// touches, does NOT apply the crate's own operation protocol, and returns
+    /// the raw outcome. Rule 9's framings (one quoted word per operand, `--`
+    /// before a value that may start with `-`, wire records delimited by a byte
+    /// a name cannot contain) are applied to the crate's OWN scripts, not to
+    /// arbitrary caller `argv`; the implementations pass each token as ONE
+    /// argument with no shell re-splitting, but a caller that interpolates
+    /// untrusted data into `argv` still owns its framing, and a caller that
+    /// runs a destructive command owns its effect. The reach is any public
+    /// caller (and every [`Remote`] default that shells out, such as
+    /// [`Remote::remove_dir`]), and it cannot be closed without removing the
+    /// seam that those defaults and the test transports are built on; it is
+    /// therefore stated here, where a consumer reads it.
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
     /// Total and available bytes on the filesystem backing the remote root.
     /// `total` is the filesystem's full size; `available` is the free space a
@@ -1943,7 +1978,7 @@ impl LocalTransport {
     // names a non-empty path below the root: a symlink injected at ANY
     // component below the root is refused (never followed), exactly as the
     // fd-confined `Side::Local` destination already does. The reads (`read`,
-    // `read_link`, `metadata_opt`/`metadata`, `exists`) are confined so a
+    // `read_link`, `metadata_opt`/`metadata`) are confined so a
     // verification verdict cannot be sourced from outside the pinned root. The
     // path-based bodies below are kept `#[cfg(not(unix))]` (the Windows port
     // has no directory descriptors and keeps its documented weaker guarantee)
@@ -2017,7 +2052,7 @@ impl LocalTransport {
         // the same directory, fsynced, then renamed into place, then the
         // parent directory fsynced — the replace has TWO commit points and a
         // failure BEFORE the rename leaves the PREVIOUS content untouched and
-        // unlinks the temp (see [`crate::atomic::write_atomic_replace`]). The
+        // unlinks the temp (see `crate::atomic::write_atomic_replace`). The
         // old path here (`atomic::write_file_fd`) opened the destination
         // `O_WRONLY|O_CREAT|O_TRUNC` and did ONE `write` with no temp, no
         // rename and no fsync, so a push into a LOCAL destination could leave
@@ -2805,22 +2840,6 @@ impl Remote for LocalTransport {
     /// The TRI-STATE existence check, descriptor-relative on Unix: `rel` is
     /// resolved component-wise with `O_NOFOLLOW` and the final component is
     /// `fstat`ed, so a symlink at any component is refused rather than followed.
-    /// `bool` swallows the error by this trait's contract (callers that must
-    /// distinguish a failure from absence use [`Remote::metadata_opt`], which is
-    /// also descriptor-relative on Unix).
-    #[cfg(unix)]
-    fn exists(&self, rel: &RootedRelativePath) -> bool {
-        match self.root_dir(false) {
-            Ok(Some(root)) => self.confined_lstat(&root, rel).is_ok_and(|m| m.is_some()),
-            _ => false,
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn exists(&self, rel: &RootedRelativePath) -> bool {
-        join(&self.base, rel).exists()
-    }
-
     fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.metadata_opt(rel)?.ok_or_else(|| {
             Error::NotFound(format!(
@@ -3258,7 +3277,7 @@ mod tests {
         .unwrap();
         t.provision_layout().unwrap();
         assert!(
-            t.exists(&marker),
+            t.metadata_opt(&marker).unwrap().is_some(),
             "provisioning creates the receiver-id marker"
         );
         let first = read_receiver_id(&t, &marker).expect("the marker reads back");
@@ -3576,7 +3595,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            t.exists(&RootedRelativePath::parse(Path::new(".tmp.x")).unwrap()),
+            t.metadata_opt(&RootedRelativePath::parse(Path::new(".tmp.x")).unwrap())
+                .unwrap()
+                .is_some(),
             "symlink should exist"
         );
         t.rename(
@@ -3585,7 +3606,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            t.exists(&RootedRelativePath::parse(Path::new("current")).unwrap()),
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("current")).unwrap())
+                .unwrap()
+                .is_some(),
             "current should exist after rename"
         );
         let target = t
@@ -3662,7 +3685,9 @@ mod tests {
     }
 
     /// FINDING 4/5: the READS the applier verifies against are descriptor-relative
-    /// too. Pre-fix `read`, `read_link`, `exists`, and `metadata_opt` were
+    /// too. Pre-fix `read`, `read_link`, `exists` (since REMOVED by API
+    /// constraint #8 — an error-swallowing `bool` probe is no longer on the
+    /// trait), and `metadata_opt` were
     /// PATH-based (`std::fs::read`/`read_link`/`exists`/`symlink_metadata`), so a
     /// symlink injected at a PARENT component made them FOLLOW it: a content
     /// hash — and therefore an `applied` verdict — could be computed from an
@@ -3696,8 +3721,8 @@ mod tests {
             "read_link must refuse a symlinked parent"
         );
         assert!(
-            !t.exists(&link_planted),
-            "exists must refuse a symlinked parent, never follow it"
+            t.metadata_opt(&link_planted).is_err(),
+            "metadata_opt must refuse a symlinked parent, never follow it"
         );
         assert!(
             t.metadata_opt(&link_planted).is_err(),
@@ -3763,7 +3788,6 @@ mod tests {
                     "a read escaped the pinned root and returned OUTSIDE content"
                 );
             }
-            let _ = t.exists(&rel_planted);
             let _ = t.metadata_opt(&rel_planted);
             assert!(
                 !outside.join("x").exists(),
@@ -4612,9 +4636,6 @@ mod tests {
         }
         fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_residue_dir(rel)
-        }
-        fn exists(&self, rel: &RootedRelativePath) -> bool {
-            self.inner.exists(rel)
         }
         fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
             self.inner.metadata(rel)

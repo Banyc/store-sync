@@ -51,7 +51,13 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// [`ReplaceOutcome::ReplacedDurabilityUnknown`]. The per-stage fault hook
 /// fires at every stage exactly as on Unix (the test surface is
 /// platform-independent).
-pub fn write_atomic_replace(
+///
+/// CRATE-INTERNAL (API constraint #8): this PATH-BASED replace takes a raw
+/// `&Path` rather than the crate's validated [`crate::RootedRelativePath`],
+/// so it is not public and cannot be reached while believing it is the
+/// crate's default; on this port it IS the body of the public fd surface
+/// ([`write_atomic_replace_fd`]), which is path-based throughout.
+pub(crate) fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,

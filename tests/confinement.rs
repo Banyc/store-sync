@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use storekit::Error;
 use storekit::RootedRelativePath;
 use storekit::atomic::{
-    RootDir, path_state_fd, read_fd, renameat_paths, write_atomic_cas_fd, write_atomic_replace,
-    write_atomic_replace_fd, write_file_fd,
+    RootDir, path_state_fd, read_fd, renameat_paths, write_atomic_cas_fd, write_atomic_replace_fd,
+    write_file_fd,
 };
 use storekit::lock::FileLock;
 use storekit::root::{EndpointKey, OwnedRoot};
@@ -258,22 +258,26 @@ fn root_dir_open_refuses_a_symlink_root_but_opens_the_real_directory() {
     assert_open_refusal(&err, "open root");
 }
 
-/// F-A1 (production-lib reproduction): the PATH-BASED
-/// `atomic::write_atomic_replace` had NO lock-record guard. Pre-fix a holder
-/// held `operation.lock`, the path-based replace renamed a fresh inode OVER
-/// the record, and a second acquisition then flocked the NEW inode while the
-/// first holder still held the old one — TWO simultaneous holders. The replace
-/// is now refused, the inode is unchanged, and the second acquisition
-/// contends.
+/// F-A1 (production-lib reproduction): the atomic REPLACE must consult the
+/// lock-record guard, or a holder's record is swapped for a fresh inode and a
+/// second acquisition flocks the NEW inode while the first holder still holds
+/// the old one — TWO simultaneous holders. Pre-fix the PATH-BASED replace had
+/// no guard; as of API constraint #8 that unconfined form is no longer public,
+/// so this test drives the CONFINED public replace (`write_atomic_replace_fd`,
+/// the only atomic replace a caller can name). The record lives INSIDE the
+/// root, so the confined primitive can address it; the guard is on the spelling,
+/// not the location. The replace is refused, the inode is unchanged, and the
+/// second acquisition contends.
 #[test]
-fn path_based_write_atomic_replace_cannot_swap_the_lock_record_inode() {
+fn write_atomic_replace_cannot_swap_the_lock_record_inode() {
     use std::os::unix::fs::MetadataExt;
     let tmp = tempfile::tempdir().unwrap();
-    let record = tmp.path().join("operation.lock");
+    let (owned, root) = open_root(tmp.path(), "confinement-f-a1");
+    let record = owned.canonical().join("operation.lock");
     let holder = FileLock::acquire(&record, "A").expect("A acquires the record");
     let ino_a = std::fs::metadata(&record).unwrap().ino();
-    let err = write_atomic_replace(&record, b"evil", &mut |_| None)
-        .expect_err("a path-based replace of the lock record must be refused");
+    let err = write_atomic_replace_fd(&root, &rp("operation.lock"), b"evil", &mut |_| None)
+        .expect_err("a replace of the lock record must be refused");
     assert!(
         matches!(err, Error::Conflict(_)),
         "the refusal must be a conflict, got: {err:?}"

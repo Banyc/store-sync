@@ -116,6 +116,23 @@
 //! parent-directory fsync durability, a non-atomic replace (Windows
 //! `rename` does not overwrite), and no Unix mode bits. The rest of the
 //! crate calls the re-exported surface below and never sees the switch.
+//!
+//! # The unconfined replace is not public (API constraint #8)
+//!
+//! The PATH-BASED atomic replace (`write_atomic_replace`) takes a raw `&Path`
+//! and resolves every component by that path, so an intermediate symlink is
+//! FOLLOWED. It is `pub(crate)` — `#[cfg(test)]` on Unix, where no production
+//! body needs it, and the body of the fd surface on Windows — so a caller
+//! cannot reach a name-mutation that skips the validated
+//! [`crate::RootedRelativePath`] while believing it is the crate's default.
+//! The public replace is the confined [`write_atomic_replace_fd`]. This is
+//! compile-checked, not just documented:
+//!
+//! ```compile_fail
+//! // The unconfined path-based replace is crate-internal: a caller cannot
+//! // name it.
+//! let _unconfined = storekit::atomic::write_atomic_replace;
+//! ```
 
 use crate::error::{Error, ReservedKind, Result, StoreKind};
 use crate::relpath::RootedRelativePath;
@@ -580,6 +597,13 @@ pub fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
 /// IS the destination), so an unlink would remove the committed content. The
 /// post-rename parent-fsync failure ([`ReplaceOutcome::ReplacedDurabilityUnknown`])
 /// is therefore NOT a cleanup point.
+///
+/// GATED to the builds that use it: on Windows the PATH-BASED
+/// `write_atomic_replace` (the body of the fd surface) calls this in
+/// production, while on Unix that replace is test-only, so the path-based
+/// cleanup is compiled only for tests there. The descriptor-relative twin is
+/// [`atomic::unix::discard_temp_fd`].
+#[cfg(any(test, windows))]
 fn discard_temp(original: Error, tmp: &Path) -> Error {
     match std::fs::remove_file(tmp) {
         Ok(()) => original,
@@ -612,8 +636,8 @@ pub enum ReplaceOutcome {
     ReplacedDurabilityUnknown { error: Error },
 }
 
-/// The [`write_atomic_replace`] stage a test-injected fault fires at. The
-/// hook is [`write_atomic_replace`]'s own `fault` parameter, so a
+/// The `write_atomic_replace` stage a test-injected fault fires at. The
+/// hook is that replace's own `fault` parameter, so a
 /// per-fixture registry can fault each atomic-replacement stage exactly as
 /// the append path's `FaultKind::AppendWrite` family does; production
 /// passes a no-op hook.

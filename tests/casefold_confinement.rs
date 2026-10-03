@@ -31,7 +31,7 @@
 
 use storekit::env::SysEnv;
 use storekit::manifest::{
-    canonicalize_remote_entries, canonicalize_tree, remote_tree_verify_script,
+    canonicalize_remote_entries_checked, canonicalize_tree, remote_tree_verify_script,
 };
 use storekit::sync::{
     DestinationOwnership, Direction, Extraneous, Policy, ReplaceAll, SyncError, SyncResult, sync,
@@ -171,7 +171,7 @@ fn source_escape_refused_by_all_views(on_disk: &str, spelled: &str) {
     }
 
     let local = canonicalize_tree(&root);
-    let remote = canonicalize_remote_entries(&remote_listing(&root), &root);
+    let remote = canonicalize_remote_entries_checked(&remote_listing(&root), &root, true);
     let dst = base.path().join("dst");
     let transport =
         LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).expect("build");

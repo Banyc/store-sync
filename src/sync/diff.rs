@@ -35,9 +35,9 @@
 
 use crate::error::{Error, Result, TransportKind};
 use crate::manifest::{
-    DestinationTree, TreeEntry, TreeMetadata, canonicalize_remote_entries,
-    canonicalize_remote_entries_destination, canonicalize_tree, canonicalize_tree_destination,
-    remote_tree_verify_script,
+    DestinationTree, TreeEntry, TreeMetadata, canonicalize_remote_entries_checked,
+    canonicalize_remote_entries_destination_checked, canonicalize_tree,
+    canonicalize_tree_destination, remote_tree_verify_script,
 };
 use crate::transport::{ExecOutcome, Remote, TimeoutCause};
 use std::collections::{BTreeMap, BTreeSet};
@@ -278,7 +278,10 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     if !out.success() {
         return Err(remote_manifest_failure(root, &out));
     }
-    canonicalize_remote_entries(&out.stdout, root)
+    // The completeness precondition is ENFORCED at this call site: the checked
+    // constructor refuses `exited_zero == false`, so the assembler can never
+    // describe an incomplete walk as a (possibly empty) faithful tree.
+    canonicalize_remote_entries_checked(&out.stdout, root, out.success())
 }
 
 /// The DESTINATION-side counterpart of [`remote_manifest`]: the same branch on
@@ -344,7 +347,8 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
     if !out.success() {
         return Err(remote_manifest_failure(root, &out));
     }
-    canonicalize_remote_entries_destination(&out.stdout, root)
+    // Same enforced completeness precondition on the DESTINATION side.
+    canonicalize_remote_entries_destination_checked(&out.stdout, root, out.success())
 }
 
 /// The pair of manifests `crate::sync::apply` actually DIFFS: the SOURCE with
@@ -917,9 +921,6 @@ mod tests {
         }
         fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir(rel)
-        }
-        fn exists(&self, rel: &RootedRelativePath) -> bool {
-            self.inner.exists(rel)
         }
         fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
             self.inner.metadata(rel)

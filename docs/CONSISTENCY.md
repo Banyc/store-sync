@@ -137,3 +137,44 @@ literal `.` segment. No input the guard refused is now accepted.
 production the pinned `std::fs`/`libc` counts dropped with it (`remove_file`,
 `rmdir`, `open`). That is the pin doing its job: the count changed, so the
 change had to say so.
+
+**D — the unconfined replace answered to the crate's DEFAULT name. FIXED.**
+`atomic::write_atomic_replace` took a raw `&Path` and resolved every component
+by that path (so an intermediate symlink was followed), yet its unqualified
+name read as the crate's default atomic replace — the confined form is
+`write_atomic_replace_fd`. It stayed public because an integration test used
+it, which is not a consumer reason. **Fixed** by API constraint #8: it is now
+`pub(crate)` (test-only on Unix, where no production body needs it; the body
+of the fd surface on Windows), with a `compile_fail` doctest in `atomic`'s
+module docs proving a caller cannot name the unconfined form. The integration
+test's assertions are unchanged; it now drives the confined PUBLIC primitive
+(`write_atomic_replace_fd`). This removed the LAST public mutation that did
+not take `(&RootDir, &RootedRelativePath)`, completing constraint #1's stated
+rule. A rename to a name stating the weakness was the alternative; demotion was
+chosen because the only reason it was public was a test, and the constraint's
+real product is a smaller surface.
+
+**D — an existence probe answered a question it could not answer. FIXED.**
+`Remote::exists` returned `bool`: a permission error, an I/O fault and a
+genuine absence all read as `false`. Its own trait documentation said callers
+must never consult it, and the crate's production code never did — it was a
+public trap. **Fixed** by deleting it from the trait; `Remote::metadata_opt`
+(the typed `Ok(Some)` / `Ok(None)` / `Err` probe) is the only existence
+primitive, and the few tests that used `exists` now branch on that distinction
+(one assertion got STRONGER: a symlinked parent is now asserted as `Err`, not
+as "not present").
+
+**D (stated residual, no action) — `is_reserved_name` is narrower than the
+name rule.** `reserved::is_reserved_name` / `is_reserved_path` answer a
+byte-exact reserved MATCH (what the sync strips), not "may I use this name" —
+the authority is `is_unaddressable_name` / `is_unaddressable_path`. The names
+do not say "narrow", but the README names the authority and the narrower pair
+at the same place; renaming them would touch every call site for a predicate
+whose distinction is already stated. Recorded as a residual rather than fixed.
+
+**I — an audit pin moved again, deliberately (API constraint #8).** Making the
+unconfined `write_atomic_replace` `#[cfg(test)]` on Unix removed its
+`std::fs::rename` from the production count, so the pin entry
+`("src/atomic/unix.rs", "rename", 1)` was removed in the same change, with the
+reason recorded AT the pin. The guard still runs on the function; the call is
+simply no longer production code, which is exactly what the audit excludes.

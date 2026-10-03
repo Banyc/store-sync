@@ -1218,13 +1218,15 @@ mod tests {
         }
         let expected: &[(&str, &str, usize)] = &[
             ("src/atomic/mod.rs", "remove_file", 1),
-            // CHANGED DELIBERATELY (constraint #1): the path-based
-            // `remove_dir_all_path` became `#[cfg(test)]` (it has no production
-            // caller; the fd-confined `remove_dir_all_fd` is the production
-            // authority), so its `std::fs::remove_file` left the PRODUCTION
-            // count. The remaining `rename` (the manifest walk's own swap) is
-            // unchanged.
-            ("src/atomic/unix.rs", "rename", 1),
+            // CHANGED DELIBERATELY (API constraint #8): the path-based
+            // `write_atomic_replace` became `#[cfg(test)]` on Unix (no Unix
+            // production body needs the unconfined replace), so its
+            // `std::fs::rename` left the PRODUCTION count — the entry
+            // `("src/atomic/unix.rs", "rename", 1)` is removed here, not
+            // dropped silently. The guard still runs on the function; the
+            // call is simply no longer production code, which is exactly what
+            // the audit excludes. This is the deliberate pin move, recorded
+            // per the audit's own rule.
             ("src/atomic/windows.rs", "remove_dir", 2),
             // TWO production `remove_dir_all` calls since R2: the implicit
             // recursive removal (`remove_dir_all_fd`, refused for residue) and
