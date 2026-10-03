@@ -1246,25 +1246,18 @@ pub(crate) fn durable_create_new(
     options: CreateNewOptions<'_>,
 ) -> Result<CreateNewVerdict> {
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let p = join(base, rel);
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
     }
-    // 1. create temp: a unique dot-prefixed name inside the destination
-    //    directory, with create-new semantics (never truncates a stale temp
-    //    a crashed controller left behind).
-    let tmp = p.with_file_name(format!(
-        ".{}.tmp.{}.{}",
-        p.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
+    // 1. create temp: the crate's ONE bounded local temp name inside the
+    //    destination directory (see [`crate::atomic::temp_name_for`]), with
+    //    create-new semantics (never truncates a stale temp a crashed
+    //    controller left behind). The embedded destination name is bounded to
+    //    `NAME_MAX`, so a legal 255-byte destination still has a usable temp.
+    let tmp = crate::atomic::temp_name_for(&p);
     let fail = |step: CreateNewStep| options.fault.is_some_and(|f| f.consume(step));
     if fail(CreateNewStep::CreateTemp) {
         return Err(Error::transport(format!(
@@ -2824,13 +2817,20 @@ impl LocalTransport {
         // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
         // destination's parent directory (same filesystem, same directory
         // namespace as the lock), exactly like durable_create_new's temps.
-        let tmp = p.with_file_name(format!(
-            ".{}.claim.{}.{}",
-            p.file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default(),
+        let suffix = format!(
+            ".claim.{}.{}",
             std::process::id(),
-            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let tmp = p.with_file_name(format!(
+            ".{}{}",
+            crate::atomic::bounded_temp_trunk(
+                &p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                &suffix,
+            ),
+            suffix,
         ));
         // CLAIM: rename the entry to the temp — atomic, so only ONE
         // contender can ever win the claim; every other breaker's rename

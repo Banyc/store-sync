@@ -377,6 +377,29 @@ fn upload_leaf_names_with_metacharacters_round_trip() {
     }
 }
 
+/// F1: a destination name at the manifest's legal MAXIMUM must still upload.
+/// The manifest accepts a name up to `NAME_MAX` (255 bytes), and the far-side
+/// upload writes through a same-directory temp whose name was derived from the
+/// destination basename as `.basename.tmp.XXXXXX` — 12 bytes MORE than the
+/// name. A 243-byte name left exactly 12 bytes of headroom and uploaded; a
+/// 244-byte name overflowed and `mktemp` failed with `File name too long`, so a
+/// legal tree was silently untransferable. The fix bounds the temp trunk while
+/// keeping it in the destination's own directory.
+///
+/// The measured boundary pre-fix: 243 bytes Ok, 244 bytes
+/// `Err(Transport("ssh upload failed: mktemp: mkstemp failed on
+/// .../<244 a's>.tmp.eWbAFI: File name too long"))`. Post-fix every length from
+/// 1 through `NAME_MAX` transfers.
+#[test]
+fn upload_names_at_the_name_max_boundary_are_transferable() {
+    for len in [1usize, 243, 244, 254, 255] {
+        let name = "a".repeat(len);
+        let rel = format!("dir/{name}");
+        let data = format!("payload at name length {len}").into_bytes();
+        assert_literal_upload("dst", &rel, &[], &data);
+    }
+}
+
 /// A symlink LINK TARGET that starts with `-` is an operand, not an option:
 /// pre-fix `ln -sfn '-dash-target' <link>` was parsed by `ln` as the option
 /// cluster `-d` (`ln: illegal option -- d`) and the link was never created.

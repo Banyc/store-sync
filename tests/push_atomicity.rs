@@ -136,3 +136,68 @@ fn push_mid_write_failure_leaves_previous_content_intact_child() {
         "a failed atomic replace must leave no temp behind, found {temps:?}"
     );
 }
+
+/// F2: a local PUSH must transfer a destination name at the manifest's legal
+/// MAXIMUM. Change 1 routed the local push through the atomic replace, whose
+/// temp was `.{name}.tmp.{pid}.{counter}` — the embedded name made the temp
+/// 10–12 bytes longer than the destination, so the longest legal names failed
+/// `openat ...: File name too long (os error 63)` and the destination was left
+/// in `indeterminate` (fail-closed, but untransferable).
+///
+/// The measured pre-fix boundary (pid-dependent): a 240-byte name transferred
+/// and a 243-byte name failed with
+/// `Err(Transport("write <name>: store error: openat .<243 a's>.tmp.72526.2:
+/// File name too long (os error 63)"))`. Post-fix every length from 1 through
+/// `NAME_MAX` transfers.
+#[test]
+fn push_names_at_the_name_max_boundary_are_transferable() {
+    let tmp = tempfile::Builder::new()
+        .prefix("storesync-push-namemax-")
+        .tempdir()
+        .expect("create the tempdir");
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    std::fs::create_dir_all(&src).expect("create the source root");
+    std::fs::create_dir_all(&dst).expect("create the destination root");
+
+    let lengths = [1usize, 243, 244, 254, 255];
+    let mut names = Vec::new();
+    for len in lengths {
+        let name = "a".repeat(len);
+        std::fs::write(src.join(&name), format!("payload at name length {len}"))
+            .expect("write the source entry");
+        names.push(name);
+    }
+
+    let transport = LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty())
+        .expect("build the local transport");
+    let report = push(&src, &transport, &ReplaceAll)
+        .expect("every name up to NAME_MAX is legal and must push");
+    assert_eq!(
+        report.applied.len(),
+        lengths.len(),
+        "every boundary-length name must be applied: {report:?}"
+    );
+    for (len, name) in lengths.iter().zip(&names) {
+        assert_eq!(
+            std::fs::read(dst.join(name)).expect("read the pushed destination"),
+            format!("payload at name length {len}").into_bytes(),
+            "the {len}-byte name must round-trip"
+        );
+    }
+    // The atomic replace consumes its temp on success: no residue.
+    let temps: Vec<String> = std::fs::read_dir(&dst)
+        .expect("list the destination")
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(
+        temps.is_empty(),
+        "a successful push must leave no temp behind, found {temps:?}"
+    );
+}

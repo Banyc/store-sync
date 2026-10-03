@@ -170,38 +170,82 @@ fn absent_or_store(e: std::io::Error, path: &Path) -> Result<bool> {
     }
 }
 
-/// Unique temp-file name for an atomic replace of `path`: same directory,
-/// hidden dot-prefixed name carrying the process id and a process-scoped
-/// counter, so concurrent atomic writes on one store stay collision-free.
-pub fn temp_name_for(path: &Path) -> PathBuf {
+/// The largest number of bytes a single filesystem NAME may hold (POSIX
+/// `NAME_MAX`). The manifest accepts a name up to this bound, so every temp
+/// name the crate derives from a destination must stay within it — a temp
+/// that is even one byte longer makes a legal destination untransferable.
+pub(crate) const NAME_MAX: usize = 255;
+
+/// Derive the BOUNDED trunk of a temp name from a destination `name`, so
+/// `.TRUNK<SUFFIX>` never exceeds [`NAME_MAX`] bytes.
+///
+/// When the destination's name already leaves room for `suffix`, the trunk
+/// IS the name VERBATIM, so the historical spelling `.name.tmp.<pid>.<n>` is
+/// preserved for every name that fits. When it does not fit, the trunk is a
+/// byte-truncated prefix of the name plus the SHA-256 of the FULL name: the
+/// prefix keeps the temp recognizable next to its destination and the hash
+/// keeps two DISTINCT long names distinct (a truncation alone could collapse
+/// them), while the total length is exactly [`NAME_MAX`]. Truncation stops on
+/// a UTF-8 boundary — the names the crate carries are the manifest's UTF-8
+/// names.
+pub(crate) fn bounded_temp_trunk(name: &str, suffix: &str) -> String {
+    let overhead = 1 + suffix.len();
+    if overhead + name.len() <= NAME_MAX {
+        return name.to_string();
+    }
+    let hash = crate::digest::sha256_bytes(name.as_bytes());
+    let budget = NAME_MAX
+        .saturating_sub(overhead)
+        .saturating_sub(1)
+        .saturating_sub(hash.len());
+    let mut end = budget.min(name.len());
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}.{}", &name[..end], hash)
+}
+
+/// The next value of the process-scoped temp counter shared by EVERY local
+/// temp-naming authority, so two temps derived for one destination can never
+/// collide even when the path-based and descriptor-relative writers both run.
+fn next_temp_counter() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-    path.with_file_name(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ))
+    TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The unique temp NAME for a destination named `name`, shared by
+/// [`temp_name_for`] and [`temp_file_name`]: `.trunk.tmp.<pid>.<n>` with the
+/// trunk bounded to [`NAME_MAX`] by [`bounded_temp_trunk`].
+fn temp_name_string(name: &str) -> String {
+    let suffix = format!(".tmp.{}.{}", std::process::id(), next_temp_counter());
+    format!(".{}{}", bounded_temp_trunk(name, &suffix), suffix)
+}
+
+/// Unique temp-file name for an atomic replace of `path`: same directory,
+/// hidden dot-prefixed name carrying the process id and a process-scoped
+/// counter, so concurrent atomic writes on one store stay collision-free. The
+/// embedded destination name is BOUNDED ([`bounded_temp_trunk`]), so a
+/// destination at the manifest's legal maximum (255 bytes) still has a usable
+/// temp name.
+pub fn temp_name_for(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(temp_name_string(&name))
 }
 
 /// The unique temp FILE NAME for an atomic replace of a file named
 /// `file_name`: hidden dot-prefixed, carrying the process id and a
 /// process-scoped counter (the same naming as [`temp_name_for`], but for
-/// the descriptor-relative writers that need just the name). Unix-only
+/// the descriptor-relative writers that need just the name). The embedded
+/// name is bounded exactly as [`temp_name_for`] bounds it. Unix-only
 /// (the Windows `_fd` writers use the path-based replace's own temp
 /// naming).
 #[cfg(unix)]
 pub fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-    std::ffi::OsString::from(format!(
-        ".{}.tmp.{}.{}",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ))
+    std::ffi::OsString::from(temp_name_string(&file_name.to_string_lossy()))
 }
 
 /// Best-effort removal of a FAILED atomic replace's temp file.

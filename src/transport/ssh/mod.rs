@@ -134,6 +134,26 @@ const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
 const PERL_FSYNC_FILE: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_FILE";
 const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_DIR";
 
+/// THE TRUNCATION GUARD: refuse to PUBLISH a payload whose received byte count
+/// does not match the client's.
+///
+/// Every far-side payload script writes the client's stdin into a temp and then
+/// publishes it (`rename(2)` / `link(2)`). If the client→sshd connection is
+/// lost MID-PAYLOAD, sshd closes the remote stdin, the remote `cat` (or perl's
+/// `do { local $/; <STDIN> }`) reads a CLEAN EOF and succeeds with FEWER bytes,
+/// and the script happily publishes the truncated temp — the previous content
+/// is gone and the caller's generic "stdin write: Broken pipe" does not disclose
+/// the mutation. The client therefore passes the exact payload length as an
+/// argv token, and this check runs BETWEEN the write and the publish:
+///
+/// `perl -e '<this>' -- <tmp> <expected_bytes>` exits 0 only when the temp holds
+/// exactly that many bytes; otherwise it prints a `store-sync:` error to stderr
+/// (which the caller surfaces) and exits nonzero, so the surrounding script
+/// removes the temp and never publishes it. `-s` is the byte size of a regular
+/// file and is portable across GNU and BSD userlands; perl is already required
+/// on the far side for the fsync helpers.
+const PERL_VERIFY_LEN: &str = "my $n = -s $ARGV[0]; if (!defined $n || $n != $ARGV[1]) { print STDERR \"store-sync: remote payload truncated: \", $ARGV[0], \" holds \", (defined $n ? $n : \"?\"), \" bytes, expected $ARGV[1]; refusing to publish\\n\"; exit 1; } exit 0; # STORE_SYNC_TEST_VERIFY_LEN";
+
 /// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
 /// `crate::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
 /// → wait `interval.min(remaining)`; `EINTR` → retry immediately; any other
@@ -446,8 +466,33 @@ impl SshTransport {
     /// file, the pinned file, or the configured fingerprint before the pin
     /// resolves), and every caller-supplied ssh option (which may carry
     /// `IdentityFile`, `CertificateFile`, `HostKeyAlgorithms`, or
-    /// `ProxyJump`). Identical material derives the same socket and DOES
-    /// multiplex.
+    /// `ProxyJump`).
+    ///
+    /// It also carries the AMBIENT AUTHENTICATION ENVIRONMENT. With no
+    /// `identity_file` the marker `identity=<ambient>` alone collapses every
+    /// ambient environment to ONE key, so two transports that differ only in
+    /// `HOME` or `SSH_AUTH_SOCK` would share a master — and the second would
+    /// inherit the first's authenticated session, skipping its own host-key
+    /// check and key selection. That is exactly the "ambient `~/.ssh/config` /
+    /// agent key" class the keying exists to close. The material therefore
+    /// carries `HOME` and `SSH_AUTH_SOCK`, the two variables OpenSSH consults
+    /// for authentication and host verification: `HOME` locates
+    /// `~/.ssh/config` (which can set `IdentityFile`, `CertificateFile`,
+    /// `HostKeyAlgorithms`, `ProxyCommand`, `ProxyJump`, `CanonicalDomains`,
+    /// ...), `~/.ssh/known_hosts`, and the default identities, and
+    /// `SSH_AUTH_SOCK` selects the agent that supplies keys.
+    ///
+    /// The crate passes its WHOLE environment snapshot to `ssh`, but no other
+    /// variable in it changes authentication or host verification:
+    /// `BatchMode=yes` is fixed by the crate's own options (and the crate's
+    /// options precede any caller option, so OpenSSH's first-obtained-value
+    /// rule keeps it), hence askpass is never consulted;
+    /// `PreferredAuthentications=publickey` excludes GSSAPI; and the login
+    /// user is carried in the TARGET. An input genuinely NOT covered is the
+    /// passwd-entry home directory `ssh` falls back to when `HOME` is unset —
+    /// the crate cannot observe the OS's resolution.
+    ///
+    /// Identical material derives the same socket and DOES multiplex.
     fn mux_identity_material(&self, pinned: Option<&Path>) -> String {
         let host_identity = match (&self.known_hosts, pinned) {
             (Some(known_hosts), _) => format!("known_hosts={}", known_hosts.display()),
@@ -463,14 +508,29 @@ impl SshTransport {
             Some(path) => format!("identity={}", path.display()),
             None => "identity=<ambient>".to_string(),
         };
+        // The ambient inputs OpenSSH reads for authentication / host
+        // verification (see the doc above). Rendered as `<unset>` when absent
+        // so a missing variable is a DISTINCT key from an empty one.
+        let env_value = |key: &str| {
+            self.env
+                .get(key)
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<unset>".to_string())
+        };
+        let ambient = format!(
+            "HOME={}|SSH_AUTH_SOCK={}",
+            env_value("HOME"),
+            env_value("SSH_AUTH_SOCK"),
+        );
         format!(
-            "target={}:{}|{}|{}|fingerprint={}|options={}",
+            "target={}:{}|{}|{}|fingerprint={}|options={}|ambient={}",
             self.target,
             self.port,
             user_identity,
             host_identity,
             self.host_key_fingerprint.as_deref().unwrap_or(""),
             self.ssh_options.join("\u{1f}"),
+            ambient,
         )
     }
 
@@ -495,8 +555,8 @@ impl SshTransport {
             // ONE persistent master connection per user@host:port AND
             // IDENTITY, so the multi-round-trip handshake (banner, key
             // exchange, auth, session) is paid once per push instead of once
-            // per operation. The socket name is a short FNV hash of the
-            // connection identity (Unix domain socket paths are
+            // per operation. The socket name is a full-strength SHA-256 hash of
+            // the connection identity (Unix domain socket paths are
             // length-limited); keying on the identity is what keeps a reused
             // master from bypassing a DIFFERENT transport's host-key check or
             // `-i` key. The master daemonizes into its own process group, so
@@ -582,10 +642,19 @@ impl SshTransport {
     /// stdout/stderr/status. The command is passed as one `ssh` argument after
     /// `--`, so OpenSSH cannot interpret any part of our data as options or as
     /// the connection target. Runs through the shared bounded runner: once
-    /// connected, a remote command that hangs is killed after
-    /// `SSH_COMMAND_TIMEOUT_SECS`, and the call returns within that deadline
-    /// PLUS the additive termination/drain tail (~2.2 s; see
-    /// [`SshRunner::run`]) — bounded, but not at the deadline exactly.
+    /// connected, a remote command that hangs makes the call return after
+    /// `SSH_COMMAND_TIMEOUT_SECS` PLUS the additive termination/drain tail
+    /// (~2.2 s; see [`SshRunner::run`]) — bounded, but not at the deadline
+    /// exactly.
+    ///
+    /// WHO is killed is the LOCAL `ssh` client (its whole process group). The
+    /// far-side command is NOT killed by this: the remote has no obligation to
+    /// terminate when the connection drops, and baseline OpenSSH does not ask
+    /// it to. Measured on both GNU/Linux and macOS far sides, a remote
+    /// `sleep 303` started through `exec(["sleep", "303"], 2s)` is reparented to
+    /// init and KEEPS RUNNING after the local client is killed. The deadline
+    /// therefore bounds the CALLER, never the remote work; a far-side command
+    /// whose effects must stop needs its own bound.
     pub(crate) fn run_remote(&self, command: &str) -> Result<std::process::Output> {
         self.run_remote_op(OpKind::Remote, command)
     }
@@ -812,7 +881,22 @@ impl SshTransport {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "object".to_string());
-        let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
+        // The temp name is BOUNDED regardless of the destination basename's
+        // length: the manifest permits a name up to `NAME_MAX`, and a fixed
+        // `.{basename}.tmp.XXXXXX` adds 12 bytes and made a 244-byte name
+        // overflow (`mktemp: ... File name too long`).
+        // [`crate::atomic::bounded_temp_trunk`] keeps the basename verbatim
+        // while it fits and falls back to a truncated prefix plus a hash for
+        // long names; `mktemp`'s `XXXXXX` still allocates a UNIQUE name, so
+        // concurrent runs cannot collide (a fixed name could).
+        let tmp_suffix = ".tmp.XXXXXX";
+        let tmp_trunk = crate::atomic::bounded_temp_trunk(&basename, tmp_suffix);
+        let tmp_template = format!(
+            "{}/.{}{}",
+            parent.trim_end_matches('/'),
+            tmp_trunk,
+            tmp_suffix
+        );
         // The final mode is applied to the TEMP before the rename (the same
         // ordering `write_new_cmd` uses), so the published inode carries the
         // caller's mode, never the remote umask. A `mode` of 0 keeps the
@@ -822,10 +906,17 @@ impl SshTransport {
         } else {
             String::new()
         };
+        // The received length is checked BETWEEN the stdin write and the
+        // publish (see [`PERL_VERIFY_LEN`]): a mid-transfer connection loss
+        // makes the remote `cat` see a clean, short EOF, so without this guard
+        // the script would rename a TRUNCATED temp over the previous content.
+        // The length is an argv token (a number), never the payload itself.
         let script = format!(
-            "mkdir -p -- {parent} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && {chmod}perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e 'exit 0 if rename($ARGV[0], $ARGV[1]); exit 1' \"$tmp\" {p}; rc=$?; if [ \"$rc\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e '{fsync_dir}' -- {parent}; dirc=$?; if [ \"$dirc\" -ne 0 ]; then exit {post_rename}; fi; exit 0",
+            "mkdir -p -- {parent} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && perl -e '{verify_len}' -- \"$tmp\" {len} && {chmod}perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e 'exit 0 if rename($ARGV[0], $ARGV[1]); exit 1' \"$tmp\" {p}; rc=$?; if [ \"$rc\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e '{fsync_dir}' -- {parent}; dirc=$?; if [ \"$dirc\" -ne 0 ]; then exit {post_rename}; fi; exit 0",
             parent = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
+            verify_len = PERL_VERIFY_LEN,
+            len = data.len(),
             chmod = chmod_step,
             p = shell_quote(&remote_path_str),
             fsync_file = PERL_FSYNC_FILE,
@@ -1174,8 +1265,12 @@ impl SshTransport {
     // ([`PERL_FSYNC_FILE`] / [`PERL_FSYNC_DIR`]) because `sync <path>` is
     // GNU-only and a silent no-op on BSD/macOS. The payload write is a
     // bare `cat > "$tmp"`: `cat` is POSIX, reads stdin to EOF, and the
-    // redirect opens the temp — no quoting of data anywhere.
-    fn write_new_cmd(root: &Path, rel: &Path, mode: u32) -> String {
+    // redirect opens the temp — no quoting of data anywhere. `expected_len` is
+    // the client's exact payload length; the remote verifies it
+    // ([`PERL_VERIFY_LEN`]) BEFORE the publish, so a mid-transfer connection
+    // loss that makes `cat` see a clean, short EOF can never `link(2)` a
+    // truncated record into an immutable slot.
+    fn write_new_cmd(root: &Path, rel: &Path, mode: u32, expected_len: u64) -> String {
         let remote_path = root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         let parent = Path::new(&remote_path_str)
@@ -1206,8 +1301,18 @@ impl SshTransport {
         // managed remote root whenever the destination's parent IS the
         // deployment root. The `XXXXXX` suffix is the mktemp template; it
         // must survive shell quoting verbatim (single quotes are fine) so GNU
-        // and BSD mktemp both accept it.
-        let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
+        // and BSD mktemp both accept it. The embedded basename is BOUNDED
+        // ([`crate::atomic::bounded_temp_trunk`]), so a destination name at
+        // the manifest's `NAME_MAX` (255 bytes) still has a usable temp; the
+        // `XXXXXX` keeps the name unique across concurrent runs.
+        let tmp_suffix = ".tmp.XXXXXX";
+        let tmp_trunk = crate::atomic::bounded_temp_trunk(&basename, tmp_suffix);
+        let tmp_template = format!(
+            "{}/.{}{}",
+            parent.trim_end_matches('/'),
+            tmp_trunk,
+            tmp_suffix
+        );
         let mode_str = format!("{:o}", mode & 0o7777);
         // The publish step: perl's raw `link(2)` (perl ships with every
         // reasonable remote — the same interpreter the framed `lstat` helper
@@ -1220,9 +1325,11 @@ impl SshTransport {
         // identical to the reserved [`SSH_TWRITE_CONFLICT_EXIT`]; any other
         // link failure is the pre-install exit (a real publish error).
         format!(
-            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then perl -e '{fsync_dir}' -- {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && perl -e '{verify_len}' -- \"$tmp\" {len} && chmod {mode} \"$tmp\" && perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then perl -e '{fsync_dir}' -- {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
             p = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
+            verify_len = PERL_VERIFY_LEN,
+            len = expected_len,
             mode = mode_str,
             d = shell_quote(&remote_path_str),
             conflict = SSH_TWRITE_CONFLICT_EXIT,
@@ -1253,7 +1360,11 @@ impl SshTransport {
     /// the descriptor, so the flock is still held (the `sync` is durability,
     /// not mutual exclusion, but keeping it inside avoids releasing the lock
     /// before the directory entry is durable).
-    fn try_write_new_sidecar_cmd(&self, rel: &Path, mode: u32) -> String {
+    /// `expected_len` is the client's exact payload length; the perl helper
+    /// verifies `length($data)` against it BEFORE creating the temp, so a
+    /// mid-transfer connection loss (a clean, short EOF on stdin) can never
+    /// `link(2)` a truncated record into the lock slot.
+    fn try_write_new_sidecar_cmd(&self, rel: &Path, mode: u32, expected_len: u64) -> String {
         let sidecar = self
             .root
             .join(&self.layout.lock_sidecar)
@@ -1272,11 +1383,12 @@ impl SshTransport {
         let prelude =
             sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
         format!(
-            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; {prelude} binmode STDIN; my $data = do {{ local $/; <STDIN> }}; my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode}",
+            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; {prelude} binmode STDIN; my $data = do {{ local $/; <STDIN> }}; if (length($data) != $ARGV[3]) {{ print STDERR \"store-sync: sidecar payload truncated: received \", length($data), \" bytes, expected $ARGV[3]; refusing to publish\\n\"; exit {preinst}; }} my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode} {len}",
             parent = parent_q,
             sidecar = sidecar_q,
             lock = lock_q,
             mode = mode_q,
+            len = expected_len,
             conflict = SSH_TWRITE_CONFLICT_EXIT,
             preinst = SSH_TWRITE_PREINSTALL_EXIT,
             prelude = prelude,
@@ -1373,11 +1485,16 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "record".to_string());
         // The claim temp lives INSIDE the destination's parent directory and
-        // is dot-prefixed, exactly like write_new_cmd's temp.
+        // is dot-prefixed, exactly like write_new_cmd's temp. Its embedded
+        // basename is bounded the same way, so a 255-byte destination name is
+        // still claimable; `mktemp`'s `XXXXXX` keeps it unique.
+        let claim_suffix = ".claim.XXXXXX";
+        let claim_trunk = crate::atomic::bounded_temp_trunk(&basename, claim_suffix);
         let tmp_template = format!(
-            "{}/.{}.claim.XXXXXX",
+            "{}/.{}{}",
             parent.trim_end_matches('/'),
-            basename
+            claim_trunk,
+            claim_suffix
         );
         let expected_str = expected.to_string();
         format!(
@@ -1468,12 +1585,20 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// `verify_existing`), so the raw value changes no decision; the old
     /// `& 0o7777` here made the field silently different from the local view.
     fn meta_from_raw_mode(raw: u32) -> RemoteMeta {
-        let is_symlink = (raw & 0o170000) == 0o120000;
-        let is_dir = (raw & 0o170000) == 0o040000;
+        // Classify from `S_IFMT` exactly as the local view does
+        // (`LocalTransport::metadata` reports `std::fs::Metadata::is_file()`, a
+        // strict `S_IFREG` test). The old `!is_symlink && !is_dir` made the two
+        // transports DISAGREE for a fifo/socket/device: the SSH view called
+        // such an entry a FILE, the local view did not. `RemoteMeta` is public
+        // API, so the two views of one entry must agree.
+        let kind = raw & 0o170000;
+        let is_symlink = kind == 0o120000;
+        let is_dir = kind == 0o040000;
+        let is_file = kind == 0o100000;
         RemoteMeta {
             is_dir,
             is_symlink,
-            is_file: !is_symlink && !is_dir,
+            is_file,
             // The verify-open frame carries no size; content is compared
             // byte-exactly, so the field is unused there. The framed-lstat
             // parser (`parse_lstat_frame`) overwrites it with the REAL size
@@ -2222,10 +2347,18 @@ impl Remote for SshTransport {
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
+        // The payload length rides the command as an argv token so the far side
+        // can refuse to publish a short (connection-loss-truncated) payload.
+        let expected_len = data.len() as u64;
         let cmd = if rel.as_path() == self.layout.lock.as_path() {
-            self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE)
+            self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE, expected_len)
         } else {
-            Self::write_new_cmd(&self.root, rel.as_path(), IMMUTABLE_RECORD_MODE)
+            Self::write_new_cmd(
+                &self.root,
+                rel.as_path(),
+                IMMUTABLE_RECORD_MODE,
+                expected_len,
+            )
         };
         let argv = self.ssh_command_argv(&cmd)?;
         // The payload travels through the runner's STDIN — never through the
@@ -2634,6 +2767,46 @@ mod tests_ssh {
         assert_eq!(link.mode, 0o120755, "the RAW symlink mode is carried");
         assert_eq!(link.size, 3, "a symlink carries its own size");
         assert!(link.is_symlink && !link.is_file && !link.is_dir);
+    }
+
+    /// `RemoteMeta.is_file` must agree between the two transports for a
+    /// fifo/socket/device. Pre-fix the SSH classification was
+    /// `is_file = !is_symlink && !is_dir`, so an `S_IFIFO` entry reported
+    /// `is_file == true` over SSH while `LocalTransport::metadata` reported
+    /// false (the public-API inconsistency the reviewer verified against a real
+    /// sshd). Both now use a strict `S_IFREG` test.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_not_a_file_on_either_transport() {
+        for raw in [0o010644u32, 0o140755, 0o060644] {
+            let meta = SshTransport::meta_from_raw_mode(raw);
+            assert!(
+                !meta.is_file,
+                "raw mode {raw:o} is not a regular file: {meta:?}"
+            );
+            assert!(!meta.is_dir && !meta.is_symlink);
+            assert!(matches!(
+                SshTransport::kind_of(&meta),
+                crate::transport::NotRegularFileKind::Other
+            ));
+        }
+        // The LOCAL view of a real fifo must agree.
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let p = dir.path().join("pipe");
+        let c = std::ffi::CString::new(p.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let t = crate::transport::LocalTransport::new(
+            &test_env(),
+            dir.path().to_path_buf(),
+            Layout::empty(),
+        )
+        .unwrap();
+        let rooted = RootedRelativePath::parse(Path::new("pipe")).unwrap();
+        let local = Remote::metadata(&t, &rooted).unwrap();
+        assert!(
+            !local.is_file,
+            "the local view must not call a fifo a regular file: {local:?}"
+        );
     }
 
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.
@@ -3238,6 +3411,7 @@ mod tests_ssh {
             t.root(),
             Path::new("state/operation.lock"),
             IMMUTABLE_RECORD_MODE,
+            0,
         );
         assert!(
             cmd.starts_with("mkdir -p '/srv/app/state'"),
@@ -3448,6 +3622,76 @@ mod tests_ssh {
         );
     }
 
+    /// F4: the ControlMaster socket is keyed on the AMBIENT AUTHENTICATION
+    /// ENVIRONMENT. With `identity_file = None` the material used to write the
+    /// single marker `identity=<ambient>`, which collapsed EVERY ambient
+    /// environment to one key: two transports differing only in `HOME` (hence
+    /// `~/.ssh/config`, `~/.ssh/known_hosts`, default identities) or
+    /// `SSH_AUTH_SOCK` (the agent) derived the SAME `ControlPath`, so the second
+    /// reused the first's authenticated master and skipped its own host-key
+    /// check and key selection. Pre-fix every `assert_ne!` below failed because
+    /// all four paths were equal.
+    #[test]
+    fn the_control_socket_is_keyed_on_the_ambient_environment() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        fn env_with(pairs: &[(&str, &str)]) -> SysEnv {
+            let vars: BTreeMap<OsString, OsString> = pairs
+                .iter()
+                .map(|(k, v)| (OsString::from(*k), OsString::from(*v)))
+                .collect();
+            SysEnv::from_map(vars)
+        }
+        fn control_path(env: &SysEnv) -> String {
+            let t = SshTransport::new(
+                "deploy",
+                "db.example.com",
+                2222,
+                Path::new("/srv/app"),
+                Layout::empty(),
+                Some(Path::new("/dev/null")),
+                None,
+                Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+                env,
+                false,
+            )
+            .unwrap();
+            t.ssh_args()
+                .unwrap()
+                .into_iter()
+                .find(|arg| arg.starts_with("ControlPath="))
+                .expect("a ControlPath option")
+        }
+
+        let base = env_with(&[("HOME", "/home/a"), ("SSH_AUTH_SOCK", "/tmp/a.sock")]);
+        let other_home = env_with(&[("HOME", "/home/b"), ("SSH_AUTH_SOCK", "/tmp/a.sock")]);
+        let other_sock = env_with(&[("HOME", "/home/a"), ("SSH_AUTH_SOCK", "/tmp/b.sock")]);
+        let both = env_with(&[("HOME", "/home/b"), ("SSH_AUTH_SOCK", "/tmp/b.sock")]);
+
+        let base_path = control_path(&base);
+        assert_eq!(
+            control_path(&base),
+            base_path,
+            "two transports with identical ambient environments must share a socket"
+        );
+        assert_ne!(
+            base_path,
+            control_path(&other_home),
+            "a different HOME (config / known_hosts / default identities) must not share a master"
+        );
+        assert_ne!(
+            base_path,
+            control_path(&other_sock),
+            "a different SSH_AUTH_SOCK (agent keys) must not share a master"
+        );
+        assert_ne!(
+            base_path,
+            control_path(&both),
+            "a different HOME and SSH_AUTH_SOCK must not share a master"
+        );
+    }
+
     /// F1, BEHAVIOUR: the LITERAL `rename_cmd` runs under `sh` against a real
     /// root, and a symlink-to-directory destination is REPLACED IN PLACE. This
     /// replaces the old `rename_uses_no_target_directory_flag`, which asserted
@@ -3586,6 +3830,7 @@ mod tests_ssh {
             t.root(),
             Path::new("state/operation.lock"),
             IMMUTABLE_RECORD_MODE,
+            0,
         );
         assert!(
             cmd.contains("mktemp '/srv/app/state/.operation.lock.tmp.XXXXXX'"),
@@ -3611,7 +3856,8 @@ mod tests_ssh {
     #[test]
     fn try_write_new_temp_stays_inside_root_for_root_level_dest() {
         let t = transport();
-        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("files"), IMMUTABLE_RECORD_MODE);
+        let cmd =
+            SshTransport::write_new_cmd(t.root(), Path::new("files"), IMMUTABLE_RECORD_MODE, 0);
         assert!(
             cmd.contains("mktemp '/srv/app/.files.tmp.XXXXXX'"),
             "temp for a root-level destination must stay inside the root, got: {cmd}"
@@ -3625,8 +3871,11 @@ mod tests_ssh {
     #[test]
     fn try_write_new_sidecar_is_perl_native_and_holds_flock() {
         let tr = transport();
-        let cmd =
-            tr.try_write_new_sidecar_cmd(Path::new("state/operation.lock"), IMMUTABLE_RECORD_MODE);
+        let cmd = tr.try_write_new_sidecar_cmd(
+            Path::new("state/operation.lock"),
+            IMMUTABLE_RECORD_MODE,
+            0,
+        );
         assert!(
             !cmd.contains("exec"),
             "the sidecar flock must survive to process exit: the perl must not exec"
@@ -3666,6 +3915,7 @@ mod tests_ssh {
             tr.root(),
             Path::new("state/other.json"),
             IMMUTABLE_RECORD_MODE,
+            0,
         );
         assert!(
             !ordinary.contains("operation.lock.mutex"),
@@ -3776,8 +4026,11 @@ mod tests_ssh {
             "new",
         );
         let tr = transport();
-        let create =
-            tr.try_write_new_sidecar_cmd(Path::new("state/operation.lock"), IMMUTABLE_RECORD_MODE);
+        let create = tr.try_write_new_sidecar_cmd(
+            Path::new("state/operation.lock"),
+            IMMUTABLE_RECORD_MODE,
+            0,
+        );
         for (name, cmd) in [
             ("remove", remove),
             ("recover", recover),
@@ -3811,8 +4064,11 @@ mod tests_ssh {
         }
         // The tmp-name O_EXCL allocation loop in create-new is still present.
         let tr2 = transport();
-        let create2 =
-            tr2.try_write_new_sidecar_cmd(Path::new("state/operation.lock"), IMMUTABLE_RECORD_MODE);
+        let create2 = tr2.try_write_new_sidecar_cmd(
+            Path::new("state/operation.lock"),
+            IMMUTABLE_RECORD_MODE,
+            0,
+        );
         assert!(
             create2.contains("sysopen($tfh"),
             "create-new must retain tmp sysopen loop"
@@ -4352,7 +4608,12 @@ mod tests_ssh {
             // the same destination with a different payload.
             let mut writers = Vec::new();
             for payload in &payloads {
-                let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+                let cmd = SshTransport::write_new_cmd(
+                    &root,
+                    rel,
+                    IMMUTABLE_RECORD_MODE,
+                    payload.len() as u64,
+                );
                 let payload = payload.clone();
                 writers.push(s.spawn(move || run_sh_stdin(&cmd, payload.as_bytes())));
             }
@@ -4422,7 +4683,7 @@ mod tests_ssh {
         let parent = dest.parent().unwrap();
 
         // First invocation: installs the record and cleans up its own temp.
-        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 5);
         let out1 = run_sh_stdin(&cmd1, b"gen-1");
         assert!(
             out1.status.success(),
@@ -4457,7 +4718,7 @@ mod tests_ssh {
 
         // Fresh invocation with a different payload: must fail (already
         // exists), leave dest and stale untouched, and clean up its own temp.
-        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 5);
         let out2 = run_sh_stdin(&cmd2, b"gen-2");
         assert_eq!(
             out2.status.code(),
@@ -4501,7 +4762,8 @@ mod tests_ssh {
     #[test]
     fn try_write_new_cmd_final_chmod_and_portable_fsyncs() {
         let t = transport();
-        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("state/operation.lock"), 0o640);
+        let cmd =
+            SshTransport::write_new_cmd(t.root(), Path::new("state/operation.lock"), 0o640, 0);
         // Step 3 (final chmod) BEFORE step 4 (file fsync) BEFORE step 5
         // (no-replace install) BEFORE step 7 (parent-dir fsync): the published
         // inode carries the caller's mode, never the remote umask, and the
@@ -4549,7 +4811,7 @@ mod tests_ssh {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd = SshTransport::write_new_cmd(&root, rel, 0o644);
+        let cmd = SshTransport::write_new_cmd(&root, rel, 0o644, 12);
         // `mktemp` under umask 077 creates the temp 0600; without the chmod
         // step the installed record would keep 0600. The final chmod must
         // make it 0644 before the install. The payload is piped on stdin,
@@ -4584,7 +4846,7 @@ mod tests_ssh {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 12);
         let fakebin = dir.path().join("fakebin");
         install_fake_perl(&fakebin, FSYNC_DIR_HOOK, 9);
         let out = run_sh_stdin(
@@ -4670,6 +4932,188 @@ mod tests_ssh {
         );
     }
 
+    /// F-1: a mid-transfer connection loss makes the remote `cat` see a CLEAN,
+    /// SHORT EOF (sshd closes the remote stdin; the write "succeeds" with fewer
+    /// bytes). The far side must REFUSE TO PUBLISH: the previous content stays
+    /// and the error names the truncation.
+    ///
+    /// The short read is SIMULATED here with a fake `cat` that consumes only 3
+    /// of the payload's bytes and exits 0 — exactly the clean, short EOF a lost
+    /// connection produces. The reviewer proved the REAL-connection case over
+    /// live sshds (killing the ControlMaster mid-128-MiB-write left a strict
+    /// prefix: 36,110,336 bytes on macOS/BSD, 196,608 on GNU/Linux, with the
+    /// OLD content gone). Pre-fix this test FAILED: the script renamed the
+    /// 3-byte temp over `state/f` and exited 0, so `OLD-CONTENT` was replaced.
+    #[test]
+    fn upload_refuses_to_publish_a_truncated_payload() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().join("remote");
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("state/f"), b"OLD-CONTENT").unwrap();
+        let fakebin = dir.path().join("fakebin");
+        // "ssh" runs the remote command locally; "cat" truncates the payload to
+        // 3 bytes and exits 0 (a clean short EOF).
+        crate::test_support::write_executable(
+            &fakebin.join("ssh"),
+            b"#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+        );
+        crate::test_support::write_executable(&fakebin.join("cat"), b"#!/bin/sh\nhead -c 3\n");
+        let env = SysEnv::from_map(std::collections::BTreeMap::from([
+            (
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from(format!("{}:/usr/bin:/bin", fakebin.display())),
+            ),
+            (
+                std::ffi::OsString::from("TMPDIR"),
+                std::ffi::OsString::from(dir.path().to_string_lossy().into_owned()),
+            ),
+        ]));
+        let runner = SshRunner::new(&env);
+        let t = SshTransport::with_runner(
+            "deploy",
+            "db.example.com",
+            2222,
+            &root,
+            Some(Path::new("/dev/null")),
+            None,
+            &dir.path().join("knownhosts-cache"),
+            &env,
+            runner,
+        )
+        .unwrap();
+        let err = t
+            .upload_bytes(Path::new("state/f"), b"NEW-PAYLOAD", 0o644)
+            .expect_err("a truncated payload must never be published");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("payload truncated"),
+            "the error must name the truncation, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("state/f")).unwrap(),
+            b"OLD-CONTENT".to_vec(),
+            "a truncated upload must leave the previous content intact"
+        );
+        let residues: Vec<String> = std::fs::read_dir(root.join("state"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "f")
+            .collect();
+        assert!(
+            residues.is_empty(),
+            "a refused upload must leave no temp behind, found {residues:?}"
+        );
+    }
+
+    /// F-1 (`try_write_new`): the SAME truncation on a FRESH immutable record.
+    /// The far side must refuse to publish and leave the slot FREE, so a re-run
+    /// still succeeds. Pre-fix the truncated record was `link(2)`-published and
+    /// the re-run returned `Conflict(ContentMismatch)` — the slot was
+    /// permanently poisoned.
+    #[test]
+    fn try_write_new_refuses_a_truncated_payload_and_leaves_the_slot_replaceable() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let rooted = RootedRelativePath::parse(rel).unwrap();
+        let fakebin = dir.path().join("fakebin");
+        crate::test_support::write_executable(
+            &fakebin.join("ssh"),
+            b"#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+        );
+        crate::test_support::write_executable(&fakebin.join("cat"), b"#!/bin/sh\nhead -c 3\n");
+        let env = SysEnv::from_map(std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from(format!("{}:/usr/bin:/bin", fakebin.display())),
+        )]));
+        let runner = SshRunner::new(&env);
+        let t = SshTransport::with_runner(
+            "deploy",
+            "db.example.com",
+            2222,
+            &root,
+            Some(Path::new("/dev/null")),
+            None,
+            &dir.path().join("knownhosts-cache"),
+            &env,
+            runner,
+        )
+        .unwrap();
+        let err = t
+            .try_write_new(&rooted, b"FULL-PAYLOAD")
+            .expect_err("a truncated immutable record must not be published");
+        assert!(
+            err.to_string().contains("payload truncated"),
+            "the error must name the truncation, got: {err}"
+        );
+        assert!(
+            !root.join(rel).exists(),
+            "the truncated record must not be published"
+        );
+        // The slot is FREE: restore a real `cat` and retry — it must succeed.
+        std::fs::remove_file(fakebin.join("cat")).unwrap();
+        let verdict = t
+            .try_write_new(&rooted, b"FULL-PAYLOAD")
+            .expect("the slot must still be replaceable after a refused truncation");
+        assert!(
+            matches!(verdict, CreateNewVerdict::Created),
+            "a retry after a refused truncation must create the record, got {verdict:?}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            b"FULL-PAYLOAD".to_vec()
+        );
+    }
+
+    /// F-1 (`try_write_new_sidecar_cmd`): the operation-lock path reads its
+    /// payload with perl's `do { local $/; <STDIN> }`, so a mid-transfer
+    /// connection loss yields a clean, short read too. The perl helper must
+    /// refuse BEFORE creating the temp, leaving the lock slot replaceable.
+    #[test]
+    fn sidecar_refuses_a_truncated_payload_and_leaves_the_slot_replaceable() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let dest = root.join(rel);
+        let t = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            &root,
+            Layout::empty(),
+            Some(Path::new("/dev/null")),
+            None,
+            &dir.path().join("knownhosts-cache"),
+            &test_env(),
+            false,
+        )
+        .unwrap();
+        let bad = t.try_write_new_sidecar_cmd(rel, IMMUTABLE_RECORD_MODE, 12);
+        let out = run_sh_stdin(&bad, b"abc");
+        assert!(
+            !out.status.success(),
+            "a truncated sidecar payload must fail, got {:?}",
+            out.status.code()
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("payload truncated"),
+            "the error must name the truncation, got: {stderr}"
+        );
+        assert!(
+            !dest.exists(),
+            "the truncated lock record must not be published"
+        );
+        let good = t.try_write_new_sidecar_cmd(rel, IMMUTABLE_RECORD_MODE, 12);
+        let out2 = run_sh_stdin(&good, b"FULL-PAYLOAD");
+        assert!(
+            out2.status.success(),
+            "the slot must remain replaceable after a refused truncation: {}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"FULL-PAYLOAD".to_vec());
+    }
+
     /// F3, FAIL-CLOSED: a failure of the FILE fsync (step 4) aborts BEFORE the
     /// publish — the command exits [`SSH_TWRITE_PREINSTALL_EXIT`] and NOTHING is
     /// installed, because the record's bytes were never made durable.
@@ -4682,7 +5126,7 @@ mod tests_ssh {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 12);
         let fakebin = dir.path().join("fakebin");
         install_fake_perl(&fakebin, FSYNC_FILE_HOOK, 9);
         let out = run_sh_stdin(
@@ -4731,14 +5175,14 @@ mod tests_ssh {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 5);
         let out1 = run_sh_stdin(&cmd1, b"gen-1");
         assert!(
             out1.status.success(),
             "first install failed: {}",
             String::from_utf8_lossy(&out1.stderr)
         );
-        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 5);
         let out2 = run_sh_stdin(&cmd2, b"gen-2");
         assert_eq!(
             out2.status.code(),
@@ -4811,7 +5255,7 @@ mod tests_ssh {
             let root = dir.path().to_path_buf();
             let rel = Path::new("state/op.json");
             let dest = root.join(rel);
-            let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+            let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE, 12);
             let fakebin = dir.path().join("fakebin");
             std::fs::create_dir_all(&fakebin).unwrap();
 

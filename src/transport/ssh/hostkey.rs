@@ -71,7 +71,7 @@ pub(crate) fn pin_known_hosts(
             cache_dir.display()
         ))
     })?;
-    let path = cache_dir.join(format!("knownhosts-{}.txt", simple_hash(target)));
+    let path = pin_file_path(&cache_dir, target, port);
 
     // Validate any existing cached file against the configured fingerprint
     // before reusing it: a changed key (or a locally pre-created file) is
@@ -204,6 +204,23 @@ pub(crate) fn key_matches_fingerprint(line: &str, expected: &str, env: &SysEnv) 
     fp_field == expected
 }
 
+/// The path of the managed known-hosts pin file for `target` on `port`.
+///
+/// The key is the PAIR `(target, port)`, never `target` alone. The pinned
+/// content is the key `ssh-keyscan -p <port>` returned, so two sshd instances
+/// reached at DIFFERENT ports on one host can serve DIFFERENT host keys (and
+/// different fingerprints). Keying on `user@host` alone made both ports share
+/// ONE pin file: each transport's fingerprint check would then discard and
+/// re-pin the other's file, and a pinned key could momentarily clash between
+/// ports. Including the port keeps each pinned content under its own key; the
+/// target stays in the key so two accounts never share a pin either.
+pub(crate) fn pin_file_path(cache_dir: &Path, target: &str, port: u16) -> PathBuf {
+    cache_dir.join(format!(
+        "knownhosts-{}.txt",
+        simple_hash(&format!("{target}:{port}"))
+    ))
+}
+
 /// Return true if any key line in `text` matches `expected` fingerprint.
 pub(crate) fn fingerprints_match(text: &str, expected: &str, env: &SysEnv) -> bool {
     text.lines().any(|line| {
@@ -212,19 +229,66 @@ pub(crate) fn fingerprints_match(text: &str, expected: &str, env: &SysEnv) -> bo
     })
 }
 
-/// Stable, filesystem-safe hash of a string for building temp-file names.
+/// Stable, filesystem-safe hash of a string for building temp-file names and
+/// identity cache keys.
+///
+/// This is full-strength SHA-256, not a 64-bit FNV-1a. The hash is a SECURITY
+/// boundary here: a collision between two distinct connection identities would
+/// make them derive the SAME `ControlPath`, and a reused ControlMaster skips
+/// the second connection's host-key check and key selection. At 64 bits a
+/// collision is merely unlikely; at 256 bits it is infeasible, and the cost is
+/// one SHA-256 over a short string once per connection.
 pub(crate) fn simple_hash(s: &str) -> String {
-    let mut h: u64 = 1469598103934665603; // FNV-1a offset basis
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    format!("{h:016x}")
+    crate::digest::sha256_bytes(s.as_bytes())
 }
 
 #[cfg(test)]
 mod tests_hostkey {
     use super::*;
+
+    /// The pin cache key includes the PORT: two ports on one host derive
+    /// different pin files (their `ssh-keyscan` content can differ), while an
+    /// identical (target, port) is stable so the pin is reused.
+    #[test]
+    fn pin_path_is_keyed_on_target_and_port() {
+        let dir = Path::new("/cache");
+        let a = pin_file_path(dir, "deploy@db.example.com", 22);
+        let b = pin_file_path(dir, "deploy@db.example.com", 2222);
+        assert_ne!(
+            a, b,
+            "two ports on one host must not share a pinned known-hosts file"
+        );
+        assert_eq!(
+            a,
+            pin_file_path(dir, "deploy@db.example.com", 22),
+            "an identical (target, port) must reuse the same pin file"
+        );
+        assert_ne!(
+            a,
+            pin_file_path(dir, "other@db.example.com", 22),
+            "two accounts must not share a pin file"
+        );
+        let name = a.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("knownhosts-") && name.ends_with(".txt"),
+            "got {name}"
+        );
+    }
+
+    /// The identity hash is full-strength SHA-256 (256 bits), not a 64-bit
+    /// FNV-1a: a ControlPath collision between two distinct identities would
+    /// let one reuse the other's authenticated master. Pinned against the
+    /// SHA-256 `abc` vector so a future "simplification" cannot quietly
+    /// weaken it.
+    #[test]
+    fn simple_hash_is_sha256() {
+        assert_eq!(
+            simple_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(simple_hash("abc").len(), 64);
+        assert_ne!(simple_hash("a"), simple_hash("b"));
+    }
 
     // Finding 1: the configured port is propagated to ssh-keyscan, and the
     // bare host is passed (not `user@address`).

@@ -1073,6 +1073,16 @@ struct RecordingRemote {
     dest_read_writer: Option<(String, usize, AfterWrite)>,
     /// Successful reads seen per destination path, for [`Self::dest_read_writer`].
     dest_read_counts: Mutex<BTreeMap<String, usize>>,
+    /// The BEFORE-READ window writer: IMMEDIATELY BEFORE the Nth (1-based)
+    /// `Remote::read` of the path named in `.0`, apply the `AfterWrite` to the
+    /// stored destination root. The append's destination read is the first read
+    /// of a file, so `.1 == 1` makes that read itself observe the mutation —
+    /// the exact window between the live-kind read and the byte read.
+    dest_read_before_writer: Option<(String, usize, AfterWrite)>,
+    /// Read ATTEMPTS seen per destination path, for
+    /// [`Self::dest_read_before_writer`] (kept separate from
+    /// [`Self::dest_read_counts`], which counts SUCCESSFUL reads).
+    dest_read_before_counts: Mutex<BTreeMap<String, usize>>,
     /// Successful `read` calls seen, so `pull_writer` and `source_writer` can
     /// target one by
     /// position.
@@ -1154,6 +1164,8 @@ impl RecordingRemote {
             source_writer: None,
             dest_read_writer: None,
             dest_read_counts: Mutex::new(BTreeMap::new()),
+            dest_read_before_writer: None,
+            dest_read_before_counts: Mutex::new(BTreeMap::new()),
             reads: AtomicUsize::new(0),
             fail_nth_read: None,
             mutate_after_failed_write: None,
@@ -1334,6 +1346,20 @@ impl Remote for RecordingRemote {
         let nth = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
         if self.fail_nth_read == Some(nth) {
             return Err(Error::transport(format!("injected read failure #{nth}")));
+        }
+        // The BEFORE-READ window writer: a concurrent deletion the append's own
+        // byte read then observes as an error (not as absent bytes). Counted
+        // separately from the after-read hook so the two can be armed together.
+        if let Some((path, target, action)) = &self.dest_read_before_writer {
+            let spelled = rel.as_path().to_string_lossy().into_owned();
+            if &spelled == path {
+                let mut counts = self.dest_read_before_counts.lock().unwrap();
+                let count = counts.entry(spelled).or_insert(0);
+                *count += 1;
+                if *count == *target {
+                    action.apply(self.inner.root());
+                }
+            }
         }
         let bytes = self.inner.read(rel)?;
         // After the Nth successful source read, run the pull-writer hook against
@@ -4743,6 +4769,115 @@ fn an_append_whose_target_is_deleted_during_the_compare_creates_it() {
     assert!(
         report.conflicts.is_empty(),
         "a deleted-then-recreated append must not conflict: {report:?}"
+    );
+    assert_report_lists_disjoint(&report);
+}
+
+/// F3: a concurrent DELETION between the LIVE-KIND read and the BYTE read.
+/// The writer unlinks `f` IMMEDIATELY BEFORE the append's own `Remote::read` of
+/// `f` (the first read of that path), so the read itself fails with ENOENT.
+/// The documented contract is the SAME one the compare's re-read follows: an
+/// entry that has become ABSENT is a MISMATCH, never an error — the retry
+/// re-reads, sees the live kind is `None`, takes the absent-destination branch,
+/// CREATES `f = "a\nb\n"`, and reports it applied.
+///
+/// Pre-fix the append's first read was `Some(EntryKind::File) =>
+/// self.dest.read(rel)?`, which propagated the missing file as a hard error:
+/// `Err(Transport("read f: store error: openat f: No such file or directory
+/// (os error 2)"))` with `f` in NONE of the report lists. The neighbouring
+/// `an_append_whose_target_is_deleted_during_the_compare_creates_it` pins the
+/// compare's re-read window; this pins the FIRST read.
+#[test]
+fn an_append_whose_target_is_deleted_before_the_byte_read_is_created() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // The destination is `a\n`; our append carries `a\nb\n` (a prefix). The
+    // writer DELETES `f` immediately before the append's own byte read, so the
+    // read observes ENOENT rather than the bytes.
+    write(&src.join("f"), b"a\nb\n");
+    write(&dst.join("f"), b"a\n");
+
+    let mut remote = RecordingRemote::over(transport(&dst), true);
+    // The append's destination read is the FIRST `Remote::read` of `f` (a
+    // LOCAL remote's manifest is canonicalized in-process and never reads
+    // through the transport); the live-kind probe uses `metadata`, not `read`,
+    // so this fires in the exact window between the kind and the bytes.
+    remote.dest_read_before_writer =
+        Some(("f".to_string(), 1, AfterWrite::Delete("f".to_string())));
+    let policy = |path: &str, _: EntryKind| {
+        if path == "f" {
+            EntryPolicy::AppendTail
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let report = sync(Direction::Push, &src, &remote, &policy, Keep)
+        .expect("an append target deleted before the byte read is a mismatch, never an error");
+
+    assert_eq!(
+        read(&dst.join("f")),
+        b"a\nb\n",
+        "the retry must create the source bytes at the deleted target: {report:?}"
+    );
+    assert!(
+        report.applied.contains(&"f".to_string()),
+        "the created append target is applied: {report:?}"
+    );
+    assert!(
+        report.conflicts.is_empty(),
+        "a deleted-then-recreated append must not conflict: {report:?}"
+    );
+    assert_report_lists_disjoint(&report);
+}
+
+/// F3 (the adjacent window): a concurrent DELETION between the append's byte
+/// read and the `append_settle_mode` kind re-read. Here NO byte write is due
+/// (the source `a\n` is a PREFIX of the destination `a\nb\n`), so the settle
+/// path runs — and the destination vanished in the window.
+///
+/// Pre-fix `append_settle_mode` mapped the vanished entry (`kind_opt` is
+/// `None`) to an `AppendNotAFile` CONFLICT, discarding the source: the very
+/// same absence the first read now reports as a mismatch was treated as a
+/// non-file kind. After the fix absence is `AppendAttempt::Changed`, so the
+/// retry takes the absent-destination branch and creates the source bytes.
+#[test]
+fn an_append_settle_whose_target_is_deleted_after_the_byte_read_is_created() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // The source `a\n` is a PREFIX of the destination `a\nb\n`, so the append
+    // rule writes NO bytes and settles through `append_settle_mode`.
+    write(&src.join("f"), b"a\n");
+    write(&dst.join("f"), b"a\nb\n");
+
+    let mut remote = RecordingRemote::over(transport(&dst), true);
+    // After the append's byte read lands, the writer deletes `f`, so the settle
+    // path's kind re-read sees the entry GONE.
+    remote.dest_read_writer = Some(("f".to_string(), 1, AfterWrite::Delete("f".to_string())));
+    let policy = |path: &str, _: EntryKind| {
+        if path == "f" {
+            EntryPolicy::AppendTail
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let report = sync(Direction::Push, &src, &remote, &policy, Keep)
+        .expect("a settled append target deleted in the window is a mismatch, never an error");
+
+    assert!(
+        report.conflicts.is_empty(),
+        "a deleted-then-recreated settle must not conflict (pre-fix it maps the absent entry to \
+         AppendNotAFile and discards the source): {report:?}"
+    );
+    assert!(
+        report.applied.contains(&"f".to_string()),
+        "the created append target is applied: {report:?}"
+    );
+    assert_eq!(
+        read(&dst.join("f")),
+        b"a\n",
+        "the retry must create the source bytes at the deleted target: {report:?}"
     );
     assert_report_lists_disjoint(&report);
 }

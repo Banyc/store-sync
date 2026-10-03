@@ -1287,13 +1287,18 @@ pub struct SyncReport {
     ///
     /// **The crate's OWN stale temp is NOT residue.** A replace that fails in
     /// place leaves no temp, but a temp a CRASHED writer left behind is a
-    /// dot-prefixed `.name.tmp.<pid>.<n>` entry whose name is public through
-    /// [`crate::atomic::temp_name_for`]. That spelling is NOT reserved, so the
-    /// entry is reported as [`SyncReport::extraneous`] — and [`Extraneous::Keep`],
-    /// the default, leaves it in place forever. It holds no original entry, so
-    /// recovery is a plain removal of each `extraneous` path whose last
-    /// component matches the temp pattern; a caller that owns the destination
-    /// and wants the tree clean should sweep that pattern after a crashed run.
+    /// dot-prefixed entry whose name ends `.tmp.<pid>.<n>` and whose trunk is
+    /// the destination's own name — or, when that name leaves no room under
+    /// `NAME_MAX`, a byte-truncated prefix of it plus the SHA-256 of the FULL
+    /// name (see [`crate::atomic::bounded_temp_trunk`], the one spelling
+    /// authority, public through [`crate::atomic::temp_name_for`] and
+    /// [`crate::atomic::temp_file_name`]). That spelling is NOT reserved, so
+    /// the entry is reported as [`SyncReport::extraneous`] — and
+    /// [`Extraneous::Keep`], the default, leaves it in place forever. It holds
+    /// no original entry, so recovery is a plain removal of each `extraneous`
+    /// path whose last component matches the temp pattern (dot-prefixed and
+    /// containing `.tmp.`); a caller that owns the destination and wants the
+    /// tree clean should sweep that pattern after a crashed run.
     ///
     /// Reserved residue is
     /// stripped from the destination manifest BEFORE the diff, so it is NEVER
@@ -5007,7 +5012,27 @@ impl Applier<'_, '_> {
                 let source_bytes = self.source.read(rel)?;
                 return self.append_write(entry, rel, dest_kind, None, &source_bytes, expected);
             }
-            Some(EntryKind::File) => self.dest.read(rel)?,
+            // The live kind said FILE a moment ago, but the entry can VANISH
+            // between that read and this one. A failed read is NOT itself the
+            // absence signal — both transports wrap ENOENT as a `Transport`
+            // error, so no production `read` returns `Error::NotFound`. The
+            // AUTHORITATIVE signal is the live KIND: when the entry is GONE
+            // the destination the kind read observed is now ABSENT, which the
+            // documented contract calls a MISMATCH, never an error — the
+            // append loop re-reads, sees `None`, and takes the
+            // absent-destination branch (create). When the entry is still
+            // there the failure is about the LIVE entry (a directory, a
+            // symlink, a permission problem) and propagates unchanged. This is
+            // the same rule [`Side::write_file_if_match`] applies to the
+            // compare's re-read.
+            Some(EntryKind::File) => match self.dest.read(rel) {
+                Ok(bytes) => bytes,
+                Err(error) => match self.dest.kind_opt(rel) {
+                    Ok(None) => return Ok(AppendAttempt::Changed),
+                    Ok(Some(_)) => return Err(error),
+                    Err(_) => return Err(error),
+                },
+            },
             Some(_) => {
                 // A source FILE over a destination DIRECTORY is `AppendNotAFile`.
                 // The conflict itself forbids destruction of the directory (its
@@ -5027,9 +5052,10 @@ impl Applier<'_, '_> {
         let source_bytes = self.source.read(rel)?;
         if dest_bytes == source_bytes {
             // Identical bytes: the append-only rule writes nothing. A differing
-            // mode is still applied — the rule constrains BYTES, not modes.
-            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)?;
-            Ok(AppendAttempt::Done)
+            // mode is still applied — the rule constrains BYTES, not modes. A
+            // destination that VANISHED under the settle is a mismatch, which
+            // the settle reports as [`AppendAttempt::Changed`].
+            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)
         } else if source_bytes.starts_with(&dest_bytes) {
             // The destination is a prefix: write the whole source through the
             // durable compare-and-replace primitive (same observable result as
@@ -5045,9 +5071,10 @@ impl Applier<'_, '_> {
             )
         } else if dest_bytes.starts_with(&source_bytes) {
             // The source is a prefix: append-only writes NO BYTES, but a
-            // differing mode is still applied.
-            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)?;
-            Ok(AppendAttempt::Done)
+            // differing mode is still applied. A destination that VANISHED
+            // under the settle is a mismatch, which the settle reports as
+            // [`AppendAttempt::Changed`].
+            self.append_settle_mode(entry, dest_entry, rel, &dest_bytes)
         } else {
             self.conflict(
                 &entry.path,
@@ -5073,24 +5100,32 @@ impl Applier<'_, '_> {
         dest_entry: Option<&TreeEntry>,
         rel: &RootedRelativePath,
         observed_bytes: &[u8],
-    ) -> Result<()> {
+    ) -> Result<AppendAttempt> {
         let mode = parse_mode(&entry.mode)?;
         let Some(dest) = dest_entry else {
             self.outcomes.insert(entry.path.clone(), Outcome::Skipped);
-            return Ok(());
+            return Ok(AppendAttempt::Done);
         };
         // Re-establish the LIVE kind after the byte read: the append rule
         // constrains a LIVE regular FILE, and applying a file mode to a live
         // directory is the stale-kind class. A non-file live kind is refused and
-        // named, never chmodded.
-        if self.dest.kind_opt(rel)? != Some(EntryKind::File) {
-            self.conflict(
-                &entry.path,
-                EntryKind::File,
-                EntryPolicy::AppendTail,
-                ConflictReason::AppendNotAFile,
-            );
-            return Ok(());
+        // named, never chmodded. An entry that is now ABSENT is NOT a non-file
+        // kind, though — it is the SAME vanishing-destination window the byte
+        // read above closes, so it is a MISMATCH ([`AppendAttempt::Changed`])
+        // and the caller re-reads and recreates it, never an `AppendNotAFile`
+        // conflict that discards the source.
+        match self.dest.kind_opt(rel)? {
+            Some(EntryKind::File) => {}
+            Some(_) => {
+                self.conflict(
+                    &entry.path,
+                    EntryKind::File,
+                    EntryPolicy::AppendTail,
+                    ConflictReason::AppendNotAFile,
+                );
+                return Ok(AppendAttempt::Done);
+            }
+            None => return Ok(AppendAttempt::Changed),
         }
         // The decision uses the file's CURRENT mode, not the (possibly stale)
         // manifest value.
@@ -5100,7 +5135,7 @@ impl Applier<'_, '_> {
             .unwrap_or(parse_mode(&dest.mode)?);
         if current == mode {
             self.outcomes.insert(entry.path.clone(), Outcome::Skipped);
-            return Ok(());
+            return Ok(AppendAttempt::Done);
         }
         self.journal
             .note_first_touch(&entry.path, EntryKind::File, Some(current));
@@ -5121,7 +5156,7 @@ impl Applier<'_, '_> {
                     kind: EntryKind::File,
                     expected_sha256: crate::digest::sha256_bytes(observed_bytes),
                 });
-                Ok(())
+                Ok(AppendAttempt::Done)
             }
             Err(error) => Err(error),
         }
