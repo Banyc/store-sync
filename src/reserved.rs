@@ -241,8 +241,10 @@ pub fn is_residue_path(path: &str) -> bool {
 
 /// Whether `name` is a LOCK-RECORD spelling: the application lock record
 /// ([`APPLICATION_LOCK_NAME`]) or the sibling record spelling
-/// [`is_reserved_name`] recognises (`.<name>.operation.lock`), in byte-exact or
-/// case-ALIAS form.
+/// [`is_reserved_name`] recognises (`.<name>.operation.lock`), in byte-exact,
+/// case-ALIAS, or trailing-dot/space ALIAS form (the last two are the same
+/// entry on a filesystem that folds case or ignores a trailing dot/space —
+/// Win32 does the latter on a short absolute drive path).
 ///
 /// Every name-mutating primitive of the [`crate::atomic`] SUBSTRATE consults
 /// this spelling through the ONE guard authority (`atomic::guard`), which
@@ -259,7 +261,7 @@ pub fn is_residue_path(path: &str) -> bool {
 /// [`crate::atomic::symlink_fd`], and [`crate::atomic::renameat_paths`] —
 /// which additionally refuses a source SUBTREE containing a record) must
 /// first mint the unforgeable [`crate::atomic::GuardedRel`] capability, whose
-/// only constructor runs the guard; the low-level single-name syscall
+/// constructors run the guard; the low-level single-name syscall
 /// wrappers guard the final name at the primitive. The record's STABLE INODE
 /// is what makes two simultaneous holders impossible, so removing, replacing,
 /// renaming, or truncating the record through the substrate would admit a
@@ -274,25 +276,41 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   ([`crate::transport::Remote::remove_file_if`], and `durable_create_new`)
 ///   compare-and-deletes / re-creates the in-root lock, serialized through the
 ///   sidecar flock. Those operations MAKE and BREAK locks by design; guarding
-///   them would break the protocol, not protect it.
+///   them would break the protocol, not protect it. The protocol's reach is
+///   bounded to the ONE record the layout OWNS: the transport's `*_if`
+///   primitives mint [`crate::atomic::GuardedRel`] through
+///   [`crate::atomic::GuardedRel::new_for_owned_lock_record`], which refuses
+///   every lock-record spelling other than `Layout::lock` (byte-exact, case
+///   alias, trailing dot/space alias, or interior component), so a bare
+///   `operation.lock`, a nested `snapshots/.001.operation.lock`, or any other
+///   spelling can no longer be claimed away.
 /// * the PATH-BASED helpers the manifest/retention machinery uses take an
 ///   ordinary path. `set_private`, `ensure_private_dir`,
-///   `ensure_private_dir_durable`, and the PATH-BASED `write_atomic_replace`
-///   now consult the guard too; the remaining unguarded `std::fs` mutations
-///   are the local transport's crate-INTERNAL staged-publish
-///   rename/remove/create on its own temp/swap names, the destination-root
-///   `create_dir_all`, and the ssh hostkey cache — none of which a caller can
-///   steer to the record's spelling. `copy_dir_recursive` (test-only) is a
-///   path-based copy. The lock's assumption section already states that a
-///   caller acting outside the substrate (a foreign process, a raw `std::fs`
-///   call the caller writes itself) is not stopped.
+///   `ensure_private_dir_durable`, the PATH-BASED `write_atomic_replace`, and
+///   the descriptor-relative `set_private_fd` now consult the guard too; the
+///   remaining unguarded `std::fs` mutations are the local transport's
+///   crate-INTERNAL staged-publish rename/remove/create on its own temp/swap
+///   names, the destination-root `create_dir_all`, and the ssh hostkey cache
+///   — none of which a caller can steer to the record's spelling.
+///   `copy_dir_recursive` is `#[cfg(test)]` on BOTH ports
+///   (`src/atomic/unix.rs` and `src/atomic/windows.rs`), so it is a
+///   test-only path-based copy and never reaches a production build on any
+///   platform — the residual does not list it as a production hole. The
+///   lock's assumption section already states that a caller acting outside
+///   the substrate (a foreign process, a raw `std::fs` call the caller writes
+///   itself) is not stopped.
 /// * a foreign process, or a developer writing a brand-new direct `libc::`
 ///   mutation OUTSIDE the funnel module, is not stopped by the type system.
-///   The crate carries a source audit
-///   (`atomic::tests::no_raw_name_mutating_syscall_outside_the_funnel`) that
-///   fails when such a raw mutation appears outside `src/atomic/unix.rs`, and
-///   the funnel wrappers themselves are private, so the "obvious way" to add
-///   a mutation cannot bypass the guard.
+///   The crate carries two source audits
+///   (`atomic::guard::tests::no_raw_name_mutating_syscall_outside_the_funnel` and
+///   `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned`) that fail when a
+///   direct name-mutating `libc` call — by `libc::name(` literal OR by a
+///   `use libc::name as alias;` / `use libc::name;` alias — appears outside
+///   `src/atomic/unix.rs`, or when a `std::fs` removal/replace/rename call in
+///   a production file changes count. Their exact scope (and the holes no
+///   text audit can close) is documented at the audits themselves; the
+///   funnel wrappers themselves are private, so the "obvious way" to add a
+///   mutation cannot bypass the guard.
 pub fn is_lock_record_name(name: &str) -> bool {
     fn sibling(name: &str) -> bool {
         let Some(base) = name.strip_prefix('.') else {
@@ -303,11 +321,54 @@ pub fn is_lock_record_name(name: &str) -> bool {
         };
         !base.is_empty()
     }
-    if sibling(name) || is_application_lock_name(name) {
-        return true;
+    // ONE fold decides every spelling ALIAS: Unicode lowercase then strip
+    // trailing `.`/` ` (see [`fold_lock_record_component`]). Byte-exact
+    // matching is deliberately NOT used here — a trailing dot is a distinct
+    // entry on macOS/Linux but Win32 strips it from a short absolute drive
+    // path, so recognising the alias is correct everywhere and only load
+    // bearing on Windows.
+    let folded = fold_lock_record_component(name);
+    sibling(&folded) || is_application_lock_name(&folded)
+}
+
+/// The ONE normalization that decides whether two lock-record spellings are
+/// the SAME record: Unicode lowercase (`str::to_lowercase`, the fold the
+/// crate's case-alias model already uses) followed by stripping trailing `.`
+/// and ` ` (the Win32 final-component normalization that removes a trailing
+/// dot/space on a short absolute drive path; `is_lock_record_name` must
+/// recognise that alias everywhere so a Windows path cannot slip a record
+/// past the guard, and folding is harmless on a case-sensitive,
+/// dot-preserving filesystem). Kept private: callers compare through
+/// [`is_same_lock_record_path`], so the fold lives at one place.
+fn fold_lock_record_component(name: &str) -> String {
+    name.to_lowercase().trim_end_matches(['.', ' ']).to_string()
+}
+
+/// Whether two ROOT-RELATIVE paths name the SAME lock record: equal component
+/// counts, and every component equal after [`fold_lock_record_component`].
+///
+/// This is the ONE authority for "is this the record the layout lock owns":
+/// [`crate::atomic::GuardedRel::new_for_owned_lock_record`] consults it, so a
+/// case alias (`state/OPERATION.LOCK`) or a trailing-dot alias
+/// (`state/operation.lock.`) of the layout lock is recognised as the owned
+/// record rather than routed around the sidecar (D2). Folding EVERY component
+/// (not only the last) is deliberate: on a case-insensitive filesystem a
+/// folded DIRECTORY component (`STATE/operation.lock`) resolves to the same
+/// entry too. Component splitting is [`Path::components`], never a literal
+/// separator.
+pub fn is_same_lock_record_path(a: &Path, b: &Path) -> bool {
+    let mut a_components = a.components();
+    let mut b_components = b.components();
+    loop {
+        match (a_components.next(), b_components.next()) {
+            (None, None) => return true,
+            (Some(Component::Normal(x)), Some(Component::Normal(y)))
+                if x.to_str().zip(y.to_str()).is_some_and(|(x, y)| {
+                    fold_lock_record_component(x) == fold_lock_record_component(y)
+                }) => {}
+            _ => return false,
+        }
     }
-    let folded = name.to_lowercase();
-    folded != name && (sibling(&folded) || is_application_lock_name(&folded))
 }
 
 /// Whether ANY component of a canonical manifest path is reserved (see
@@ -515,6 +576,79 @@ mod tests {
             assert!(
                 !is_lock_record_name(other),
                 "{other:?} does not name a lock record"
+            );
+        }
+    }
+
+    /// G5: a trailing dot or space is stripped by Win32 from the final
+    /// component of a short absolute drive path, so `operation.lock.` and
+    /// `operation.lock` are the SAME entry on Windows and the predicate must
+    /// fold the trailing dot/space (harmless on macOS/Linux, where a trailing
+    /// dot is a genuinely distinct name). The on-disk Windows behaviour cannot
+    /// be exercised here; THIS pins the predicate-level rule.
+    #[test]
+    fn lock_record_names_fold_trailing_dots_and_spaces() {
+        for lock in [
+            "operation.lock.",
+            "operation.lock ",
+            "operation.lock. . ",
+            "OPERATION.LOCK.",
+            ".001.operation.lock.",
+            ".001.operation.lock ",
+        ] {
+            assert!(
+                is_lock_record_name(lock),
+                "{lock:?} aliases a lock record once the Win32 trailing dot/space is folded"
+            );
+        }
+        // A genuinely distinct spelling — the dot/space is not trailing — is
+        // left ordinary.
+        for other in [
+            "operation.lock.x",
+            "operation.lock! ",
+            ".operation.lock.",
+            "operation. lock",
+        ] {
+            assert!(
+                !is_lock_record_name(other),
+                "{other:?} does not name a lock record"
+            );
+        }
+    }
+
+    /// D2's authority: two root-relative paths name the SAME lock record when
+    /// their components match after the ONE fold (case + trailing dot/space).
+    /// `state/OPERATION.LOCK` and `state/operation.lock.` are the layout
+    /// lock's own entry on macOS/Windows respectively, and a DIFFERENT
+    /// component count (`operation.lock`) or a different directory is not the
+    /// same record.
+    #[test]
+    fn same_lock_record_path_folds_case_and_trailing_dots() {
+        let lock = Path::new("state/operation.lock");
+        for same in [
+            "state/operation.lock",
+            "state/OPERATION.LOCK",
+            "STATE/Operation.Lock",
+            "state/operation.lock.",
+            "state/operation.lock ",
+            "state/OPERATION.LOCK. ",
+        ] {
+            assert!(
+                is_same_lock_record_path(Path::new(same), lock),
+                "{same:?} names the layout lock's record"
+            );
+        }
+        for different in [
+            "operation.lock",
+            "state/op.lock",
+            "snapshots/.001.operation.lock",
+            "state/operation.lockx",
+            "other/operation.lock",
+            "state/operation.lock/nested",
+        ] {
+            assert!(
+                !is_same_lock_record_path(Path::new(different), lock),
+                "{different:?} is NOT the layout lock's record"
             );
         }
     }

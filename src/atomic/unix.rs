@@ -1383,6 +1383,11 @@ pub fn sync_parent_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// (0o600), leaving it unenterable. The opened inode is therefore classified
 /// and only [`PathKind::File`] is accepted.
 pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    // G4: the PATH-BASED `set_private` already consults the guard; this
+    // descriptor-relative twin must too, so the two cannot disagree about the
+    // record's spelling. A chmod preserves the inode (no holder split), but
+    // consistency at the ONE authority is the point.
+    refuse_lock_record_mutation(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = std::fs::File::from(openat_readable_regular(
         &parent_fd,
@@ -3074,6 +3079,28 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(file_mode, 0o600, "a regular file is narrowed to 0o600");
+    }
+
+    /// G4: the descriptor-relative `set_private_fd` consults the SAME guard as
+    /// the path-based `set_private`. A chmod preserves the inode, so this is
+    /// not a holder split, but the two spellings of the primitive must not
+    /// disagree about the record. Pre-fix `set_private_fd` chmodded the record
+    /// and returned `Ok(())`.
+    #[test]
+    fn set_private_fd_refuses_the_lock_record() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join("operation.lock"), b"HELD").unwrap();
+        let err = set_private_fd(&root, Path::new("operation.lock"))
+            .expect_err("the descriptor-relative chmod must refuse the lock record");
+        assert!(
+            format!("{err}").contains("lock record"),
+            "the refusal must name the lock record, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("operation.lock")).unwrap(),
+            b"HELD".to_vec(),
+            "the record must be untouched"
+        );
     }
 
     /// R2 — the RAW rename primitive is guarded at the PRIMITIVE, not at the

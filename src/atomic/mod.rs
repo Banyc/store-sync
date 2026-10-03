@@ -63,17 +63,19 @@
 //! and missed one, so the guard is no longer applied by enumeration:
 //!
 //! * the private [`guard`] module owns the ONE spelling authority and the
-//!   unforgeable [`GuardedRel`] capability (private field, `new` is the only
-//!   constructor and the only caller of the guard); every rel-path mutator
-//!   mints one, and the rename worker demands one;
+//!   unforgeable [`GuardedRel`] capability (private fields; `new` and
+//!   `new_for_owned_lock_record` are the only constructors and the only
+//!   callers of the guard); every rel-path mutator mints one, and the rename
+//!   worker demands one;
 //! * the low-level single-NAME syscall wrappers in [`unix`] (`unlinkat`,
 //!   `renameat`, `symlinkat`, `linkat`, `mkdirat`) and the mutating branch of
 //!   [`openat_no_follow_io`] run the guard at the PRIMITIVE, so a new caller
 //!   of an existing wrapper is guarded without remembering to be;
 //! * the wrappers are private and every direct name-mutating `libc` call in
-//!   the crate lives in [`unix`] (enforced by the source audit in
-//!   `guard::tests::no_raw_name_mutating_syscall_outside_the_funnel`), so a
-//!   new primitive must either present the capability or fail the audit.
+//!   the crate lives in [`unix`] (enforced by the source audits in
+//!   `guard::tests::no_raw_name_mutating_syscall_outside_the_funnel` and
+//!   `guard::tests::std_fs_name_mutation_counts_are_pinned`), so a new
+//!   primitive must either present the capability or fail an audit.
 //!
 //! The honest residual is in [`guard`]'s module docs and [`crate::reserved::is_lock_record_name`].
 //!
@@ -120,11 +122,12 @@ mod windows;
 // The alias keeps the historical spelling used throughout the primitives.
 pub(crate) use guard::GuardedRel;
 
-/// Run the lock-record guard through the capability's ONLY constructor
-/// ([`GuardedRel::new`]); `guard::refuse_lock_record` itself is private to
-/// `guard`, so this convenience wrapper — and every rel-path mutator that
-/// calls it — must still mint the capability. There is no other way to run
-/// the guard.
+/// Run the lock-record guard through the capability's constructors
+/// ([`GuardedRel::new`] for ordinary content and
+/// [`GuardedRel::new_for_owned_lock_record`] for the protocol's own record);
+/// `guard::refuse_lock_record` itself is private to `guard`, so this
+/// convenience wrapper — and every rel-path mutator that calls it — must still
+/// mint the capability. There is no other way to run the guard.
 pub(crate) fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
     GuardedRel::new(rel).map(|_| ())
 }

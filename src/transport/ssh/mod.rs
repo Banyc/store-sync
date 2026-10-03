@@ -2279,20 +2279,28 @@ impl Remote for SshTransport {
     }
 
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        // The remote shell command cannot consult the local guard, so the
+        // guard runs HERE, before the command is built: every substrate
+        // mutation is refused for a lock-record spelling, exactly as its local
+        // counterpart is through the atomic funnel.
+        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
         self.upload_bytes(rel.as_path(), data, mode)
     }
 
     fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), p]))
     }
 
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), "-p".into(), p]))
     }
 
     fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&[
             "chmod".into(),
@@ -2313,6 +2321,8 @@ impl Remote for SshTransport {
     }
 
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(from.as_path())?;
+        crate::atomic::refuse_lock_record_mutation(to.as_path())?;
         self.run_remote_ok(&SshTransport::rename_cmd(
             &self.root,
             from.as_path(),
@@ -2341,6 +2351,7 @@ impl Remote for SshTransport {
     }
 
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(link.as_path())?;
         // The target is embedded in a shell command, so a non-UTF-8 target
         // could only be written LOSSILY — creating a link whose target differs
         // from the caller's intent, which the post-transfer `read_link`
@@ -2381,6 +2392,7 @@ impl Remote for SshTransport {
     }
 
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         // Ignore "not found".
         let out = self.run_remote(&Self::argv_cmd(&["rm".into(), "-f".into(), p]))?;
@@ -2394,6 +2406,15 @@ impl Remote for SshTransport {
     }
 
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        // The sanctioned protocol may break EXACTLY the ONE record the layout
+        // OWNS: the guard refuses every other lock-record spelling before any
+        // remote command runs, and the fold-aware scope selects the sidecar for
+        // a case/trailing-dot alias of the owned record (the same authority
+        // [`LocalTransport`] uses).
+        let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(
+            rel.as_path(),
+            self.layout.lock.as_path(),
+        )?;
         // The remote compare runs a shell command carrying `expected` as an
         // argv token: a non-UTF-8 `expected` could only be embedded LOSSILY,
         // so the compare would be against a different byte string than the
@@ -2403,7 +2424,7 @@ impl Remote for SshTransport {
                 "ssh remove_file_if: the expected content is not valid UTF-8 and cannot be compared byte-exactly over the remote shell; refusing rather than comparing a lossy rendering",
             )
         })?;
-        let cmd = if rel.as_path() == self.layout.lock.as_path() {
+        let cmd = if guarded.is_owned_lock_record() {
             remove_file_if_sidecar_cmd(
                 &self.root,
                 &self.layout.lock_sidecar,
@@ -2431,6 +2452,7 @@ impl Remote for SshTransport {
     }
 
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["rm".into(), "-rf".into(), p]))
     }
@@ -2613,7 +2635,14 @@ impl Remote for SshTransport {
         // The payload length rides the command as an argv token so the far side
         // can refuse to publish a short (connection-loss-truncated) payload.
         let expected_len = data.len() as u64;
-        let cmd = if rel.as_path() == self.layout.lock.as_path() {
+        // The same ONE guard/scope authority as the local transport: a foreign
+        // lock-record spelling is refused before any remote command, and a
+        // case/trailing-dot alias of the owned record takes the sidecar route.
+        let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(
+            rel.as_path(),
+            self.layout.lock.as_path(),
+        )?;
+        let cmd = if guarded.is_owned_lock_record() {
             self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE, expected_len)
         } else {
             Self::write_new_cmd(
@@ -2723,7 +2752,7 @@ impl Remote for SshTransport {
         new_data: &[u8],
     ) -> Result<Option<()>> {
         // Only the operation lock's recover is sidecar-serialized; other paths are not supported.
-        if rel.as_path() != self.layout.lock.as_path() {
+        if !crate::reserved::is_same_lock_record_path(rel.as_path(), self.layout.lock.as_path()) {
             return Ok(None);
         }
         // `observed` and `new_data` cross into the remote perl command as argv
@@ -5578,6 +5607,43 @@ mod tests_ssh {
             std::fs::read(root.join(rel)).unwrap(),
             b"FULL-PAYLOAD".to_vec()
         );
+    }
+
+    /// D1/D2 (ssh half): the SAME ONE guard/scope authority governs the remote
+    /// ownership-token protocol AND the remote substrate mutations. A foreign
+    /// lock-record spelling is refused BEFORE any remote command is built (so
+    /// no ssh is attempted), and the substrate methods (`write`, `remove_file`,
+    /// `remove_dir_all`, `rename`, `symlink`, `set_mode`, `create_dir*`) are
+    /// guarded too. Pre-fix these all built and ran a remote command.
+    #[test]
+    fn ssh_mutations_refuse_a_lock_record_they_do_not_own() {
+        let t = transport();
+        for text in [
+            "operation.lock",
+            "snapshots/.001.operation.lock",
+            "OPERATION.LOCK",
+            "state/operation.lock/nested",
+        ] {
+            let rel = RootedRelativePath::parse(Path::new(text)).unwrap();
+            for (label, err) in [
+                (
+                    "remove_file_if",
+                    t.remove_file_if(&rel, b"x").expect_err("refused"),
+                ),
+                (
+                    "try_write_new",
+                    t.try_write_new(&rel, b"x").expect_err("refused"),
+                ),
+                ("write", t.write(&rel, b"x", 0o600).expect_err("refused")),
+                ("remove_file", t.remove_file(&rel).expect_err("refused")),
+            ] {
+                assert!(
+                    format!("{err}").contains("lock record"),
+                    "{label} on {text:?} must be refused by the ONE guard before any remote \
+                     command, got: {err}"
+                );
+            }
+        }
     }
 
     /// F-1 (`try_write_new_sidecar_cmd`): the operation-lock path reads its

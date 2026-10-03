@@ -1241,13 +1241,13 @@ pub(crate) struct CreateNewOptions<'a> {
 /// convergent path still returns with a durable entry.
 pub(crate) fn durable_create_new(
     base: &Path,
-    rel: &RootedRelativePath,
+    guarded: crate::atomic::GuardedRel<'_>,
     data: &[u8],
     options: CreateNewOptions<'_>,
 ) -> Result<CreateNewVerdict> {
     use std::io::Write;
 
-    let p = join(base, rel);
+    let p = base.join(guarded.as_path());
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
@@ -2527,24 +2527,32 @@ impl Remote for LocalTransport {
     }
 
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
-        // If this is the lock path, serialize through the sidecar mutex so
-        // the compare-then-delete becomes operation-atomic: a contender's
-        // create-if-absent cannot win the freed path mid-operation.
-        if rel.as_path() == self.layout.lock.as_path() {
+        // The sanctioned protocol may break EXACTLY the ONE record the layout
+        // OWNS (see [`LocalTransport::guarded_mutation_target`]): the bare
+        // `operation.lock`, a nested `snapshots/.001.operation.lock`, and any
+        // other spelling are refused before any mutation, because claiming one
+        // away would swap its inode and admit a second holder. The owned record
+        // is serialized through the sidecar mutex so its compare-then-delete is
+        // operation-atomic. The selection is FOLD-AWARE (case and trailing
+        // dot/space aliases of the layout lock count as the layout lock), so a
+        // `state/OPERATION.LOCK` spelling cannot skip the sidecar.
+        let guarded = self.guarded_mutation_target(rel)?;
+        if guarded.is_owned_lock_record() {
             return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
-                self.remove_file_if_inner(rel, expected)
+                self.remove_file_if_inner(guarded, expected)
             });
         }
-        self.remove_file_if_inner(rel, expected)
+        self.remove_file_if_inner(guarded, expected)
     }
 
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
-        if rel.as_path() == self.layout.lock.as_path() {
+        let guarded = self.guarded_mutation_target(rel)?;
+        if guarded.is_owned_lock_record() {
             return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
-                self.try_write_new_inner(rel, data)
+                self.try_write_new_inner(guarded, data)
             });
         }
-        self.try_write_new_inner(rel, data)
+        self.try_write_new_inner(guarded, data)
     }
 
     fn try_write_new_with(
@@ -2553,12 +2561,13 @@ impl Remote for LocalTransport {
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
-        if rel.as_path() == self.layout.lock.as_path() {
+        let guarded = self.guarded_mutation_target(rel)?;
+        if guarded.is_owned_lock_record() {
             return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
-                self.try_write_new_with_inner(rel, data, equivalence)
+                self.try_write_new_with_inner(guarded, data, equivalence)
             });
         }
-        self.try_write_new_with_inner(rel, data, equivalence)
+        self.try_write_new_with_inner(guarded, data, equivalence)
     }
 
     #[cfg(not(unix))]
@@ -2727,12 +2736,29 @@ impl Remote for LocalTransport {
 }
 
 impl LocalTransport {
+    /// Mint the ONE capability every lock-record-breaking local mutation must
+    /// present, through the guard's owned-lock-record constructor. It refuses
+    /// every lock-record spelling EXCEPT the single layout lock the protocol
+    /// OWNS ([`crate::reserved::is_same_lock_record_path`], the crate's ONE
+    /// case/trailing-dot fold), so a future `*_if`-style primitive cannot
+    /// repeat the D1 hole: it either mints a capability (which runs the guard)
+    /// or cannot call a mutation worker, whose argument is that capability.
+    fn guarded_mutation_target<'a>(
+        &self,
+        rel: &'a RootedRelativePath,
+    ) -> Result<crate::atomic::GuardedRel<'a>> {
+        crate::atomic::GuardedRel::new_for_owned_lock_record(
+            rel.as_path(),
+            self.layout.lock.as_path(),
+        )
+    }
+
     fn remove_file_if_inner(
         &self,
-        rel: &RootedRelativePath,
+        guarded: crate::atomic::GuardedRel<'_>,
         expected: &[u8],
     ) -> Result<RemoveIfVerdict> {
-        let p = join(&self.base, rel);
+        let p = self.base.join(guarded.as_path());
         // When already holding the sidecar (we are inside with_operation_lock_sidecar),
         // the mutation is already serialized, so a simple read-compare-unlink
         // keeps the record continuously visible for a mismatched remove (no
@@ -2818,7 +2844,7 @@ impl LocalTransport {
         // way a successor's lock survives untouched.
         let restored = durable_create_new(
             &self.base,
-            rel,
+            guarded,
             &content,
             CreateNewOptions {
                 mode: IMMUTABLE_RECORD_MODE,
@@ -2841,21 +2867,21 @@ impl LocalTransport {
 
     fn try_write_new_inner(
         &self,
-        rel: &RootedRelativePath,
+        guarded: crate::atomic::GuardedRel<'_>,
         data: &[u8],
     ) -> Result<CreateNewVerdict> {
-        self.try_write_new_with_inner(rel, data, ContentEquivalence::Exact)
+        self.try_write_new_with_inner(guarded, data, ContentEquivalence::Exact)
     }
 
     fn try_write_new_with_inner(
         &self,
-        rel: &RootedRelativePath,
+        guarded: crate::atomic::GuardedRel<'_>,
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
         durable_create_new(
             &self.base,
-            rel,
+            guarded,
             data,
             CreateNewOptions {
                 mode: IMMUTABLE_RECORD_MODE,
@@ -2871,6 +2897,14 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
+
+    /// Mint the guard proof for an ordinary test path — the `durable_create_new`
+    /// worker accepts only a [`crate::atomic::GuardedRel`], so tests present the
+    /// capability just like production callers.
+    fn guarded(rel: &RootedRelativePath) -> crate::atomic::GuardedRel<'_> {
+        crate::atomic::GuardedRel::new(rel.as_path())
+            .expect("an ordinary test path is not a lock record")
+    }
 
     /// W1 — the LOCAL producer of the typed timeout cause, PINNED. A real child
     /// that outlives its deadline is killed and reaped by [`ChildRunner`], and
@@ -3572,6 +3606,200 @@ mod tests {
         );
     }
 
+    /// D1 — the sanctioned lock protocol may break EXACTLY the record it OWNS.
+    /// `remove_file_if` used to route through the sidecar only for the
+    /// byte-exact layout lock and to fall back to the claim-by-rename path for
+    /// every other spelling, so a caller could claim away `operation.lock` or
+    /// `snapshots/.001.operation.lock`: the claim RENAMED the live record away
+    /// and (on a mismatch) re-published it via `hard_link` under a NEW inode,
+    /// splitting the holder. Each row below holds a `FileLock`, calls
+    /// `remove_file_if`, and asserts the record's INODE is unchanged and a
+    /// second `FileLock` is REFUSED. Pre-fix the inode assertion is the
+    /// two-holder reproduction: the record is re-created under a fresh inode,
+    /// or (on a byte-identical expectation) removed outright.
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_refuses_a_lock_record_it_does_not_own() {
+        use crate::error::Error;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+
+        for (label, rel_text) in [
+            ("the bare application lock record", "operation.lock"),
+            ("a nested sibling record", "snapshots/.001.operation.lock"),
+        ] {
+            let record = base.join(rel_text);
+            let holder = crate::lock::FileLock::acquire(&record, "A")
+                .unwrap_or_else(|e| panic!("{label}: acquire A: {e}"));
+            let before = std::fs::metadata(&record)
+                .unwrap_or_else(|e| panic!("{label}: stat before: {e}"))
+                .ino();
+            let rel = RootedRelativePath::parse(Path::new(rel_text)).unwrap();
+            let current = std::fs::read(&record).unwrap();
+            for expected in [b"wrong".as_slice(), current.as_slice()] {
+                let verdict = t.remove_file_if(&rel, expected);
+                let after = std::fs::metadata(&record).ok().map(|m| m.ino());
+                assert_eq!(
+                    after,
+                    Some(before),
+                    "{label}: remove_file_if on {rel_text:?} with expected {expected:?} must leave \
+                     the record's inode unchanged — pre-fix the claim renamed the live record away \
+                     and re-published it under a NEW inode (or removed it), admitting a second holder"
+                );
+                assert!(
+                    verdict.is_err(),
+                    "{label}: a lock record the protocol does not own must be REFUSED, got {verdict:?}"
+                );
+                let second = crate::lock::FileLock::acquire(&record, "B");
+                assert!(
+                    matches!(&second, Err(Error::LockContended(_))),
+                    "{label}: a second FileLock::acquire on {rel_text:?} must stay contended"
+                );
+            }
+            drop(holder);
+        }
+    }
+
+    /// D1's sibling primitive: `try_write_new` shares the same guard gate, so it
+    /// also refuses a lock record the layout does not own. Pre-fix it went
+    /// straight to `durable_create_new`; the refusal keeps the protocol's reach
+    /// at ONE record.
+    #[cfg(unix)]
+    #[test]
+    fn try_write_new_refuses_a_lock_record_it_does_not_own() {
+        use crate::error::Error;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let record = base.join("operation.lock");
+        let _holder = crate::lock::FileLock::acquire(&record, "A").unwrap();
+        let before = std::fs::metadata(&record).unwrap().ino();
+        let rel = RootedRelativePath::parse(Path::new("operation.lock")).unwrap();
+        let verdict = t.try_write_new(&rel, b"x");
+        assert!(
+            verdict.is_err(),
+            "a lock record the protocol does not own must be REFUSED, got {verdict:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().ino(),
+            before,
+            "the refused install must not touch the record's inode"
+        );
+        let second = crate::lock::FileLock::acquire(&record, "B");
+        assert!(
+            matches!(&second, Err(Error::LockContended(_))),
+            "the record must stay locked"
+        );
+    }
+
+    /// D2 — the sidecar selection must fold a case alias of the layout lock.
+    /// On macOS `state/OPERATION.LOCK` resolves to `state/operation.lock`, but
+    /// the byte-exact comparison sent it down the claim-by-rename fallback, so
+    /// the sanctioned mutex was skipped for the protocol's OWN record. After
+    /// the fix the alias is recognised through the reserved-name fold and goes
+    /// through the sidecar, so a mismatched compare leaves the inode in place
+    /// and a second holder is refused. The on-disk half is skipped on a
+    /// case-sensitive filesystem (Linux), where the two spellings are distinct
+    /// entries; the predicate is pinned on every platform by
+    /// `reserved::tests::same_lock_record_path_folds_case_and_trailing_dots`.
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_folds_a_case_alias_of_the_layout_lock_into_the_sidecar_route() {
+        use crate::error::Error;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let record = base.join("state/operation.lock");
+        let alias = base.join("state/OPERATION.LOCK");
+        let holder = crate::lock::FileLock::acquire(&record, "A").unwrap();
+        if std::fs::metadata(&alias).is_err() {
+            crate::test_support::announce_skip(
+                "this filesystem is case-SENSITIVE, so `state/OPERATION.LOCK` is a DIFFERENT path \
+                 from `state/operation.lock` and the fold-aware sidecar selection cannot be \
+                 exercised on disk here; the fold rule is pinned by \
+                 reserved::tests::same_lock_record_path_folds_case_and_trailing_dots",
+            );
+            return;
+        }
+        let before = std::fs::metadata(&record).unwrap().ino();
+        let rel = RootedRelativePath::parse(Path::new("state/OPERATION.LOCK")).unwrap();
+        // A mismatch is a Mismatch verdict — the alias went through the sidecar
+        // as the OWNED record — and leaves the inode intact.
+        assert_eq!(
+            t.remove_file_if(&rel, b"not-the-record").unwrap(),
+            RemoveIfVerdict::Mismatch,
+            "the alias must be the owned record (sidecar route), not a refused foreign spelling"
+        );
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().ino(),
+            before,
+            "the mismatched compare must not touch the record's inode"
+        );
+        let second = crate::lock::FileLock::acquire(&record, "B");
+        assert!(
+            matches!(&second, Err(Error::LockContended(_))),
+            "a second holder must stay contended"
+        );
+        // A matching compare is the SANCTIONED break: the record is removed,
+        // proving the alias is authorized rather than merely refused.
+        let current = std::fs::read(&record).unwrap();
+        assert_eq!(
+            t.remove_file_if(&rel, &current).unwrap(),
+            RemoveIfVerdict::Removed,
+            "a matching alias removal is the sanctioned owned-record break"
+        );
+        assert!(!record.exists(), "the sanctioned break removes the record");
+        drop(holder);
+    }
+
+    /// D1/D2 — the LEGITIMATE case, on both platforms: the ONE record the
+    /// layout OWNS is still breakable through the sidecar. A mismatch is a
+    /// Mismatch (the record untouched) and a match is Removed (the sanctioned
+    /// break). This is the behaviour the residual must preserve: guarding the
+    /// foreign spellings must not guard the owned record.
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_still_breaks_the_owned_layout_lock() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let record = base.join("state/operation.lock");
+        let holder = crate::lock::FileLock::acquire(&record, "A").unwrap();
+        let before = std::fs::metadata(&record).unwrap().ino();
+        let rel = RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap();
+        assert_eq!(
+            t.remove_file_if(&rel, b"not-the-record").unwrap(),
+            RemoveIfVerdict::Mismatch,
+            "a mismatched compare against the owned record is a Mismatch, never a delete"
+        );
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().ino(),
+            before,
+            "the mismatched compare leaves the owned record's inode intact"
+        );
+        let current = std::fs::read(&record).unwrap();
+        assert_eq!(
+            t.remove_file_if(&rel, &current).unwrap(),
+            RemoveIfVerdict::Removed,
+            "a matching compare breaks the owned record by design"
+        );
+        assert!(!record.exists(), "the sanctioned break removes the record");
+        drop(holder);
+    }
+
     /// The durability property's scenario dimension: the healthy install, a
     /// one-shot crash/failure at one of the SEVEN stages, and the
     /// pre-existing-winner retry cases (identical / different content /
@@ -3666,9 +3894,7 @@ mod tests {
 
             match scenario {
                 CreateNewScenario::Healthy => {
-                    let verdict = durable_create_new(
-                        &root,
-                        &rel,
+                    let verdict = durable_create_new(&root, guarded(&rel),
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -3704,9 +3930,7 @@ mod tests {
                     let fault = CreateNewFault::new(step);
                     // FAILURE PROPAGATION: the faulted attempt is an Err
                     // naming the injected stage — never a swallowed Ok.
-                    let err = durable_create_new(
-                        &root,
-                        &rel,
+                    let err = durable_create_new(&root, guarded(&rel),
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: Some(&fault) },
                     )
@@ -3719,9 +3943,7 @@ mod tests {
                     // one-shot, already consumed) must succeed and leave the
                     // destination EITHER the fully-written identical content
                     // OR absent — never a partial/torn file.
-                    let retry = durable_create_new(
-                        &root,
-                        &rel,
+                    let retry = durable_create_new(&root, guarded(&rel),
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -3751,10 +3973,10 @@ mod tests {
                     // A previous successful publish (identical bytes + mode):
                     // the identical retry converges — AlreadyPresent, no
                     // error, no replace.
-                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                    durable_create_new(&root, guarded(&rel), &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let verdict =
-                        durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        durable_create_new(&root, guarded(&rel), &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                             .expect("an identical retry must converge, not error");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
                     prop_assert_eq!(
@@ -3787,9 +4009,7 @@ mod tests {
                         std::fs::Permissions::from_mode(mode & 0o7777),
                     )
                     .unwrap();
-                    let verdict = durable_create_new(
-                        &root,
-                        &rel,
+                    let verdict = durable_create_new(&root, guarded(&rel),
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -3808,7 +4028,7 @@ mod tests {
                     // Identical bytes but a DIFFERENT mode: still a genuine
                     // conflict (the mode is part of the record) — the verdict,
                     // never a replace.
-                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                    durable_create_new(&root, guarded(&rel), &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let other_mode = if (mode & 0o7777) == 0o600 { 0o644 } else { 0o600 };
                     std::fs::set_permissions(
@@ -3817,7 +4037,7 @@ mod tests {
                     )
                     .unwrap();
                     let verdict =
-                        durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        durable_create_new(&root, guarded(&rel), &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                             .expect("a mode mismatch is a verdict, not an I/O error");
                     let is_mode_mismatch = matches!(
                         verdict,
@@ -3847,9 +4067,7 @@ mod tests {
                         std::fs::Permissions::from_mode(mode & 0o7777),
                     )
                     .unwrap();
-                    let verdict = durable_create_new(
-                        &root,
-                        &rel,
+                    let verdict = durable_create_new(&root, guarded(&rel),
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -3882,12 +4100,10 @@ mod tests {
                     // identical existing entry — the retry must return Err
                     // (the faulted parent fsync), never a false
                     // Ok(AlreadyPresent) that claims durability.
-                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                    durable_create_new(&root, guarded(&rel), &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let fault = CreateNewFault::new(CreateNewStep::ParentFsync);
-                    let err = durable_create_new(
-                        &root,
-                        &rel,
+                    let err = durable_create_new(&root, guarded(&rel),
                         &content,
                         CreateNewOptions {
                             mode,
@@ -3934,7 +4150,7 @@ mod tests {
         fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             durable_create_new(
                 self.inner.root(),
-                rel,
+                guarded(rel),
                 data,
                 CreateNewOptions {
                     mode: IMMUTABLE_RECORD_MODE,
