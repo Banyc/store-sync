@@ -1,23 +1,45 @@
 # storekit extraction
 
+**Status: the historical extraction plan, as executed.** The crate has moved on
+since: the public API was deliberately CONSTRAINED (see
+[`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md)), several inconsistencies were
+swept and written down ([`docs/CONSISTENCY.md`](docs/CONSISTENCY.md)), and
+[`README.md`](README.md) is the current contract. Where a name or path below has
+since changed, the README and the source are authoritative — read this document
+for what was ported and why, not for what the crate looks like now.
+
 `~/code/deploy` is the read-only source of truth. Each slice ports the named
-production code **and its tests** here, applies the adaptations below, and
-must pass the gate. Do not invent a new design where a faithful port exists:
-the value of this crate is the semantics already encoded in the source, and
-those semantics live in the doc comments and the tests.
+production code **and its tests** here, applies the adaptations below, and must
+pass the gate. Do not invent a new design where a faithful port exists: the
+value of this crate is the semantics already encoded in the source, and those
+semantics live in the doc comments and the tests.
 
 Source paths below are relative to `~/code/deploy`.
 
 ## Adaptations (every slice)
 
-1. **Error type.** `crate::error::Error` is already ported here with the same
-   variant names and the same constructor helpers: `Error::{store, integrity,
-   transport, materialization, preflight, path, not_found, r#ref, conflict}`,
-   plus `Io(#[from] io::Error)` and `Json(#[from] serde_json::Error)`. A
-   `crate::kernel::KernelError` variant does not exist here; if a ported file
-   needs it, that is a signal the file is domain code and must be dropped.
-2. **Visibility.** `pub(crate)` becomes `pub` for every item that is part of
-   the crate's API. Genuinely internal helpers stay `pub(crate)`.
+1. **Error type.** `crate::error::Error` is the crate's own error. As ported it
+   kept the source's variant names and constructor helpers; it has SINCE been
+   restructured so that every condition a caller must branch on is a TYPED
+   VALUE rather than message text (see [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md)
+   #4). The variants now carry `{ kind, message }` — `Error::{Materialization,
+   Store, Transport, Reserved}` with `MaterializationKind`/`StoreKind`/
+   `TransportKind`/`ReservedKind` — the constructors are `*_kind(kind, msg)`
+   (the one-argument forms produce `Unclassified`), and the MESSAGE TEXT is
+   preserved verbatim so a text-matching caller keeps working. `Io(#[from]
+   io::Error)` and `Json(#[from] serde_json::Error)` remain. Read `src/error.rs`
+   for the current shape. A `crate::kernel::KernelError` variant does not exist
+   here; if a ported file needs it, that is a signal the file is domain code and
+   must be dropped.
+2. **Visibility.** An item is `pub` only if a CONSUMER needs it. The default is
+   the narrowest visibility that compiles, and a later pass deliberately SHRANK
+   the surface — `pub(crate)` is the right answer for anything the crate's own
+   paths can reach. Note the asymmetry that cost a round: a deletion justified
+   by *"the crate's own tests do not use it"* is not justified at all. The
+   consumers are `~/code/deploy` and `~/code/ckpt`; the durable guard for their
+   needs is `tests/consumer_fit.rs`, which fails to COMPILE if a
+   consumer-required name is removed. See [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md)
+   #8 and the rule in the README.
 3. **Test helpers.** `crate::testutil::{fixture_env, fixture_tmpdir,
    proptest_cases, slow_tests_enabled}` become `crate::test_support::{...}`
    (already present). Any other `crate::testutil::*` use means the test is
@@ -37,21 +59,35 @@ Source paths below are relative to `~/code/deploy`.
    Never replace an assertion with a weaker one to keep a test compiling.
 7. **No new dependencies** without a reason in the report. `Cargo.toml`
    already carries the union the whole crate needs.
-8. **Windows.** `src/low-level-windows` ports are required (the `#[cfg(windows)]`
-   modules exist), but this machine cannot compile them; port them verbatim
-   and say so in the report. Do not add `#[cfg(unix)]` to a Windows file.
+8. **Windows.** The `#[cfg(windows)]` modules are required and are part of the
+   gate: `cargo check --all-targets --target x86_64-pc-windows-msvc` must be 0,
+   so a Windows file and its TESTS must COMPILE. Carry a `#[cfg(unix)]` gate on
+   a test that genuinely needs a unix primitive (and say what it needs); do not
+   add `#[cfg(unix)]` to a production Windows file. The port's RUNTIME remains
+   unverified — no Windows host has executed it — and the crate says so.
 
 ## Gate
 
-From the repo root:
+The gate has grown since the extraction. Read exit codes DIRECTLY, never through
+a pipe. On macOS:
 
 ```sh
-cargo fmt
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test                                  # x3
+(umask 0002; cargo test)
+(umask 0077; cargo test)
+STOREKIT_FULL_TESTS=1 cargo test
+cargo test --doc
+cargo check --all-targets --target x86_64-pc-windows-msvc
 ```
 
-`cargo fmt` is allowed to reformat; the other two must pass.
+and the same set on Linux (`ssh ser`; `cargo` is on PATH only in a login shell,
+so use `ssh ser 'bash -lc "..."'`). A green gate on one platform is not evidence
+for another — it is not even evidence that the other platform BUILDS, because a
+call site behind `#[cfg(...)]` is compiled on one host only. The platforms'
+`STOREKIT_SKIP` marker sets are disjoint by design: a case that a filesystem
+cannot host announces a skip with its reason instead of passing vacuously.
 
 ## Wave 1 review notes
 
@@ -109,6 +145,17 @@ These are pinned by characterization and behaviour tests in
 behaviour is a deliberate, test-visible act.
 
 ## Slices
+
+**Read these as the plan that was executed, not as the current file map.** Since
+the extraction: `RootedRelativePath` moved out of `src/transport/rooted.rs` into
+its own `src/relpath.rs` (below `atomic` and `sync`, both of which need it); the
+path-based helpers `ensure_private_dir`, `ensure_private_dir_durable`,
+`sync_parent_dir` and `remove_dir_all_path` were DELETED as the validated path
+type took over, so every root-relative mutation now names a
+`RootedRelativePath`; the six `sync` entry points collapsed to ONE; and the crate
+gained `src/reserved.rs`, `src/casefold.rs` and `src/sync/residue.rs`. The README
+and the source are authoritative, and [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md)
+records why each change happened.
 
 ### slice-core — `src/digest.rs`, `src/platform.rs`, `src/trace.rs`, `src/id.rs`
 
