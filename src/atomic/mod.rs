@@ -180,6 +180,45 @@ pub(crate) fn residue_refusal(rel: &Path) -> Error {
     )
 }
 
+/// The CREATE/COPY sibling of [`residue_refusal`]: the SAME typed refusal
+/// (`ReservedKind::ResidueBelow`), but phrased for an operation that would
+/// have CREATED the entry rather than removed it. [`refuse_reserved_creation`]
+/// runs the ONE gate and rewrites only the wording, because a copy that refuses
+/// a residue spelling is not "refusing to remove" anything — it never got as
+/// far as creating the strand, and telling the caller to `recover_to` before it
+/// copied would be nonsense.
+pub(crate) fn residue_creation_refusal(rel: &Path) -> Error {
+    Error::reserved(
+        ReservedKind::ResidueBelow,
+        format!(
+            "{}: refusing to create {} — it is (or holds) destination residue, a claim-aside that \
+             HOLDS a stranded original (the pre-replace state). A copy must never land on it: \
+             recover it with `sync::Residue::recover_to` or discard it with the deliberate \
+             `sync::Residue::discard`.",
+            crate::reserved::RESIDUE_BELOW,
+            rel.display()
+        ),
+    )
+}
+
+/// Run the ONE reserved-spelling gate for a CREATE/COPY and report a residue
+/// refusal in the operation's own vocabulary.
+///
+/// The gate itself is unchanged ([`refuse_reserved_mutation`] with
+/// [`Sanction::None`], so both authorities run and a residue spelling is
+/// refused on EVERY component); only the message differs from the removal
+/// sibling. A lock-record refusal already reads correctly and is propagated
+/// unchanged.
+pub(crate) fn refuse_reserved_creation(rel: &Path) -> Result<()> {
+    match refuse_reserved_mutation(rel, Sanction::None) {
+        Ok(()) => Ok(()),
+        Err(e) if e.reserved_kind() == Some(ReservedKind::ResidueBelow) => {
+            Err(residue_creation_refusal(rel))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The shared guard for the EXPLICIT discard primitives
 /// (`remove_residue_file_fd` / `remove_residue_dir_all_fd`): the FINAL component
 /// must BE a residue, so a discard handle can only ever remove a strand, never
@@ -228,6 +267,9 @@ pub use windows::*;
 ///   `ensure_private_dir`, `ensure_private_dir_durable`, `copy_dir_recursive`,
 ///   `remove_dir_all_path`): those take an ordinary path, so an intermediate
 ///   symlink in it IS followed — see [`unix`]'s module docs for the split.
+///   [`unix::copy_dir_recursive_fd`] is a partial exception: its arbitrary
+///   out-of-root SOURCE is path-based (followed once, as a read), while its
+///   ROOT-CONFINED destination is component-confined.
 /// * `false` on Windows: the `windows` module is path-based (`Path::join`
 ///   plus `std::fs`), and `Path::join` has no component-wise `O_NOFOLLOW`,
 ///   so a symlink in a path component is followed. A caller must not treat a

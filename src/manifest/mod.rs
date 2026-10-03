@@ -69,8 +69,8 @@
 //! guess where a follow ends.
 //!
 //! The walk is over root-RELATIVE paths and never builds an absolute base, so
-//! it does not depend on the root's spelling. BOTH call sites now answer "does
-//! this component resolve to a symlink?" from the SAME
+//! it does not depend on the root's spelling. Both manifest call sites now
+//! answer "does this component resolve to a symlink?" from the SAME
 //! [`SymlinkContainmentIndex`] they build from their own entry list — the local
 //! walk from the entries its `WalkDir` produced, the assembler from the entries
 //! the far side's listing produced — and both apply the crate's ONE
@@ -361,7 +361,7 @@ fn fold_path(path: &str) -> String {
 
 /// What a SPELLED root-relative path resolves to in one view of a tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ComponentResolution {
+pub(crate) enum ComponentResolution {
     /// Neither an exact entry nor a fold-equal symlink exists: the kernel's
     /// `lstat` of the spelled path would fail.
     Absent,
@@ -440,7 +440,8 @@ impl<'a> SymlinkContainmentIndex<'a> {
 }
 
 /// Decide whether a RELATIVE symlink target may be accepted, using the SAME
-/// rule at BOTH call sites: the local walk and the far-side wire assembler.
+/// rule at EVERY call site: the local manifest walk, the far-side wire
+/// assembler, and the [`crate::atomic`] tree copy.
 ///
 /// `link_rel` is the link's path relative to the tree root (e.g. `dir/link`),
 /// and `target` is its raw relative link target. The walk starts at the link's
@@ -449,15 +450,18 @@ impl<'a> SymlinkContainmentIndex<'a> {
 /// `Component::Normal` that resolves to a symlink is refused, because the
 /// kernel follows it and the physical location is then not the spelled one.
 ///
-/// `resolve` answers, for a ROOT-RELATIVE spelling, what the tree view holds
-/// there (see [`SymlinkContainmentIndex::resolve`]). Both call sites work in
-/// root-RELATIVE paths over the SAME [`SymlinkContainmentIndex`], so neither
-/// depends on the root's spelling and the two cannot disagree. (The previous
+/// `resolve` answers, for a ROOT-RELATIVE spelling, what the caller's view of
+/// the tree holds there (see [`SymlinkContainmentIndex::resolve`]). The two
+/// manifest views work in root-RELATIVE paths over the SAME
+/// [`SymlinkContainmentIndex`], so neither depends on the root's spelling and
+/// the two cannot disagree; the atomic tree copy passes a live-filesystem
+/// resolver (the source subtree it is copying, and the destination root
+/// outside it) through the same signature. (The previous
 /// rule built an ABSOLUTE base from the root and collapsed the target
 /// lexically; that made the local walk canonicalize the root while the
 /// assembler could not, so a symlinked root made the two disagree, and the
 /// collapse itself never followed a symlink component.)
-fn check_relative_symlink_target(
+pub(crate) fn check_relative_symlink_target(
     link_rel: &Path,
     target: &Path,
     resolve: &mut dyn FnMut(&Path) -> ComponentResolution,
@@ -649,7 +653,7 @@ fn unrepresentable_char_name(c: char) -> &'static str {
 /// spelling to be already NFC instead of normalizing it. A non-NFC name is
 /// refused, naming the entry: storing a normalized spelling would address a
 /// path that does not exist on a normalization-sensitive filesystem.
-fn validate_entry_path(path: &str) -> Result<String> {
+pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
     if let Some(c) = first_unrepresentable_char(path) {
         return Err(Error::materialization(format!(
             "path contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {path}",
@@ -710,7 +714,7 @@ fn validate_entry_path(path: &str) -> Result<String> {
 /// content. A non-UTF-8 target cannot be stored in a UTF-8 manifest at all, so
 /// it is refused rather than lossily converted (which would install a link to a
 /// different path). `entry_path` names the offending entry in every error.
-fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
+pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
     if target.is_empty() {
         return Err(Error::materialization(format!(
             "symlink target of entry {entry_path} is empty; an empty relative target cannot be a faithful address and the kernel refuses it",

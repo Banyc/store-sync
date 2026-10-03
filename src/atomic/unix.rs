@@ -35,6 +35,15 @@
 //! design). The component confinement claimed below belongs to the `_fd`
 //! surface only, never to these.
 //!
+//! The `_fd` tree copy [`copy_dir_recursive_fd`] is a PARTIAL exception and
+//! is called out here so the list above is not read as exhaustive: it takes an
+//! arbitrary, possibly OUT-OF-ROOT source path by design, so its SOURCE side
+//! is path-based — the caller's `src` spelling (including any intermediate
+//! symlink in it) is followed ONCE when the source directory descriptor is
+//! opened, and only the caller's own tree is read. Every entry below it is
+//! then reached RELATIVE to that descriptor. Its DESTINATION side is fully
+//! component-confined (`O_NOFOLLOW`, `ELOOP` on a symlink in any component).
+//!
 //! The OPEN / CREATE-NEW helpers — [`openat_no_follow`], [`write_file_fd`],
 //! [`write_atomic_cas_fd`] — also open the FINAL component with
 //! `O_NOFOLLOW`, so a symlink there is refused too.
@@ -1679,10 +1688,17 @@ pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 
 /// The descriptor-relative single-directory creation (no parent creation,
 /// no chmod — `create_dir` semantics). The name is guarded at the chokepoint.
+///
+/// A residue spelling is REFUSED BEFORE the mkdir, at THIS gate — not merely
+/// by the [`mkdirat_fd`] chokepoint, which also presents [`Sanction::None`].
+/// The copy primitive refuses every destination residue for the same reason,
+/// so the two creation paths agree on ONE sanction: a residue spelling is
+/// never created, because a copy must not occupy a strand that may hold a
+/// stranded original. The previous `Sanction::Residue` here was dead (the
+/// chokepoint refused) and its comment claimed a create the copy must never
+/// make.
 pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    // CREATE only: a residue spelling is permitted (mkdir fails `EEXIST` if the
-    // strand is already there, and never destroys it); the lock authority runs.
-    refuse_reserved_mutation(rel, Sanction::Residue)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     mkdirat_fd(&parent_fd, name)
 }
@@ -1759,6 +1775,160 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
     fsync_dir_fd(&parent_fd)
 }
 
+/// The canonical filesystem path pinned by an owned-root DESCRIPTOR.
+///
+/// The Unix [`RootDir`] stores only a descriptor, so the copy's overlap check
+/// needs the descriptor's own resolved path. Linux exposes it as
+/// `/proc/self/fd/N`; macOS via `fcntl(F_GETPATH)`. Either answer is already
+/// canonical (the kernel tracks the resolved path), which is exactly what the
+/// overlap comparison needs.
+fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
+    let fd = root.as_fd().as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .map_err(|e| Error::store(format!("resolve the owned root descriptor: {e}")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
+        let r = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+        if r < 0 {
+            return Err(Error::store(format!(
+                "fcntl(F_GETPATH) on the owned root descriptor: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let bytes = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_bytes().to_vec();
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        Err(Error::store(
+            "resolving the owned root descriptor's path is not implemented on this platform",
+        ))
+    }
+}
+
+/// Refuse a copy whose SOURCE and DESTINATION overlap.
+///
+/// The destination root is `<owned root>/dst_rel` (a lexical join of the
+/// canonical root and validated `Normal` components; a symlink component is
+/// refused later by the guarded create); the source is canonicalized. The
+/// three overlap cases — the destination inside the source, the source inside
+/// the destination, and the two being the same directory — are all refused by
+/// construction, with the condition named in the error. This primitive has NO
+/// final rename, so entries appear IN PLACE: an overlap cannot be neutralized
+/// by a rename fence, and the destination directory is created before the
+/// source is read, so `read_dir(src)` would re-yield the destination and
+/// recurse without bound.
+fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
+    let dst_abs = owned_root_self_path(root)?.join(dst_rel);
+    let src_c = std::fs::canonicalize(src)
+        .map_err(|e| Error::store(format!("canonicalize source {}: {e}", src.display())))?;
+    if src_c == dst_abs || dst_abs.starts_with(&src_c) || src_c.starts_with(&dst_abs) {
+        return Err(Error::store(format!(
+            "copy_dir_recursive_fd: refusing to copy {} to {} — the source and the destination \
+             overlap (the destination is inside the source, the source is inside the destination, \
+             or they are the same directory), so the walk would copy the tree into itself without \
+             bound",
+            src.display(),
+            dst_abs.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The ONE name gate the copy applies to every entry name BEFORE it lands:
+/// the crate's name authority ([`crate::manifest::validate_entry_path`], the
+/// rule the manifest walk and the far-side wire both apply: valid UTF-8,
+/// already NFC, free of NUL/LF/CR/TAB, within [`NAME_MAX`], a normal
+/// component) PLUS [`crate::reserved::is_unaddressable_name`], the id rule's
+/// unaddressability half (a reserved spelling, the application lock record,
+/// a case/trailing-dot alias of either, or one of the crate's own TEMP
+/// shapes).
+///
+/// The temp half is load-bearing: the crate's documented recovery
+/// sweep removes every [`crate::atomic::is_crate_temp_name`] match, and
+/// `reserved.rs` states the sweep is safe BY CONSTRUCTION because no
+/// ADDRESSABLE content can match. A copy that landed a raw source name would
+/// break that construction, so the name is refused instead of landed.
+fn refuse_unlandable_name<'a>(name: &'a [u8], parent: &Path) -> Result<&'a str> {
+    let shown = parent.join(std::ffi::OsStr::from_bytes(name));
+    let name_str = std::str::from_utf8(name).map_err(|_| {
+        Error::store(format!(
+            "refusing to copy {}: the entry name is not valid UTF-8, and the crate's manifests \
+             require NFC/UTF-8 names",
+            shown.display()
+        ))
+    })?;
+    crate::manifest::validate_entry_path(name_str)
+        .map_err(|e| Error::store(format!("refusing to copy {}: {e}", shown.display())))?;
+    if crate::reserved::is_unaddressable_name(name_str) {
+        return Err(Error::store(format!(
+            "refusing to copy {}: the name {name_str:?} is unaddressable in this crate (a reserved \
+             spelling, the application lock record, or one of the crate's own temp shapes). The \
+             documented recovery sweep removes every temp-shaped name, so a copy must never land \
+             such a name",
+            shown.display()
+        )));
+    }
+    Ok(name_str)
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` on `name` relative to `dir_fd`, returning the
+/// whole `stat` (so the copy can read both the kind/mode and the link count).
+fn fstatat_stat_io(dir_fd: &OwnedFd, name: &[u8]) -> std::io::Result<libc::stat> {
+    let c = CString::new(name).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component with NUL")
+    })?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// Read the target of the symlink `name` relative to `dir_fd`, WITHOUT
+/// following it and without materializing a long path (so a deep source tree is
+/// never limited by `PATH_MAX`).
+fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBuf> {
+    let c = CString::new(name).map_err(|_| Error::store("symlink name with NUL"))?;
+    let mut buf: Vec<u8> = vec![0; 256];
+    loop {
+        let n = unsafe {
+            libc::readlinkat(
+                dir_fd.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(Error::store(format!(
+                "readlinkat {}: {}",
+                shown.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let n = n as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
+        }
+        buf.resize(buf.len() * 2, 0);
+    }
+}
+
 /// The descriptor-relative ITERATIVE recursive tree copy: copy the tree at
 /// the (arbitrary, possibly OUT-OF-ROOT) read path `src` to the ROOT-RELATIVE
 /// destination `dst_rel`, creating `dst_rel` and every missing ancestor.
@@ -1775,10 +1945,17 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
 /// CONFINEMENT: the destination resolves component-wise from the owned root
 /// descriptor with `O_NOFOLLOW`, so a symlink injected into any destination
 /// component is REFUSED (ELOOP), never followed — the copy can never be
-/// redirected outside the root. The SOURCE is a read and is path-based
-/// (`std::fs::read_dir`/`read_link`/`File::open`), so an intermediate symlink
-/// in the SOURCE path IS followed; that is a read, never a mutation, and it
-/// is confined to the caller's own `src`.
+/// redirected outside the root. The SOURCE is opened ONCE as a descriptor
+/// (the caller's own `src`, deliberately an arbitrary possibly-out-of-root
+/// path) and the walk then reads it with `fstatat`/`readlinkat`/`openat`
+/// RELATIVE to that descriptor, so an intermediate symlink in the caller's
+/// `src` SPELLING is followed exactly once (that is a read, never a mutation,
+/// confined to the caller's own source). Opening the source entries through
+/// the descriptor also means no entry is reached by a path longer than one
+/// component, so a deep source tree is not bounded by `PATH_MAX`. The crate's
+/// guarded, classified open ([`openat_readable_regular`]) is what reads a
+/// regular file: `O_NONBLOCK` plus an `fstat` of the OPENED inode, so a FIFO,
+/// socket, or device is REFUSED rather than opened.
 ///
 /// ITERATIVE, NEVER RECURSIVE. The walk keeps an explicit heap `Vec` of open
 /// frames instead of one Rust frame per directory level (the source tool's
@@ -1798,12 +1975,45 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
 /// source directory failed with `EACCES`; keeping the exact final modes while
 /// fixing that is a deliberate, documented difference.)
 ///
-/// RESERVED NAMES: every destination mutation runs the ONE guarded gate (the
-/// directory/file creates and the mutating `openat` all refuse a lock-record
-/// spelling; a residue spelling is created only when ABSENT, exactly as the
-/// other creation primitives permit). A source tree that itself contains a
-/// lock-record name (e.g. `operation.lock`) is therefore REFUSED on the
-/// destination side; the source tool's original had no such authority.
+/// NAMES: every entry name is validated BEFORE any destination mutation by
+/// [`refuse_unlandable_name`], which applies the crate's ONE name authority
+/// ([`crate::manifest::validate_entry_path`] — valid UTF-8, already NFC, free
+/// of NUL/LF/CR/TAB, within [`NAME_MAX`]) AND the id rule's unaddressability
+/// half ([`crate::reserved::is_unaddressable_name`] — reserved spellings, the
+/// application lock record, their case/trailing-dot aliases, and the crate's
+/// own TEMP shapes). A name the crate would refuse as an id, or strip from a
+/// manifest, or that the documented recovery sweep
+/// ([`crate::atomic::is_crate_temp_name`]) would REMOVE, is therefore refused
+/// instead of landed. The `dst_rel` path itself runs
+/// [`refuse_reserved_creation`] before anything is created, so a
+/// residue-spelled destination component is refused with NO partial state and
+/// with CREATE/COPY wording (never the removal `recover_to` vocabulary).
+/// Every destination mutation still runs the ONE guarded gate as well (the
+/// directory/file creates and the mutating `openat`), so a lock-record
+/// spelling cannot be created by any route.
+///
+/// HARD LINKS are REFUSED (a regular file with `st_nlink > 1`): the crate's
+/// own `canonicalize_tree` refuses hard links by rule, so silently
+/// duplicating one into an independent regular file would materialize a tree
+/// the crate cannot canonicalize. A caller that must copy such a tree
+/// pre-checks and dereferences them itself.
+///
+/// OVERLAP is refused by construction ([`refuse_overlapping_copy`]): when the
+/// canonicalized source and the resolved destination root are equal, or either
+/// contains the other, the call fails before creating anything. Without this,
+/// a destination created INSIDE the source would be re-yielded by the source
+/// `read_dir` and the walk would recurse without bound (the reproduction ran
+/// to `ENAMETOOLONG` at depth 236 on macOS and 1017 on Linux).
+///
+/// NOT ATOMIC, NOT DURABLE, PARTIAL ON FAILURE: there is no temp directory and
+/// no final rename, so entries appear at their destination in `read_dir`
+/// order, a crash or error mid-walk leaves a PARTIAL destination tree, and the
+/// primitive does not fsync. A caller that needs either guarantee must copy
+/// into a fresh staging path it owns and rename it into place itself, and must
+/// treat ANY `Err` as "the destination may hold a partial subtree at
+/// `dst_rel`" — inspect or remove that subtree before retrying (the crate
+/// contributes no resumability). Use [`fsync_tree_recursive_fd`] to make a
+/// completed copy durable.
 ///
 /// SYMLINKS are recreated as symlinks (the link's own target is copied,
 /// never followed), replacing any existing destination entry at that name,
@@ -1821,11 +2031,11 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
 pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
     struct Frame {
         dst_rel: PathBuf,
-        entries: std::fs::ReadDir,
-    }
-
-    fn read_dir_entries(src: &Path) -> Result<std::fs::ReadDir> {
-        std::fs::read_dir(src).map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))
+        src_dir: OwnedFd,
+        /// The source directory's path, for error display ONLY (never a
+        /// syscall argument, so a deep tree is not bounded by `PATH_MAX`).
+        src_shown: PathBuf,
+        names: std::vec::IntoIter<Vec<u8>>,
     }
 
     let src_meta = std::fs::symlink_metadata(src)
@@ -1839,6 +2049,21 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     }
     let root_mode = src_meta.permissions().mode() & 0o7777;
 
+    // Run the ONE gate on the WHOLE destination path BEFORE creating
+    // anything, so a residue-spelled component is refused with no partial
+    // state and in the operation's own (CREATE/COPY) vocabulary. The child
+    // names are gated per-entry by [`refuse_unlandable_name`].
+    refuse_reserved_creation(dst_rel)?;
+
+    // Refuse an overlapping source/destination BEFORE creating anything.
+    refuse_overlapping_copy(root, src, dst_rel)?;
+    // The resolved destination root, used to judge a symlink target whose
+    // spelled walk leaves the copied SUBTREE (`../foo`): inside the subtree the
+    // SOURCE tree answers whether a component is a symlink (it mirrors the
+    // copy), but outside it only the destination root can, which is exactly
+    // what `canonicalize_tree` will see.
+    let dst_root_abs = owned_root_self_path(root)?;
+
     // Create the destination chain (guarded, component-wise O_NOFOLLOW) and
     // widen the FINAL directory during the walk; the exact mode is restored
     // deepest-first below.
@@ -1847,56 +2072,135 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
 
     // `(dst_rel, final_mode)` for the deepest-first finalize.
     let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let src_root_fd: OwnedFd = std::fs::File::open(src)
+        .map_err(|e| Error::store(format!("open dir {}: {e}", src.display())))?
+        .into();
+    let names = dir_entry_names(&src_root_fd)?;
     let mut stack: Vec<Frame> = vec![Frame {
         dst_rel: dst_rel.to_path_buf(),
-        entries: read_dir_entries(src)?,
+        src_dir: src_root_fd,
+        src_shown: src.to_path_buf(),
+        names: names.into_iter(),
     }];
 
     while let Some(top) = stack.last_mut() {
-        let Some(entry) = top.entries.next() else {
+        let Some(name) = top.names.next() else {
             stack.pop();
             continue;
         };
-        let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
-        let descend: Option<Frame> = {
-            let top = stack.last().expect("the frame just examined");
-            let child_src = entry.path();
-            let child_rel = top.dst_rel.join(entry.file_name());
-            let ft = entry
-                .file_type()
-                .map_err(|e| Error::store(format!("file_type: {e}")))?;
-            if ft.is_dir() {
-                let mode = std::fs::symlink_metadata(&child_src)
-                    .map_err(|e| Error::store(format!("stat {}: {e}", child_src.display())))?
-                    .permissions()
-                    .mode()
-                    & 0o7777;
-                // Guarded create (mkdir semantics: refuses a lock-record
-                // spelling, never destroys a residue), then widen during the
-                // walk so a read-only source directory can receive children.
+        // Validate the NAME through the crate's ONE name authority
+        // BEFORE any destination mutation.
+        let name_str = refuse_unlandable_name(&name, &top.src_shown)?;
+        let child_rel = top.dst_rel.join(name_str);
+        let child_src = top.src_shown.join(name_str);
+        let st = fstatat_stat_io(&top.src_dir, &name)
+            .map_err(|e| Error::store(format!("fstatat {}: {e}", child_src.display())))?;
+        // `st_mode` is `u16` on macOS and `u32` on Linux: cast, not
+        // `u32::from`, so the SAME expression is clippy-clean on both.
+        let mode = (st.st_mode as u32) & 0o7777;
+        let descend: Option<Frame> = match kind_from_mode(st.st_mode) {
+            PathKind::Dir => {
+                // Guarded create (mkdir semantics, refusing a residue/lock
+                // spelling), then widen during the walk so a read-only source
+                // directory can receive children.
                 create_dir_fd(root, &child_rel)?;
                 set_dir_mode_fd(root, &child_rel, (mode | 0o200) & 0o7777)?;
                 dirs.push((child_rel.clone(), mode));
+                let child_fd = openat_no_follow_io(
+                    &top.src_dir,
+                    Path::new(name_str),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )
+                .map_err(|e| Error::store(format!("open dir {}: {e}", child_src.display())))?;
+                let names = dir_entry_names(&child_fd)?;
                 Some(Frame {
                     dst_rel: child_rel,
-                    entries: read_dir_entries(&entry.path())?,
+                    src_dir: child_fd,
+                    src_shown: child_src,
+                    names: names.into_iter(),
                 })
-            } else if ft.is_symlink() {
-                let link = std::fs::read_link(&child_src)
-                    .map_err(|e| Error::store(format!("readlink {}: {e}", child_src.display())))?;
+            }
+            PathKind::Symlink => {
+                let link = readlinkat_name(&top.src_dir, &name, &child_src)?;
+                // The crate's OWN symlink rules, REUSED rather than
+                // restated — the target must be valid UTF-8 and free of
+                // NUL/LF/CR/TAB ([`crate::manifest::validate_symlink_target`]),
+                // and its spelled walk from the link's directory must not
+                // escape the root or pass THROUGH a symlink component
+                // ([`crate::manifest::check_relative_symlink_target`]). A link
+                // is copied AS a link, never followed.
+                let link_str = std::str::from_utf8(link.as_os_str().as_bytes()).map_err(|_| {
+                    Error::store(format!(
+                        "refusing to copy symlink {}: its target is not valid UTF-8",
+                        child_src.display()
+                    ))
+                })?;
+                crate::manifest::validate_symlink_target(&child_rel.to_string_lossy(), link_str)
+                    .map_err(|e| {
+                        Error::store(format!(
+                            "refusing to copy symlink {}: {e}",
+                            child_src.display()
+                        ))
+                    })?;
+                let mut resolve = |rel: &Path| -> crate::manifest::ComponentResolution {
+                    let probe = match rel.strip_prefix(dst_rel) {
+                        Ok(sub) => src.join(sub),
+                        Err(_) => dst_root_abs.join(rel),
+                    };
+                    match std::fs::symlink_metadata(probe) {
+                        Ok(m) if m.is_symlink() => crate::manifest::ComponentResolution::Symlink,
+                        Ok(_) => crate::manifest::ComponentResolution::NotSymlink,
+                        Err(_) => crate::manifest::ComponentResolution::Absent,
+                    }
+                };
+                if let Err(refusal) =
+                    crate::manifest::check_relative_symlink_target(&child_rel, &link, &mut resolve)
+                {
+                    return Err(Error::store(format!(
+                        "refusing to copy symlink {}: {}",
+                        child_src.display(),
+                        crate::manifest::symlink_target_refusal_message(
+                            refusal,
+                            &child_src.display().to_string(),
+                            &link.to_string_lossy(),
+                        )
+                    )));
+                }
                 // The ONE symlink authority: guards the whole path and the
                 // final name, replaces an existing entry, fsyncs the parent.
                 symlink_fd(root, &link, &child_rel)?;
                 None
-            } else {
-                let mut src_f = std::fs::File::open(&child_src)
-                    .map_err(|e| Error::store(format!("open {}: {e}", child_src.display())))?;
-                let mode = src_f
-                    .metadata()
-                    .map_err(|e| Error::store(format!("fstat {}: {e}", child_src.display())))?
-                    .permissions()
-                    .mode()
-                    & 0o7777;
+            }
+            kind @ (PathKind::File | PathKind::Other) => {
+                // The crate refuses HARD LINKS by rule
+                // (`canonicalize_tree` refuses a file with nlink > 1), so a
+                // copy must not silently duplicate one into an independent
+                // regular file.
+                if kind == PathKind::File && st.st_nlink > 1 {
+                    return Err(Error::store(format!(
+                        "refusing to copy {}: it is a hard link (link count {}); the crate refuses \
+                         hard links by rule, so a copy must not silently duplicate one into an \
+                         independent regular file",
+                        child_src.display(),
+                        st.st_nlink
+                    )));
+                }
+                // The source read goes through the crate's OWN guarded,
+                // classified open ([`openat_readable_regular`]), which adds
+                // `O_NONBLOCK` (a no-op for a regular file) and classifies the
+                // OPENED inode — so a FIFO/socket/device is REFUSED instead of
+                // blocking forever in `open(2)`.
+                let src_fd =
+                    openat_readable_regular(&top.src_dir, Path::new(name_str), libc::O_RDONLY)
+                        .map_err(|e| {
+                            Error::store(format!(
+                                "refusing to copy {}: {e} (the crate refuses special files by \
+                                 rule)",
+                                child_src.display()
+                            ))
+                        })?;
+                let mut src_f = std::fs::File::from(src_fd);
                 // Create-new-only through the mutating `openat` chokepoint
                 // (which runs the lock-record guard); a pre-existing entry is
                 // refused (O_EXCL), matching the source tool.
@@ -1988,6 +2292,20 @@ fn set_dir_mode_fd(root: &RootDir, rel: &Path, mode: u32) -> Result<()> {
 /// `Err` (never swallowed). The walk is an explicit heap `Vec` stack, so a
 /// deep tree surfaces a clean `Err` (at the descriptor limit) rather than
 /// aborting the host on a stack overflow.
+///
+/// COST — O(depth^2) `openat` CALLS (documented, deliberately NOT changed
+/// here): the walk reopens the whole root-relative path COMPONENT-WISE for
+/// every directory it enumerates, every file it fsyncs, and every directory it
+/// finally fsyncs, because it keeps only the path in its heap stack, never a
+/// directory descriptor. Measured `openat` counts (Linux, one `open` per
+/// component): 1202 at depth 32, 17042 at depth 128, 264722 at depth 512 —
+/// i.e. ~depth^2. The fix (hold one directory descriptor per level and reach
+/// each child relative to its parent) is understood but not taken here: it
+/// trades the open count for one descriptor per level, so its failure mode at
+/// the descriptor limit changes shape, and the current form is already
+/// fail-closed, error-propagating, deepest-first, and ITERATIVE (a deep tree
+/// surfaces a clean `Err`, never an abort). A caller fsyncing trees deeper than
+/// a few hundred levels should prefer a streaming walk.
 pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
     let mut dirs: Vec<PathBuf> = vec![rel.to_path_buf()];
     let mut stack: Vec<PathBuf> = vec![rel.to_path_buf()];
@@ -4056,5 +4374,425 @@ mod tests {
             err.to_string().contains("openat"),
             "the refusal must name the component-wise open, got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // A FIFO (or socket/device) in the source is REFUSED promptly.
+    // ------------------------------------------------------------------
+
+    /// A FIFO in the source tree must be refused PROMPTLY, never opened
+    /// blocking. `open(2)` of a FIFO read-only blocks until a writer appears,
+    /// and the primitive used to `File::open` every non-dir/non-symlink entry.
+    /// The call runs on a worker thread so the WAIT IS BOUNDED: the test
+    /// returns (failing) after the timeout even if the fix regresses, and the
+    /// suite can never hang. PRE-FIX: the worker blocks in `open` and never
+    /// answers, so the timeout fires.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_fifo_source_without_blocking() {
+        let (base, _root, src) = out_of_root_fixture();
+        std::fs::write(src.join("a-before"), b"before").unwrap();
+        let fifo = src.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_path = base.path().join("root");
+        let src_path = src.clone();
+        std::thread::spawn(move || {
+            let owned = RootDir::open(&root_path).expect("open the owned root");
+            let r = copy_dir_recursive_fd(&owned, &src_path, Path::new("dst"));
+            let _ = tx.send(r.map_err(|e| e.to_string()));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "copy_dir_recursive_fd did not return within 5s: the FIFO open is BLOCKING \
+                 an unbounded hang on user data"
+                )
+            });
+        let err = outcome.expect_err("a FIFO in the source must be refused, not opened");
+        assert!(
+            err.contains("not a regular file") && err.contains("refusing to copy"),
+            "the refusal must classify the OPENED inode and name the copy, got: {err}"
+        );
+        assert!(
+            !base.path().join("root/dst/pipe").exists(),
+            "the FIFO must not be materialized in the destination"
+        );
+    }
+
+    /// Companion: a Unix SOCKET is a non-regular entry that `open(2)` does
+    /// not block on (it fails `ENXIO`), so this is a COVERAGE case rather than
+    /// a hang reproduction — but it proves the classified-open path refuses a
+    /// non-regular entry with a store error. A DEVICE cannot be created by an
+    /// unprivileged process (`mknod` needs `CAP_MKNOD`), so the device case is
+    /// REASONED, not run: [`openat_readable_regular`] classifies every
+    /// `S_IFMT` outside file/dir/symlink as `PathKind::Other` and refuses it,
+    /// exactly as it refuses the FIFO and the socket.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_socket_source() {
+        let (base, root, src) = out_of_root_fixture();
+        let sock = src.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a socket in the source must be refused");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, Error::Store(_)) && msg.contains("refusing to copy"),
+            "the refusal must be a store error naming the copy, got: {err}"
+        );
+        assert!(!base.path().join("root/dst/sock").exists());
+    }
+
+    // ------------------------------------------------------------------
+    // The crate's ONE name authority gates every landed name.
+    // ------------------------------------------------------------------
+
+    /// A source entry whose name is a crate TEMP shape is refused instead
+    /// of landed. `is_crate_temp_name` recognises the landed entry, so the
+    /// documented recovery sweep would DELETE a live file. PRE-FIX: the name
+    /// was written verbatim and the copy returned `Ok`.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_crate_temp_name() {
+        let (base, root, src) = out_of_root_fixture();
+        std::fs::write(src.join(".victim.tmp.1.2"), b"live content").unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a crate-temp-shaped name must be refused, not landed");
+        assert!(
+            err.to_string().contains("unaddressable") && err.to_string().contains("recovery sweep"),
+            "the refusal must name the unaddressability and the sweep, got: {err}"
+        );
+        assert!(
+            !base.path().join("root/dst/.victim.tmp.1.2").exists(),
+            "the temp-shaped name was never landed"
+        );
+    }
+
+    /// A reserved SPELLING (the claim-aside namespace) is refused for the
+    /// same reason: the sync strips reserved components from both manifests,
+    /// so the crate could never transfer or destroy an entry with this name.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_reserved_source_name() {
+        let (base, root, src) = out_of_root_fixture();
+        std::fs::write(src.join(".sync-aside.1.2"), b"live content").unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a reserved spelling must be refused");
+        assert!(err.to_string().contains("unaddressable"), "{err}");
+        assert!(!base.path().join("root/dst/.sync-aside.1.2").exists());
+    }
+
+    /// A name carrying a manifest-wire separator (LF, CR, TAB) is refused,
+    /// so the destination always `canonicalize_tree`s cleanly. NUL cannot be
+    /// tested because NO supported filesystem can represent it (an OS filename
+    /// is a NUL-terminated C string).
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_wire_unrepresentable_name() {
+        let (base, root, src) = out_of_root_fixture();
+        for (rep, name) in [
+            ("LF", "bad\nname"),
+            ("CR", "bad\rname"),
+            ("TAB", "bad\tname"),
+        ] {
+            std::fs::write(src.join(name), b"x").unwrap();
+            // A FRESH destination per case: reusing one would make an earlier
+            // case's landed entries collide (`O_EXCL`) before this case's name
+            // is reached.
+            let dst = format!("dst-{rep}");
+            let err = copy_dir_recursive_fd(&root, &src, Path::new(&dst))
+                .expect_err("a wire-unrepresentable name must be refused");
+            assert!(
+                err.to_string().contains("wire-unrepresentable"),
+                "the refusal must name the wire rule for {rep}, got: {err}"
+            );
+            assert!(
+                !base.path().join("root").join(&dst).join(name).exists(),
+                "the {rep} name was never landed"
+            );
+            std::fs::remove_file(src.join(name)).unwrap();
+        }
+    }
+
+    /// A decomposed (non-NFC) name is refused rather than landed on a
+    /// normalization-sensitive filesystem. This is representable on macOS APFS
+    /// and Linux alike (both store the decomposed spelling), so it runs on
+    /// both.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_non_nfc_name() {
+        let (base, root, src) = out_of_root_fixture();
+        // `e` + COMBINING ACUTE ACCENT: NFD, not NFC.
+        let decomposed = "e\u{301}";
+        std::fs::write(src.join(decomposed), b"x").unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a non-NFC name must be refused");
+        assert!(
+            err.to_string().contains("NFC"),
+            "the refusal must name the NFC rule, got: {err}"
+        );
+        assert!(!base.path().join("root/dst").join(decomposed).exists());
+    }
+
+    /// A NON-UTF-8 name is refused. The spelling can only be CREATED on a
+    /// filesystem that stores raw bytes (Linux ext4/tmpfs); macOS APFS refuses
+    /// the write, so the case is announced as a SKIP there rather than silently
+    /// passing.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_non_utf8_name() {
+        let (base, root, src) = out_of_root_fixture();
+        let raw = std::ffi::OsStr::from_bytes(b"raw\xffname");
+        if std::fs::write(src.join(raw), b"x").is_err() {
+            crate::test_support::announce_skip(
+                "this filesystem cannot store a non-UTF-8 name, so the refusal cannot be exercised here",
+            );
+            return;
+        }
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a non-UTF-8 name must be refused");
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "the refusal must name the UTF-8 rule, got: {err}"
+        );
+        assert!(!base.path().join("root/dst").join(raw).exists());
+    }
+
+    /// The legitimate cases still copy — ordinary names, spaces, quotes,
+    /// `$`, `;`, `*`, a leading `-`, a 255-byte name, and a DIRECTORY with a
+    /// space. These are exactly the classes the crate's id charset refuses but
+    /// a manifest NAME accepts, so the name gate must not be the id charset.
+    #[test]
+    fn copy_dir_recursive_fd_still_copies_legal_awkward_names() {
+        let (base, root, src) = out_of_root_fixture();
+        let long = "L".repeat(crate::atomic::NAME_MAX);
+        let names = [
+            "ordinary",
+            "with space",
+            "quote's\"x",
+            "dollar$d",
+            "semi;colon",
+            "star*star",
+            "-leading-dash",
+            long.as_str(),
+        ];
+        for name in names {
+            std::fs::write(src.join(name), name.as_bytes()).unwrap();
+        }
+        std::fs::create_dir(src.join("dir with space")).unwrap();
+        std::fs::write(src.join("dir with space/inner"), b"inner").unwrap();
+
+        copy_dir_recursive_fd(&root, &src, Path::new("dst")).unwrap();
+        for name in names {
+            assert_eq!(
+                std::fs::read(base.path().join("root/dst").join(name)).unwrap(),
+                name.as_bytes(),
+                "the legal name {name:?} must copy"
+            );
+        }
+        assert_eq!(
+            std::fs::read(base.path().join("root/dst/dir with space/inner")).unwrap(),
+            b"inner"
+        );
+        // The whole result must canonicalize cleanly (the manifest walk's oracle).
+        crate::manifest::canonicalize_tree(&base.path().join("root/dst")).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Overlapping source/destination is refused by construction.
+    // ------------------------------------------------------------------
+
+    /// The overlapping reproduction — `src = <root>/tree`, `dst_rel =
+    /// "tree/sub"` — must be refused BEFORE anything is created, so no partial
+    /// tree is left. PRE-FIX: `ensure_private_dir_fd` created `<root>/tree/sub`,
+    /// the source `read_dir` re-yielded it, and the walk recursed to
+    /// `ENAMETOOLONG` (macOS depth 236, Linux 1017).
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_destination_inside_the_source() {
+        let (base, root, _src) = out_of_root_fixture();
+        let tree = base.path().join("root/tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("f"), b"f").unwrap();
+        std::fs::create_dir(tree.join("d")).unwrap();
+        std::fs::write(tree.join("d/inner"), b"inner").unwrap();
+
+        let err = copy_dir_recursive_fd(&root, &tree, Path::new("tree/sub"))
+            .expect_err("a destination inside the source must be refused");
+        assert!(
+            err.to_string().contains("overlap"),
+            "the refusal must name the overlap, got: {err}"
+        );
+        assert!(
+            !base.path().join("root/tree/sub").exists(),
+            "no partial destination tree may be left behind"
+        );
+    }
+
+    /// The reverse overlap (source inside the destination root) and the
+    /// equal case are refused too.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_source_inside_the_destination() {
+        let (base, root, _src) = out_of_root_fixture();
+        std::fs::create_dir_all(base.path().join("root/tree/sub")).unwrap();
+        std::fs::write(base.path().join("root/tree/sub/f"), b"f").unwrap();
+        let inner = base.path().join("root/tree/sub");
+        let err = copy_dir_recursive_fd(&root, &inner, Path::new("tree"))
+            .expect_err("a source inside the destination must be refused");
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    /// A genuinely non-overlapping source still copies — including a source
+    /// INSIDE the root that is a sibling of the destination, and an
+    /// out-of-root source sharing a long path prefix with the root.
+    #[test]
+    fn copy_dir_recursive_fd_allows_non_overlapping_sources() {
+        let (base, root, _src) = out_of_root_fixture();
+        // A sibling under the root.
+        let tree = base.path().join("root/tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("f"), b"f").unwrap();
+        copy_dir_recursive_fd(&root, &tree, Path::new("copy")).unwrap();
+        assert_eq!(
+            std::fs::read(base.path().join("root/copy/f")).unwrap(),
+            b"f"
+        );
+
+        // An out-of-root source whose spelling shares the root's prefix.
+        let twin = base.path().join("root2");
+        std::fs::create_dir(&twin).unwrap();
+        std::fs::write(twin.join("g"), b"g").unwrap();
+        copy_dir_recursive_fd(&root, &twin, Path::new("copy2")).unwrap();
+        assert_eq!(
+            std::fs::read(base.path().join("root/copy2/g")).unwrap(),
+            b"g"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Symlink containment is the crate's own rule.
+    // ------------------------------------------------------------------
+
+    /// An ESCAPING relative symlink target is refused (both platforms), and
+    /// once it is removed the ordinary tree plus the legitimate in-root
+    /// relative link copy and the destination `canonicalize_tree`s cleanly.
+    /// PRE-FIX: the escaping target was copied verbatim and the result failed
+    /// `canonicalize_tree`.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_an_escaping_symlink_and_keeps_the_tree_canonicalizable() {
+        let (base, root, src) = out_of_root_fixture();
+        std::os::unix::fs::symlink("../../outside", src.join("esc")).unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("an escaping symlink target must be refused");
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the refusal must reuse the crate's symlink vocabulary, got: {err}"
+        );
+        assert!(!base.path().join("root/dst/esc").exists());
+
+        // With the escaping link gone, the legitimate in-root relative link
+        // (`link -> file.txt`, seeded by the fixture) copies, and the whole
+        // destination canonicalizes cleanly.
+        std::fs::remove_file(src.join("esc")).unwrap();
+        copy_dir_recursive_fd(&root, &src, Path::new("dst2")).unwrap();
+        assert_eq!(
+            std::fs::read_link(base.path().join("root/dst2/link")).unwrap(),
+            Path::new("file.txt")
+        );
+        crate::manifest::canonicalize_tree(&base.path().join("root/dst2")).unwrap();
+    }
+
+    /// A relative symlink target that stays INSIDE the root but leaves the
+    /// COPIED subtree and resolves THROUGH a pre-existing destination symlink
+    /// is refused too: the kernel follows the component, so
+    /// `canonicalize_tree(root)` would refuse the result. Inside the copied
+    /// subtree the SOURCE tree answers whether a component is a symlink;
+    /// outside it the resolved destination root does.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_target_through_an_outside_symlink() {
+        let (base, root, src) = out_of_root_fixture();
+        std::os::unix::fs::symlink("real", base.path().join("root/outside-link")).unwrap();
+        std::fs::create_dir(base.path().join("root/real")).unwrap();
+        // From `dst/esc`, `../outside-link` lands on `<root>/outside-link`.
+        std::os::unix::fs::symlink("../outside-link", src.join("esc")).unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a target through an outside symlink component must be refused");
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the refusal must reuse the crate's symlink vocabulary, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A residue-spelled destination is refused with no partial state.
+    // ------------------------------------------------------------------
+
+    /// A residue-spelled DESTINATION component is refused BEFORE anything
+    /// is created, with the CREATE/COPY vocabulary (not the removal
+    /// `recover_to` wording), and no partial directory is left. PRE-FIX:
+    /// `ensure_private_dir_fd` created `<root>/.sync-aside.probe`, then the
+    /// NEXT call refused with a REMOVAL-worded message and left the directory
+    /// behind.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_residue_destination_with_no_partial_state() {
+        let (base, root, src) = out_of_root_fixture();
+
+        let err = copy_dir_recursive_fd(&root, &src, Path::new(".sync-aside.probe/inner"))
+            .expect_err("a residue-spelled destination component must be refused");
+        assert_eq!(err.reserved_kind(), Some(ReservedKind::ResidueBelow));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to create") && msg.contains(crate::reserved::RESIDUE_BELOW),
+            "the refusal must use the CREATE vocabulary and keep the token, got: {msg}"
+        );
+        assert!(
+            !msg.contains("refusing to remove"),
+            "a copy must not report a removal, got: {msg}"
+        );
+        assert!(
+            !base.path().join("root/.sync-aside.probe").exists(),
+            "NO partial state may be created before the refusal"
+        );
+
+        // The single-component spelling is refused the same way.
+        let err = copy_dir_recursive_fd(&root, &src, Path::new(".sync-aside.probe"))
+            .expect_err("a residue-spelled destination root must be refused");
+        assert_eq!(err.reserved_kind(), Some(ReservedKind::ResidueBelow));
+        assert!(!base.path().join("root/.sync-aside.probe").exists());
+    }
+
+    /// A LOCK-RECORD destination spelling is still refused
+    /// cleanly, with no partial state.
+    #[test]
+    fn copy_dir_recursive_fd_still_refuses_a_lock_record_destination() {
+        let (base, root, src) = out_of_root_fixture();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new(".dest.operation.lock"))
+            .expect_err("a lock-record destination must be refused");
+        assert!(
+            err.to_string().contains("lock record"),
+            "the refusal must name the lock record, got: {err}"
+        );
+        assert!(!base.path().join("root/.dest.operation.lock").exists());
+    }
+
+    // ------------------------------------------------------------------
+    // Hard links are refused, matching `canonicalize_tree`.
+    // ------------------------------------------------------------------
+
+    /// A HARD LINK in the source is refused rather than duplicated as
+    /// an independent regular file (`nlink` 1 vs 2), because the crate's own
+    /// `canonicalize_tree` refuses hard links by rule.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_hard_link_source() {
+        let (base, root, src) = out_of_root_fixture();
+        std::fs::hard_link(src.join("file.txt"), src.join("hard")).unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a hard link must be refused, not duplicated");
+        assert!(
+            err.to_string().contains("hard link"),
+            "the refusal must name the hard link, got: {err}"
+        );
+        assert!(!base.path().join("root/dst/hard").exists());
     }
 }

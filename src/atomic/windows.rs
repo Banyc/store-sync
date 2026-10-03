@@ -285,11 +285,103 @@ fn rel_join(root: &RootDir, rel: &Path) -> Result<PathBuf> {
     Ok(root.path().join(rel))
 }
 
+/// The Windows twin of the Unix name gate: the crate's ONE name authority
+/// ([`crate::manifest::validate_entry_path`] plus
+/// [`crate::reserved::is_unaddressable_name`]) applied to every landed entry
+/// name, so a name the crate would refuse as an id, strip from a manifest, or
+/// that the documented recovery sweep would REMOVE is refused instead of
+/// landed. A Windows name is UTF-16, so `to_str` refuses an unpaired surrogate
+/// (the platform's non-UTF-8 case).
+fn refuse_unlandable_name<'a>(name: &'a std::ffi::OsStr, parent: &Path) -> Result<&'a str> {
+    let shown = parent.join(name);
+    let Some(name_str) = name.to_str() else {
+        return Err(Error::store(format!(
+            "refusing to copy {}: the entry name is not valid UTF-8, and the crate's manifests \
+             require NFC/UTF-8 names",
+            shown.display()
+        )));
+    };
+    crate::manifest::validate_entry_path(name_str)
+        .map_err(|e| Error::store(format!("refusing to copy {}: {e}", shown.display())))?;
+    if crate::reserved::is_unaddressable_name(name_str) {
+        return Err(Error::store(format!(
+            "refusing to copy {}: the name {name_str:?} is unaddressable in this crate (a reserved \
+             spelling, the application lock record, or one of the crate's own temp shapes). The \
+             documented recovery sweep removes every temp-shaped name, so a copy must never land \
+             such a name",
+            shown.display()
+        )));
+    }
+    Ok(name_str)
+}
+
+/// The Windows twin of the Unix overlap refusal, using the platform's
+/// case-INSENSITIVE comparison: a Windows filesystem folds case, so `Tree` and
+/// `tree` are one directory and a case-only difference must not evade the
+/// check.
+fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
+    fn key(p: &Path) -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    }
+    let root_c = std::fs::canonicalize(root.path())
+        .map_err(|e| Error::store(format!("canonicalize root {}: {e}", root.path().display())))?;
+    let dst_abs = root_c.join(dst_rel);
+    let src_c = std::fs::canonicalize(src)
+        .map_err(|e| Error::store(format!("canonicalize source {}: {e}", src.display())))?;
+    let (d, s) = (key(&dst_abs), key(&src_c));
+    let prefix = |a: &[String], b: &[String]| b.len() >= a.len() && a == &b[..a.len()];
+    if d == s || prefix(&s, &d) || prefix(&d, &s) {
+        return Err(Error::store(format!(
+            "copy_dir_recursive_fd: refusing to copy {} to {} — the source and the destination \
+             overlap (the destination is inside the source, the source is inside the destination, \
+             or they are the same directory), so the walk would copy the tree into itself without \
+             bound",
+            src.display(),
+            dst_abs.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Path-based equivalent of the Unix fd-confined `copy_dir_recursive_fd`:
 /// copy the
 /// tree at `src` to the root-relative `dst_rel`, iteratively (an explicit
 /// heap `Vec` stack, so a deep tree cannot exhaust the C stack), preserving
 /// symlinks and (best-effort — a no-op on Windows) modes.
+///
+/// NAMES: every entry name is validated by [`refuse_unlandable_name`] before
+/// it lands, and `dst_rel` runs [`refuse_reserved_creation`] before anything
+/// is created, exactly as the Unix port does.
+///
+/// OVERLAP: a source/destination overlap is refused by
+/// [`refuse_overlapping_copy`] (case-insensitively) before anything is
+/// created, so the walk cannot copy a tree into itself without bound.
+///
+/// SYMLINKS: the crate's OWN target rules are reused
+/// ([`crate::manifest::validate_symlink_target`] and
+/// [`crate::manifest::check_relative_symlink_target`]), and a link is copied
+/// as a link, never followed.
+///
+/// HARD LINKS are NOT detected on this port (Windows exposes no stable
+/// `nlink` through `std::fs`), and the crate's own Windows manifest cannot
+/// refuse them either (its check is `#[cfg(unix)]`), so this port duplicates
+/// them; a caller that must not duplicate them pre-checks on the source.
+///
+/// MEMORY BOUND: every regular file is read WHOLE into memory
+/// (`std::fs::read`) and then written, so the peak allocation is the size of
+/// the LARGEST file in the source tree, plus the destination write buffer. A
+/// tree with a multi-gigabyte file must not be copied through this port; use
+/// a streaming copy instead. (The Unix port streams through a 64 KiB heap
+/// buffer.)
+///
+/// NOT ATOMIC, NOT DURABLE, PARTIAL ON FAILURE: as on Unix, there is no temp
+/// directory and no final rename, so entries appear in place, an error
+/// mid-walk leaves a PARTIAL destination tree, and this port cannot fsync a
+/// directory entry. A caller that needs atomicity copies into a staging path
+/// it owns and renames it into place, and must treat ANY `Err` as "the
+/// destination may hold a partial subtree at `dst_rel`".
 ///
 /// DOCUMENTED WEAKER GUARANTEE: there is no directory descriptor and no
 /// `O_NOFOLLOW`, so a symlink injected into a destination component IS
@@ -320,17 +412,25 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
         )));
     }
     let root_mode = crate::platform::metadata_mode(&src_meta);
+    refuse_reserved_creation(dst_rel)?;
+    refuse_overlapping_copy(root, src, dst_rel)?;
+    // See the Unix port: a symlink target that walks OUT of the copied subtree
+    // is judged against the destination root, exactly as `canonicalize_tree`
+    // will judge the result.
+    let dst_root_abs = root.path().to_path_buf();
     ensure_private_dir_fd(root, dst_rel)?;
     crate::platform::chmod(&rel_join(root, dst_rel)?, (root_mode | 0o200) & 0o7777)
         .map_err(|e| Error::store(format!("chmod {}: {e}", dst_rel.display())))?;
 
     struct Frame {
         dst_rel: PathBuf,
+        src_shown: PathBuf,
         entries: std::vec::IntoIter<std::fs::DirEntry>,
     }
     let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
     let mut stack: Vec<Frame> = vec![Frame {
         dst_rel: dst_rel.to_path_buf(),
+        src_shown: src.to_path_buf(),
         entries: open_frame(src)?,
     }];
     while let Some(top) = stack.last_mut() {
@@ -338,7 +438,9 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
             stack.pop();
             continue;
         };
-        let child_rel = top.dst_rel.join(entry.file_name());
+        let name = entry.file_name();
+        let name_str = refuse_unlandable_name(&name, &top.src_shown)?;
+        let child_rel = top.dst_rel.join(name_str);
         let child_src = entry.path();
         let ft = entry
             .file_type()
@@ -355,13 +457,52 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
             let entries = open_frame(&entry.path())?;
             stack.push(Frame {
                 dst_rel: child_rel,
+                src_shown: child_src,
                 entries,
             });
         } else if ft.is_symlink() {
             let link = std::fs::read_link(&child_src)
                 .map_err(|e| Error::store(format!("readlink {}: {e}", child_src.display())))?;
+            let link_str = link.to_str().ok_or_else(|| {
+                Error::store(format!(
+                    "refusing to copy symlink {}: its target is not valid UTF-8",
+                    child_src.display()
+                ))
+            })?;
+            crate::manifest::validate_symlink_target(&child_rel.to_string_lossy(), link_str)
+                .map_err(|e| {
+                    Error::store(format!(
+                        "refusing to copy symlink {}: {e}",
+                        child_src.display()
+                    ))
+                })?;
+            let mut resolve = |rel: &Path| -> crate::manifest::ComponentResolution {
+                let probe = match rel.strip_prefix(dst_rel) {
+                    Ok(sub) => src.join(sub),
+                    Err(_) => dst_root_abs.join(rel),
+                };
+                match std::fs::symlink_metadata(probe) {
+                    Ok(m) if m.is_symlink() => crate::manifest::ComponentResolution::Symlink,
+                    Ok(_) => crate::manifest::ComponentResolution::NotSymlink,
+                    Err(_) => crate::manifest::ComponentResolution::Absent,
+                }
+            };
+            if let Err(refusal) =
+                crate::manifest::check_relative_symlink_target(&child_rel, &link, &mut resolve)
+            {
+                return Err(Error::store(format!(
+                    "refusing to copy symlink {}: {}",
+                    child_src.display(),
+                    crate::manifest::symlink_target_refusal_message(
+                        refusal,
+                        &child_src.display().to_string(),
+                        &link.to_string_lossy(),
+                    )
+                )));
+            }
             symlink_fd(root, &link, &child_rel)?;
-        } else {
+        } else if ft.is_file() {
+            // MEMORY BOUND (see the primitive's doc): read whole.
             let bytes = std::fs::read(&child_src)
                 .map_err(|e| Error::store(format!("read {}: {e}", child_src.display())))?;
             let mode = crate::platform::metadata_mode(
@@ -371,6 +512,11 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
             write_file_fd(root, &child_rel, &bytes)?;
             crate::platform::chmod(&rel_join(root, &child_rel)?, mode)
                 .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
+        } else {
+            return Err(Error::store(format!(
+                "refusing to copy {}: it is not a regular file, directory, or symlink",
+                child_src.display()
+            )));
         }
     }
     dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
@@ -579,11 +725,10 @@ pub(crate) fn remove_owned_lock_record_fd(
 }
 
 /// Path-based single-directory creation (`create_dir` semantics), guarded like
-/// the Unix port's `create_dir_fd`.
+/// the Unix port's `create_dir_fd`: a residue spelling is REFUSED before the
+/// mkdir, exactly as the copy's own destination components are.
 pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    // CREATE only: a residue spelling is permitted (mkdir fails if the strand
-    // is already there, and never destroys it); the lock authority runs.
-    refuse_reserved_mutation(rel, Sanction::Residue)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     std::fs::create_dir(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", rel.display())))
 }

@@ -347,15 +347,30 @@ copies from an arbitrary, possibly out-of-root source), and `Remote::fsync_tree`
 is PATH-based (`WalkDir`, so a symlinked component is followed) where the
 source tool's version refuses one. The migration was blocked on this, so this
 change re-adds the PUBLIC `atomic::copy_dir_recursive_fd`
-(`src/atomic/unix.rs:1821`) and `atomic::fsync_tree_recursive_fd`
-(`src/atomic/unix.rs:1991`), ITERATIVE and descriptor-confined. Their exact
+(`src/atomic/unix.rs:2031`) and `atomic::fsync_tree_recursive_fd`
+(`src/atomic/unix.rs:2309`), ITERATIVE and descriptor-confined. Their exact
 deltas from `deploy`'s originals (each documented on the primitive itself):
 
 * ITERATIVE, not recursive — the source tool's original recursed one Rust
   frame per level, so a deep tree aborted the host; the re-added forms hold an
   explicit heap `Vec` stack and surface a clean `Err` at the descriptor limit.
   Proven by `deep_tree_fd_copy_does_not_abort_the_process` and
-  `deep_tree_fd_fsync_does_not_abort_the_process` (a 16 KiB stack, depth 256).
+  `deep_tree_fd_fsync_does_not_abort_the_process` (depth 256). The stack is
+  PROFILE-DEPENDENT and the numbers are MEASURED (depth 256, both platforms):
+  in DEBUG the fd copy aborts at 16/24 KiB on Linux and fits from 32 KiB
+  (macOS fits 16 KiB), while the recursive reference aborts at 64 KiB and
+  needs >256 KiB on macOS — so the tests use 64 KiB; in RELEASE the fd copy
+  and fsync fit 8 KiB on both platforms, while the recursive reference aborts
+  through 64 KiB and first survives at 96 KiB — so the tests use 24 KiB. The
+  calibration test (`deep_tree_recursive_reference_copy_aborts_at_the_fd_stack`)
+  additionally requires the recursive reference to abort at TWICE the fd
+  stack, asserting a >=2x margin rather than relying on a hard-coded number
+  that sat 1.5x below the release cliff.
+* `fsync_tree_recursive_fd` reopens each root-relative path COMPONENT-WISE, so
+  its cost is O(depth^2) `openat` calls (measured 1202 / 17042 / 264722 at
+  depth 32 / 128 / 512 on Linux). It stays fail-closed, error-propagating,
+  deepest-first, and iterative; the cost is stated on the primitive (documented,
+  not changed).
 * TWO-PHASE mode finalize — a read-only source directory copies cleanly (the
   source tool's one-phase original failed with `EACCES`); the final modes are
   still EXACT, including the setuid/setgid/sticky bits.
@@ -366,10 +381,36 @@ deltas from `deploy`'s originals (each documented on the primitive itself):
 * The ONE reserved-spelling gate runs on every destination mutation (the
   source tool's original had none), so a source entry named like a lock record
   (e.g. `operation.lock`) is REFUSED rather than copied into the destination
-  namespace.
+  namespace, and a residue-spelled destination component is refused BEFORE
+  anything is created (the source tool's original created it and then reported
+  the refusal in removal vocabulary).
+* Every landed NAME runs the crate's ONE name authority: valid UTF-8, already
+  NFC, free of NUL/LF/CR/TAB, within `NAME_MAX`, and not
+  [`reserved::is_unaddressable_name`] — so a crate-temp-shaped or reserved
+  name (which the documented recovery sweep or the manifest strip would
+  remove) is REFUSED instead of landed, while spaces, quotes, `$`, `;`, `*`,
+  leading `-`, and 255-byte names still copy.
+* A source entry that is not a regular file, directory, or symlink (a FIFO,
+  socket, or device) is REFUSED through the crate's `O_NONBLOCK`-classified
+  open, so a FIFO cannot block the copy, and a HARD LINK is refused rather
+  than silently duplicated into an independent regular file.
+* A source/destination OVERLAP (either inside the other, or equal) is refused
+  before anything is created, so a destination inside the source cannot be
+  re-yielded by the source read and recurse without bound.
+* A symlink's TARGET is judged by the crate's own containment rule
+  (`manifest::check_relative_symlink_target`), so a target that escapes the
+  root or resolves through a symlink component (inside the copied subtree or in
+  the destination root outside it) is refused and the destination always
+  `canonicalize_tree`s cleanly.
+* NOT atomic, NOT durable, and PARTIAL ON FAILURE: there is no temp directory
+  and no final rename, so entries appear in place, an error mid-walk leaves a
+  partial destination tree, and nothing is fsynced; a caller that needs more
+  copies into a staging path it owns and renames it into place.
 * The destination side is descriptor-confined (a symlinked component is
   refused); the source side is a path-based READ, exactly as the original. The
-  Windows port is path-based with the port's documented weaker guarantee.
+  Windows port is path-based with the port's documented weaker guarantee, and
+  it materializes each file whole through `std::fs::read` (the Unix port
+  streams through a 64 KiB heap buffer).
 
 ## Rules for changing this crate
 

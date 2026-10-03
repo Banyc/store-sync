@@ -63,15 +63,33 @@ const CHILD_STACK: usize = 16 * 1024;
 /// walk's CONSTANT stack cost (the fd-confined copy needs more than the raw
 /// syscall removal walk on glibc, for reasons unrelated to recursion).
 const STACK_ENV: &str = "STORE_SYNC_DEEP_TREE_STACK";
-/// The stack the fd-confined copy/fsync children run on. The copy's CONSTANT
-/// cost (glibc `open`/`read`/`chmod`, the debug-build frames of the guarded
-/// primitives, and the streaming copy) is larger than the raw-syscall removal
-/// walk's, so 16 KiB overflows on Linux even though the walk is iterative — a
-/// property of the platform's libc, not of the algorithm. 64 KiB is
-/// comfortably above the measured constant cost while still below what the
-/// RECURSIVE shape needs at 256 levels (proven by
-/// `deep_tree_recursive_reference_copy_aborts_at_the_fd_stack`).
-const FD_COPY_STACK: usize = 64 * 1024;
+/// The stack the fd-confined copy/fsync children run on.
+///
+/// PROFILE-DEPENDENT and MEASURED per platform (all at depth 256; a stack the
+/// walk's CONSTANT cost fits is what the ITERATIVE shape needs, while the
+/// RECURSIVE reference's need grows with depth):
+///
+/// * DEBUG: the fd copy aborts at 16/24 KiB on Linux and fits from 32 KiB
+///   (macOS fits 16 KiB); the recursive reference aborts at 64 KiB on BOTH
+///   platforms and needs >256 KiB on macOS. 64 KiB therefore leaves the
+///   ITERATIVE shape a 2x margin on Linux and the RECURSIVE reference at
+///   least a 4x margin on both.
+/// * RELEASE: the fd copy and fsync fit 8 KiB on BOTH platforms, and the
+///   recursive reference aborts through 64 KiB and first SURVIVES at 96 KiB
+///   (macOS and Linux alike). 24 KiB leaves the iterative shape a 3x margin
+///   and the recursive reference a 2.7x margin.
+///
+/// The RELEASE value is deliberately NOT 64 KiB: at the old single value the
+/// release recursive reference sat only 1.5x above the stack (it survived at
+/// 96 KiB), so an optimizer change could have let the reference survive and
+/// made the calibration vacuous. 24 KiB restores a multi-x margin, and the
+/// calibration test ASSERTS a >=2x margin at runtime instead of only claiming
+/// one.
+const FD_COPY_STACK: usize = if cfg!(debug_assertions) {
+    64 * 1024
+} else {
+    24 * 1024
+};
 /// The tree root under the transport base; also the walk's `src`.
 const TOP: &str = "deep";
 /// The `copy_tree` destination, a sibling of [`TOP`].
@@ -114,20 +132,33 @@ fn deep_tree_fd_fsync_does_not_abort_the_process() {
 /// rather than evidence of a generous stack: at this stack one shape overflows
 /// and the other does not. The reference is test-only and is never part of the
 /// crate's public surface.
+///
+/// MARGIN: the reference must abort at BOTH [`FD_COPY_STACK`] and `2 *
+/// FD_COPY_STACK`, so the recursive cliff is provably at least 2x above the
+/// stack the iterative copy uses. If an optimizer change lets recursion fit
+/// twice the fd stack, this fails rather than letting the calibration pass
+/// vacuously.
 #[test]
 fn deep_tree_recursive_reference_copy_aborts_at_the_fd_stack() {
-    let out = run_child("copy_recursive", FD_COPY_STACK);
+    assert_recursive_reference_aborts(FD_COPY_STACK);
+    assert_recursive_reference_aborts(FD_COPY_STACK * 2);
+}
+
+/// Spawn the recursive-reference child at `stack` and require a STACK-OVERFLOW
+/// abort (never some other failure, and never survival).
+fn assert_recursive_reference_aborts(stack: usize) {
+    let out = run_child("copy_recursive", stack);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "a RECURSIVE copy must not survive the fd-copy calibration stack; if it did, the \
-         iterative test would prove nothing. status={:?}",
+        "a RECURSIVE copy must not survive the fd-copy calibration stack ({stack}); if it did, \
+         the iterative test would prove nothing. status={:?}",
         out.status
     );
     assert!(
         stderr.contains("has overflowed its stack") || stderr.contains("stack overflow"),
-        "the recursive reference must die of STACK OVERFLOW (an abort), not some other \
-         failure:\n--- child stderr ---\n{stderr}"
+        "the recursive reference must die of STACK OVERFLOW (an abort) at {stack}, not some \
+         other failure:\n--- child stderr ---\n{stderr}"
     );
 }
 
