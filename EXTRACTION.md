@@ -55,6 +55,18 @@ cargo test
 
 ## Wave 1 review notes
 
+* **Consumer hygiene of exported macros.** An exported `macro_rules!` macro is
+  a document that a downstream crate compiles. It must name every external
+  item through `$crate::…`; a bare `serde::` (or any other crate) path
+  compiles INSIDE this crate and inside its `tests/` (Cargo makes the
+  package's normal dependencies available to test targets) yet fails in a real
+  consumer with `cannot find module or crate` — and no in-repo test can catch
+  it. The crate therefore re-exports what the macro needs under a hidden name
+  (`#[doc(hidden)] pub use ::serde as __serde` in `src/lib.rs`) and
+  `id_newtype!` writes its serde impls by hand rather than deriving them, so
+  no `#[serde(...)]` helper attribute has to resolve at the call site. The
+  regression guard for this property is an OUT-OF-REPO consumer crate whose
+  only dependency is `store-sync`.
 * `test_support.rs` carries a module-level `#![allow(dead_code)]`: it is a
   test-only module shared by suites that land in separate waves, so a helper
   no current suite calls is not a defect.

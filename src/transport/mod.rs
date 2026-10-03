@@ -577,6 +577,12 @@ pub trait Remote {
     /// copier's for a non-root far-side user (see the override). The full
     /// carried/not-carried list is the crate's fidelity scope in
     /// [`crate::manifest`].
+    ///
+    /// MEMORY BOUND: the DEFAULT walk carries each file through
+    /// [`Remote::read`] and [`Remote::write`], so every file is materialized
+    /// WHOLE — the same O(largest entry) peak RSS those primitives document
+    /// (a 350 MB file ≈ 362 MB peak), NOT a streaming copy. See
+    /// [`Remote::read`] for the measured figures and the workaround.
     fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
         if let Some(parent) = dest.parent() {
             self.create_dir_all(&parent)?;
@@ -839,10 +845,25 @@ pub(crate) fn read_receiver_id_opt<R: Remote + ?Sized>(
             remote.root().display()
         ))
     })?;
+    // FAIL CLOSED, ACTIONABLY. The refusal keeps its `transport` class (a
+    // marker that is present but not this crate's format is a
+    // marker-protocol violation, and a caller must be able to tell it from a
+    // filesystem fault), but the message names the CONDITION (not a
+    // 40-hex-character receiver id), the likely CAUSE (a marker written by a
+    // tool that predates this crate's format — the source tool writes
+    // `recv-<uuid-v7>` — or a tampered/foreign file), and the fact that no
+    // adoption exists, so an operator does not have to read this source to
+    // diagnose it.
     ReceiverId::parse(s.trim())
         .map_err(|e| {
             Error::transport(format!(
-                "deploy_dir {}: the receiver-id marker is malformed: {e}",
+                "deploy_dir {}: refusing the receiver-id marker at {marker}: its content is not a \
+                 {RECEIVER_ID_LEN}-character lowercase-hex receiver id ({e}). This is a FAIL-CLOSED \
+                 refusal — a marker this crate did not write, such as a legacy `recv-<uuid-v7>` \
+                 marker from a tool that predates this crate's format (or a tampered/foreign \
+                 file), is never adopted as a physical identity, because silently adopting a \
+                 foreign format would misidentify the deploy_dir. Point the store at a deploy_dir \
+                 this crate provisioned, or re-provision a fresh one.",
                 remote.root().display()
             ))
         })
@@ -3250,6 +3271,53 @@ mod tests {
         t3.provision_layout().unwrap();
         t3.write(&marker, b"not-a-receiver-id", 0o644).unwrap();
         read_receiver_id(&t3, &marker).expect_err("a malformed marker fails closed");
+    }
+
+    /// A marker in the SOURCE TOOL's legacy format (`recv-<uuid-v7>`, written
+    /// by `~/code/deploy`'s `ids.rs` before this crate's 40-hex format) fails
+    /// closed, and the error is ACTIONABLE: it names the condition (not a
+    /// 40-hex receiver id) and the likely cause (a marker that predates this
+    /// crate's format), so an operator hitting it during a migration can
+    /// diagnose it without reading this crate's source. The error class is
+    /// unchanged (`transport`).
+    #[test]
+    fn a_legacy_recv_marker_fails_closed_with_an_actionable_error() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let marker = RootedRelativePath::parse(Path::new("receiver-marker")).unwrap();
+        let layout = Layout {
+            receiver_marker: Some(marker.clone()),
+            ..Layout::empty()
+        };
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("legacy"), layout)
+            .unwrap();
+        t.provision_layout().unwrap();
+        // The source tool's spelling: `recv-` plus a UUID v7 (lowercase hex,
+        // dashed).
+        let legacy = b"recv-0190f3c2-7a1e-7b3c-8d4f-0123456789ab\n";
+        t.write(&marker, legacy, 0o644).unwrap();
+        let err = read_receiver_id(&t, &marker)
+            .expect_err("a legacy recv-<uuid-v7> marker must fail closed");
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "the marker refusal keeps the transport error class, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a 40-character lowercase-hex receiver id"),
+            "the error must name the condition, got: {msg}"
+        );
+        assert!(
+            msg.contains("predates this crate") && msg.contains("recv-<uuid-v7>"),
+            "the error must name the likely legacy cause, got: {msg}"
+        );
+        // A VALID marker still reads back (the actionable refusal did not
+        // break the success path).
+        let good = ReceiverId::generate().expect("entropy for a receiver id");
+        t.write(&marker, &good.wire_bytes(), 0o644).unwrap();
+        assert_eq!(
+            read_receiver_id(&t, &marker).expect("a valid marker still reads"),
+            good
+        );
     }
 
     /// Concurrent readers must only ever observe the destination file fully

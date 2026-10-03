@@ -285,6 +285,136 @@ fn rel_join(root: &RootDir, rel: &Path) -> Result<PathBuf> {
     Ok(root.path().join(rel))
 }
 
+/// Path-based equivalent of the Unix fd-confined `copy_dir_recursive_fd`:
+/// copy the
+/// tree at `src` to the root-relative `dst_rel`, iteratively (an explicit
+/// heap `Vec` stack, so a deep tree cannot exhaust the C stack), preserving
+/// symlinks and (best-effort — a no-op on Windows) modes.
+///
+/// DOCUMENTED WEAKER GUARANTEE: there is no directory descriptor and no
+/// `O_NOFOLLOW`, so a symlink injected into a destination component IS
+/// followed (`rel_join` only refuses absolute/`..`/`.` spellings). This is
+/// the same weakness every other `_fd` primitive of the Windows port carries.
+/// A pre-existing destination file at a copied file's name is overwritten
+/// (`std::fs::copy`), where the Unix port refuses it with `O_EXCL`; the
+/// caller is expected to pass a fresh destination.
+pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
+    // Every destination mutation routes through the SAME guarded rel-path
+    // primitives the rest of the port uses (`create_dir_fd`, `write_file_fd`,
+    // `symlink_fd`), so the ONE reserved-spelling gate runs here too rather
+    // than a raw `std::fs` call bypassing it.
+    fn open_frame(src: &Path) -> Result<std::vec::IntoIter<std::fs::DirEntry>> {
+        let entries = std::fs::read_dir(src)
+            .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| Error::store(format!("entry: {e}")))?;
+        Ok(entries.into_iter())
+    }
+
+    let src_meta = std::fs::symlink_metadata(src)
+        .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
+    if !src_meta.is_dir() {
+        return Err(Error::store(format!(
+            "copy_dir_recursive_fd: source {} is not a directory",
+            src.display()
+        )));
+    }
+    let root_mode = crate::platform::metadata_mode(&src_meta);
+    ensure_private_dir_fd(root, dst_rel)?;
+    crate::platform::chmod(&rel_join(root, dst_rel)?, (root_mode | 0o200) & 0o7777)
+        .map_err(|e| Error::store(format!("chmod {}: {e}", dst_rel.display())))?;
+
+    struct Frame {
+        dst_rel: PathBuf,
+        entries: std::vec::IntoIter<std::fs::DirEntry>,
+    }
+    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let mut stack: Vec<Frame> = vec![Frame {
+        dst_rel: dst_rel.to_path_buf(),
+        entries: open_frame(src)?,
+    }];
+    while let Some(top) = stack.last_mut() {
+        let Some(entry) = top.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let child_rel = top.dst_rel.join(entry.file_name());
+        let child_src = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| Error::store(format!("file_type: {e}")))?;
+        if ft.is_dir() {
+            let mode = crate::platform::metadata_mode(
+                &std::fs::symlink_metadata(&child_src)
+                    .map_err(|e| Error::store(format!("stat {}: {e}", child_src.display())))?,
+            );
+            create_dir_fd(root, &child_rel)?;
+            crate::platform::chmod(&rel_join(root, &child_rel)?, (mode | 0o200) & 0o7777)
+                .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
+            dirs.push((child_rel.clone(), mode));
+            let entries = open_frame(&entry.path())?;
+            stack.push(Frame {
+                dst_rel: child_rel,
+                entries,
+            });
+        } else if ft.is_symlink() {
+            let link = std::fs::read_link(&child_src)
+                .map_err(|e| Error::store(format!("readlink {}: {e}", child_src.display())))?;
+            symlink_fd(root, &link, &child_rel)?;
+        } else {
+            let bytes = std::fs::read(&child_src)
+                .map_err(|e| Error::store(format!("read {}: {e}", child_src.display())))?;
+            let mode = crate::platform::metadata_mode(
+                &std::fs::metadata(&child_src)
+                    .map_err(|e| Error::store(format!("stat {}: {e}", child_src.display())))?,
+            );
+            write_file_fd(root, &child_rel, &bytes)?;
+            crate::platform::chmod(&rel_join(root, &child_rel)?, mode)
+                .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
+        }
+    }
+    dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
+    for (dir, mode) in dirs {
+        crate::platform::chmod(&rel_join(root, &dir)?, mode)
+            .map_err(|e| Error::store(format!("chmod {}: {e}", dir.display())))?;
+    }
+    crate::platform::chmod(&rel_join(root, dst_rel)?, root_mode)
+        .map_err(|e| Error::store(format!("chmod {}: {e}", dst_rel.display())))?;
+    Ok(())
+}
+
+/// Path-based equivalent of the Unix `fsync_tree_recursive_fd`.
+///
+/// DOCUMENTED WEAKER GUARANTEE: the Windows port has no directory-entry fsync
+/// (`sync_parent_dir` is a no-op), so only regular FILES are fsynced here and
+/// directory entries rely on the filesystem's own ordering. Symlinks are
+/// skipped. A file in a deep tree is reached by accumulating PATH components,
+/// so the platform path limit applies.
+pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let start = rel_join(root, rel)?;
+    let mut stack: Vec<PathBuf> = vec![start];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| Error::store(format!("read_dir {}: {e}", dir.display())))?
+        {
+            let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
+            let path = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| Error::store(format!("file_type: {e}")))?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                std::fs::File::open(&path)
+                    .map_err(|e| Error::store(format!("open {}: {e}", path.display())))?
+                    .sync_all()
+                    .map_err(|e| Error::store(format!("fsync {}: {e}", path.display())))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Path-based atomic replace (see [`write_atomic_replace`]). Refuses a crate
 /// lock-record spelling (the stable-inode discipline's structural guard; see
 /// the Unix port).

@@ -59,6 +59,19 @@ const DEPTH: usize = 256;
 /// macOS allows; it is far below the 2 MiB libtest uses, so per-level stack
 /// growth is the only thing under test.
 const CHILD_STACK: usize = 16 * 1024;
+/// Optional override of the child's stack size, so a caller can measure a
+/// walk's CONSTANT stack cost (the fd-confined copy needs more than the raw
+/// syscall removal walk on glibc, for reasons unrelated to recursion).
+const STACK_ENV: &str = "STORE_SYNC_DEEP_TREE_STACK";
+/// The stack the fd-confined copy/fsync children run on. The copy's CONSTANT
+/// cost (glibc `open`/`read`/`chmod`, the debug-build frames of the guarded
+/// primitives, and the streaming copy) is larger than the raw-syscall removal
+/// walk's, so 16 KiB overflows on Linux even though the walk is iterative — a
+/// property of the platform's libc, not of the algorithm. 64 KiB is
+/// comfortably above the measured constant cost while still below what the
+/// RECURSIVE shape needs at 256 levels (proven by
+/// `deep_tree_recursive_reference_copy_aborts_at_the_fd_stack`).
+const FD_COPY_STACK: usize = 64 * 1024;
 /// The tree root under the transport base; also the walk's `src`.
 const TOP: &str = "deep";
 /// The `copy_tree` destination, a sibling of [`TOP`].
@@ -75,6 +88,47 @@ fn deep_tree_removal_does_not_abort_the_process() {
 #[test]
 fn deep_tree_copy_does_not_abort_the_process() {
     assert_child_succeeds("copy");
+}
+
+/// A deep tree is copied by the re-added PUBLIC `atomic::copy_dir_recursive_fd`
+/// without overflowing the stack (subprocess). The source tool's original was
+/// RECURSIVE; the crate's replacement is iterative precisely so this cannot
+/// abort the host.
+#[test]
+fn deep_tree_fd_copy_does_not_abort_the_process() {
+    assert_child_succeeds_with_stack("copy_fd", FD_COPY_STACK);
+}
+
+/// A deep tree is fsynced by the re-added PUBLIC
+/// `atomic::fsync_tree_recursive_fd` without overflowing the stack
+/// (subprocess).
+#[test]
+fn deep_tree_fd_fsync_does_not_abort_the_process() {
+    assert_child_succeeds_with_stack("fsync_fd", FD_COPY_STACK);
+}
+
+/// The CALIBRATION for the two tests above: a RECURSIVE reference copy (the
+/// shape the source tool's original used, and the shape the crate's re-added
+/// primitive replaced) ABORTS on the SAME stack and the SAME 256-level tree.
+/// This is what makes the iterative primitive's success evidence of iteration
+/// rather than evidence of a generous stack: at this stack one shape overflows
+/// and the other does not. The reference is test-only and is never part of the
+/// crate's public surface.
+#[test]
+fn deep_tree_recursive_reference_copy_aborts_at_the_fd_stack() {
+    let out = run_child("copy_recursive", FD_COPY_STACK);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a RECURSIVE copy must not survive the fd-copy calibration stack; if it did, the \
+         iterative test would prove nothing. status={:?}",
+        out.status
+    );
+    assert!(
+        stderr.contains("has overflowed its stack") || stderr.contains("stack overflow"),
+        "the recursive reference must die of STACK OVERFLOW (an abort), not some other \
+         failure:\n--- child stderr ---\n{stderr}"
+    );
 }
 
 /// A deep removal with `RLIMIT_NOFILE` lowered surfaces a CLEAN
@@ -108,8 +162,12 @@ fn deep_tree_child() {
         println!("{DONE_MARKER} mode={mode} depth={depth}");
         return;
     }
+    let stack = std::env::var(STACK_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(CHILD_STACK);
     std::thread::Builder::new()
-        .stack_size(CHILD_STACK)
+        .stack_size(stack)
         .spawn(move || {
             build_deep_tree(&root, depth).unwrap_or_else(|e| panic!("build: {e}"));
             run_walk(&root, &mode).unwrap_or_else(|e| panic!("walk: {e}"));
@@ -141,8 +199,54 @@ fn run_walk(root: &Path, mode: &str) -> Result<(), String> {
                 .copy_tree(&src, &dest)
                 .map_err(|e| format!("copy_tree: {e}"))
         }
+        // The re-added PUBLIC fd-confined copy (the source tool's
+        // `copy_dir_recursive_fd` equivalent): it must be iterative too, or a
+        // deep tree aborts on this deliberately small stack.
+        "copy_fd" => {
+            let owned =
+                crate::atomic::RootDir::open(root).map_err(|e| format!("open root: {e}"))?;
+            crate::atomic::copy_dir_recursive_fd(&owned, &root.join(TOP), Path::new(COPY))
+                .map_err(|e| format!("copy_dir_recursive_fd: {e}"))
+        }
+        // The re-added PUBLIC fd-confined tree fsync.
+        "fsync_fd" => {
+            let owned =
+                crate::atomic::RootDir::open(root).map_err(|e| format!("open root: {e}"))?;
+            crate::atomic::fsync_tree_recursive_fd(&owned, Path::new(TOP))
+                .map_err(|e| format!("fsync_tree_recursive_fd: {e}"))
+        }
+        // The test-only RECURSIVE reference copy: the shape the source tool's
+        // original used. It exists to prove the fd-copy stack calibration.
+        "copy_recursive" => recursive_copy_reference(&root.join(TOP), &root.join(COPY)),
         other => Err(format!("unknown mode {other:?}")),
     }
+}
+
+/// A deliberately RECURSIVE reference copy — the shape the source tool's
+/// original `copy_dir_recursive_fd` used (one Rust frame per directory level).
+/// TEST-ONLY: it exists so the deep-tree harness can prove that
+/// [`FD_COPY_STACK`] is calibrated to distinguish recursion from iteration at
+/// 256 levels, not merely to fit.
+fn recursive_copy_reference(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read_dir {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let ft = entry.file_type().map_err(|e| format!("file_type: {e}"))?;
+        let target = dst.join(entry.file_name());
+        if ft.is_dir() {
+            recursive_copy_reference(&entry.path(), &target)?;
+        } else if ft.is_symlink() {
+            let link = std::fs::read_link(entry.path())
+                .map_err(|e| format!("readlink {}: {e}", entry.path().display()))?;
+            let _ = std::fs::remove_file(&target);
+            crate::platform::symlink(&link, &target)
+                .map_err(|e| format!("symlink {}: {e}", target.display()))?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Build `<base>/<TOP>/d/d/.../d/leaf` with `OPENAT`/`MKDIRAT` relative to the
@@ -220,19 +324,33 @@ fn cstr(name: &[u8]) -> Result<CString, String> {
     CString::new(name).map_err(|_| "name contains NUL".to_string())
 }
 
-/// Spawn the parent's own test binary as a child, wait for it, clean the deep
-/// tree up, and only THEN assert the child succeeded.
+/// Spawn the child with the default 16 KiB stack, clean up, and require
+/// success (the raw-syscall walks fit it).
 fn assert_child_succeeds(mode: &str) {
+    let out = run_child(mode, CHILD_STACK);
+    assert_child_done(&out, mode, CHILD_STACK);
+}
+
+/// [`assert_child_succeeds`] with an explicit stack (the fd-confined copy has
+/// a larger CONSTANT stack cost on glibc, unrelated to recursion).
+fn assert_child_succeeds_with_stack(mode: &str, stack: usize) {
+    let out = run_child(mode, stack);
+    assert_child_done(&out, mode, stack);
+}
+
+/// Spawn the parent's own test binary as a child with `stack` bytes of stack,
+/// wait for it, clean the deep tree up, and return the child's output.
+fn run_child(mode: &str, stack: usize) -> std::process::Output {
     let env = SysEnv::from_process();
     let tmp = crate::test_support::fixture_tmpdir(&env).expect("tempdir for the deep tree");
     let root = tmp.path().to_path_buf();
     let exe = std::env::current_exe().expect("the running test binary path");
-    let done_marker = format!("{DONE_MARKER} mode={mode} depth={DEPTH}");
     let out = std::process::Command::new(exe)
         .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
         .env(MODE_ENV, mode)
         .env(ROOT_ENV, &root)
         .env(DEPTH_ENV, DEPTH.to_string())
+        .env(STACK_ENV, stack.to_string())
         .output()
         .expect("spawn the child test binary");
 
@@ -241,15 +359,20 @@ fn assert_child_succeeds(mode: &str) {
     // it. `DEPTH` is far below the parent thread's stack budget.
     let _ = std::fs::remove_dir_all(root.join(TOP));
     let _ = std::fs::remove_dir_all(root.join(COPY));
+    out
+}
 
+/// Assert a child exited successfully AND printed its completion marker.
+fn assert_child_done(out: &std::process::Output, mode: &str, stack: usize) {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "the {mode} child did not exit successfully on a {DEPTH}-level tree: \
+        "the {mode} child did not exit successfully on a {DEPTH}-level tree (stack={stack}): \
          status={:?}\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
         out.status,
     );
+    let done_marker = format!("{DONE_MARKER} mode={mode} depth={DEPTH}");
     assert!(
         stdout.contains(&done_marker),
         "the {mode} child exited 0 but never reached the end of the walk, so it ran no \

@@ -1004,6 +1004,55 @@ pub enum EntryPolicy {
     /// source is a prefix of the destination, and report a conflict when the
     /// two diverge.
     ///
+    /// # WARNING — this does NOT preserve a concurrent-append guarantee
+    ///
+    /// **What it is:** a WHOLE-FILE compare-and-replace. The crate has no
+    /// append primitive, so `AppendTail` reads the whole destination, checks
+    /// the prefix relation, and — when the rule admits an append — writes the
+    /// ENTIRE result back through the ordinary atomic replace (a fresh temp
+    /// and a `renameat`). It never issues an `O_APPEND` write.
+    ///
+    /// **What it therefore does NOT give you:** concurrent appends are NOT
+    /// preserved. Two writers that each `O_APPEND` one complete line to the
+    /// same file both land because the kernel serializes the two appends on
+    /// the shared inode; `AppendTail` has no such serialization. Each run
+    /// reads a snapshot, decides from it, and publishes a whole new file, so:
+    /// (1) on a REMOTE destination there is no lock and no server-side
+    /// compare, so two concurrent runs can both read the same prefix and the
+    /// later `rename`/`cat` DISCARDS the other's line (a lost update); (2)
+    /// even on a LOCAL confined destination the compare and the install do
+    /// not share one atomic step against an outside writer — the residual
+    /// window is the `renameat` (and on Windows, which has no atomic replace,
+    /// it is wider) — so a plain `O_APPEND` writer racing the run is still
+    /// lost; and (3) the two runs are not even ordered against each other
+    /// unless they took the SAME destination lock
+    /// ([`crate::sync::apply::sync`]/`push`/`pull` take the sibling record;
+    /// `*_unowned` and remote destinations take none).
+    ///
+    /// **Why this matters at the point of use:** a consumer that reaches for
+    /// `AppendTail` PRECISELY BECAUSE its own design relies on one `O_APPEND`
+    /// write of a complete line being safe under concurrency (two verifiers
+    /// appending to a shared log) will not get that property here — it will
+    /// get a lost update instead. `AppendTail` is for converging a tree whose
+    /// file grew by appends BETWEEN syncs, not for multiplexing live writers
+    /// into one file.
+    ///
+    /// **What to do instead:** keep the append outside this crate. Either
+    /// (a) let the writers `O_APPEND` their records themselves into a file
+    /// that lives OUTSIDE the synced tree and ship the whole log as a blob
+    /// when it rotates, or (b) give each writer its OWN file (a per-writer
+    /// name the tree can carry) and merge on read, or (c) serialize every
+    /// append through one holder of the destination lock and accept that a
+    /// non-cooperating writer is still only DETECTED, never excluded. Do not
+    /// use `AppendTail` as a concurrency-safe append, because it is not one.
+    ///
+    /// (A true atomic single-write append primitive would need either a
+    /// far-side `O_APPEND` + `fsync` command or a local fd-confined
+    /// `O_APPEND` open; it is NOT part of this crate. This warning is a
+    /// documentation fix and deliberately does not change `AppendTail`'s
+    /// behaviour. Adding such a primitive is an owner decision — see the
+    /// README's "Design conflicts surfaced by the consumer audit".)
+    ///
     /// KNOWN COST: an append is O(TOTAL SIZE), not O(appended bytes). There is
     /// no [`Remote::append`](crate::transport::Remote) primitive, so the append
     /// is realized as a compare-and-replace of the WHOLE file, and the run's

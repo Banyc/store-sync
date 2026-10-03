@@ -30,6 +30,14 @@
 /// build arbitrary ids, production never can.
 ///
 /// `$validator` is a `fn(&str) -> bool` implementing the type's format rule.
+///
+/// CONSUMER CONTRACT: the expansion names every external item through
+/// `$crate::…`, including the serde traits through the crate's
+/// `#[doc(hidden)] pub use ::serde as __serde` re-export. A downstream crate
+/// therefore invokes this macro with ONLY `store-sync` in its `[dependencies]`
+/// — it does NOT need `serde` (or any `derive` feature) of its own, and the
+/// `Serialize`/`Deserialize` impls are written by hand rather than derived so
+/// no `#[serde(...)]` helper attribute has to be in scope at the call site.
 #[macro_export]
 macro_rules! id_newtype {
     ($name:ident, $validator:expr, $doc:expr) => {
@@ -38,8 +46,7 @@ macro_rules! id_newtype {
         // EMPTY string, a malformed durable record constructible by anyone
         // (the exact gap this hardening closes). An identity can only be
         // built through the validated `parse` (or `FromStr`/`TryFrom`).
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
-        #[serde(transparent)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name(String);
 
         impl $name {
@@ -104,16 +111,30 @@ macro_rules! id_newtype {
         /// silently bypass validation in test builds (and `From<&str>` would
         /// conflict with the validated `TryFrom<&str>`).
 
-        impl<'de> serde::Deserialize<'de> for $name {
-            /// Wire strings go through the validated parse: an invalid wire
-            /// identity fails deserialization (fail closed — a record that
-            /// carries a malformed identity is never silently accepted).
+        /// The serde `Serialize` impl, written by hand (never derived) so the
+        /// expansion needs no `#[serde(...)]` helper attribute at the call
+        /// site: the wire form is a single JSON/string scalar, the same bytes
+        /// `#[serde(transparent)]` produces.
+        impl $crate::__serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: $crate::__serde::Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        /// The serde `Deserialize` impl, written by hand for the same reason.
+        /// Wire strings go through the validated parse: an invalid wire
+        /// identity fails deserialization (fail closed — a record that
+        /// carries a malformed identity is never silently accepted).
+        impl<'de> $crate::__serde::Deserialize<'de> for $name {
             fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
             where
-                D: serde::Deserializer<'de>,
+                D: $crate::__serde::Deserializer<'de>,
             {
-                let s = <String as serde::Deserialize>::deserialize(deserializer)?;
-                $name::parse(&s).map_err(serde::de::Error::custom)
+                let s = <String as $crate::__serde::Deserialize>::deserialize(deserializer)?;
+                $name::parse(&s).map_err($crate::__serde::de::Error::custom)
             }
         }
     };

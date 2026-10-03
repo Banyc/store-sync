@@ -43,6 +43,13 @@
 //! the root was otherwise unreachable) and [`is_crate_temp_name`] recognises
 //! the crate's own crash residue (B1/B2).
 //!
+//! The `_fd` tree pair a migration onto this crate needs — an arbitrary-path
+//! SOURCE copied to a ROOT-CONFINED destination, and the fd-confined tree
+//! fsync — is [`copy_dir_recursive_fd`] and [`fsync_tree_recursive_fd`] (both
+//! ITERATIVE, and both documenting their deltas from the source tool's
+//! originals; see the README's "Design conflicts surfaced by the consumer
+//! audit").
+//!
 //! Parse-sensitive marker reads: a PRESENT-but-malformed marker CONTENT is
 //! semantic CORRUPTION and maps to [`Error::integrity`] via
 //! `read_json_marker` (the file exists, it is just not a valid marker),
@@ -706,6 +713,23 @@ fn validate_rel(path: &Path) -> std::io::Result<()> {
 
 impl RootDir {
     /// Open the owned root.
+    ///
+    /// PREREQUISITE — the directory MUST ALREADY EXIST: `open` does NOT
+    /// create it. A caller that owns a fresh root must `create_dir_all` it
+    /// first (the transports do this in `LocalTransport::new` / their layout
+    /// provisioning). This is deliberate — the root's own spelling and mode
+    /// are the caller's trust decision, and `open`'s job is only to pin an
+    /// existing directory, so it cannot be tricked into creating one
+    /// through a symlinked component.
+    ///
+    /// HOW the prerequisite fails is PLATFORM-SPECIFIC. On Unix a missing
+    /// (or non-directory) base is an immediate `Err` naming the path
+    /// (`Error::store("open root <path>: <io error>")`, i.e. `NotFound` or
+    /// `ENOTDIR`), because the descriptor is opened here. On the Windows
+    /// path-based port `open` performs no filesystem call — it only stores
+    /// the normalized path — so a missing base is NOT reported until the
+    /// first mutation resolves it. Either way a caller must create the
+    /// directory before relying on a `RootDir`.
     ///
     /// The path is normalized first ([`normalize_root`]): trailing path
     /// separators are stripped, so `dir/` and `dir` open the SAME root. On

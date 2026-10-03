@@ -1,11 +1,16 @@
-//! This file exists to prove the exported `id_newtype!` macro survives
-//! call-site hygiene.
+//! This file exercises the exported `id_newtype!` macro at a call site that
+//! imports nothing (`store_sync::id_newtype!`, no `use`).
 //!
-//! Integration tests are separate crates linking `store_sync`, so this file
-//! invokes `store_sync::id_newtype!` with NO `use store_sync::...` and NO
-//! `use serde::...`. Every path the macro needs is qualified (`$crate::...`,
-//! `serde::...`, `std::fmt::...`), so any reliance on call-site imports
-//! would fail to compile here.
+//! LIMIT OF THIS TEST: an integration-test crate links the package's NORMAL
+//! `[dependencies]` too (Cargo makes them available to `tests/`), so `serde`
+//! and `serde_json` resolve here even if the macro expansion used a bare
+//! `serde::` path. This file therefore CANNOT catch a regression to
+//! consumer-unhygienic paths; the macro is written with `$crate::…` and
+//! hand-written serde impls (see `id_newtype!`'s consumer contract) precisely
+//! because a bare path compiles here yet fails in a real consumer. The
+//! regression guard for THAT property is a consumer crate whose only
+//! dependency is `store-sync` (see the crate's `EXTRACTION.md` note); this
+//! file remains the in-repo round-trip check for the generated impls.
 
 /// The validator the macro's `$validator` slot takes: the contract is a
 /// plain `fn(&str) -> bool`.

@@ -1759,6 +1759,267 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
     fsync_dir_fd(&parent_fd)
 }
 
+/// The descriptor-relative ITERATIVE recursive tree copy: copy the tree at
+/// the (arbitrary, possibly OUT-OF-ROOT) read path `src` to the ROOT-RELATIVE
+/// destination `dst_rel`, creating `dst_rel` and every missing ancestor.
+///
+/// This is the public equivalent of the source tool's
+/// `deploy::store::atomic::copy_dir_recursive_fd` (see the README's "Design
+/// conflicts surfaced by the consumer audit"): `Remote::copy_tree` cannot
+/// stand in for it, because that trait method requires BOTH endpoints to be
+/// [`RootedRelativePath`]s under ONE transport root, while this primitive
+/// reads its source from an arbitrary path (the source tool's staging copy
+/// legitimately reads a tree outside the destination root) and confines only
+/// the DESTINATION.
+///
+/// CONFINEMENT: the destination resolves component-wise from the owned root
+/// descriptor with `O_NOFOLLOW`, so a symlink injected into any destination
+/// component is REFUSED (ELOOP), never followed — the copy can never be
+/// redirected outside the root. The SOURCE is a read and is path-based
+/// (`std::fs::read_dir`/`read_link`/`File::open`), so an intermediate symlink
+/// in the SOURCE path IS followed; that is a read, never a mutation, and it
+/// is confined to the caller's own `src`.
+///
+/// ITERATIVE, NEVER RECURSIVE. The walk keeps an explicit heap `Vec` of open
+/// frames instead of one Rust frame per directory level (the source tool's
+/// original recursed); a deep tree therefore cannot exhaust the C stack and
+/// ABORT the host process. The only remaining bound is the process descriptor
+/// limit (one descriptor per level on the source side, none held on the
+/// destination side beyond the per-frame open), which surfaces as a clean
+/// `Err`, never an abort. This is why the re-added form is the iterative one.
+///
+/// MODE FIDELITY: directory and file modes are copied EXACTLY from the source
+/// (including the setuid/setgid/sticky bits — a mode-shifted copy would fail
+/// the staged-object digest verification). The walk is TWO-PHASE: every
+/// destination directory is created owner-writable and widened during the
+/// walk, and every final mode is applied DEEPEST-FIRST at the end, so a
+/// READ-ONLY source tree copies cleanly. (The source tool's original created
+/// each directory at its final mode before copying into it, so a read-only
+/// source directory failed with `EACCES`; keeping the exact final modes while
+/// fixing that is a deliberate, documented difference.)
+///
+/// RESERVED NAMES: every destination mutation runs the ONE guarded gate (the
+/// directory/file creates and the mutating `openat` all refuse a lock-record
+/// spelling; a residue spelling is created only when ABSENT, exactly as the
+/// other creation primitives permit). A source tree that itself contains a
+/// lock-record name (e.g. `operation.lock`) is therefore REFUSED on the
+/// destination side; the source tool's original had no such authority.
+///
+/// SYMLINKS are recreated as symlinks (the link's own target is copied,
+/// never followed), replacing any existing destination entry at that name,
+/// exactly as the source tool's original did. A pre-existing destination FILE
+/// at a copied file's name is refused (`O_EXCL`), matching the original; the
+/// caller is expected to pass a fresh destination (the source tool removes a
+/// stale staging directory first).
+///
+/// `dst_rel` must not name the destination ROOT itself (an empty path is
+/// refused): use [`copy_dir_recursive_fd`] on a non-empty relative path.
+/// Ancestors created for `dst_rel` use the store-private `0o700` mode (the
+/// shared directory-creation authority); only the FINAL directory gets the
+/// source's mode, and an intermediate staging directory's mode is outside the
+/// copied tree, so it is not part of a staged-object digest.
+pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
+    struct Frame {
+        dst_rel: PathBuf,
+        entries: std::fs::ReadDir,
+    }
+
+    fn read_dir_entries(src: &Path) -> Result<std::fs::ReadDir> {
+        std::fs::read_dir(src).map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))
+    }
+
+    let src_meta = std::fs::symlink_metadata(src)
+        .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
+    if !src_meta.is_dir() {
+        return Err(Error::store(format!(
+            "copy_dir_recursive_fd: source {} is not a directory (refusing to follow a \
+             symlink source)",
+            src.display()
+        )));
+    }
+    let root_mode = src_meta.permissions().mode() & 0o7777;
+
+    // Create the destination chain (guarded, component-wise O_NOFOLLOW) and
+    // widen the FINAL directory during the walk; the exact mode is restored
+    // deepest-first below.
+    ensure_private_dir_fd(root, dst_rel)?;
+    set_dir_mode_fd(root, dst_rel, (root_mode | 0o200) & 0o7777)?;
+
+    // `(dst_rel, final_mode)` for the deepest-first finalize.
+    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let mut stack: Vec<Frame> = vec![Frame {
+        dst_rel: dst_rel.to_path_buf(),
+        entries: read_dir_entries(src)?,
+    }];
+
+    while let Some(top) = stack.last_mut() {
+        let Some(entry) = top.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
+        let descend: Option<Frame> = {
+            let top = stack.last().expect("the frame just examined");
+            let child_src = entry.path();
+            let child_rel = top.dst_rel.join(entry.file_name());
+            let ft = entry
+                .file_type()
+                .map_err(|e| Error::store(format!("file_type: {e}")))?;
+            if ft.is_dir() {
+                let mode = std::fs::symlink_metadata(&child_src)
+                    .map_err(|e| Error::store(format!("stat {}: {e}", child_src.display())))?
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                // Guarded create (mkdir semantics: refuses a lock-record
+                // spelling, never destroys a residue), then widen during the
+                // walk so a read-only source directory can receive children.
+                create_dir_fd(root, &child_rel)?;
+                set_dir_mode_fd(root, &child_rel, (mode | 0o200) & 0o7777)?;
+                dirs.push((child_rel.clone(), mode));
+                Some(Frame {
+                    dst_rel: child_rel,
+                    entries: read_dir_entries(&entry.path())?,
+                })
+            } else if ft.is_symlink() {
+                let link = std::fs::read_link(&child_src)
+                    .map_err(|e| Error::store(format!("readlink {}: {e}", child_src.display())))?;
+                // The ONE symlink authority: guards the whole path and the
+                // final name, replaces an existing entry, fsyncs the parent.
+                symlink_fd(root, &link, &child_rel)?;
+                None
+            } else {
+                let mut src_f = std::fs::File::open(&child_src)
+                    .map_err(|e| Error::store(format!("open {}: {e}", child_src.display())))?;
+                let mode = src_f
+                    .metadata()
+                    .map_err(|e| Error::store(format!("fstat {}: {e}", child_src.display())))?
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                // Create-new-only through the mutating `openat` chokepoint
+                // (which runs the lock-record guard); a pre-existing entry is
+                // refused (O_EXCL), matching the source tool.
+                let dst_fd = openat_no_follow(
+                    root.as_fd(),
+                    &child_rel,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )?;
+                let mut dst_f = std::fs::File::from(dst_fd);
+                copy_file_streaming(&mut src_f, &mut dst_f, &child_src)?;
+                dst_f
+                    .set_permissions(std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
+                None
+            }
+        };
+        if let Some(frame) = descend {
+            stack.push(frame);
+        }
+    }
+
+    // Restore every directory's exact mode, deepest-first, then the root of
+    // the copy last (it is the shallowest).
+    dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
+    for (rel, mode) in dirs {
+        set_dir_mode_fd(root, &rel, mode)?;
+    }
+    set_dir_mode_fd(root, dst_rel, root_mode)?;
+    Ok(())
+}
+
+/// Stream `src` into `dst` through a SMALL HEAP buffer.
+///
+/// `std::io::copy` would place its default buffer ON THE STACK, which matters
+/// here: the iterative walk is exercised on a deliberately SMALL thread stack
+/// by the deep-tree regression, and a stack buffer large enough to copy a file
+/// eats the budget the walk itself needs. A heap buffer keeps this frame (and
+/// therefore the walk's constant stack cost) small. The function is
+/// deliberately a separate, `inline(never)` frame so the copy's locals do not
+/// inflate the walk's own frame.
+#[inline(never)]
+fn copy_file_streaming(
+    src: &mut std::fs::File,
+    dst: &mut std::fs::File,
+    shown: &Path,
+) -> Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(src, &mut buf)
+            .map_err(|e| Error::store(format!("read {}: {e}", shown.display())))?;
+        if n == 0 {
+            return Ok(());
+        }
+        dst.write_all(&buf[..n])
+            .map_err(|e| Error::store(format!("write {}: {e}", shown.display())))?;
+    }
+}
+
+/// Set the permission mode of the DIRECTORY at root-relative `rel` through an
+/// `O_NOFOLLOW`-confined descriptor (`fchmod` on the opened inode, never a
+/// path-based `chmod`). Reaches the same ONE gate as the other rel-path
+/// primitives for consistency: a chmod preserves the inode (it cannot split a
+/// lock holder), but the lock-record spelling is still refused so a copy
+/// cannot even retune the record's mode.
+fn set_dir_mode_fd(root: &RootDir, rel: &Path, mode: u32) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    let fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    std::fs::File::from(fd)
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))
+}
+
+/// The descriptor-relative ITERATIVE recursive tree fsync: make every regular
+/// file and every directory under root-relative `rel` durable, DEEPEST-FIRST
+/// (a directory is fsynced only after everything it contains), so a crash
+/// after this returns loses at most content that was never claimed durable.
+///
+/// This is the public equivalent of the source tool's
+/// `deploy::store::atomic::fsync_tree_recursive_fd`: unlike
+/// [`crate::transport::Remote::fsync_tree`] (a path-based `WalkDir` over the
+/// transport's base), this resolves EVERY component with
+/// `openat(O_NOFOLLOW)`, so a symlink injected into any component is REFUSED
+/// (ELOOP), never followed, and the fd is the one that is fsynced.
+///
+/// SYMLINKS ARE SKIPPED: a symlink's durability is its parent directory
+/// entry, which the parent's own fsync covers. A directory that cannot be
+/// opened with `O_DIRECTORY`, or a file whose `fsync` fails, is a propagated
+/// `Err` (never swallowed). The walk is an explicit heap `Vec` stack, so a
+/// deep tree surfaces a clean `Err` (at the descriptor limit) rather than
+/// aborting the host on a stack overflow.
+pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let mut dirs: Vec<PathBuf> = vec![rel.to_path_buf()];
+    let mut stack: Vec<PathBuf> = vec![rel.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in read_dir_fd(root, &dir)? {
+            let child = dir.join(&entry.name);
+            if entry.is_dir {
+                dirs.push(child.clone());
+                stack.push(child);
+            } else {
+                // Symlinks and other entry kinds are SKIPPED (their
+                // durability is their directory entry, covered by the
+                // parent's fsync below); only a regular file is fsynced.
+                if let Some(PathKind::File) = path_kind_fd(root, &child)? {
+                    let fd = openat_no_follow(root.as_fd(), &child, libc::O_RDONLY, 0)?;
+                    std::fs::File::from(fd)
+                        .sync_all()
+                        .map_err(|e| Error::store(format!("fsync {}: {e}", child.display())))?;
+                }
+            }
+        }
+    }
+    // Deepest-first: a child directory is durable before its parent's entry
+    // that names it is fsynced.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for dir in dirs {
+        let fd = openat_no_follow(root.as_fd(), &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        fsync_dir_fd(&fd)?;
+    }
+    Ok(())
+}
+
 /// Remove the CONTENTS of the directory `dir_fd`, leaving the directory
 /// itself in place.
 ///
@@ -2167,13 +2428,13 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, Sanction, openat_no_follow,
-        parent_fd_of, path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd,
-        remove_dir_all_fd, remove_dir_all_path, remove_dir_fd, remove_file_fd,
-        remove_owned_lock_record_fd, remove_residue_dir_all_fd, remove_residue_file_fd,
-        rename_residue_paths, renameat_fd, renameat_paths, replace_order_probe, set_private_fd,
-        symlink_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
-        write_file_fd,
+        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, Sanction, copy_dir_recursive_fd,
+        fsync_tree_recursive_fd, openat_no_follow, parent_fd_of, path_kind_fd, read_dir_fd,
+        read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_dir_all_path,
+        remove_dir_fd, remove_file_fd, remove_owned_lock_record_fd, remove_residue_dir_all_fd,
+        remove_residue_file_fd, rename_residue_paths, renameat_fd, renameat_paths,
+        replace_order_probe, set_private_fd, symlink_fd, write_atomic_cas_fd, write_atomic_replace,
+        write_atomic_replace_fd, write_file_fd,
     };
     use crate::error::ReservedKind;
     use std::os::unix::ffi::OsStrExt;
@@ -3652,6 +3913,148 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join(".sync-aside.5.0")).unwrap(),
             b"ordinary2"
+        );
+    }
+
+    /// A source tree OUTSIDE the owned root (with an out-of-root source, the
+    /// shape `deploy`'s `copy_dir_recursive_fd` is called with) plus a root
+    /// that is a SIBLING of it.
+    fn out_of_root_fixture() -> (tempfile::TempDir, RootDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(base.path().join("root")).unwrap();
+        let root = RootDir::open(&base.path().join("root")).expect("open the owned root");
+        let src = base.path().join("src");
+        std::fs::create_dir_all(src.join("ro")).unwrap();
+        std::fs::write(src.join("file.txt"), b"hello").unwrap();
+        std::fs::write(src.join("ro").join("inner"), b"deep").unwrap();
+        std::fs::write(src.join("bin"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(src.join("bin"), std::fs::Permissions::from_mode(0o4755)).unwrap();
+        // A READ-ONLY source directory: the two-phase walk must widen it,
+        // copy the child, then restore 0o555 (the source tool's one-phase
+        // original failed here with EACCES).
+        std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink("file.txt", src.join("link")).unwrap();
+        (base, root, src)
+    }
+
+    /// The re-added public tree copy carries content, symlink targets, and
+    /// EXACT modes (including a read-only directory and the setuid bit) into
+    /// the root-confined destination, and the re-added tree fsync accepts the
+    /// result. PRE-FIX: these two public primitives did not exist, so this
+    /// test did not COMPILE (the failure was a missing primitive); there is no
+    /// runtime assertion that could have failed first.
+    #[test]
+    fn copy_dir_recursive_fd_carries_content_modes_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, root, src) = out_of_root_fixture();
+        copy_dir_recursive_fd(&root, &src, Path::new("dst")).unwrap();
+
+        assert_eq!(
+            std::fs::read(base.path().join("root/dst/file.txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            std::fs::read(base.path().join("root/dst/ro/inner")).unwrap(),
+            b"deep"
+        );
+        assert_eq!(
+            std::fs::read_link(base.path().join("root/dst/link")).unwrap(),
+            Path::new("file.txt")
+        );
+        let mode_of = |rel: &str| {
+            std::fs::symlink_metadata(base.path().join("root").join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(
+            mode_of("dst/ro"),
+            0o555,
+            "a read-only directory keeps its mode"
+        );
+        assert_eq!(mode_of("dst/bin"), 0o4755, "setuid is carried");
+        // A plain file's mode is whatever the SOURCE has (the test process's
+        // umask decides it), so compare against the source rather than a
+        // hardcoded 0o644 — the copy must carry the EXACT source mode.
+        assert_eq!(
+            mode_of("dst/file.txt"),
+            std::fs::symlink_metadata(src.join("file.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            "the copied file keeps the source's mode under any umask"
+        );
+
+        // A subtree fsync must accept the copied tree (and skip the symlink).
+        fsync_tree_recursive_fd(&root, Path::new("dst")).unwrap();
+    }
+
+    /// A symlink injected into a DESTINATION component of the copy is refused
+    /// (the destination is descriptor-confined), and nothing is written
+    /// outside the root.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_symlinked_destination_component() {
+        let (base, root, src) = out_of_root_fixture();
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.path().join("root/escape")).unwrap();
+
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("escape/nested"))
+            .expect_err("a symlink-injected destination component must be refused");
+        assert!(
+            matches!(err, Error::Store(_)),
+            "the refusal must be a store error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("openat"),
+            "the refusal must name the component-wise open, got: {err}"
+        );
+        assert!(
+            !outside.join("nested").exists(),
+            "nothing may be written through the injected symlink"
+        );
+    }
+
+    /// The copy reaches the ONE reserved-spelling gate: a source entry that a
+    /// destination mutation would name as a lock record is refused, rather
+    /// than copied into the destination namespace.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_lock_record_name() {
+        let (base, root, src) = out_of_root_fixture();
+        std::fs::write(src.join("operation.lock"), b"content").unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a lock-record spelling must be refused on the destination side");
+        assert!(
+            matches!(err, Error::Store(_)),
+            "the refusal must be a store error from the guarded openat, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("lock record"),
+            "the refusal must name the lock record, got: {err}"
+        );
+        assert!(
+            !base.path().join("root/dst/operation.lock").exists(),
+            "the lock record was never created"
+        );
+    }
+
+    /// The re-added tree fsync is fd-confined: a symlink injected into a
+    /// component of the tree path is refused rather than followed out of the
+    /// root (the path-based `Remote::fsync_tree` would follow it).
+    #[test]
+    fn fsync_tree_recursive_fd_refuses_a_symlinked_component() {
+        let (base, root, _src) = out_of_root_fixture();
+        std::fs::create_dir(base.path().join("root/real")).unwrap();
+        std::fs::write(base.path().join("root/real/f"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", base.path().join("root/alias")).unwrap();
+        let err = fsync_tree_recursive_fd(&root, Path::new("alias/f"))
+            .expect_err("a symlink component must be refused");
+        assert!(
+            err.to_string().contains("openat"),
+            "the refusal must name the component-wise open, got: {err}"
         );
     }
 }

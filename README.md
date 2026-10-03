@@ -143,6 +143,14 @@ rule's three whole-file reads and omitted the verification reads. Budget the
 verification, not just the append rule. Batch small appends, or keep the log
 outside the synced tree and ship it whole.
 
+**`AppendTail` is NOT a concurrency-safe append.** It is a whole-file
+compare-and-replace: concurrent appends are NOT preserved (two runs can read
+the same prefix and the later publish discards the other's line — a lost
+update on a remote destination, and a `renameat`-wide window locally). A
+consumer that relies on one `O_APPEND` write of a complete line landing under
+concurrent appenders must keep those writes OUTSIDE the synced tree; see the
+`EntryPolicy::AppendTail` warning for what to do instead.
+
 To make a freshly pushed SUBTREE durable, call `fsync_tree(child)` AND
 `fsync_parent(child)` on the transport rooted at the child's PARENT. A
 `RootedRelativePath` cannot be empty, so a transport rooted at the child itself
@@ -268,6 +276,84 @@ simplification; removing one means adding back the logic it removes.
 - **Metadata beyond name, kind, mode, content and symlink target is outside the
   model.** *Buys:* a small manifest, and no extended-attribute, ACL, ownership,
   timestamp or sparseness machinery.
+
+## Design conflicts surfaced by the consumer audit
+
+Three places where this crate's guarantees and a real consumer's design pull
+apart. They are recorded here, with evidence and a recommendation, so the
+owner decides them deliberately rather than by omission. Only (c) is a crate
+defect, and this change fixes it; (a) and (b) are documented-limitation
+candidates that each need an owner decision. Nothing here changes behaviour
+beyond (c).
+
+### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — OWNER DECISION
+
+`sync`/`push`/`pull` take `<parent>/.<name>.operation.lock`
+(`src/sync/apply.rs:1644`, `destination_lock_path`; rationale at
+`src/sync/apply.rs:513`), while `Layout::lock` names the IN-ROOT
+`state/operation.lock` (`src/transport/mod.rs:116`, `:129`). They are
+DIFFERENT FILES, so the two locks do NOT exclude each other: a consumer that
+already holds its own in-root `operation.lock` and then calls `sync` ends up
+with two files that both claim to be "the operation lock"
+(`src/sync/apply.rs:526`). The sibling location is deliberate — an in-root
+record would create the destination ROOT and enter the destination manifest
+the run is judging — and it cannot be composed from the applier's side,
+because `Remote` exposes no accessor for its `Layout` (`src/sync/apply.rs:545`).
+
+RECOMMENDATION (owner decision, not a defect): either give the applier the
+caller's `Layout::lock` path so a run can take BOTH records, or state in the
+entry-point contract that a consumer with its own in-root record must
+serialize at a higher level. Do NOT simply move the record in-root: that
+breaks the "a fully-refused pull creates NOTHING" contract.
+
+### (b) Ownership enforcement is unavailable for exactly the remote case — DOCUMENTED LIMITATION, OWNER DECISION
+
+`sync`/`push`/`pull` REFUSE a destination whose lock they cannot take
+(`src/sync/apply.rs:2109`, `:2260`, `:2278`), and a remote (SSH) destination
+can never be locked: the far-side sidecar `flock` lives inside a single remote
+command and dies with it (`src/sync/apply.rs:498`). Only the explicitly weaker
+`sync_unowned` (`src/sync/apply.rs:2145`) reaches a remote destination, so the
+crate's strongest guarantee applies to the case a cross-host tool uses LEAST.
+
+RECOMMENDATION (owner decision): keep the refusal (fail-closed beats silently
+unowned) and, if the remote case must be owned, build a persistent far-side
+lock session (a long-lived SSH mux command holding the record) rather than
+widening `sync`. Until then this is a documented limitation, not a defect.
+
+### (c) The fd-confined tree helpers the source tool calls had no public equivalent — CRATE DEFECT, FIXED HERE
+
+`~/code/deploy` calls `copy_dir_recursive_fd` and `fsync_tree_recursive_fd`
+(`deploy/src/store/local/mod.rs:444`, `:451`, defined at
+`deploy/src/store/atomic/unix.rs:902`, `:997`), but the crate had dropped them
+and `Remote::{copy_tree,fsync_tree}` are NOT 1:1 replacements: both require
+`RootedRelativePath` endpoints under ONE transport root (the deploy call site
+copies from an arbitrary, possibly out-of-root source), and `Remote::fsync_tree`
+is PATH-based (`WalkDir`, so a symlinked component is followed) where the
+source tool's version refuses one. The migration was blocked on this, so this
+change re-adds the PUBLIC `atomic::copy_dir_recursive_fd`
+(`src/atomic/unix.rs:1821`) and `atomic::fsync_tree_recursive_fd`
+(`src/atomic/unix.rs:1991`), ITERATIVE and descriptor-confined. Their exact
+deltas from `deploy`'s originals (each documented on the primitive itself):
+
+* ITERATIVE, not recursive — the source tool's original recursed one Rust
+  frame per level, so a deep tree aborted the host; the re-added forms hold an
+  explicit heap `Vec` stack and surface a clean `Err` at the descriptor limit.
+  Proven by `deep_tree_fd_copy_does_not_abort_the_process` and
+  `deep_tree_fd_fsync_does_not_abort_the_process` (a 16 KiB stack, depth 256).
+* TWO-PHASE mode finalize — a read-only source directory copies cleanly (the
+  source tool's one-phase original failed with `EACCES`); the final modes are
+  still EXACT, including the setuid/setgid/sticky bits.
+* The destination intermediates are created at the store-private `0o700` mode
+  (the shared directory authority); only the FINAL copied directory takes the
+  source's mode, and an intermediate staging directory is outside the copied
+  tree, so it is not part of a staged-object digest.
+* The ONE reserved-spelling gate runs on every destination mutation (the
+  source tool's original had none), so a source entry named like a lock record
+  (e.g. `operation.lock`) is REFUSED rather than copied into the destination
+  namespace.
+* The destination side is descriptor-confined (a symlinked component is
+  refused); the source side is a path-based READ, exactly as the original. The
+  Windows port is path-based with the port's documented weaker guarantee.
 
 ## Rules for changing this crate
 

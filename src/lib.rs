@@ -48,6 +48,16 @@ mod deep_tree_regression;
 #[cfg(all(test, unix))]
 mod fifo_regression;
 
+/// The serde crate re-exported under a hidden name so the exported
+/// [`id_newtype!`] macro can name serde's traits through `$crate::__serde`.
+/// This is what lets a downstream crate invoke the macro with ONLY
+/// `store-sync` in its `[dependencies]`: the expansion never resolves a bare
+/// `serde::` path, so the consumer needs no `serde` dependency and no
+/// `derive` feature of its own. Not part of the public API surface (it exists
+/// solely for macro hygiene); do not depend on it directly.
+#[doc(hidden)]
+pub use ::serde as __serde;
+
 pub use error::{Error, Result};
 pub use reserved::{
     APPLICATION_LOCK_NAME, ASIDE_PREFIX, OPERATION_LOCK_SUFFIX, RESIDUE_BELOW,
