@@ -351,6 +351,21 @@ fn validate_entry_path(path: &str) -> Result<String> {
             "path contains a traversal or empty component: {path}"
         )));
     }
+    // NAME_MAX is asserted in prose (see [`crate::atomic::NAME_MAX`]) AND
+    // enforced here, at the wire/local boundary: a component longer than any
+    // filesystem entry could hold is refused with a clear materialization
+    // error instead of being accepted here and then refused by the store with
+    // `ENAMETOOLONG` (B5).
+    if let Some(component) = path
+        .split('/')
+        .find(|component| component.len() > crate::atomic::NAME_MAX)
+    {
+        return Err(Error::materialization(format!(
+            "path component exceeds the {}-byte filesystem name bound: {component:?} ({} bytes) in {path}",
+            crate::atomic::NAME_MAX,
+            component.len()
+        )));
+    }
     let nfc: String = path.nfc().collect();
     if nfc != path {
         return Err(Error::materialization(format!(
@@ -1415,6 +1430,28 @@ mod tests {
             "newline must be refused"
         );
         assert!(validate_entry_path("a\tb").is_err(), "tab must be refused");
+
+        // B5: the NAME_MAX bound is ENFORCED at the wire/local boundary, not
+        // merely asserted in prose. A component at the bound is accepted; one
+        // byte over is refused with a clear error (the store would otherwise
+        // refuse it later with `ENAMETOOLONG`).
+        let at_max = "a".repeat(crate::atomic::NAME_MAX);
+        assert_eq!(validate_entry_path(&at_max).unwrap(), at_max);
+        let over = "a".repeat(crate::atomic::NAME_MAX + 1);
+        let over_err = validate_entry_path(&over).unwrap_err();
+        assert!(
+            over_err.to_string().contains("filesystem name bound"),
+            "an over-long component must be refused with the bound named, got: {over_err}"
+        );
+        // A DEEP path is fine as long as every COMPONENT is within the bound.
+        let deep = format!("{at_max}/{at_max}");
+        assert_eq!(validate_entry_path(&deep).unwrap(), deep);
+        // A hand-built 1000-byte WIRE component is refused by the assembler.
+        let wire = format!("{}\tf\t644\t1\t{}\t\n", "b".repeat(1000), "0".repeat(64));
+        assert!(
+            canonicalize_remote_entries(&wire, Path::new("/srv/store")).is_err(),
+            "a 1000-byte wire component must be refused at assembly"
+        );
 
         // The NFC rule: an already-NFC non-ASCII name is accepted and
         // returned UNCHANGED, while a decomposed spelling is refused (never

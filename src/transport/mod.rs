@@ -1881,8 +1881,11 @@ impl LocalTransport {
             // A missing parent component (or any other failure resolving the
             // final entry) is handled by the fd-safe create below, which
             // REFUSES a symlink at any component.
-            Ok(None) | Err(_) => crate::atomic::ensure_private_dir_fd(root, parent.as_path())
-                .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display()))),
+            Ok(None) | Err(_) => {
+                crate::atomic::ensure_private_dir_durable_fd(root, parent.as_path())
+                    .map(|_| ())
+                    .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
+            }
         }
     }
 
@@ -1960,7 +1963,8 @@ impl LocalTransport {
             // create below, which refuses a symlink at any component.
             Ok(None) | Err(_) => {}
         }
-        crate::atomic::ensure_private_dir_fd(&root, rel.as_path())
+        crate::atomic::ensure_private_dir_durable_fd(&root, rel.as_path())
+            .map(|_| ())
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 

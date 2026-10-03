@@ -8,7 +8,7 @@
 //! could not be made durable ([`Error::Store`]), a transport failure
 //! ([`Error::Transport`]), and the closed refusals a caller reacts to
 //! ([`Error::Preflight`], [`Error::NotFound`], [`Error::Ref`],
-//! [`Error::Conflict`]).
+//! [`Error::Conflict`], [`Error::LockContended`]).
 
 use thiserror::Error;
 
@@ -46,6 +46,15 @@ pub enum Error {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The advisory lock is held by a LIVE holder. This is a TYPED contention
+    /// signal, distinct from a real open/flock failure (which stays
+    /// [`Error::Preflight`]): a caller that wants to RETRY a contended lock
+    /// matches this variant instead of string-matching the holder message.
+    /// The lock is non-blocking by design (`flock` `LOCK_NB` / `LockFileEx`
+    /// with `LOCKFILE_FAIL_IMMEDIATELY`), so retrying is the caller's policy.
+    #[error("lock contended: {0}")]
+    LockContended(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -79,6 +88,13 @@ impl Error {
         Error::Conflict(msg.into())
     }
 
+    /// The typed LOCK-CONTENTION signal ([`Error::LockContended`]): the
+    /// advisory lock is held by a live holder, so a retrying caller reacts to
+    /// this instead of string-matching the holder message.
+    pub fn lock_contended(msg: impl Into<String>) -> Self {
+        Error::LockContended(msg.into())
+    }
+
     /// Append `context` to this error's message, PRESERVING its class.
     ///
     /// Used where a best-effort cleanup fails while an earlier failure is
@@ -104,6 +120,7 @@ impl Error {
             Error::NotFound(m) => Error::NotFound(format!("{m}; {context}")),
             Error::Ref(m) => Error::Ref(format!("{m}; {context}")),
             Error::Conflict(m) => Error::Conflict(format!("{m}; {context}")),
+            Error::LockContended(m) => Error::LockContended(format!("{m}; {context}")),
         }
     }
 }

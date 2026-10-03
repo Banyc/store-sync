@@ -126,11 +126,14 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 
 /// The name rule shared by the identifier-like validated values AND the
 /// identity newtypes built on it (a single safe path segment): a SINGLE
-/// FILESYSTEM-SAFE ASCII path segment — non-empty, only `[a-zA-Z0-9._-]`,
-/// not a `.`/`..` traversal component, never a leading dash, and NEVER one of
-/// the crate's RESERVED spellings ([`crate::reserved::is_reserved_name`]): the
-/// claim-aside namespace `.sync-aside.` and the operation-lock record spelling
-/// `.<name>.operation.lock`.
+/// FILESYSTEM-SAFE ASCII path segment — non-empty, at most
+/// [`crate::atomic::NAME_MAX`] bytes, only `[a-zA-Z0-9._-]`, not a `.`/`..`
+/// traversal component, never a leading dash, and NEVER a spelling that names
+/// or can ALIAS the crate's own bookkeeping ([`crate::reserved::is_unaddressable_name`]):
+/// the claim-aside namespace `.sync-aside.`, the operation-lock record spelling
+/// `.<name>.operation.lock`, the application-store lock record `operation.lock`,
+/// and any CASE ALIAS of those (on a case-insensitive filesystem
+/// `.SYNC-ASIDE.1` IS `.sync-aside.1`).
 ///
 /// A name becomes a directory/file component UNCHANGED (the store stores
 /// validated names VERBATIM), so the rule must make the valid set INJECTIVE
@@ -139,6 +142,9 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// (`/`, `\`) would nest, whitespace/control/unicode would have to be
 /// re-encoded (two distinct names collapsing onto one encoded name), `.`/`..`
 /// escape the namespace, and a leading dash invites option-parser confusion.
+/// A name longer than [`crate::atomic::NAME_MAX`] names no single directory
+/// entry on any supported filesystem (`ENAMETOOLONG`), and a reserved spelling
+/// (or a case alias of one) would collide with the crate's own bookkeeping.
 /// The RESERVED spellings are excluded for a stronger reason: a whole-store
 /// sync STRIPS them from both manifests before the diff, so an identity the
 /// crate accepted but the sync cannot transfer (and cannot destroy through
@@ -148,10 +154,11 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// path components.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
+        && s.len() <= crate::atomic::NAME_MAX
         && !s.starts_with('-')
         && s != "."
         && s != ".."
-        && !crate::reserved::is_reserved_name(s)
+        && !crate::reserved::is_unaddressable_name(s)
         && s.bytes()
             .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
 }
@@ -225,10 +232,12 @@ mod tests {
             Identifier::parse(bad).expect_err("invalid identifier must be rejected");
             assert!(bad.parse::<Identifier>().is_err(), "{bad:?}");
         }
-        // The near-miss `operation.lock` (no leading dot) stays a VALID id:
-        // the reserved rule is the exact `.<name>.operation.lock` spelling,
-        // not any name ending in `.operation.lock`.
-        assert!(Identifier::parse("operation.lock").is_ok());
+        // The near-miss `operation.lock` is NO LONGER a valid id: it is the
+        // crate's own application-store lock record, which FileLock::acquire
+        // truncates and rewrites, so an id that named it could not coexist
+        // with the lock. Its case aliases are refused too (A3/A4).
+        assert!(Identifier::parse("operation.lock").is_err());
+        assert!(Identifier::parse("OPERATION.LOCK").is_err());
         assert!(Identifier::parse(".sync-aside").is_ok());
     }
 
@@ -267,6 +276,64 @@ mod tests {
             "snapshots/.001.operation.lock"
         ));
         assert!(!crate::reserved::is_reserved_name("production"));
+    }
+
+    /// The id rule refuses the crate's own APPLICATION lock record and every
+    /// case alias of a reserved spelling, through every construction path —
+    /// so an identity the crate accepts can never be (or alias) the record
+    /// `FileLock::acquire` truncates, on a case-insensitive filesystem too.
+    #[test]
+    fn the_identifier_refuses_the_lock_record_and_case_aliases() {
+        assert!(crate::reserved::is_application_lock_name("operation.lock"));
+        assert!(!crate::reserved::is_reserved_name("operation.lock"));
+        for bad in [
+            "operation.lock",
+            "OPERATION.LOCK",
+            "Operation.Lock",
+            ".SYNC-ASIDE.1",
+            ".Sync-Aside.1",
+            ".001.OPERATION.LOCK",
+        ] {
+            assert!(Identifier::parse(bad).is_err(), "parse must refuse {bad:?}");
+            assert!(
+                bad.parse::<Identifier>().is_err(),
+                "FromStr must refuse {bad:?}"
+            );
+            assert!(
+                serde_json::from_str::<Identifier>(&format!("{bad:?}")).is_err(),
+                "wire deserialization must refuse {bad:?}"
+            );
+        }
+        // A genuinely distinct near-miss is still ordinary.
+        assert!(Identifier::parse("a.operation.lock").is_ok());
+        assert!(Identifier::parse("operation.lockx").is_ok());
+    }
+
+    /// The NAME_MAX bound the manifest documents is ENFORCED at the name
+    /// boundary: a name the store would refuse with `ENAMETOOLONG` is refused
+    /// by [`valid_name`]/[`Identifier::parse`] too, through every path.
+    #[test]
+    fn the_identifier_enforces_the_name_max_bound() {
+        let max = crate::atomic::NAME_MAX;
+        let at_max = "a".repeat(max);
+        assert!(valid_name(&at_max), "a name at NAME_MAX is legal");
+        assert!(Identifier::parse(&at_max).is_ok());
+        for over in [max + 1, 256, 300] {
+            let long = "a".repeat(over);
+            assert!(
+                !valid_name(&long),
+                "a {over}-byte name must be refused by the name authority"
+            );
+            let err = Identifier::parse(&long).expect_err("parse must refuse an over-long name");
+            assert!(
+                matches!(err, crate::error::Error::Integrity(_)),
+                "the refusal keeps the integrity class: {err:?}"
+            );
+            assert!(
+                serde_json::from_str::<Identifier>(&format!("{long:?}")).is_err(),
+                "wire deserialization must refuse an over-long name"
+            );
+        }
     }
 
     /// The serde wire path routes every string through the same validation:
@@ -324,16 +391,18 @@ mod tests {
     }
 
     /// The independent characterization of the name rule: a value is a safe
-    /// filesystem ASCII single path segment iff it is non-empty, uses only
-    /// `[a-zA-Z0-9._-]`, is not a `.`/`..` traversal component, never starts
-    /// with `-` (a leading dash invites option-parser confusion), and is not
-    /// a RESERVED spelling ([`crate::reserved::is_reserved_name`]).
+    /// filesystem ASCII single path segment iff it is non-empty, at most
+    /// [`crate::atomic::NAME_MAX`] bytes, uses only `[a-zA-Z0-9._-]`, is not a
+    /// `.`/`..` traversal component, never starts with `-` (a leading dash
+    /// invites option-parser confusion), and names or can alias no crate
+    /// bookkeeping spelling ([`crate::reserved::is_unaddressable_name`]).
     fn is_safe_segment(s: &str) -> bool {
         !s.is_empty()
+            && s.len() <= crate::atomic::NAME_MAX
             && !s.starts_with('-')
             && s != "."
             && s != ".."
-            && !crate::reserved::is_reserved_name(s)
+            && !crate::reserved::is_unaddressable_name(s)
             && s.bytes().all(|b| {
                 matches!(
                     b,
@@ -378,9 +447,16 @@ mod tests {
                 ".sync-aside.1".to_string(),
                 ".sync-aside.123.0".to_string(),
                 ".001.operation.lock".to_string(),
-                // Near-misses that stay ORDINARY.
-                "operation.lock".to_string(),
+                // Near-misses that stay ORDINARY in the reserved MATCH (the
+                // application lock record below is refused by the id rule as
+                // UNaddressable, not by the reserved match).
+                "sync-aside".to_string(),
                 ".sync-aside".to_string(),
+                "a.operation.lock".to_string(),
+                // The crate's own lock record and its case alias: refused as
+                // UNaddressable, not by the byte-exact reserved MATCH.
+                "operation.lock".to_string(),
+                "OPERATION.LOCK".to_string(),
             ]),
             prop::collection::vec(prop::char::any(), 0..12).prop_map(|v| v.into_iter().collect()),
         ]

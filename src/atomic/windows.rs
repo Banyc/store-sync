@@ -353,7 +353,7 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
             if existing == bytes {
                 return Ok(());
             }
-            return Err(Error::store(format!(
+            return Err(Error::conflict(format!(
                 "refusing to replace existing {} with different content",
                 rel.display()
             )));
@@ -396,10 +396,27 @@ pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
     set_private(&rel_join(root, rel)?)
 }
 
-/// Path-based remove of a single file.
+/// Path-based remove of a single file. Refuses a crate lock-record spelling
+/// (the stable-inode discipline's structural guard; see the Unix port).
 pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_removal(rel)?;
     std::fs::remove_file(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
+}
+
+/// Refuse a destructive mutation whose FINAL component is one of the crate's
+/// lock-record spellings (see the Unix port for the full rationale).
+fn refuse_lock_record_removal(rel: &Path) -> Result<()> {
+    if let Some(name) = rel.file_name().and_then(|name| name.to_str())
+        && crate::reserved::is_lock_record_name(name)
+    {
+        return Err(Error::conflict(format!(
+            "refusing to remove the crate's lock record {}: the record's stable inode is what makes \
+             two simultaneous holders impossible, so removing it would admit a second holder",
+            rel.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Path-based rename of a path under the root to another path under the
@@ -427,6 +444,7 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 /// path gets from its own walk. (Windows is type-checked only, never run
 /// here.)
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_removal(rel)?;
     std::fs::remove_dir_all(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
 }
@@ -507,12 +525,27 @@ fn kind_from_file_type(ft: std::fs::FileType) -> PathKind {
     }
 }
 
-/// Read the entries of the directory at `rel` under the root path.
+/// Read the entries of the directory at `rel` under the root path. `rel` must
+/// name at least one normal component ([`validate_rel`] refuses the empty and
+/// `.` spellings); the OWNED ROOT itself is enumerated with
+/// [`read_root_dir_fd`].
 pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
+    let entries = std::fs::read_dir(rel_join(root, rel)?)
+        .map_err(|e| Error::store(format!("read_dir {}: {e}", rel.display())))?;
+    read_dir_entries(entries)
+}
+
+/// Read the entries of the OWNED ROOT itself (see the Unix port for the B1
+/// rationale).
+pub fn read_root_dir_fd(root: &RootDir) -> Result<Vec<DirEntry>> {
+    let entries = std::fs::read_dir(root.path())
+        .map_err(|e| Error::store(format!("read_dir {}: {e}", root.path().display())))?;
+    read_dir_entries(entries)
+}
+
+fn read_dir_entries(entries: std::fs::ReadDir) -> Result<Vec<DirEntry>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(rel_join(root, rel)?)
-        .map_err(|e| Error::store(format!("read_dir {}: {e}", rel.display())))?
-    {
+    for entry in entries {
         let entry = entry.map_err(|e| Error::store(format!("entry: {e}")))?;
         let ft = entry
             .file_type()

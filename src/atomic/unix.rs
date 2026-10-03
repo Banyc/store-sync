@@ -60,6 +60,59 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 
+/// TEST-ONLY ORDERING PROBE for the atomic replace (A1). It records, on the
+/// calling thread only, the sequence of directory-entry commits the durable
+/// directory helper performs and the rename the replace performs, so a test can
+/// assert that every directory the replace CREATED had its entry fsynced into
+/// its own parent BEFORE the rename (the ordering the durability claim rests
+/// on). It is a no-op in a production build (the whole module is
+/// `#[cfg(test)]`).
+#[cfg(test)]
+pub(crate) mod replace_order_probe {
+    use std::cell::RefCell;
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn begin() {
+        EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+    }
+    pub(crate) fn record(event: String) {
+        EVENTS.with(|events| {
+            if let Some(list) = events.borrow_mut().as_mut() {
+                list.push(event);
+            }
+        });
+    }
+    pub(crate) fn take() -> Vec<String> {
+        EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+/// Record a created-directory ENTRY-FSYNC for the ordering probe. A no-op
+/// outside test builds.
+#[cfg(test)]
+fn probe_commit_entry(prefix: &str) {
+    replace_order_probe::record(format!("commit-dir-entry {prefix}"));
+}
+#[cfg(not(test))]
+fn probe_commit_entry(_prefix: &str) {}
+
+/// Record the atomic replace's `renameat` for the ordering probe.
+#[cfg(test)]
+fn probe_rename() {
+    replace_order_probe::record("rename".to_string());
+}
+#[cfg(not(test))]
+fn probe_rename() {}
+
+/// Record the atomic replace's post-rename parent-directory fsync.
+#[cfg(test)]
+fn probe_fsync_replace_parent() {
+    replace_order_probe::record("fsync-replace-parent".to_string());
+}
+#[cfg(not(test))]
+fn probe_fsync_replace_parent() {}
+
 pub fn set_private(path: &Path) -> Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms)
@@ -78,8 +131,11 @@ pub fn write_atomic_replace(
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+        // DURABLE creation of the parent chain: every directory created here
+        // has its own entry fsynced into its parent BEFORE the temp write and
+        // the rename, so the replace's durability claim covers the WHOLE chain
+        // (A1). `create_dir_all` left the created directories' entries unsynced.
+        ensure_private_dir_durable(parent)?;
     }
     let tmp = temp_name_for(path);
     // Stage 1: the temp create/write. A failure (or an injected
@@ -143,6 +199,7 @@ pub fn write_atomic_replace(
     if let Some(e) = fault(ReplaceStage::Rename) {
         return Err(discard_temp(e, &tmp));
     }
+    probe_rename();
     if let Err(e) = std::fs::rename(&tmp, path) {
         return Err(discard_temp(
             Error::store(format!("rename {}: {e}", path.display())),
@@ -266,6 +323,7 @@ pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     // base — which an earlier UNSYNCED creation (the store open) may have
     // made: the first append is the first chance to make it durable.
     for component in missing.iter().rev() {
+        probe_commit_entry(&component.to_string_lossy());
         sync_parent_dir(component)?;
     }
     if let Some(parent) = path.parent()
@@ -421,6 +479,41 @@ pub fn openat_no_follow_io(
 pub fn openat_no_follow(dir_fd: &OwnedFd, rel: &Path, flags: i32, mode: u32) -> Result<OwnedFd> {
     openat_no_follow_io(dir_fd, rel, flags, mode)
         .map_err(|e| Error::store(format!("openat {}: {e}", rel.display())))
+}
+
+/// Open the final component `rel` relative to `dir_fd` without following a
+/// symlink and WITHOUT BLOCKING, then require the OPENED inode to be a regular
+/// file or a directory.
+///
+/// `open(2)` of a FIFO read-only BLOCKS until a writer appears, so a read-side
+/// primitive that opens user data with a bare `O_RDONLY` hangs forever on one
+/// FIFO in the store — an unbounded hang on user data. `O_NONBLOCK` is a no-op
+/// for a regular file and a directory, so adding it makes the open return
+/// immediately, and classifying the OPENED inode with `fstat` refuses a
+/// FIFO/socket/device with a clear error instead of reading it. This is the
+/// local shape of the far-side fsync helper (`sysopen(..., O_RDONLY|O_NONBLOCK)`
+/// then `stat` and `die` on a non-regular entry): classify the
+/// opened inode, never assume its kind from the path. `O_NOFOLLOW` is applied
+/// by [`openat_no_follow_io`], so a final-component symlink is refused (ELOOP)
+/// before the classification.
+fn openat_readable_regular(dir_fd: &OwnedFd, rel: &Path, flags: i32) -> std::io::Result<OwnedFd> {
+    let opened = openat_no_follow_io(dir_fd, rel, flags | libc::O_NONBLOCK, 0)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(opened.as_raw_fd(), &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    match kind_from_mode(st.st_mode) {
+        PathKind::File | PathKind::Dir => Ok(opened),
+        PathKind::Symlink => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the entry is a symlink",
+        )),
+        PathKind::Other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the entry is not a regular file or a directory (a FIFO, socket, or device); \
+             refusing instead of opening or reading it",
+        )),
+    }
 }
 
 /// Open the parent directory of `rel` relative to `root` (component-wise
@@ -675,7 +768,9 @@ fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Er
 /// REFUSE a foreign final entry instead of overwriting it uses one of the
 /// open/create-new primitives — [`openat_no_follow`], [`write_file_fd`],
 /// [`write_atomic_cas_fd`], [`read_fd`], or [`path_state_fd`]. The parent
-/// directory is created via [`ensure_private_dir_fd`] if missing. A failure
+/// directory is created via [`ensure_private_dir_durable_fd`] if missing (so
+/// every created directory's own entry is fsynced into its parent before the
+/// rename). A failure
 /// BEFORE the rename UNLINKS the temp before the `Err` returns (best-effort,
 /// the cleanup failure carried with the original one), so a failed replace
 /// leaves no stray temp; the post-rename parent-fsync failure is NOT a
@@ -735,7 +830,7 @@ pub enum CompareReplace {
 /// its target), a directory fails the read, and every other failure is a real
 /// error. Fail closed: only a byte-identical regular file compares equal.
 fn live_matches(parent_fd: &OwnedFd, file_name: &OsStr, expected: &[u8]) -> Result<bool> {
-    match openat_no_follow_io(parent_fd, Path::new(file_name), libc::O_RDONLY, 0) {
+    match openat_readable_regular(parent_fd, Path::new(file_name), libc::O_RDONLY) {
         Ok(f) => Ok(read_fd_to_end(&f)? == expected),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(Error::store(format!(
@@ -786,7 +881,14 @@ fn replace_core(
     // chmodded.
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     if ensure_parent && !parent_rel.as_os_str().is_empty() {
-        ensure_private_dir_fd(root, parent_rel)?;
+        // DURABLE creation of the parent chain: every directory this call
+        // creates has its OWN entry fsynced into its parent BEFORE the temp
+        // write and the rename, so the [
+        // `ReplaceOutcome::ReplacedDurable`] claim ("visible under its final
+        // name AND durable across power loss") is true for the WHOLE chain,
+        // not only for the final entry's parent. The non-durable helper used
+        // to leave the created directories' entries unsynced (A1).
+        ensure_private_dir_durable_fd(root, parent_rel)?;
     }
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     // The FIRST compare: fail before writing a temp if the destination already
@@ -872,6 +974,7 @@ fn replace_core(
     if let Some(e) = fault(ReplaceStage::Rename) {
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
+    probe_rename();
     if let Err(e) = renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name) {
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
@@ -882,6 +985,7 @@ fn replace_core(
             ReplaceOutcome::ReplacedDurabilityUnknown { error: e },
         ));
     }
+    probe_fsync_replace_parent();
     if let Err(e) = fsync_dir_fd(&parent_fd) {
         return Ok(CoreReplace::Replaced(
             ReplaceOutcome::ReplacedDurabilityUnknown { error: e },
@@ -925,13 +1029,13 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
     // If the file exists, its content must be byte-identical (an identical
     // rewrite is an idempotent success; a symlink at the final component is
     // refused by the O_NOFOLLOW open — never followed).
-    match openat_no_follow_io(&parent_fd, Path::new(file_name), libc::O_RDONLY, 0) {
+    match openat_readable_regular(&parent_fd, Path::new(file_name), libc::O_RDONLY) {
         Ok(f) => {
             let existing = read_fd_to_end(&f)?;
             if existing == bytes {
                 return Ok(());
             }
-            return Err(Error::store(format!(
+            return Err(Error::conflict(format!(
                 "refusing to replace existing {} with different content",
                 rel.display()
             )));
@@ -989,10 +1093,10 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
     let _ = unlinkat_fd(&parent_fd, &tmp_name);
     if !installed {
         // Lost the race: the winner's content must match ours or refuse.
-        let f = openat_no_follow(&parent_fd, Path::new(file_name), libc::O_RDONLY, 0)?;
+        let f = openat_readable_regular(&parent_fd, Path::new(file_name), libc::O_RDONLY)?;
         let existing = read_fd_to_end(&f)?;
         if existing != bytes {
-            return Err(Error::store(format!(
+            return Err(Error::conflict(format!(
                 "refusing to replace existing {} with different content",
                 rel.display()
             )));
@@ -1003,11 +1107,10 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
     // parent directory (THE DURABILITY COMMIT POINT — fail closed, see
     // [`write_atomic_cas`]).
     {
-        let f = std::fs::File::from(openat_no_follow(
+        let f = std::fs::File::from(openat_readable_regular(
             &parent_fd,
             Path::new(file_name),
             libc::O_RDONLY,
-            0,
         )?);
         f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))?;
@@ -1116,6 +1219,12 @@ pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool>
     // created component (deepest first), then the parent of the new path's
     // own parent (the entry that names the directory HOLDING the new path).
     for &i in created.iter().rev() {
+        let prefix = comps[..=i]
+            .iter()
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        probe_commit_entry(&prefix);
         if i == 0 {
             fsync_dir_fd(root.as_fd())?;
         } else {
@@ -1154,19 +1263,43 @@ pub fn sync_parent_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// The descriptor-relative private chmod (0o600) of a file under the root.
 pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
-    let f = std::fs::File::from(openat_no_follow(
+    let f = std::fs::File::from(openat_readable_regular(
         &parent_fd,
         Path::new(name),
         libc::O_RDONLY,
-        0,
     )?);
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))
 }
 
+/// Refuse a destructive mutation whose FINAL component is one of the crate's
+/// LOCK-RECORD spellings ([`crate::reserved::is_lock_record_name`]): the
+/// application-store lock record `operation.lock` or the sibling record
+/// `.<name>.operation.lock`, in byte-exact or case-ALIAS form.
+///
+/// The stable-inode discipline gives "at most one holder" only while the
+/// record is not removed: unlinking the path lets a later acquisition create a
+/// DIFFERENT inode and flock that while a live holder still holds the old one
+/// — two simultaneous holders (A5). Removing a lock record through the crate's
+/// own removal primitives is therefore refused, which makes the guarantee
+/// structural for every caller that goes through the substrate.
+fn refuse_lock_record_removal(rel: &Path) -> Result<()> {
+    if let Some(name) = rel.file_name().and_then(|name| name.to_str())
+        && crate::reserved::is_lock_record_name(name)
+    {
+        return Err(Error::conflict(format!(
+            "refusing to remove the crate's lock record {}: the record's stable inode is what makes \
+             two simultaneous holders impossible, so removing it would admit a second holder",
+            rel.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The descriptor-relative remove of a single file (or symlink — the
 /// symlink itself is removed, never its target).
 pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_removal(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     unlinkat_fd(&parent_fd, name)
 }
@@ -1185,6 +1318,7 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 /// recursed into, and the tree root is removed last. A symlink injected at
 /// any component is refused (ELOOP) — never followed.
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_removal(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let dir_fd = openat_no_follow(
         &parent_fd,
@@ -1400,11 +1534,14 @@ pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
 /// COMPONENT-WISE with `openat(O_NOFOLLOW)`: every intermediate component
 /// is opened as a directory (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
 /// O_CLOEXEC`) and the final component is opened with
-/// `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
+/// `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
 /// component is refused (ELOOP) — a read can never be redirected outside
-/// the root the descriptor pins.
+/// the root the descriptor pins. `O_NONBLOCK` (a no-op for a regular file)
+/// plus the `fstat` classification of the OPENED inode refuse a FIFO/socket/
+/// device promptly instead of hanging forever on a FIFO (A2).
 pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
-    let f = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY, 0)?;
+    let f = openat_readable_regular(root.as_fd(), rel, libc::O_RDONLY)
+        .map_err(|e| Error::store(format!("openat {}: {e}", rel.display())))?;
     read_fd_to_end(&f)
 }
 
@@ -1459,8 +1596,10 @@ pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) 
 /// component is REFUSED (ELOOP — never followed); a genuine NotFound of
 /// the final component is ABSENCE (`Ok(false)`); EVERY other filesystem
 /// error is a real failure → [`Error::store`], NEVER treated as absence.
+/// The final open is `O_NONBLOCK` and the OPENED inode is classified, so a
+/// FIFO is refused promptly (A2) instead of blocking the open forever.
 pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
-    match openat_no_follow_io(root.as_fd(), rel, libc::O_RDONLY, 0) {
+    match openat_readable_regular(root.as_fd(), rel, libc::O_RDONLY) {
         Ok(fd) => {
             let f = std::fs::File::from(fd);
             f.metadata()
@@ -1528,11 +1667,37 @@ fn kind_from_mode(mode: libc::mode_t) -> PathKind {
 /// resolved COMPONENT-WISE with `openat(O_NOFOLLOW)` (a symlink injected
 /// at any component is refused — ELOOP — never followed). Each entry is
 /// classified with `fstatat(AT_SYMLINK_NOFOLLOW)` (a symlink entry is
-/// reported as a non-directory, never followed).
+/// reported as a non-directory, never followed). `rel` must name at least one
+/// normal component: [`validate_rel`] refuses the empty and `.` spellings, so
+/// the OWNED ROOT itself is enumerated with [`read_root_dir_fd`] instead.
 pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
     let dir_fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    read_dir_of_opened_fd(&dir_fd, rel)
+}
+
+/// Read the entries of the OWNED ROOT itself.
+///
+/// `read_dir_fd(root, "")` and `read_dir_fd(root, ".")` are refused by
+/// [`validate_rel`] — those spellings name the root, not an entry UNDER it —
+/// so before this function a consumer had NO public way to enumerate the root
+/// and could not reach residue sitting directly at the store root (a crashed
+/// temp, a stray file). The root descriptor is already pinned by the
+/// [`RootDir`], so no path spelling is involved; each entry is classified
+/// exactly as [`read_dir_fd`] classifies a child (B1).
+pub fn read_root_dir_fd(root: &RootDir) -> Result<Vec<DirEntry>> {
+    let dir_fd = root
+        .as_fd()
+        .try_clone()
+        .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
+    read_dir_of_opened_fd(&dir_fd, Path::new(""))
+}
+
+/// Classify the entries of an already-open directory descriptor; `shown` is
+/// used only to name a failing entry in an error (the empty path for the
+/// owned root).
+fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>> {
     let mut out = Vec::new();
-    for_each_dir_entry(&dir_fd, |name| {
+    for_each_dir_entry(dir_fd, |name| {
         let c = CString::new(name).map_err(|_| Error::store("path component with NUL"))?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let r = unsafe {
@@ -1546,7 +1711,8 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
         if r < 0 {
             return Err(Error::store(format!(
                 "fstatat {}: {}",
-                rel.join(Path::new(std::ffi::OsStr::from_bytes(name)))
+                shown
+                    .join(Path::new(std::ffi::OsStr::from_bytes(name)))
                     .display(),
                 std::io::Error::last_os_error()
             )));
@@ -1564,7 +1730,8 @@ pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
 mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, path_kind_fd, read_dir_fd, read_fd,
-        read_link_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
+        read_link_fd, read_root_dir_fd, remove_file_fd, replace_order_probe, write_atomic_cas_fd,
+        write_atomic_replace, write_atomic_replace_fd,
     };
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -2150,15 +2317,20 @@ mod tests {
         assert_eq!(read_fd(&root, rel).unwrap(), b"FIRST".to_vec());
     }
 
-    /// A CAS that refuses different content returns an `Err` and leaves only
-    /// the existing destination (no temp is created on the refusal path).
+    /// A CAS that refuses different content returns an `Err` of the CONFLICT
+    /// class (the closed refusal a caller reacts to — not a mechanical store
+    /// failure), and leaves only the existing destination (no temp is created
+    /// on the refusal path).
     #[test]
     fn refusing_cas_leaves_only_the_destination() {
         let (dir, root) = owned_root();
         let rel = Path::new("cas.json");
         std::fs::write(dir.path().join("cas.json"), b"OLD").unwrap();
         let err = write_atomic_cas_fd(&root, rel, b"NEW").unwrap_err();
-        assert!(matches!(err, Error::Store(_)), "got: {err:?}");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "a content divergence is the CONFLICT class: {err:?}"
+        );
         assert_eq!(entry_names(dir.path()), only("cas.json"));
         assert_eq!(read_fd(&root, rel).unwrap(), b"OLD".to_vec());
     }
@@ -2248,5 +2420,187 @@ mod tests {
             .collect();
         assert_eq!(order.len(), names.len(), "the probe must list every name");
         (order[0].clone(), order[order.len() - 1].clone())
+    }
+
+    // -----------------------------------------------------------------
+    // A1: the durable ordering the replace claims
+    // -----------------------------------------------------------------
+
+    /// The ORDERING PROOF for A1: replacing a path whose parent chain is
+    /// MISSING commits every CREATED directory's own entry into its parent
+    /// BEFORE the rename, so `ReplacedDurable` is true for the whole chain.
+    /// The pre-fix code created the chain with the non-durable helper and
+    /// fsynced only the file's parent, so this test failed with "the created
+    /// directory entry ... was never fsynced into its parent".
+    #[test]
+    fn a_missing_parent_chain_is_committed_durably_before_the_rename() {
+        let (_dir, root) = owned_root();
+        replace_order_probe::begin();
+        let outcome =
+            write_atomic_replace_fd(&root, Path::new("newdir/sub/file.txt"), b"x", &mut |_| None)
+                .unwrap();
+        let events = replace_order_probe::take();
+        assert!(
+            matches!(outcome, ReplaceOutcome::ReplacedDurable),
+            "a replace of a fresh chain is durable: {outcome:?}"
+        );
+        let rename_at = events
+            .iter()
+            .position(|event| event == "rename")
+            .unwrap_or_else(|| panic!("the rename must be recorded: {events:?}"));
+        for expected in ["commit-dir-entry newdir", "commit-dir-entry newdir/sub"] {
+            let at = events.iter().position(|event| event == expected).unwrap_or_else(|| {
+                panic!(
+                    "the created directory entry {expected:?} was never fsynced into its parent, \
+                     so a power loss could lose it while the replace reports ReplacedDurable: {events:?}"
+                )
+            });
+            assert!(
+                at < rename_at,
+                "{expected:?} must be committed BEFORE the rename: {events:?}"
+            );
+        }
+    }
+
+    /// The same ordering for the PATH-BASED replace (the Windows local path,
+    /// also reachable on Unix): `create_dir_all` used to leave the new
+    /// directories' entries unsynced.
+    #[test]
+    fn the_path_based_replace_commits_new_parent_entries_before_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnew/sub/file.txt");
+        replace_order_probe::begin();
+        let outcome = write_atomic_replace(&path, b"x", &mut |_| None).unwrap();
+        let events = replace_order_probe::take();
+        assert!(
+            matches!(outcome, ReplaceOutcome::ReplacedDurable),
+            "a replace of a fresh chain is durable: {outcome:?}"
+        );
+        let rename_at = events
+            .iter()
+            .position(|event| event == "rename")
+            .unwrap_or_else(|| panic!("the rename must be recorded: {events:?}"));
+        let commits: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("commit-dir-entry "))
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            commits.len() >= 2,
+            "both created directories must have their entry fsynced before the rename: {events:?}"
+        );
+        for at in commits {
+            assert!(
+                at < rename_at,
+                "every created directory entry must be committed BEFORE the rename: {events:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // B1: the owned root is enumerable
+    // -----------------------------------------------------------------
+
+    /// Residue sitting DIRECTLY at the store root used to be unreachable: the
+    /// empty and `.` spellings are refused by `validate_rel`. The dedicated
+    /// root enumerator reaches it, while those child spellings stay refused.
+    #[test]
+    fn the_owned_root_is_enumerable_and_root_child_spellings_stay_refused() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join("root-residue"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert!(
+            read_dir_fd(&root, Path::new("")).is_err(),
+            "the empty spelling names the root, not an entry under it"
+        );
+        assert!(
+            read_dir_fd(&root, Path::new(".")).is_err(),
+            "the `.` spelling names the root, not an entry under it"
+        );
+        let mut names: Vec<String> = read_root_dir_fd(&root)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["root-residue".to_string(), "sub".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // B2: the crate's OWN crash-temp recognizer is public
+    // -----------------------------------------------------------------
+
+    /// A crashed atomic replace (SIGKILL mid-protocol) leaves its temp behind;
+    /// the now-public recognizer is the recovery hook, and it must NOT confuse
+    /// a genuine claim-ASIDE (which HOLDS a stranded original) for a temp.
+    #[test]
+    fn the_crate_temp_recognizer_is_public_and_distinguishes_a_held_aside() {
+        let temp = crate::atomic::temp_name_for(Path::new("record.json"));
+        let temp_name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            crate::atomic::is_crate_temp_name(&temp_name),
+            "the crate's own temp must be recognized: {temp_name}"
+        );
+        assert!(
+            !crate::atomic::is_crate_temp_name(".sync-aside.123.0"),
+            "a genuine claim-aside holds the stranded original and is NOT a temp"
+        );
+        // The recognizer reaches residue ENUMERATED AT THE ROOT.
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join(&temp_name), b"partial").unwrap();
+        let listed = read_root_dir_fd(&root).unwrap();
+        let listed_names: Vec<String> = listed
+            .iter()
+            .map(|entry| entry.name.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| crate::atomic::is_crate_temp_name(&entry.name.to_string_lossy())),
+            "root enumeration must surface the crashed temp: {listed_names:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // A5: the stable-inode guarantee is structural
+    // -----------------------------------------------------------------
+
+    /// The two-holder reproduction: while A holds the record, B used to UNLINK
+    /// it through the substrate and C then created a fresh inode and acquired
+    /// it — two simultaneous holders. The removal primitive now refuses a
+    /// lock-record spelling, so the record keeps A's inode and C is refused.
+    #[test]
+    fn removing_the_lock_record_is_refused_so_no_second_holder_can_appear() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, root) = owned_root();
+        let path = dir.path().join("operation.lock");
+        let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
+        let inode_a = std::fs::metadata(&path).unwrap().ino();
+        let err = remove_file_fd(&root, Path::new("operation.lock"))
+            .expect_err("removing the crate's lock record through the substrate must be refused");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the removal refusal is a conflict: {err:?}"
+        );
+        // The record still names A's inode, so C cannot acquire: ONE holder.
+        let err2 = match crate::lock::FileLock::acquire(&path, "op-C") {
+            Ok(_) => panic!("C must not acquire while A holds the record"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err2, Error::LockContended(_)),
+            "C must be refused with the typed contention signal: {err2:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_a,
+            "the record must keep its stable inode"
+        );
+        drop(holder);
+        // The case ALIAS of the record is protected too (A3/A5).
+        let alias_err = remove_file_fd(&root, Path::new(".Destroot.Operation.Lock"))
+            .expect_err("a case alias of the lock record must be refused");
+        assert!(matches!(alias_err, Error::Conflict(_)), "{alias_err:?}");
     }
 }

@@ -7756,7 +7756,8 @@ impl LocalSide {
     }
 
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::ensure_private_dir_fd(self.root_for_mutation()?, rel.as_path())
+        crate::atomic::ensure_private_dir_durable_fd(self.root_for_mutation()?, rel.as_path())?;
+        Ok(())
     }
 
     fn write_file(&self, rel: &RootedRelativePath, bytes: &[u8], mode: Mode) -> Result<()> {
@@ -8125,7 +8126,7 @@ fn symlink_local(
 
     let parent_rel = rel.as_path().parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent_rel {
-        crate::atomic::ensure_private_dir_fd(root, parent)?;
+        crate::atomic::ensure_private_dir_durable_fd(root, parent)?;
     }
     let parent_fd = match parent_rel {
         Some(parent) => crate::atomic::openat_no_follow(

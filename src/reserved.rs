@@ -29,7 +29,22 @@
 //!
 //! A reserved name is matched as a whole path COMPONENT, byte-exactly: the
 //! check never decodes, normalizes, or case-folds, so a name that merely
-//! resembles a reserved spelling is ordinary content.
+//! RESEMBLES a reserved spelling without being an ALIAS of one is ordinary
+//! content. Two spellings that are not byte-identical but CASE-FOLD onto one
+//! another are the SAME directory entry on a case-insensitive filesystem
+//! (macOS APFS by default, Windows by default), so the id/name rule refuses
+//! such an alias ([`is_reserved_case_alias`]) even though the byte-exact
+//! reserved MATCH above leaves it alone: `.SYNC-ASIDE.1` IS `.sync-aside.1`,
+//! and `.DESTROOT.OPERATION.LOCK` IS `.destroot.operation.lock`.
+//!
+//! The application-store lock record's own name — the bare `operation.lock`
+//! that [`crate::lock::FileLock`] holds at a store root — is likewise not one
+//! of the two byte-exact reserved families, but it is unaddressable as an
+//! identity ([`APPLICATION_LOCK_NAME`]): accepting it would let consumer
+//! content share the name of the crate's own lock record. The crate's own
+//! removal primitives refuse the whole lock-record spelling family
+//! ([`is_lock_record_name`]), so the record's stable inode cannot be unlinked
+//! through the substrate.
 
 use std::path::{Component, Path};
 
@@ -67,6 +82,80 @@ pub fn is_reserved_name(name: &str) -> bool {
         return false;
     };
     !base.is_empty()
+}
+
+/// The FILE NAME of the crate's application-store lock record: the in-root
+/// advisory lock [`crate::lock::FileLock`] holds (`<root>/operation.lock`).
+///
+/// This spelling is deliberately NOT one of the two byte-exact reserved
+/// families above — [`is_reserved_name`] stays byte-exact, so the sync's
+/// reserved stripping is unchanged — but it IS unaddressable as an identity:
+/// accepting it would let consumer content share a name with the crate's own
+/// lock record, which [`crate::lock::FileLock::acquire`] truncates and
+/// rewrites, and which the crate's removal guard protects.
+pub const APPLICATION_LOCK_NAME: &str = "operation.lock";
+
+/// Whether `name` is the crate's application-store lock record spelling
+/// ([`APPLICATION_LOCK_NAME`]).
+pub fn is_application_lock_name(name: &str) -> bool {
+    name == APPLICATION_LOCK_NAME
+}
+
+/// Whether `name` is a CASE ALIAS of a spelling the crate reserves for its own
+/// bookkeeping: its Unicode case fold (`str::to_lowercase` — the SAME fold the
+/// sync's destination-alias model uses) is a reserved spelling or the
+/// application lock record while `name` itself is byte-different.
+///
+/// On a case-insensitive filesystem (macOS APFS by default, Windows by
+/// default) `name` and the reserved spelling are the SAME directory entry, so
+/// an accepted alias could collide with the crate's own bookkeeping:
+/// `.SYNC-ASIDE.1` IS `.sync-aside.1`, and `.DESTROOT.OPERATION.LOCK` IS
+/// `.destroot.operation.lock` (the record [`crate::lock::FileLock::acquire`]
+/// truncates). Byte-exact reserved MATCHING is deliberately unaffected — this
+/// is about ALIASING, not about matching — so [`is_reserved_name`] keeps
+/// answering byte-exactly while the id/name rule refuses the alias.
+pub fn is_reserved_case_alias(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let folded = name.to_lowercase();
+    folded != name && (is_reserved_name(&folded) || is_application_lock_name(&folded))
+}
+
+/// Whether the id/name rule must REFUSE `name` because it NAMES or can ALIAS
+/// the crate's own bookkeeping on a supported filesystem: a byte-exact
+/// reserved spelling, the application lock record, or a case alias of either.
+/// This is the predicate [`crate::id::valid_name`] consults, so an identity
+/// the crate accepts can never alias a reserved entry on any filesystem the
+/// crate supports (while [`is_reserved_name`] / [`is_reserved_path`] stay
+/// byte-exact for the sync's reserved stripping).
+pub fn is_unaddressable_name(name: &str) -> bool {
+    is_reserved_name(name) || is_application_lock_name(name) || is_reserved_case_alias(name)
+}
+
+/// Whether `name` is a LOCK-RECORD spelling: the application lock record
+/// ([`APPLICATION_LOCK_NAME`]) or the sibling record spelling
+/// [`is_reserved_name`] recognises (`.<name>.operation.lock`), in byte-exact or
+/// case-ALIAS form. The crate's own removal primitives refuse this spelling
+/// ([`crate::atomic::remove_file_fd`] / [`crate::atomic::remove_dir_all_fd`]):
+/// the lock's STABLE INODE is what makes two simultaneous holders impossible,
+/// so removing (or replacing) the record through the substrate would admit a
+/// second holder.
+pub fn is_lock_record_name(name: &str) -> bool {
+    fn sibling(name: &str) -> bool {
+        let Some(base) = name.strip_prefix('.') else {
+            return false;
+        };
+        let Some(base) = base.strip_suffix(OPERATION_LOCK_SUFFIX) else {
+            return false;
+        };
+        !base.is_empty()
+    }
+    if sibling(name) || is_application_lock_name(name) {
+        return true;
+    }
+    let folded = name.to_lowercase();
+    folded != name && (sibling(&folded) || is_application_lock_name(&folded))
 }
 
 /// Whether ANY component of a canonical manifest path is reserved (see
@@ -158,5 +247,126 @@ mod tests {
             assert!(!is_reserved_name(ok), "{ok:?} is ordinary");
             assert!(crate::id::valid_name(ok), "{ok:?} is a valid id");
         }
+    }
+
+    /// A name that is not byte-identical to a reserved spelling but CASE-FOLDS
+    /// onto one is the SAME directory entry on a case-insensitive filesystem,
+    /// so the id/name rule refuses the alias while the byte-exact reserved
+    /// MATCH leaves it alone. This is the A3 aliasing rule: matching is
+    /// byte-exact, ALIASING is folded.
+    #[test]
+    fn case_aliases_of_reserved_spellings_are_unaddressable_but_not_byte_reserved() {
+        for alias in [
+            ".SYNC-ASIDE.1",
+            ".Sync-Aside.1",
+            ".001.OPERATION.LOCK",
+            ".Destroot.Operation.Lock",
+            "OPERATION.LOCK",
+            "Operation.Lock",
+        ] {
+            assert!(
+                is_reserved_case_alias(alias),
+                "{alias:?} case-folds onto a reserved spelling and must be an alias"
+            );
+            assert!(
+                !is_reserved_name(alias),
+                "the byte-exact MATCH must leave {alias:?} alone (aliasing is a separate rule)"
+            );
+            assert!(
+                is_unaddressable_name(alias),
+                "{alias:?} must be unaddressable as an identity"
+            );
+            assert!(
+                !crate::id::valid_name(alias),
+                "the id rule must refuse the alias {alias:?}"
+            );
+        }
+        // A byte-exact reserved spelling is not an ALIAS (it is the spelling
+        // itself), and a genuinely distinct near-miss is neither.
+        for not_alias in [
+            ".sync-aside.1",
+            ".001.operation.lock",
+            "sync-aside.1",
+            ".sync-aside",
+            "a.operation.lock",
+            "operation.lock!",
+            "",
+        ] {
+            assert!(
+                !is_reserved_case_alias(not_alias),
+                "{not_alias:?} is not a case ALIAS"
+            );
+        }
+    }
+
+    /// The crate's own lock-record spellings are recognised as LOCK RECORDS
+    /// (so the removal primitives can refuse them) without turning the
+    /// byte-exact reserved family into a broader match: `.sync-aside.1` is
+    /// reserved but is NOT a lock record.
+    #[test]
+    fn lock_record_spellings_are_recognised() {
+        for lock in [
+            "operation.lock",
+            ".001.operation.lock",
+            ".Destroot.Operation.Lock",
+            "OPERATION.LOCK",
+            "Operation.Lock",
+        ] {
+            assert!(is_lock_record_name(lock), "{lock:?} names a lock record");
+        }
+        for other in [
+            ".sync-aside.1",
+            ".operation.lock",
+            "a.operation.lock",
+            "operation.lockx",
+            ".001.operation.lockx",
+            "",
+        ] {
+            assert!(
+                !is_lock_record_name(other),
+                "{other:?} does not name a lock record"
+            );
+        }
+    }
+
+    /// The ON-DISK half of the A3 aliasing rule: on a case-insensitive
+    /// filesystem `.SYNC-ASIDE.1` and `.sync-aside.1` are the SAME directory
+    /// entry, so a name the id rule accepted would collide with the crate's
+    /// claim-aside machinery. The pure rule is pinned everywhere by
+    /// [`case_aliases_of_reserved_spellings_are_unaddressable_but_not_byte_reserved`];
+    /// THIS test pins the phenomenon on the filesystem that has it, and skips
+    /// (with a truthful, announced reason) on a case-sensitive one.
+    #[test]
+    fn a_case_variant_of_a_reserved_spelling_is_one_inode_and_unaddressable() {
+        use std::fs;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env())
+            .expect("fixture tmpdir");
+        fs::write(dir.path().join(".sync-aside.1"), b"held").unwrap();
+        let folds = fs::symlink_metadata(dir.path().join(".SYNC-ASIDE.1")).is_ok();
+        if !folds {
+            crate::test_support::announce_skip(
+                "this filesystem is case-SENSITIVE, so `.SYNC-ASIDE.1` and `.sync-aside.1` are \
+                 DISTINCT entries and the on-disk alias reproduction is untestable here; the pure \
+                 alias rule is still pinned by the predicate test",
+            );
+            return;
+        }
+        println!(
+            "A3 case-alias probe ran on platform={} (the filesystem folds case, so the two \
+             spellings are one entry)",
+            std::env::consts::OS
+        );
+        // The alias the id rule must refuse; the byte-exact reserved MATCH is
+        // deliberately unchanged (aliasing is a separate rule).
+        assert!(is_reserved_case_alias(".SYNC-ASIDE.1"));
+        assert!(!is_reserved_name(".SYNC-ASIDE.1"));
+        assert!(is_unaddressable_name(".SYNC-ASIDE.1"));
+        assert!(!crate::id::valid_name(".SYNC-ASIDE.1"));
+        assert!(!crate::id::valid_name(".sync-aside.1"));
+        // The application lock record's case alias resolves to the record's
+        // own entry, and is unaddressable too.
+        fs::write(dir.path().join("operation.lock"), b"hold").unwrap();
+        assert!(fs::symlink_metadata(dir.path().join("OPERATION.LOCK")).is_ok());
+        assert!(!crate::id::valid_name("OPERATION.LOCK"));
     }
 }

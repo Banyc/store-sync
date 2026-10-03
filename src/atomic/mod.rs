@@ -21,7 +21,9 @@
 //! happened but the durability commit could not be verified"). The
 //! durability of these writes is the ordering guarantee the rest of the
 //! crate builds on: [`ReplaceOutcome::ReplacedDurable`] means the new bytes
-//! are visible AND durable BEFORE the caller proceeds, while
+//! are visible AND durable BEFORE the caller proceeds — including every
+//! directory the replace CREATED to hold them, whose own entry is fsynced
+//! into its parent before the rename — while
 //! [`ReplaceOutcome::ReplacedDurabilityUnknown`] tells the caller the
 //! content is visible but its durability is unconfirmed — so a caller's
 //! recovery step can always tell "this write committed durably" from "this
@@ -35,7 +37,11 @@
 //! (`temp_name_for`), the atomic marker/JSONL rewrites
 //! (`write_atomic_replace`, `write_jsonl_atomic`), private permissions
 //! (`set_private`, `ensure_private_dir`), the tree-object directory
-//! copy (`copy_dir_recursive`), and the JSON readers.
+//! copy (`copy_dir_recursive`), and the JSON readers. Two more are the
+//! consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the OWNED
+//! ROOT itself (the empty and `.` child spellings are refused, so residue at
+//! the root was otherwise unreachable) and [`is_crate_temp_name`] recognises
+//! the crate's own crash residue (B1/B2).
 //!
 //! Parse-sensitive marker reads: a PRESENT-but-malformed marker CONTENT is
 //! semantic CORRUPTION and maps to [`Error::integrity`] via
@@ -171,10 +177,13 @@ fn absent_or_store(e: std::io::Error, path: &Path) -> Result<bool> {
 }
 
 /// The largest number of bytes a single filesystem NAME may hold (POSIX
-/// `NAME_MAX`). The manifest accepts a name up to this bound, so every temp
+/// `NAME_MAX`). The manifest accepts a name up to this bound (and now ENFORCES
+/// it at the boundary: [`crate::manifest`]'s path validator and
+/// [`crate::id::valid_name`] both refuse a longer component rather than
+/// letting the filesystem refuse it later with `ENAMETOOLONG`), so every temp
 /// name the crate derives from a destination must stay within it — a temp
 /// that is even one byte longer makes a legal destination untransferable.
-pub(crate) const NAME_MAX: usize = 255;
+pub const NAME_MAX: usize = 255;
 
 /// Derive the BOUNDED trunk of a temp name from a destination `name`, so
 /// `.TRUNK<SUFFIX>` never exceeds [`NAME_MAX`] bytes.
@@ -250,7 +259,23 @@ fn temp_name_string(name: &str) -> String {
 /// `.sync-aside.<pid>.<n>` with NO marker — it HOLDS the stranded original. The
 /// ONLY decisive feature is the authority's own suffix, so the test is a
 /// suffix match on that spelling, never a heuristic on the destination name.
-pub(crate) fn is_crate_temp_name(name: &str) -> bool {
+///
+/// # Crash residue (B2): the recognizer and the recovery recipe
+///
+/// A failed atomic replace cleans up its temp on an ERROR RETURN (best-effort,
+/// the cleanup failure carried with the original error). A process that is
+/// KILLED mid-replace (`SIGKILL`) never returns, so the temp it wrote survives
+/// — that residue is inherent to POSIX and is NOT a leak the crate can prevent.
+/// This predicate is the crate's OWN recognizer for it, so a consumer's
+/// recovery pass can enumerate a directory (including the ROOT, via
+/// [`crate::atomic::read_root_dir_fd`]) and remove every entry for which
+/// [`is_crate_temp_name`] is true: the atomic replace has TWO commit points, so
+/// the destination is either wholly OLD or wholly NEW and a stranded temp
+/// carries no committed state. The `.claim.` variant is a compare-and-delete
+/// claim temp and is likewise residue once no operation is live. A genuine
+/// claim-ASIDE (no authority suffix) HOLDS a stranded original and must NOT be
+/// removed by this predicate — inspect it first.
+pub fn is_crate_temp_name(name: &str) -> bool {
     [TEMP_SUFFIX_MARKER, CLAIM_SUFFIX_MARKER]
         .iter()
         .any(|marker| match name.rsplit_once(marker) {
@@ -327,7 +352,10 @@ fn discard_temp(original: Error, tmp: &Path) -> Error {
 pub enum ReplaceOutcome {
     /// BOTH commit points confirmed: the new content is visible under its
     /// final name AND the parent-directory fsync succeeded — the replace
-    /// is durable across power loss.
+    /// is durable across power loss. When the replace had to CREATE the
+    /// parent chain, every newly created directory's own entry was fsynced
+    /// into its parent BEFORE the rename (the durable directory helper), so
+    /// the claim covers the WHOLE chain, not only the final entry's parent.
     ReplacedDurable,
     /// ONLY the rename (commit point 1) is confirmed: the new content IS
     /// visible under its final name, but the parent-directory open/fsync

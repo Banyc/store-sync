@@ -19,6 +19,13 @@
 //! so a `sync` and a push/checkpoint pass do NOT exclude each other in either
 //! direction.
 //!
+//! The in-root record's own spelling, `operation.lock`, is the crate's
+//! APPLICATION lock record name ([`crate::reserved::APPLICATION_LOCK_NAME`])
+//! and is deliberately UNaddressable as an identity: [`crate::id::valid_name`]
+//! refuses it (and every case alias of it), so no id the crate accepts can
+//! share the name of this record or collide with it on a case-insensitive
+//! filesystem.
+//!
 //! # The STABLE-INODE discipline (why the lock file is never deleted)
 //!
 //! POSIX `flock` locks are attached to an INODE, not a path. The lock file is
@@ -32,6 +39,29 @@
 //! single never-removed inode no such window can exist: a fresh open of the
 //! path always finds the same inode, so at most one holder can ever win the
 //! flock.
+//!
+//! # The assumption this guarantee rests on
+//!
+//! "Stable inode ⇒ at most one holder" is structural only while the record is
+//! NOT removed or replaced: unlinking the path lets a later acquisition create
+//! a DIFFERENT inode and flock that while a live holder still holds the old
+//! one — two simultaneous holders. The crate therefore refuses that through its
+//! own substrate: [`crate::atomic::remove_file_fd`] and
+//! [`crate::atomic::remove_dir_all_fd`] refuse a lock-record spelling
+//! ([`crate::reserved::is_lock_record_name`]), so the record cannot be unlinked
+//! through the crate's removal primitives. A holder that never calls those
+//! primitives (nor renames/replaces the record by another route) is the one
+//! assumption left; a crash is fine, because the kernel releases the flock and
+//! the record persists for the next acquisition.
+//!
+//! # Contention is TYPED and the lock is NON-BLOCKING
+//!
+//! Acquisition is deliberately non-blocking (Unix `flock LOCK_NB`, Windows
+//! `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY`): while another holder is
+//! live it fails IMMEDIATELY instead of waiting. The failure is the typed
+//! [`crate::error::Error::LockContended`], distinct from a real open/flock
+//! failure ([`crate::error::Error::Preflight`]), so a caller's retry policy
+//! reacts to the contention class instead of matching the holder message text.
 
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -91,6 +121,19 @@ impl FileLock {
     /// fsyncs in [`crate::atomic::ensure_private_dir_durable`] (which
     /// reports what it CREATED), never by files inside the directory, so a
     /// surviving `operation.lock` changes nothing for a first append.
+    ///
+    /// The record is PRIVATE (`0o600`), like the store's other records (the
+    /// index is `0o600` and the directories `0o700`): the mode is requested at
+    /// creation AND re-applied on every acquisition, so a record an earlier
+    /// version created with the umask-derived `0644`/`0664` is tightened on the
+    /// next acquisition (the chmod is idempotent and never changes the inode).
+    /// On Windows there are no Unix mode bits and the chmod is a no-op.
+    ///
+    /// Contention is reported as the typed
+    /// [`crate::error::Error::LockContended`] (see [`Self::acquire`]'s
+    /// module-level note); a real open/flock failure stays
+    /// [`crate::error::Error::Preflight`]. The lock is NON-BLOCKING, so a
+    /// caller that wants to wait must retry on the contention variant.
     pub fn acquire(path: &Path, op_id: &str) -> Result<Self> {
         // DURABLE parent creation: the lock file's parent directory is
         // created with EVERY newly created directory entry fsynced (see
@@ -109,13 +152,17 @@ impl FileLock {
             crate::atomic::ensure_private_dir_durable(parent)
                 .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| Error::preflight(format!("open lock {}: {e}", path.display())))?;
+        let mut file = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(path)
+                .map_err(|e| Error::preflight(format!("open lock {}: {e}", path.display())))?
+        };
         // Exclusive, non-blocking advisory lock (flock on Unix, LockFileEx
         // on Windows — the platform split lives in the [`platform`]
         // submodule). Only one holder at a time.
@@ -123,7 +170,7 @@ impl FileLock {
             platform::LockAttempt::Acquired => {}
             platform::LockAttempt::Contended => {
                 let held = std::fs::read_to_string(path).unwrap_or_default();
-                return Err(Error::preflight(format!(
+                return Err(Error::lock_contended(format!(
                     "local lock {} held by '{}'",
                     path.display(),
                     held.trim()
@@ -133,7 +180,17 @@ impl FileLock {
                 return Err(Error::preflight(format!("lock {}: {err}", path.display())));
             }
         }
-        // We hold the lock: record our operation id for diagnostics.
+        // We hold the lock: make the record PRIVATE (the mode request above is
+        // subject to the umask AND does not tighten a record an earlier version
+        // created world-readable), then record our operation id for
+        // diagnostics. The chmod opens no new inode, so the stable-inode
+        // discipline is untouched.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Error::preflight(format!("chmod lock {}: {e}", path.display())))?;
+        }
         use std::io::Write;
         file.set_len(0)
             .and_then(|_| file.write_all(op_id.as_bytes()))
@@ -250,7 +307,9 @@ mod tests {
 
     /// EAGAIN handling is preserved: while a guard is alive a second acquire
     /// of the same path fails with the explicit "held by" message (the flock
-    /// is exclusive on the single inode, so any contender is refused).
+    /// is exclusive on the single inode, so any contender is refused) AND with
+    /// the TYPED contention signal, never the same `Preflight` class a real
+    /// open/flock failure uses (B3).
     #[test]
     fn contention_is_refused_with_holder_message() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -261,9 +320,48 @@ mod tests {
             Ok(_) => panic!("B must be refused while A holds the lock"),
         };
         assert!(
+            matches!(err, Error::LockContended(_)),
+            "contention must be the TYPED signal, not a string-matching target: {err:?}"
+        );
+        assert!(
             err.to_string().contains("held by 'op-A'"),
             "the refusal must name the holder: {err}"
         );
+    }
+
+    /// The lock record is PRIVATE (`0o600`), not the umask-derived mode the
+    /// process happens to have: the one non-private record in a store of
+    /// `0o600` files and `0o700` directories (C1). This also tightens a record
+    /// an earlier version created with a wider mode, without changing its inode.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_record_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let path = dir.path().join("operation.lock");
+        let inode_before;
+        {
+            let _guard = FileLock::acquire(&path, "op-mode").expect("acquire");
+            inode_before = inode_id(&path);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                mode, 0o600,
+                "the lock record must be private like the rest of the store, got {mode:o}"
+            );
+        }
+        // A pre-existing wider record is TIGHTENED on the next acquisition,
+        // and the stable inode is preserved across the chmod.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        {
+            let _guard = FileLock::acquire(&path, "op-mode-2").expect("re-acquire");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o600, "a wider pre-existing record must be tightened");
+            assert_eq!(
+                inode_before,
+                inode_id(&path),
+                "the stable inode must survive the chmod"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
