@@ -28,9 +28,9 @@
 //! NOT COVERED by that component confinement: the module's PATH-BASED free
 //! functions take an ordinary [`Path`] and resolve it with
 //! `std::fs`/`std::fs::Permissions`, so an INTERMEDIATE symlink in that path
-//! IS followed. They are `set_private` and `write_atomic_replace` (both
-//! TEST-ONLY on Unix; `set_private` serves the unconfined replace, and no
-//! Unix production body needs either),
+//! IS followed. They are [`set_private`] (crate-internal) and the PUBLIC,
+//! deliberately-named [`write_atomic_replace`] (`set_private` serves the
+//! unconfined replace),
 //! [`sync_parent_dir`], [`ensure_private_dir_durable`], and
 //! [`copy_dir_recursive`]. The component confinement claimed below belongs to
 //! the `_fd` surface only, never to these.
@@ -122,9 +122,10 @@ fn probe_fsync_replace_parent() {
 #[cfg(not(test))]
 fn probe_fsync_replace_parent() {}
 
-/// TEST-ONLY on Unix, like the unconfined replace it serves: this PATH-BASED
-/// helper takes an ordinary path, so an intermediate symlink is followed.
-#[cfg(test)]
+/// CRATE-INTERNAL, and PATH-BASED like the unconfined replace it serves: this
+/// helper takes an ordinary path, so an intermediate symlink is followed. The
+/// confined spelling is [`set_private_fd`]; this one is not public (API
+/// constraint #1 removed the public path-based `set_private`).
 pub(crate) fn set_private(path: &Path) -> Result<()> {
     refuse_reserved_mutation(path, Sanction::None)?;
     let perms = std::fs::Permissions::from_mode(0o600);
@@ -140,18 +141,20 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// with the original failure, never swallowed); see [`ReplaceOutcome`] for
 /// the two commit points.
 ///
-/// TEST-ONLY on Unix (API constraint #8): this PATH-BASED replace takes a raw
-/// `&Path` rather than the crate's validated [`crate::RootedRelativePath`],
-/// and it resolves every component by that path, so an intermediate symlink is
-/// FOLLOWED — it is NOT component-confined. It is `pub(crate)` and `#[cfg(test)]`
-/// because no Unix production body needs it, so a caller cannot reach the
-/// unconfined mutation while believing it is the crate's default; the
-/// confined, public form is [`write_atomic_replace_fd`], and
-/// [`crate::atomic::COMPONENT_CONFINED`] describes the platform split. The
-/// Windows port keeps a `pub(crate)` body because its fd surface is
-/// path-based throughout.
-#[cfg(test)]
-pub(crate) fn write_atomic_replace(
+/// THE NAME STATES THE WEAKNESS (API constraint #8, verdict N; API constraint
+/// #1's ONE tolerated name): this PATH-BASED replace takes a raw `&Path`
+/// rather than the crate's validated [`crate::RootedRelativePath`], and it
+/// resolves every component by that path, so an intermediate symlink is
+/// FOLLOWED — it is NOT component-confined. It is the ONE mutation that does
+/// NOT take a `(&RootDir, &RootedRelativePath)` pair, so it is the form to
+/// AVOID whenever the confined [`write_atomic_replace_fd`] can name the
+/// destination; [`crate::atomic::COMPONENT_CONFINED`] describes the platform
+/// split. It is PUBLIC because it is part of the interface this crate was
+/// extracted from — a consumer's port calls the path-based replace (see
+/// `docs/CONSISTENCY.md`, axis M) — and a public-API name is justified by a
+/// consumer's need, never by this crate's own tests. The Windows port keeps
+/// the same PUBLIC name because its fd surface is path-based throughout.
+pub fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
@@ -1195,7 +1198,7 @@ fn replace_core(
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
-    // the rename. FAIL-CLOSED but EXPLICIT (see `write_atomic_replace`).
+    // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace`]).
     if let Some(e) = fault(ReplaceStage::DirSync) {
         return Ok(CoreReplace::Replaced(
             ReplaceOutcome::ReplacedDurabilityUnknown { error: e },

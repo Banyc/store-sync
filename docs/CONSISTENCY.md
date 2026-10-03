@@ -27,6 +27,7 @@ installed between the check and the walk is that kind of residual.
 | J | the `unix` ↔ `windows` twin surface | a public function present on one platform only |
 | K | the revision you are READING ↔ the revision you BELIEVE you are reading | a `pub fn` count and a gate read from a checkout still parented to the previous tip |
 | L | the platform you COMPILE ↔ the platform you claim to support | a call site inside `#[cfg(target_os = "linux")]` that a macOS-only gate never compiles, so a signature change silently missed it |
+| M | the evidence cited for a change ↔ the population it actually covers | "our production never did" used to delete a name a CONSUMER's interface declares |
 
 ## Findings
 
@@ -154,6 +155,15 @@ rule. A rename to a name stating the weakness was the alternative; demotion was
 chosen because the only reason it was public was a test, and the constraint's
 real product is a smaller surface.
 
+**REVERSED under axis M.** The demotion looked safe because *this crate's* own
+production never called the path-based replace — the wrong population. A
+consumer's port does call it (deploy's `src/store/atomic/windows.rs:196`), so
+the name is public again (verdict **N**, named, not hidden), with its doc
+stating exactly what it is: the UNCONFINED, absolute-path form. The
+`compile_fail` doctest that proved a caller could not name it became false and
+was replaced by a still-true one (the CONFINED replace's signature refuses a
+raw `&Path`).
+
 **D — an existence probe answered a question it could not answer. FIXED.**
 `Remote::exists` returned `bool`: a permission error, an I/O fault and a
 genuine absence all read as `false`. Its own trait documentation said callers
@@ -163,6 +173,14 @@ public trap. **Fixed** by deleting it from the trait; `Remote::metadata_opt`
 primitive, and the few tests that used `exists` now branch on that distinction
 (one assertion got STRONGER: a symlinked parent is now asserted as `Err`, not
 as "not present").
+
+**REVERSED under axis M.** The deletion was justified by "this crate's
+production never did" — the wrong population again. deploy's own transport
+trait DECLARES `exists` as a REQUIRED method
+(`~/code/deploy/src/remote/transport/mod.rs:326`) and its production calls it,
+so removing the name is a build break for the consumer. It is restored as a
+DEFAULT method delegating to `metadata_opt`, with a doc that states exactly
+what a `false` discards (`absent` conflated with `the probe could not tell`).
 
 **D (stated residual, no action) — `is_reserved_name` is narrower than the
 name rule.** `reserved::is_reserved_name` / `is_reserved_path` answer a
@@ -178,3 +196,57 @@ unconfined `write_atomic_replace` `#[cfg(test)]` on Unix removed its
 `("src/atomic/unix.rs", "rename", 1)` was removed in the same change, with the
 reason recorded AT the pin. The guard still runs on the function; the call is
 simply no longer production code, which is exactly what the audit excludes.
+
+**REVERSED under axis M.** Restoring the public, production
+`write_atomic_replace` put its `std::fs::rename` back into the production
+count, so the pin entry `("src/atomic/unix.rs", "rename", 1)` is restored —
+with the reason at the pin. The pin moved twice on purpose: the count changed,
+so the change had to say so, both times.
+
+**M — the evidence cited was about the wrong population. FIXED.** A pass
+resolved two items of API constraint #8 by DELETION/DEMOTION, each justified by
+"production never did [consult it]" — meaning THIS CRATE's own production. The
+population that decides whether a public name may be deleted is the CONSUMER's
+interface, and this crate's whole purpose is to be consumed by `~/code/deploy`
+(and then `~/code/ckpt`). A consumer-fit audit against those consumers found
+both deletions were over-reach:
+
+* `Remote::exists` was REMOVED from the trait. deploy DECLARES it as a REQUIRED
+  method (`~/code/deploy/src/remote/transport/mod.rs:326`,
+  `fn exists(&self, rel: &RootedRelativePath) -> bool;`) and its production
+  calls it (`src/remote/helper/mod.rs`, `src/remote/helper/durable.rs`,
+  `src/store/local/objects.rs`). It is part of the interface this crate was
+  extracted from.
+* `atomic::write_atomic_replace(&Path)` was demoted to `pub(crate)`. deploy's
+  production uses a path-based atomic replace
+  (`src/store/atomic/windows.rs:196` calls
+  `write_atomic_replace(&root.path().join(rel), ..)`; `src/store/local/mod.rs:151`
+  drives deploy's `write_atomic_replace_at`, whose confined body is
+  `write_atomic_replace_fd`).
+
+**Fixed:** `exists` is restored to the trait as a DEFAULT method delegating to
+`metadata_opt` (no implementor is forced to write it; an implementor may
+override with a cheaper probe), and its doc states exactly what a `false`
+discards, pointing a caller that must distinguish *absent* from *could not
+tell* at `metadata_opt`. `write_atomic_replace` is `pub fn` again, named for
+what it is: the UNCONFINED, absolute-path form, the one mutation that does not
+take a `(&RootDir, &RootedRelativePath)` pair and therefore the one to avoid
+when a confined form exists. Do NOT restore anything else that pass removed:
+the rest was verified against the consumers, the consumer-fit BLOCKED list was
+otherwise empty, and every other removed path-based helper has an `_fd`
+equivalent deploy can adapt to mechanically.
+
+**The CLASS fix is `tests/consumer_fit.rs`**, because the crate had no test
+that asserted the shapes its CONSUMERS require — which is why two deletions
+could pass every gate. It exercises, against the PUBLIC API only, the call
+shapes the consumers actually use: the cheap `Remote::exists` probe and the
+typed `metadata_opt` alternative; the path-based `write_atomic_replace` AND its
+confined equivalent; the tree pair with the exact consumer signatures (an
+out-of-root `&Path` source copied into a root-confined `RootedRelativePath`
+staging destination, then `fsync_tree_recursive_fd`); the ONE `sync` entry
+point in BOTH ownership states (`DestinationOwnership::lock(..)` and
+`DestinationOwnership::Unowned`); a `Layout` construction; and a typed error
+branch by KIND, not message text. It is a genuine guard, not a document: a
+control that removed the two names failed to COMPILE with `E0432` (unresolved
+import `write_atomic_replace`) and `E0599` (`no method named exists`), which is
+the failure mode we want — a deletion breaks the build, not a migration.

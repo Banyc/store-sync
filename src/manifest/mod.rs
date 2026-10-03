@@ -282,8 +282,8 @@
 //!   exercised by the far-side suites. A failure before the rename leaves the
 //!   PREVIOUS content in place and removes the temp.
 //! * **WINDOWS local destination**: the PATH-BASED replace
-//!   (`crate::atomic::write_atomic_replace`, crate-internal since API
-//!   constraint #8): a temp + rename with NO
+//!   ([`crate::atomic::write_atomic_replace`], the public UNCONFINED form as
+//!   of API constraint #8, verdict N): a temp + rename with NO
 //!   parent-directory fsync and a NON-atomic replace (Windows `rename` does
 //!   not overwrite an existing target, so the target is removed first and a
 //!   reader can observe a transient absence). This is the ONE destination kind

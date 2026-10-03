@@ -291,8 +291,8 @@ pub fn is_residue_path(path: &str) -> bool {
 /// enumerating call sites. The rel-path mutators
 /// ([`crate::atomic::remove_file_fd`], [`crate::atomic::remove_dir_all_fd`]
 /// and each entry its walk unlinks,
-/// the PATH-BASED `crate::atomic::write_atomic_replace` (crate-internal as of
-/// API constraint #8),
+/// the PATH-BASED `crate::atomic::write_atomic_replace` (the public,
+/// deliberately-named UNCONFINED form as of API constraint #8, verdict N),
 /// [`crate::atomic::write_atomic_replace_fd`],
 /// [`crate::atomic::write_atomic_if_match_fd`],
 /// [`crate::atomic::write_atomic_cas_fd`], [`crate::atomic::write_file_fd`],

@@ -33,8 +33,9 @@
 //! never followed, with NO check-then-act window — the same guarantee the
 //! crate's fd-confined `Side::Local` destination gives. That includes the
 //! READS used as verification sources — `read`, `read_link`, and `metadata_opt`
-//! (and therefore `metadata`, and `kind_opt`/`mode_opt` over a [`Remote`]) —
-//! so a content/kind/mode verdict can never be computed from an
+//! (and therefore `metadata`, `kind_opt`/`mode_opt` over a [`Remote`], and the
+//! [`Remote::exists`] default that delegates to `metadata_opt`) — so a
+//! content/kind/mode verdict can never be computed from an
 //! object outside the pinned root.
 //!
 //! The operations that are NOT component-wise confined are named precisely, and
@@ -682,16 +683,38 @@ pub trait Remote {
     /// The TYPED existence probe: `Ok(Some(meta))`
     /// when the entry exists, `Ok(None)` ONLY for a CONFIRMED `NotFound`, and
     /// `Err` for every other failure (permission, transport fault, ...). A
-    /// failed read is NEVER indistinguishable from absence. This is the ONLY
-    /// existence primitive on the trait: an error-swallowing `bool` check
-    /// (`exists`) would report a permission or transport failure as ABSENT,
-    /// so it is not part of the surface at all.
+    /// failed read is NEVER indistinguishable from absence. A caller that must
+    /// TELL absence from an unanswerable probe uses THIS method and branches on
+    /// `Ok(None)` versus `Err`; the cheap [`Remote::exists`] probe below cannot
+    /// express that difference.
     fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
         match self.metadata(rel) {
             Ok(m) => Ok(Some(m)),
             Err(crate::error::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+    /// The CHEAP existence probe: `true` when an entry is present at `rel`.
+    ///
+    /// EXACTLY WHAT IT DISCARDS: a `false` conflates TWO different states —
+    /// the entry is ABSENT, and the probe could not TELL (a permission error, a
+    /// transport fault, a symlink-injected component the confinement refuses).
+    /// The DEFAULT evaluates [`Remote::metadata_opt`] and keeps only
+    /// `Ok(Some(_))`, so it inherits exactly that conflation; an implementor is
+    /// free to OVERRIDE it with a cheaper probe (one `lstat`/`stat`) that
+    /// discards the same two states. A caller that must distinguish *absent*
+    /// from *the probe could not tell* uses [`Remote::metadata_opt`] and
+    /// branches on `Ok(None)` versus `Err`.
+    ///
+    /// This is a NAMED weak path, not a hidden one (API constraint #8, verdict
+    /// N): it exists because it is part of the INTERFACE this crate was
+    /// extracted from — a consumer's transport trait declares it and its
+    /// production code calls it (see `docs/CONSISTENCY.md`, axis M). A consumer
+    /// writing `matches!(metadata_opt(..), Ok(Some(_)))` by hand is no safer,
+    /// only more verbose, and can get the conflation wrong the same way, so the
+    /// honest contract is to name the weakness at the name.
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
+        matches!(self.metadata_opt(rel), Ok(Some(_)))
     }
     /// Execute a command vector (no shell). Returns the outcome.
     ///
@@ -1984,7 +2007,8 @@ impl LocalTransport {
     // names a non-empty path below the root: a symlink injected at ANY
     // component below the root is refused (never followed), exactly as the
     // fd-confined `Side::Local` destination already does. The reads (`read`,
-    // `read_link`, `metadata_opt`/`metadata`) are confined so a
+    // `read_link`, `metadata_opt`/`metadata`, and the `exists` default that
+    // delegates to `metadata_opt`) are confined so a
     // verification verdict cannot be sourced from outside the pinned root. The
     // path-based bodies below are kept `#[cfg(not(unix))]` (the Windows port
     // has no directory descriptors and keeps its documented weaker guarantee)
@@ -2058,7 +2082,7 @@ impl LocalTransport {
         // the same directory, fsynced, then renamed into place, then the
         // parent directory fsynced — the replace has TWO commit points and a
         // failure BEFORE the rename leaves the PREVIOUS content untouched and
-        // unlinks the temp (see `crate::atomic::write_atomic_replace`). The
+        // unlinks the temp (see [`crate::atomic::write_atomic_replace`]). The
         // old path here (`atomic::write_file_fd`) opened the destination
         // `O_WRONLY|O_CREAT|O_TRUNC` and did ONE `write` with no temp, no
         // rename and no fsync, so a push into a LOCAL destination could leave
@@ -3701,9 +3725,7 @@ mod tests {
     }
 
     /// FINDING 4/5: the READS the applier verifies against are descriptor-relative
-    /// too. Pre-fix `read`, `read_link`, `exists` (since REMOVED by API
-    /// constraint #8 — an error-swallowing `bool` probe is no longer on the
-    /// trait), and `metadata_opt` were
+    /// too. Pre-fix `read`, `read_link`, `exists`, and `metadata_opt` were
     /// PATH-based (`std::fs::read`/`read_link`/`exists`/`symlink_metadata`), so a
     /// symlink injected at a PARENT component made them FOLLOW it: a content
     /// hash — and therefore an `applied` verdict — could be computed from an
@@ -3743,6 +3765,15 @@ mod tests {
         assert!(
             t.metadata_opt(&link_planted).is_err(),
             "metadata_opt must refuse a symlinked parent"
+        );
+        // The CHEAP `exists` default delegates to the confined `metadata_opt`,
+        // so it too cannot source a verdict from outside the root — but a
+        // refused (unanswerable) probe reads as `false`, INDISTINGUISHABLE from
+        // absence. That conflation is the documented contract of `exists`; the
+        // `metadata_opt` assertion above is the typed alternative.
+        assert!(
+            !t.exists(&link_planted),
+            "the cheap exists probe must report the refused probe as false (its documented conflation)"
         );
         assert!(
             t.metadata(&link_planted).is_err(),

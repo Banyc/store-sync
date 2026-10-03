@@ -10,7 +10,7 @@ sentences disappear from `src/`.
 
 | # | Constraint | Removes from the impl | Status |
 |---|---|---|---|
-| 1 | **A mutation is named one way: `(&RootDir, &RootedRelativePath)`.** No public primitive takes a raw `&Path`. The path is parsed once, at the boundary, into a validated type; the type is the only input a mutating primitive accepts. | the private `validate_rel` guard (its looser rule was re-derived at every `_fd` primitive and at the Windows port's `rel_join`); the "which spelling did the caller use" branches; the public path-based `set_private`, `sync_parent_dir`, `ensure_private_dir(_durable)` and `remove_dir_all_path` spellings; and the *class* where a path-based primitive shipped missing the guard its `_fd` twin had. | **done** |
+| 1 | **A mutation is named one way: `(&RootDir, &RootedRelativePath)`.** No public primitive takes a raw `&Path`, with ONE tolerated, deliberately-named exception: `atomic::write_atomic_replace(&Path)` is the UNCONFINED form (see #8). The path is parsed once, at the boundary, into a validated type; the type is the only input a mutating primitive accepts. | the private `validate_rel` guard (its looser rule was re-derived at every `_fd` primitive and at the Windows port's `rel_join`); the "which spelling did the caller use" branches; the public path-based `set_private`, `sync_parent_dir`, `ensure_private_dir(_durable)` and `remove_dir_all_path` spellings; and the *class* where a path-based primitive shipped missing the guard its `_fd` twin had. | **done** |
 | 2 | **Ownership is one axis, not six entry points.** `sync`/`push`/`pull` × owned/unowned collapse to one function taking an `Ownership` value that only the lock-taking path can construct. | five near-duplicate entry bodies; the "call the right one" prose; a documented limitation that exists only because the weak path is a separate function. | **done** (`DestinationOwnership`; `DestinationOwnership::lock` is the unforgeable acquiring constructor) |
 | 3 | **Containment has one authority and it consumes kinds, not resolutions.** A caller supplies an entry-kind view; it never supplies a resolution function. | three hand-rolled resolvers, one of which projected from the live source tree and accepted an escape while the other two refused it. Verified: all three views build `SymlinkContainmentIndex` from `live_entry_kinds`, the rule and the index are `pub(crate)`, and no API accepts a resolver. | **done** |
 | 4 | **Every condition a caller must branch on is a typed value.** Each class whose conditions a caller must tell apart carries a public kind enum and every error variant names it: `ReservedKind` (reserved-spelling refusals), `MaterializationKind` (address-fidelity and wire refusals, plus `RootsOverlap`/`ParentNotClosed`), `StoreKind` (the tree copy's source-audit refusals, the residue gate, and visible-but-unconfirmed durability), and `TransportKind` (the manifest-failure LAYERS — unreachable host vs far-side script vs missing `perl` vs output-drain vs undetermined — the receiver-marker conditions, a non-directory root, and remote durability). The message is preserved VERBATIM so a text-matching caller keeps working; `with_context` preserves the kind. | string matching in callers (the manifest-failure layer tests, the copy-source-audit tests, the roots-overlap test and the receiver-marker tests all had to match message substrings to tell two conditions apart), and the mutation where two layers collapsed onto one kind stayed green under message assertions but is caught by the kind assertions. | **done** (`ReservedKind`, `MaterializationKind`, `StoreKind`, `TransportKind`) |
@@ -40,19 +40,31 @@ named AT the item with its reach).
   enough to assemble an incomplete listing" — is closed by the API shape, and
   `checked_assembler_refuses_a_nonzero_walk_exit` pins the refusal and its
   typed kind.
-* **C — the unconfined atomic replace.** `atomic::write_atomic_replace(path:
-  &Path)` was the ONE public mutation that did not take `(&RootDir,
-  &RootedRelativePath)`; it stayed public only because an integration test used
-  it. It is now `pub(crate)` (test-only on Unix, where no production body
-  needs it; the body of the fd surface on Windows), and a `compile_fail`
-  doctest in `atomic`'s module docs proves a caller cannot name it. Its F-A1
-  integration proof now drives the CONFINED public replace
-  (`write_atomic_replace_fd`), assertions unchanged.
-* **C — `Remote::exists`.** A public `bool` existence probe that swallowed
-  EVERY error (permission, transport fault) as absence; the trait's own
-  `metadata_opt` doc said callers must never consult it. It is REMOVED from
-  the trait: `metadata_opt` is the only existence primitive, and the few tests
-  that used it now branch on the typed `Ok(None)`/`Err` distinction.
+* **N — the unconfined atomic replace.** `atomic::write_atomic_replace(path:
+  &Path)` is the ONE public mutation that does not take `(&RootDir,
+  &RootedRelativePath)`. Its first resolution here was **C** (demoted to
+  `pub(crate)`) on the ground that no production body needed it — but that
+  ground covered THIS CRATE's production, not the CONSUMER's interface. The
+  reason C was wrong, in one line: **the justification covered the crate's own
+  production, not the consumer's interface** (deploy's Windows port calls the
+  path-based replace, `~/code/deploy/src/store/atomic/windows.rs:196`). It is
+  PUBLIC again, and its NAME states the weakness: the UNCONFINED,
+  absolute-path form, the one to avoid when the confined
+  `write_atomic_replace_fd` can name the destination. `docs/CONSISTENCY.md`
+  axis M records the population error.
+* **N — `Remote::exists`.** A `bool` existence probe that swallows EVERY error
+  (permission, transport fault) as absence. Its first resolution here was
+  **C** (deleted from the trait) on the ground that the crate's own production
+  and tests never needed it — the same population error: **the justification
+  covered the crate's own production, not the consumer's interface.** deploy
+  DECLARES it as a REQUIRED trait method
+  (`~/code/deploy/src/remote/transport/mod.rs:326`) and its production calls
+  it. It is a DEFAULT method again, delegating to `metadata_opt` (so no
+  implementor is forced to write it, and an implementor may override with a
+  cheaper probe), and its doc states EXACTLY what it discards — a `false`
+  conflates *absent* with *the probe could not tell* — pointing a caller that
+  must distinguish the two at `metadata_opt`. Naming the weakness, not deleting
+  the name, is what the constraint requires.
 * **R — `Remote::exec`.** The raw command seam: it runs a caller-built
   command, bypassing the operation lock, path confinement and the crate's own
   operation protocol. It cannot be closed without removing the seam every
@@ -82,9 +94,10 @@ named AT the item with its reach).
   about a DESTRUCTIVE choice; a tracer's `false` is the safe, side-effect-free
   default, so there is no weaker guarantee to name.
 
-The one deliberate pin move this cost is recorded in `docs/CONSISTENCY.md`
-("I"): gating the unconfined replace test-only on Unix removed its
-`std::fs::rename` from the production count.
+The pin move this pass first made — gating the unconfined replace test-only on
+Unix removed its `std::fs::rename` from the production count — was REVERSED
+when the demotion was; `docs/CONSISTENCY.md` ("I") records both the move and
+the reversal.
 
 ## Rules for adding a constraint
 

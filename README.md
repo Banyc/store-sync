@@ -502,6 +502,18 @@ implied to be checked.
 - A behaviour fix lands with a test that fails before the change. A test that
   cannot fail before says so in its own comment.
 - No assertion is weakened or deleted to make a change land.
+- **A public-API deletion is justified only by a CONSUMER's need, never by this
+  crate's own tests.** The crate exists to be consumed, so its own suite passing
+  means nothing about a consumer's call sites: "our production never did" and
+  "only a test used it" are evidence about the WRONG population, and a consumer
+  that DECLARES the name in its interface or CALLS it in production is the
+  authority. When a name is weak, NAME the weakness — a default whose doc states
+  what it discards, a doc that points at the typed alternative — rather than
+  deleting it; that is rule 2 ("a weaker guarantee is reachable only through an
+  entry point whose name states it"), not an exception to it.
+  `tests/consumer_fit.rs` is the backstop: it exercises the shapes a consumer
+  requires (against the public API only), so a deletion is a compile failure
+  rather than a silent green.
 - A green gate on one platform is not evidence for another.
 - Fix the class, not the instance: a rule bypassed on a path other than the one
   reported is still broken.
