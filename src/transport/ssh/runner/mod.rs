@@ -1204,11 +1204,16 @@ mod runner_property_tests {
     fn prepare_identity_creates_and_keeps_the_residue_outside_the_root() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        // A SHORT hermetic fixture: the transport derives its mux socket path
+        // from `TMPDIR`, and a fixture under the (long) default TMPDIR would
+        // leave too little room for a safe identity hash, failing closed by
+        // design. `dir` is short enough that `TMPDIR = dir` still yields a
+        // safe mux path.
+        let dir = crate::test_support::short_fixture_tmpdir().unwrap();
         // A hermetic snapshot whose TMPDIR is the fixture dir: `mux_socket_dir`
         // is `<temp_dir>/dmux`, and the pin cache is resolved by the caller, so
-        // both residue roots live inside `dir` and nothing touches the real
-        // /tmp.
+        // both residue roots live inside `dir` and nothing outside it is
+        // touched.
         let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::from([(
             std::ffi::OsString::from("TMPDIR"),
             dir.path().as_os_str().to_os_string(),

@@ -57,6 +57,61 @@ use runner::{
 const LSTAT_ERRNO_ENOENT: i32 = 2;
 const LSTAT_ERRNO_ENOTDIR: i32 = 20;
 
+/// The number of bytes the platform's `sockaddr_un.sun_path` can hold,
+/// INCLUDING the terminating NUL. An OpenSSH `ControlPath` longer than
+/// `SUN_PATH_BYTES - 1` is a FATAL configuration error (`ssh` exits 255 with
+/// `ControlPath too long`) on every operation, with no fallback — the mux
+/// socket path is bounded to this limit on the platform where `ssh` actually
+/// runs.
+#[cfg(unix)]
+const SUN_PATH_BYTES: usize = {
+    // `sun_path` is the TRAILING field of `sockaddr_un` on every supported
+    // platform, so its capacity is the struct size minus the offset at which
+    // it begins. Deriving it from `libc` keeps macOS (104) and Linux (108)
+    // from drifting apart; a hand-rolled constant would silently be wrong for
+    // one of them.
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+};
+/// Windows has no `sockaddr_un` in `libc`; the Win32 `AF_UNIX` address uses
+/// the same 108-byte `sun_path` the Linux port does. The mux socket path is
+/// only used where an `ssh` binary runs, but the constant must exist so the
+/// module compiles on every target.
+#[cfg(not(unix))]
+const SUN_PATH_BYTES: usize = 108;
+
+/// The NAME of the directory holding the mux sockets, under the snapshot's
+/// temp dir. Kept SHORT: every byte here is a byte the truncated identity hash
+/// cannot use.
+const MUX_DIR_NAME: &str = "dmux";
+/// The PREFIX of each mux socket FILE name, after which the truncated
+/// connection-identity hash is appended.
+const MUX_FILE_PREFIX: &str = "mux-";
+/// The FLOOR on the retained SHA-256 hex width for the mux socket name: 96
+/// bits, enough that finding a second connection identity colliding with a
+/// CHOSEN one is infeasible (2^96). The hash is a SECURITY boundary (a
+/// collision lets one transport reuse another identity's authenticated
+/// ControlMaster), so the platform budget may shorten it from 256 bits but
+/// never below this; under this floor the transport fails closed instead of
+/// emitting a path `ssh` cannot use. The macOS default `TMPDIR` retains 112
+/// bits (28 hex) after the listener reserve below.
+const MIN_MUX_HASH_HEX: usize = 24;
+
+/// The bytes OpenSSH adds to the `ControlPath` when it BINDS the mux listener.
+///
+/// `muxserver_listen()` (openssh-portable `mux.c`) does NOT bind the control
+/// socket at the configured path: it first binds
+/// `"<ControlPath>.<16 random alphanumerics>"` and then `link(2)`s that socket
+/// into place, so the `sun_path` that must actually fit is that TEMPORARY name.
+/// A `ControlPath` that passes OpenSSH's own `ssh.c` length check (`<
+/// sizeof(sun_path)`) but leaves less than this reserve still fails to bind a
+/// master — `unix_listener: path "..." too long for Unix domain socket`, with
+/// multiplexing silently disabled (measured on macOS 26 / OpenSSH 10.2p1: an
+/// 86-byte control path, temp 103, multiplexes; an 88-byte one, temp 105, does
+/// not). The suffix is `.` plus the 16 characters the code generates, so the
+/// reserve is exactly 17 bytes and MUST be part of the budget — not just the
+/// final path length — or the transport works without multiplexing.
+const MUX_LISTENER_RESERVE_BYTES: usize = 17;
+
 /// The reserved exit code the remote `try_write_new` script (`write_new_cmd`)
 /// exits with when the no-clobber publish (perl `link(2)`) hit an EXISTING
 /// destination — the conflict/verdict decision point. It is the ONLY nonzero
@@ -225,24 +280,27 @@ pub struct SshTransport {
     /// construction boundary, never read from the process env.
     known_hosts_cache_dir: PathBuf,
     /// The directory holding the SSH connection-multiplexing (ControlMaster)
-    /// sockets, one per distinct CONNECTION IDENTITY — the socket name is a
-    /// short hash of `user@host:port` PLUS the identity material (the USER's
-    /// key path or the ambient marker, the resolved known-hosts source, the
-    /// configured fingerprint, and the caller's ssh options). Keying on the
-    /// identity is what makes multiplexing SAFE: reusing a master skips both
-    /// the host-key verification and the `-i` key selection, so a master may
-    /// only be shared with a transport whose authentication and host-key
-    /// request is identical. The directory is a short path under the system
-    /// temp dir (`<temp_dir>/dmux`, created 0700 in
+    /// sockets, one per distinct CONNECTION IDENTITY — the socket name is the
+    /// LEADING hex characters of the SHA-256 of `user@host:port` PLUS the
+    /// identity material (the USER's key path or the ambient marker, the
+    /// resolved known-hosts source, the configured fingerprint, and the
+    /// caller's ssh options). Keying on the identity is what makes
+    /// multiplexing SAFE: reusing a master skips both the host-key
+    /// verification and the `-i` key selection, so a master may only be shared
+    /// with a transport whose authentication and host-key request is
+    /// identical. The directory is a short path under the system temp dir
+    /// (`<temp_dir>/dmux`, created 0700 in
     /// [`SshTransport::prepare_identity`] before any ssh op) because Unix
-    /// domain socket paths are length-limited (~104 bytes) and the
-    /// known-hosts cache path is too long to host them. Every ssh subprocess
-    /// this transport spawns reuses ONE persistent master connection per
-    /// remote/identity, so the per-operation SSH handshake (banner, key
-    /// exchange, auth, session — several round trips at the link's RTT) is
-    /// paid once per push instead of once per operation; the master daemonizes
-    /// into its own process group, so the runner's foreground-only containment
-    /// is unaffected.
+    /// domain socket paths are length-limited (`sockaddr_un.sun_path`: 104
+    /// bytes on macOS, 108 on Linux) and the known-hosts cache path is too long
+    /// to host them. The hash is TRUNCATED to whatever width that limit leaves
+    /// (see [`mux_hash_hex_width`]), with a 96-bit floor below which
+    /// construction fails closed. Every ssh subprocess this transport spawns
+    /// reuses ONE persistent master connection per remote/identity, so the
+    /// per-operation SSH handshake (banner, key exchange, auth, session —
+    /// several round trips at the link's RTT) is paid once per push instead of
+    /// once per operation; the master daemonizes into its own process group, so
+    /// the runner's foreground-only containment is unaffected.
     mux_socket_dir: PathBuf,
     /// The environment snapshot (owned): the pin path's `ssh-keygen`
     /// fingerprint-verification child receives its variables.
@@ -347,6 +405,14 @@ impl SshTransport {
             }
             _ => {}
         }
+        // The mux socket directory and the identity hash WIDTH it can afford
+        // are resolved HERE, at the construction boundary, from the snapshot's
+        // temp dir. A temp dir that leaves too little room for a
+        // collision-resistant hash FAILS CLOSED now (naming the `sun_path`
+        // limit and the path length) rather than emitting a `ControlPath` the
+        // real `ssh` rejects later with a fatal "ControlPath too long".
+        let mux_socket_dir = env.temp_dir().join(MUX_DIR_NAME);
+        mux_hash_hex_width(&mux_socket_dir)?;
         let t = SshTransport {
             target: format!("{user}@{address}"),
             layout,
@@ -357,7 +423,7 @@ impl SshTransport {
             host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
             pinned_known_hosts: std::sync::Mutex::new(None),
             known_hosts_cache_dir: known_hosts_cache_dir.to_path_buf(),
-            mux_socket_dir: env.temp_dir().join("dmux"),
+            mux_socket_dir,
             env: env.clone(),
             runner: SshRunner::new(env),
             verbose,
@@ -534,6 +600,25 @@ impl SshTransport {
         )
     }
 
+    /// The TRUNCATED connection-identity hash that names this transport's mux
+    /// socket: the leading [`mux_hash_hex_width`] hex characters of the
+    /// full-strength SHA-256 of [`SshTransport::mux_identity_material`].
+    ///
+    /// The truncation is forced by the platform: the `sun_path` a Unix domain
+    /// socket must fit is too short for the FULL 64 hex characters (the
+    /// pre-fix spelling, which made `ssh` refuse the option with a fatal
+    /// "ControlPath too long"), and OpenSSH additionally binds a temporary
+    /// `<ControlPath>.<16 random chars>` before linking the real socket into
+    /// place ([`MUX_LISTENER_RESERVE_BYTES`]). The width keeps a 96-bit floor
+    /// ([`MIN_MUX_HASH_HEX`]) so the collision margin stays a security
+    /// property, not a formality.
+    fn mux_identity_hash(&self, pinned: Option<&Path>) -> Result<String> {
+        let width = mux_hash_hex_width(&self.mux_socket_dir)?;
+        let full = simple_hash(&self.mux_identity_material(pinned));
+        // `full` is ASCII hex, so any byte prefix is a char boundary.
+        Ok(full[..width].to_string())
+    }
+
     /// Build the fixed `ssh` arguments (options + target). Errors if no host
     /// identity has been configured, so the caller cannot accidentally fall back
     /// to trust-on-first-use.
@@ -555,20 +640,22 @@ impl SshTransport {
             // ONE persistent master connection per user@host:port AND
             // IDENTITY, so the multi-round-trip handshake (banner, key
             // exchange, auth, session) is paid once per push instead of once
-            // per operation. The socket name is a full-strength SHA-256 hash of
-            // the connection identity (Unix domain socket paths are
-            // length-limited); keying on the identity is what keeps a reused
-            // master from bypassing a DIFFERENT transport's host-key check or
-            // `-i` key. The master daemonizes into its own process group, so
-            // the runner's foreground-only containment is unaffected; a stale
+            // per operation. The socket name is the leading hex characters of
+            // the connection identity's SHA-256, TRUNCATED to the width
+            // `sun_path` leaves (the full 64 overflowed the limit under the
+            // macOS default TMPDIR and made ssh refuse every operation);
+            // keying on the identity is what keeps a reused master from
+            // bypassing a DIFFERENT transport's host-key check or `-i` key.
+            // The master daemonizes into its own process group, so the
+            // runner's foreground-only containment is unaffected; a stale
             // socket (dead master) is detected and replaced by ssh itself.
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
             format!(
-                "ControlPath={}/mux-{}",
+                "ControlPath={}/{MUX_FILE_PREFIX}{}",
                 self.mux_socket_dir.display(),
-                simple_hash(&self.mux_identity_material(pinned.as_deref()))
+                self.mux_identity_hash(pinned.as_deref())?
             ),
             "-o".into(),
             "ControlPersist=120".into(),
@@ -1064,6 +1151,44 @@ fn upload_timeout_error(
              stopped reading stdin (a hung remote or wedged filesystem)"
         ))
     }
+}
+
+/// The hex width of the connection-identity hash the mux socket name can
+/// afford at `mux_dir`, or a fail-closed error when even
+/// [`MIN_MUX_HASH_HEX`] does not fit.
+///
+/// The final socket path is `<mux_dir>/mux-<hash>`, but the path OpenSSH
+/// actually BINDS is `<mux_dir>/mux-<hash>.<16>` — its temporary listener name
+/// (see [`MUX_LISTENER_RESERVE_BYTES`]). Both must fit `sockaddr_un.sun_path`
+/// (`SUN_PATH_BYTES - 1` bytes, the array including its terminating NUL). The
+/// budget is therefore `SUN_PATH_BYTES - 1 - MUX_LISTENER_RESERVE_BYTES` minus
+/// `len(mux_dir)` and `len("/mux-")`. The FULL SHA-256 (64 hex characters) is
+/// used when it fits; otherwise the LEADING `budget` hex characters are kept.
+/// Below [`MIN_MUX_HASH_HEX`] the derivation fails closed: the path could not
+/// be made both short enough for `ssh` to bind and collision-resistant enough
+/// to be a security boundary.
+fn mux_hash_hex_width(mux_dir: &Path) -> Result<usize> {
+    // The `sun_path` array length includes the terminating NUL.
+    let path_limit = SUN_PATH_BYTES - 1;
+    // What is left for the control path itself once OpenSSH's temporary
+    // listener name is accounted for.
+    let control_limit = path_limit - MUX_LISTENER_RESERVE_BYTES;
+    let fixed = mux_dir.as_os_str().len() + 1 + MUX_FILE_PREFIX.len();
+    let budget = control_limit.saturating_sub(fixed);
+    if budget < MIN_MUX_HASH_HEX {
+        return Err(Error::transport(format!(
+            "the SSH mux socket path cannot be bounded safely: the socket directory {} leaves \
+             room for only {budget} hex characters of the connection-identity hash, and at least \
+             {MIN_MUX_HASH_HEX} are required to keep a ControlPath collision infeasible. The \
+             platform's sockaddr_un.sun_path limit is {path_limit} bytes including the \
+             terminating NUL, of which OpenSSH reserves {MUX_LISTENER_RESERVE_BYTES} for its \
+             temporary listener name, leaving {control_limit} usable; a safe control path here \
+             would need at least {} bytes. Point TMPDIR at a shorter directory.",
+            mux_dir.display(),
+            fixed + MIN_MUX_HASH_HEX,
+        )));
+    }
+    Ok(budget.min(64))
 }
 
 /// Resolve the upload min-rate from the environment snapshot:
@@ -3692,6 +3817,189 @@ mod tests_ssh {
         );
     }
 
+    /// F1, REGRESSION: the mux socket path must FIT the platform's
+    /// `sockaddr_un.sun_path` under the REAL process environment.
+    ///
+    /// Pre-fix the socket name was the FULL 64-hex SHA-256, so with the macOS
+    /// default `TMPDIR` (`/var/folders/.../T/`) the derived `ControlPath` was
+    /// 122 bytes — over the 103-byte macOS limit (the `sun_path` array is 104
+    /// bytes including its NUL). OpenSSH treats an over-long `ControlPath` as a
+    /// FATAL configuration error with NO fallback ("ControlPath too long", exit
+    /// 255), so EVERY remote operation of EVERY `SshTransport` failed on macOS.
+    /// The gate was blind because the other ControlPath tests build
+    /// `SysEnv::from_map` with no `TMPDIR`, so `temp_dir()` fell back to `/tmp`
+    /// and the path happened to fit.
+    #[test]
+    fn the_control_path_fits_the_platform_sun_path_under_the_real_environment() {
+        // The REAL process environment, not a hermetic map: this is the one
+        // test that must see the platform's actual TMPDIR.
+        let env = SysEnv::from_process();
+        let t = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            Layout::empty(),
+            Some(Path::new("/dev/null")),
+            None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &env,
+            false,
+        )
+        .expect("a real environment whose TMPDIR leaves a safe budget must construct");
+        let path = t
+            .ssh_args()
+            .unwrap()
+            .into_iter()
+            .find_map(|arg| arg.strip_prefix("ControlPath=").map(str::to_string))
+            .expect("a ControlPath option");
+        let limit = SUN_PATH_BYTES - 1;
+        let control_limit = limit - MUX_LISTENER_RESERVE_BYTES;
+        assert!(
+            path.len() <= control_limit,
+            "the derived ControlPath is {} bytes; with OpenSSH's {MUX_LISTENER_RESERVE_BYTES}-byte \
+             temporary listener suffix that is {} bytes, over the platform's {limit}-byte \
+             sockaddr_un.sun_path limit (so no master could bind): {path}",
+            path.len(),
+            path.len() + MUX_LISTENER_RESERVE_BYTES
+        );
+        assert!(
+            path.len() + MUX_LISTENER_RESERVE_BYTES <= limit,
+            "the listener path must fit sun_path: {path}"
+        );
+        // It is still KEYED ON THE IDENTITY HASH — only truncated to the width
+        // the limit leaves, never replaced by a constant.
+        let mux_dir = env.temp_dir().join(MUX_DIR_NAME);
+        let width = mux_hash_hex_width(&mux_dir).unwrap();
+        assert!(width >= MIN_MUX_HASH_HEX);
+        let hash = path
+            .rsplit_once(MUX_FILE_PREFIX)
+            .expect("the mux file prefix")
+            .1;
+        assert_eq!(
+            hash.len(),
+            width,
+            "the retained hash width must be exactly the budget"
+        );
+        assert_eq!(
+            path.len(),
+            mux_dir.as_os_str().len() + 1 + MUX_FILE_PREFIX.len() + width
+        );
+    }
+
+    /// F1, BUDGET: the socket path is `len(mux_dir) + len("mux-") + width`, and
+    /// the width is `min(64, SUN_PATH_BYTES - 1 - len(mux_dir) - len("/mux-"))`.
+    /// This pins the arithmetic for a SHORT temp dir (full 256-bit hash), a LONG
+    /// one (truncated to the budget, path EXACTLY at the limit), and a temp dir
+    /// so long that a safe hash no longer fits (FAIL CLOSED, naming the limit
+    /// and the required length).
+    #[test]
+    fn the_mux_socket_path_budget_is_pinned_for_short_and_long_tmpdirs() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        /// A TMPDIR whose own string is exactly `len` bytes: `/` + (len-1) `a`s.
+        fn tmpdir_of_len(len: usize) -> String {
+            assert!(len >= 1);
+            format!("/{}", "a".repeat(len - 1))
+        }
+        fn env_with_tmpdir(tmpdir: &str) -> SysEnv {
+            SysEnv::from_map(BTreeMap::from([(
+                OsString::from("TMPDIR"),
+                OsString::from(tmpdir),
+            )]))
+        }
+        fn build(env: &SysEnv) -> Result<SshTransport> {
+            SshTransport::new(
+                "deploy",
+                "db.example.com",
+                2222,
+                Path::new("/srv/app"),
+                Layout::empty(),
+                Some(Path::new("/dev/null")),
+                None,
+                Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+                env,
+                false,
+            )
+        }
+        fn control_path(t: &SshTransport) -> String {
+            t.ssh_args()
+                .unwrap()
+                .into_iter()
+                .find_map(|arg| arg.strip_prefix("ControlPath=").map(str::to_string))
+                .expect("a ControlPath option")
+        }
+
+        // One byte for the `/` joining TMPDIR to `dmux`, then the built-in
+        // `/` before the `mux-` prefix.
+        let fixed = 1 + MUX_DIR_NAME.len() + 1 + MUX_FILE_PREFIX.len();
+        let limit = SUN_PATH_BYTES - 1;
+        // OpenSSH binds `<ControlPath>.<16 random chars>`; only this much of
+        // `sun_path` is usable for the control path itself.
+        let control_limit = limit - MUX_LISTENER_RESERVE_BYTES;
+
+        // SHORT: `/tmp` leaves far more than 64 hex characters, so the FULL
+        // SHA-256 is retained.
+        let short_dir = Path::new("/tmp").join(MUX_DIR_NAME);
+        let short_path =
+            control_path(&build(&env_with_tmpdir("/tmp")).expect("a short TMPDIR must construct"));
+        assert_eq!(mux_hash_hex_width(&short_dir).unwrap(), 64);
+        assert_eq!(
+            short_path.len(),
+            short_dir.as_os_str().len() + 1 + MUX_FILE_PREFIX.len() + 64
+        );
+        assert!(short_path.len() + MUX_LISTENER_RESERVE_BYTES <= limit);
+
+        // LONG: exactly 40 hex characters fit; the path lands EXACTLY on the
+        // usable control limit and the listener still fits `sun_path`.
+        let long_len = control_limit - fixed - 40;
+        let long_tmpdir = tmpdir_of_len(long_len);
+        let long_dir = Path::new(&long_tmpdir).join(MUX_DIR_NAME);
+        assert_eq!(mux_hash_hex_width(&long_dir).unwrap(), 40);
+        let long_path = control_path(
+            &build(&env_with_tmpdir(&long_tmpdir)).expect("a long-but-safe TMPDIR must construct"),
+        );
+        assert_eq!(
+            long_path.len(),
+            control_limit,
+            "the retained width must spend the whole usable budget exactly"
+        );
+        assert_eq!(long_path.rsplit_once(MUX_FILE_PREFIX).unwrap().1.len(), 40);
+        assert_eq!(long_path.len() + MUX_LISTENER_RESERVE_BYTES, limit);
+
+        // FAIL CLOSED: one byte less of budget than the floor.
+        let too_long_len = control_limit - fixed - (MIN_MUX_HASH_HEX - 1);
+        let too_long = tmpdir_of_len(too_long_len);
+        let err = match build(&env_with_tmpdir(&too_long)) {
+            Ok(_) => panic!("a temp dir that cannot hold a safe hash must fail closed"),
+            Err(error) => error,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&limit.to_string()),
+            "the refusal must name the sun_path limit ({limit} bytes): {msg}"
+        );
+        assert!(
+            msg.contains(&MUX_LISTENER_RESERVE_BYTES.to_string()),
+            "the refusal must name the listener reserve: {msg}"
+        );
+        // The message reports the ABSOLUTE safe control-path length (the mux
+        // dir plus the prefix plus the floor), which is one byte over the
+        // usable limit in this deliberately over-long case.
+        let too_long_dir = Path::new(&too_long).join(MUX_DIR_NAME);
+        let required =
+            too_long_dir.as_os_str().len() + 1 + MUX_FILE_PREFIX.len() + MIN_MUX_HASH_HEX;
+        assert!(
+            msg.contains(&required.to_string()),
+            "the refusal must name the absolute length a safe path needs ({required} bytes): {msg}"
+        );
+        assert!(msg.contains("TMPDIR"), "{msg}");
+        // Sanity: this deliberately over-long case is exactly ONE byte short,
+        // so the reported safe length is the usable limit plus one.
+        assert_eq!(required, control_limit + 1);
+    }
+
     /// F1, BEHAVIOUR: the LITERAL `rename_cmd` runs under `sh` against a real
     /// root, and a symlink-to-directory destination is REPLACED IN PLACE. This
     /// replaces the old `rename_uses_no_target_directory_flag`, which asserted
@@ -4883,7 +5191,10 @@ mod tests_ssh {
     /// parent-directory fsync fails.
     #[test]
     fn upload_reports_a_post_rename_dir_fsync_failure_as_durability_unconfirmed() {
-        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        // A SHORT hermetic TMPDIR: the transport derives its mux socket path
+        // from it, and a fixture under the (long) default TMPDIR would leave
+        // too little room for a safe identity hash, failing closed by design.
+        let dir = crate::test_support::short_fixture_tmpdir().unwrap();
         let root = dir.path().join("remote");
         let fakebin = dir.path().join("fakebin");
         install_fake_perl(&fakebin, FSYNC_DIR_HOOK, 9);
@@ -4946,7 +5257,8 @@ mod tests_ssh {
     /// 3-byte temp over `state/f` and exited 0, so `OLD-CONTENT` was replaced.
     #[test]
     fn upload_refuses_to_publish_a_truncated_payload() {
-        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        // A SHORT hermetic TMPDIR (see the sibling upload test).
+        let dir = crate::test_support::short_fixture_tmpdir().unwrap();
         let root = dir.path().join("remote");
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::write(root.join("state/f"), b"OLD-CONTENT").unwrap();

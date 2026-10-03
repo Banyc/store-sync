@@ -5632,6 +5632,211 @@ fn residue_nested_under_an_extraneous_directory_is_never_deleted() {
     assert_residue_present(&report, &[&dst]);
 }
 
+/// F2: a STALE TEMP whose destination name begins `sync-aside.` inherits the
+/// reserved `.sync-aside.` prefix, so the applier used to classify it as
+/// RESERVED residue — contradicting the report doc, which promises a stale temp
+/// is reported as `extraneous` and that recovery is a removal of each
+/// `extraneous` path matching the temp pattern. A crashed temp holds NO original
+/// entry, so calling it residue (which "HOLDS THE ORIGINAL ENTRY, so inspect it
+/// before discarding it") is wrong and leaves it unreachable by the documented
+/// sweep. Pre-fix the two reserved-namespaced temps below were in `residue` and
+/// absent from `extraneous`.
+#[cfg(unix)]
+#[test]
+fn a_stale_temp_in_the_aside_namespace_is_extraneous_not_residue() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"x");
+    write(&dst.join("f"), b"x");
+
+    fn temp_name(dest: &str) -> String {
+        crate::atomic::temp_name_for(Path::new(dest))
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // The SHORT temp for destination `sync-aside.foo`, exactly what
+    // `crate::atomic::temp_name_for` produces.
+    let short = temp_name("sync-aside.foo");
+    // The LONG (hash-truncated) temp for a 240-byte `sync-aside.` destination.
+    let long = temp_name(&format!("sync-aside.{}", "n".repeat(240)));
+    // The CONTROL: destination `sync-aside-foo` (no trailing dot) yields a temp
+    // OUTSIDE the reserved namespace, which was already `extraneous`.
+    let control = temp_name("sync-aside-foo");
+
+    // Premise: the two reserved-namespaced names really ARE reserved spellings
+    // (so the id rule still refuses them and a source collision is still a
+    // conflict), and the authority recognises all three as its own temp names.
+    for name in [&short, &long] {
+        assert!(
+            crate::reserved::is_reserved_name(name),
+            "premise: {name} is in the reserved namespace"
+        );
+        assert!(
+            crate::atomic::is_crate_temp_name(name),
+            "premise: {name} carries the temp-name authority's suffix"
+        );
+    }
+    assert!(!crate::reserved::is_reserved_name(&control));
+    assert!(crate::atomic::is_crate_temp_name(&control));
+
+    // The classification itself: a reserved-namespaced TEMP is NOT residue,
+    // while a genuine claim-aside (no authority suffix) IS — and an ordinary
+    // reservation-free name is outside this predicate entirely.
+    assert!(!is_dest_residue_path(&short));
+    assert!(!is_dest_residue_path(&long));
+    assert!(!is_dest_residue_path(&control));
+    assert!(is_dest_residue_path(".sync-aside.999.0"));
+    assert!(is_dest_residue_path(".sync-aside.case-probe.1.2"));
+    assert!(is_dest_residue_path("nested/.001.operation.lock"));
+    assert!(!is_dest_residue_path("notes.tmp.1.2"));
+
+    for name in [&short, &long, &control] {
+        write(&dst.join(name.as_str()), b"stale temp");
+    }
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    for name in [&short, &long, &control] {
+        assert!(
+            report.extraneous.contains(name),
+            "a stale temp must be reachable as `extraneous` (the doc's documented sweep): \
+             {name} missing from {:?}",
+            report.extraneous
+        );
+        assert!(
+            !report.residue.contains(name),
+            "a stale temp holds no original and must NOT be residue: {name} in {:?}",
+            report.residue
+        );
+    }
+    // Nothing was destroyed under `Keep`.
+    for name in [&short, &long, &control] {
+        assert!(dst.join(name.as_str()).exists(), "{name} survives Keep");
+    }
+
+    // And a GENUINE claim-aside is STILL residue: the reserved-spelling
+    // guarantee for a held-aside is not weakened, only a temp is told apart.
+    write(&dst.join(".sync-aside.999.0/stranded"), b"precious");
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    assert!(
+        report.residue.contains(&".sync-aside.999.0".to_string()),
+        "a genuine claim-aside stays residue: {report:?}"
+    );
+    assert!(
+        !report.extraneous.iter().any(|p| p == ".sync-aside.999.0"),
+        "a genuine claim-aside is never extraneous: {:?}",
+        report.extraneous
+    );
+    assert_eq!(read(&dst.join(".sync-aside.999.0/stranded")), b"precious");
+    assert_residue_present(&report, &[&dst]);
+}
+
+/// F3: the REMOTE live-kind classifier must agree with the LOCAL one. Both map
+/// `is_dir`/`is_symlink`/`is_file` explicitly and REFUSE anything else
+/// (fifo/socket/device), instead of the remote side mapping "not dir, not
+/// symlink" to `File` while the local side returned `Err`. The two transports
+/// already agree on the METADATA (`RemoteMeta.is_file`), and this pins that the
+/// classification built from it agrees too. Pre-fix
+/// `Side::Remote::kind_opt` returned `Ok(Some(File))` for the fifo below while
+/// `Side::Local::kind_opt` returned `Err`, so the two live-kind classifiers
+/// disagreed for exactly the entries the metadata change was made to unify.
+#[cfg(unix)]
+#[test]
+fn the_remote_and_local_live_kind_classifiers_agree_on_a_fifo() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path().join("dest");
+    fs::create_dir_all(&root).unwrap();
+    let fifo = root.join("pipe");
+    let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo {}: {}",
+        fifo.display(),
+        std::io::Error::last_os_error()
+    );
+
+    let local = LocalSide::open(&root, false).unwrap();
+    let local_side = Side::Local(&local);
+    // A PATH-BASED `Side::Remote`: the same shape the SSH transport has (a
+    // non-confined, path-based destination) without a live sshd.
+    let remote = PathRemote::over(&root);
+    let remote_side = Side::Remote(&remote);
+
+    let fifo_rel = RootedRelativePath::parse(Path::new("pipe")).unwrap();
+    let local_kind = local_side.kind_opt(&fifo_rel);
+    let remote_kind = remote_side.kind_opt(&fifo_rel);
+    assert!(
+        local_kind.is_err(),
+        "the local classifier refuses a fifo: {local_kind:?}"
+    );
+    assert!(
+        remote_kind.is_err(),
+        "the remote classifier must refuse a fifo too, not call it a File: {remote_kind:?}"
+    );
+
+    // AGREEMENT on the three supported kinds and on absence.
+    write(&root.join("file"), b"x");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    std::os::unix::fs::symlink("file", root.join("link")).unwrap();
+    for (name, expected) in [
+        ("file", EntryKind::File),
+        ("sub", EntryKind::Dir),
+        ("link", EntryKind::Symlink),
+    ] {
+        let rel = RootedRelativePath::parse(Path::new(name)).unwrap();
+        assert_eq!(local_side.kind_opt(&rel).unwrap(), Some(expected), "{name}");
+        assert_eq!(
+            remote_side.kind_opt(&rel).unwrap(),
+            Some(expected),
+            "{name}"
+        );
+    }
+    let missing = RootedRelativePath::parse(Path::new("nope")).unwrap();
+    assert_eq!(local_side.kind_opt(&missing).unwrap(), None);
+    assert_eq!(remote_side.kind_opt(&missing).unwrap(), None);
+}
+
+/// F2 (cont.): the same distinction inside the CLAIMED-subtree removal walk. A
+/// kind-changing replacement claims the stale directory aside and removes it
+/// deepest-first; a reserved-namespaced TEMP inside it is a leftover, not a
+/// held-aside, so the walk must take it and NOT stop and name it residue
+/// (pre-fix it stopped, leaving the stale temp reported as residue).
+#[cfg(unix)]
+#[test]
+fn a_stale_temp_inside_a_claimed_subtree_is_removed_not_left_as_residue() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("p"), b"now a file");
+    write(&dst.join("p/f"), b"stale child");
+    write(&dst.join("p/.sync-aside.x.tmp.7.0"), b"stale temp");
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    assert!(
+        !report
+            .residue
+            .iter()
+            .any(|p| p.contains(".sync-aside.x.tmp.")),
+        "a crate temp must not be reported as residue: {report:?}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("p"))
+            .expect("the replacement landed")
+            .is_file(),
+        "the kind-changing replacement installs the file"
+    );
+    assert!(report.applied.contains(&"p".to_string()), "{report:?}");
+}
+
 /// Addendum A (HIGH, data loss): `dir_replace_is_sanctioned` scanned the
 /// STRIPPED diff, so a directory whose only child is an aside looked childless
 /// and was replaced by a source file EVEN with `delete_extraneous == false`.
@@ -6366,7 +6571,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
 
     // (a) Stripping the reserved entry yields the canonical metadata of the
     //     remaining tree, digest included.
-    let stripped = strip_reserved(full.clone());
+    let stripped = strip_reserved(full.clone(), is_reserved_path);
     assert_eq!(
         stripped, expected,
         "stripping the reserved entry must yield the canonical metadata of the \
@@ -6375,7 +6580,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
 
     // (b) A manifest with NO reserved entries strips to ITSELF: the digest
     //     `canonicalize_tree` produced must survive the (identity) strip.
-    let untouched = strip_reserved(expected.clone());
+    let untouched = strip_reserved(expected.clone(), is_reserved_path);
     assert_eq!(
         untouched.tree_sha256, expected.tree_sha256,
         "stripping a manifest with no reserved entries must leave the canonical \
@@ -6385,7 +6590,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
     // (c) Idempotence: a second strip sees a digest already equal to the
     //     canonical one and must not drift again.
     assert_eq!(
-        strip_reserved(stripped.clone()),
+        strip_reserved(stripped.clone(), is_reserved_path),
         stripped,
         "strip_reserved must be idempotent"
     );

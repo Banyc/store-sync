@@ -2817,8 +2817,12 @@ impl LocalTransport {
         // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
         // destination's parent directory (same filesystem, same directory
         // namespace as the lock), exactly like durable_create_new's temps.
+        // The marker is defined by the temp-name authority ([`crate::atomic`]),
+        // so the claim temp and the classification of a claim temp as a TEMP
+        // (rather than a reserved held-aside) can never disagree.
+        let marker = crate::atomic::CLAIM_SUFFIX_MARKER;
         let suffix = format!(
-            ".claim.{}.{}",
+            "{marker}{}.{}",
             std::process::id(),
             CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
         );

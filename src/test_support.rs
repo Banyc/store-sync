@@ -23,6 +23,19 @@ pub(crate) fn fixture_tmpdir(env: &SysEnv) -> std::io::Result<tempfile::TempDir>
     tempfile::Builder::new().tempdir_in(env.temp_dir())
 }
 
+/// A temporary directory under the SHORT fixed root `/tmp`, for fixtures whose
+/// own path LENGTH is load-bearing. The SSH mux socket path is
+/// `<TMPDIR>/dmux/mux-<identity hash>` and must fit `sockaddr_un.sun_path`
+/// (plus OpenSSH's temporary listener suffix), so a fixture directory under a
+/// long `TMPDIR` (the macOS default is already 48 bytes; `tempfile` adds 11
+/// more) leaves too little room for a collision-resistant hash. A transport
+/// whose `TMPDIR` is such a fixture therefore fails closed BY DESIGN; a test
+/// that wants a hermetic `TMPDIR` for a real transport uses this instead. Like
+/// [`fixture_tmpdir`], the directory is removed on drop.
+pub(crate) fn short_fixture_tmpdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().tempdir_in("/tmp")
+}
+
 /// Install `body` as an executable at `path` by writing it from a SHORT-LIVED
 /// HELPER PROCESS, never from the test process itself.
 ///

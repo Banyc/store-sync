@@ -237,7 +237,10 @@ pub(crate) fn fingerprints_match(text: &str, expected: &str, env: &SysEnv) -> bo
 /// make them derive the SAME `ControlPath`, and a reused ControlMaster skips
 /// the second connection's host-key check and key selection. At 64 bits a
 /// collision is merely unlikely; at 256 bits it is infeasible, and the cost is
-/// one SHA-256 over a short string once per connection.
+/// one SHA-256 over a short string once per connection. A caller that must fit
+/// the result into a length-limited field (the mux socket name, bounded by
+/// `sockaddr_un.sun_path`) uses a LEADING HEX PREFIX of this value, never a
+/// weaker hash — see `SshTransport::mux_identity_hash`.
 pub(crate) fn simple_hash(s: &str) -> String {
     crate::digest::sha256_bytes(s.as_bytes())
 }

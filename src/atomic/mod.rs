@@ -214,12 +214,59 @@ fn next_temp_counter() -> u64 {
     TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The suffix MARKER the atomic-replace temp authority ([`temp_name_string`])
+/// appends to the bounded destination trunk: the `.tmp.` half of
+/// `.TRUNK.tmp.<pid>.<counter>`.
+pub(crate) const TEMP_SUFFIX_MARKER: &str = ".tmp.";
+
+/// The suffix MARKER of the compare-and-delete CLAIM temp
+/// ([`crate::transport::Remote::remove_file_if`]'s fallback claim, which
+/// reuses [`bounded_temp_trunk`]): the `.claim.` half of
+/// `.TRUNK.claim.<pid>.<counter>`.
+pub(crate) const CLAIM_SUFFIX_MARKER: &str = ".claim.";
+
 /// The unique temp NAME for a destination named `name`, shared by
 /// [`temp_name_for`] and [`temp_file_name`]: `.trunk.tmp.<pid>.<n>` with the
 /// trunk bounded to [`NAME_MAX`] by [`bounded_temp_trunk`].
 fn temp_name_string(name: &str) -> String {
-    let suffix = format!(".tmp.{}.{}", std::process::id(), next_temp_counter());
+    let suffix = format!(
+        "{TEMP_SUFFIX_MARKER}{}.{}",
+        std::process::id(),
+        next_temp_counter()
+    );
     format!(".{}{}", bounded_temp_trunk(name, &suffix), suffix)
+}
+
+/// Whether `name` is one of the crate's own TEMP names — it ENDS with one of
+/// the authorities' suffixes, `.tmp.<pid>.<counter>` (the atomic-replace temp,
+/// [`temp_name_string`]) or `.claim.<pid>.<counter>` (the compare-and-delete
+/// claim temp, [`crate::transport::Remote::remove_file_if`]) — with an
+/// all-digit pid and counter.
+///
+/// This is how a caller tells a CRASHED TEMP from a HELD-ASIDE. Both can sit
+/// in the RESERVED `.sync-aside.` namespace (`crate::reserved`), because a temp
+/// for a destination whose own name begins `sync-aside.` inherits the prefix:
+/// `.sync-aside.<name>.tmp.<pid>.<n>`. A genuine claim-aside, by contrast, is
+/// `.sync-aside.<pid>.<n>` with NO marker — it HOLDS the stranded original. The
+/// ONLY decisive feature is the authority's own suffix, so the test is a
+/// suffix match on that spelling, never a heuristic on the destination name.
+pub(crate) fn is_crate_temp_name(name: &str) -> bool {
+    [TEMP_SUFFIX_MARKER, CLAIM_SUFFIX_MARKER]
+        .iter()
+        .any(|marker| match name.rsplit_once(marker) {
+            Some((_, tail)) => {
+                let mut parts = tail.split('.');
+                matches!(
+                    (parts.next(), parts.next(), parts.next()),
+                    (Some(pid), Some(counter), None)
+                        if !pid.is_empty()
+                            && !counter.is_empty()
+                            && pid.bytes().all(|b| b.is_ascii_digit())
+                            && counter.bytes().all(|b| b.is_ascii_digit())
+                )
+            }
+            None => false,
+        })
 }
 
 /// Unique temp-file name for an atomic replace of `path`: same directory,
@@ -475,7 +522,10 @@ impl RootDir {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplaceOutcome, ReplaceStage, normalize_root, validate_rel, write_atomic_replace};
+    use super::{
+        ReplaceOutcome, ReplaceStage, is_crate_temp_name, normalize_root, temp_name_for,
+        validate_rel, write_atomic_replace,
+    };
     use crate::error::Error;
     use crate::test_support::{fixture_env, fixture_tmpdir, proptest_cases, slow_tests_enabled};
     use proptest::prelude::*;
@@ -510,6 +560,53 @@ mod tests {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
         let path = dir.path().join("marker.json");
         (dir, path)
+    }
+
+    /// The temp-name authority recognises EXACTLY its own suffixes — the
+    /// `.tmp.<pid>.<n>` of [`temp_name_for`]/[`super::temp_file_name`] and the
+    /// `.claim.<pid>.<n>` of the compare-and-delete claim — with an all-digit
+    /// tail. This is what lets the sync tell a CRASHED TEMP (extraneous, a
+    /// removal) from a HELD claim-aside (residue, inspect first), including
+    /// when the temp inherits the `.sync-aside.` prefix from a destination
+    /// named `sync-aside.*`. The predicate is a SHAPE test; the reserved-prefix
+    /// half of the classification lives in `sync::apply`.
+    #[test]
+    fn temp_names_are_exactly_the_authoritys_suffixes() {
+        let generated = temp_name_for(std::path::Path::new("sync-aside.foo"));
+        let generated = generated
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(generated.starts_with(".sync-aside.foo.tmp."), "{generated}");
+        assert!(is_crate_temp_name(&generated), "{generated}");
+
+        for temp in [
+            ".sync-aside.foo.tmp.12345.0",
+            ".sync-aside.case.tmp.1.2",
+            ".sync-aside.1234.claim.7.0",
+            ".a.claim.1.0",
+            // A shape match anywhere (reservation is a separate check).
+            "notes.tmp.1.0",
+        ] {
+            assert!(is_crate_temp_name(temp), "{temp:?} is a crate temp");
+        }
+        for other in [
+            // A genuine claim-aside: reserved, but NO authority suffix.
+            ".sync-aside.999.0",
+            ".sync-aside.case-probe.1.2",
+            // Near-misses on the tail shape.
+            ".sync-aside.foo.tmp.12345",
+            ".sync-aside.foo.tmp.x.0",
+            ".sync-aside.foo.tmp.12345.0.1",
+            ".sync-aside.foo.tmp..0",
+            ".sync-aside.foo.tmp.0.",
+            ".sync-aside.foo.tmp0.1",
+            ".sync-aside.foo.tmp.1.2.3",
+            "",
+        ] {
+            assert!(!is_crate_temp_name(other), "{other:?} is NOT a crate temp");
+        }
     }
 
     /// COMMIT POINT 1 (the rename): a fault at the rename stage is a

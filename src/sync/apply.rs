@@ -223,14 +223,23 @@
 //! it and never destroy it, because [`crate::lock::FileLock`]'s STABLE-INODE
 //! discipline requires the record to be created once and never removed (a
 //! removed record lets two live holders win the same logical lock). Before the
-//! diff, every manifest entry with a reserved component is stripped from BOTH
-//! sides. A
-//! DESTINATION reserved entry is abandoned residue: it is reduced to its topmost
+//! diff, every manifest entry with a reserved component is stripped from the
+//! SOURCE. On the DESTINATION the strip is NARROWER: a reserved-spelled TEMP —
+//! the atomic-replace temp for a destination whose name itself begins
+//! `sync-aside.`, `.sync-aside.<name>.tmp.<pid>.<n>`, or the claim temp
+//! `.sync-aside.<name>.claim.<pid>.<n>` — is LEFT in the destination manifest,
+//! so the diff reports it [`SyncReport::extraneous`] (it holds no original and
+//! the documented recovery is a removal of it). Only a reserved entry that is
+//! NOT a crate temp ([`crate::atomic::is_crate_temp_name`] = false: a genuine
+//! `.sync-aside.<pid>.<n>` claim-aside or a lock record) is stripped as residue.
+//! A
+//! DESTINATION reserved entry that holds something is abandoned residue: it is
+//! reduced to its topmost
 //! path in [`SyncReport::residue`], NEVER transferred (a pull must not copy a
 //! stranded aside into the other tree), and NEVER removed — not even by
 //! [`Extraneous::Delete`]: a destination-only directory that contains residue has
 //! its removal refused as [`ConflictReason::ResidueBelow`], and a CLAIMED subtree
-//! that contains residue is left in place (the removal stops at the reserved
+//! that contains residue is left in place (the removal stops at the residue
 //! child instead of handing the directory to a recursive removal, which
 //! would delete exactly the entry that was skipped) — and ALWAYS reported, so the
 //! caller can recover it by hand instead of losing it. Residue has a SECOND
@@ -1240,7 +1249,10 @@ pub struct SyncReport {
     /// and the lists state EXISTENCE for both:
     ///
     /// * a STRANDED CLAIM-ASIDE — a name in the RESERVED claim-aside
-    ///   namespace `.sync-aside.`, the last component of the reported path (the
+    ///   namespace `.sync-aside.` that is NOT a crate temp (a genuine aside is
+    ///   `.sync-aside.<pid>.<n>`; a temp for a `sync-aside.`-prefixed
+    ///   destination carries `.tmp.<pid>.<n>` and is `extraneous`, never
+    ///   residue), the last component of the reported path (the
     ///   aside holds the stranded subtree, so nothing below it is named); or
     /// * an ORDINARY destination path this run refused to remove or displace —
     ///   a live entry no manifest spelling addresses, found while walking a
@@ -1287,18 +1299,33 @@ pub struct SyncReport {
     ///
     /// **The crate's OWN stale temp is NOT residue.** A replace that fails in
     /// place leaves no temp, but a temp a CRASHED writer left behind is a
-    /// dot-prefixed entry whose name ends `.tmp.<pid>.<n>` and whose trunk is
-    /// the destination's own name — or, when that name leaves no room under
+    /// dot-prefixed entry whose name ends `.tmp.<pid>.<n>` (or, for the
+    /// compare-and-delete claim, `.claim.<pid>.<n>`) and whose trunk is the
+    /// destination's own name — or, when that name leaves no room under
     /// `NAME_MAX`, a byte-truncated prefix of it plus the SHA-256 of the FULL
     /// name (see [`crate::atomic::bounded_temp_trunk`], the one spelling
     /// authority, public through [`crate::atomic::temp_name_for`] and
-    /// [`crate::atomic::temp_file_name`]). That spelling is NOT reserved, so
-    /// the entry is reported as [`SyncReport::extraneous`] — and
-    /// [`Extraneous::Keep`], the default, leaves it in place forever. It holds
-    /// no original entry, so recovery is a plain removal of each `extraneous`
-    /// path whose last component matches the temp pattern (dot-prefixed and
-    /// containing `.tmp.`); a caller that owns the destination and wants the
-    /// tree clean should sweep that pattern after a crashed run.
+    /// [`crate::atomic::temp_file_name`]). Such an entry holds NO original, so
+    /// it is reported as [`SyncReport::extraneous`] — and [`Extraneous::Keep`],
+    /// the default, leaves it in place forever. Recovery is a plain removal of
+    /// each `extraneous` path whose last component carries a crate temp suffix
+    /// (dot-prefixed and ending `.tmp.<pid>.<n>` or `.claim.<pid>.<n>`,
+    /// [`crate::atomic::is_crate_temp_name`]); a caller that owns the
+    /// destination and wants the tree clean should sweep that pattern after a
+    /// crashed run.
+    ///
+    /// The classification is NOT just "is the spelling reserved". A temp whose
+    /// DESTINATION NAME itself begins `sync-aside.` inherits the reserved
+    /// prefix (the temp for `sync-aside.foo` is
+    /// `.sync-aside.foo.tmp.<pid>.<n>`), so it IS a reserved spelling — the id
+    /// rule still refuses it and it is still stripped from the SOURCE manifest.
+    /// What separates it from a stranded claim-aside is the temp-name
+    /// authority's suffix: a genuine aside is `.sync-aside.<pid>.<n>` with NO
+    /// marker, while every temp the crate (or its compare-and-delete claim)
+    /// writes carries one. The applier therefore classifies a reserved-spelled
+    /// DESTINATION entry as residue ONLY when it is not a crate temp
+    /// ([`crate::atomic::is_crate_temp_name`] = false); a temp stays in the
+    /// destination manifest and the diff reports it here as `extraneous`.
     ///
     /// Reserved residue is
     /// stripped from the destination manifest BEFORE the diff, so it is NEVER
@@ -2653,9 +2680,15 @@ fn run(
         Ok(entries) => entries,
         Err(error) => return Err(SyncError::from(error)),
     };
+    // DESTINATION residue is a reserved spelling that HOLDS something (a
+    // stranded claim-aside or the operation-lock record). A reserved-namespaced
+    // TEMP (a destination whose own name begins `sync-aside.` leaves
+    // `.sync-aside.<name>.tmp.<pid>.<n>`) is NOT residue: it holds no original,
+    // so it stays in the destination manifest and the diff reports it as
+    // destination-only (`extraneous`) — the spelling the report doc promises.
     let dest_residue = reserved_paths(&dest_meta);
-    let source_meta = strip_reserved(source_meta);
-    let dest_meta = strip_reserved(dest_meta);
+    let source_meta = strip_reserved(source_meta, is_reserved_path);
+    let dest_meta = strip_reserved(dest_meta, is_dest_residue_path);
     let diff = diff_trees(&source_meta, &dest_meta);
     // F2: an unsupported DESTINATION entry may be DELETED under a sanction
     // (`Extraneous::Delete`, when the source does not hold that path), but the
@@ -3449,7 +3482,7 @@ impl Applier<'_, '_> {
     /// NOT sanctioned by the EMPTINESS test alone. [`Extraneous::Delete`] DOES
     /// sanction it (the early return below consults no residue set), and that is
     /// safe: the replacement claims the directory aside and then removes it
-    /// through the ONE removal walk, which stops at the reserved child and
+    /// through the ONE removal walk, which stops at the residue child and
     /// leaves the holding directory in place ([`Removal::ResidueLeft`]), so the
     /// residue survives even a sanctioned replacement.
     fn dir_replace_is_sanctioned(&self, path: &str) -> bool {
@@ -3910,7 +3943,10 @@ impl Applier<'_, '_> {
                     let name = stack[last].children[next].0.clone();
                     stack[last].next += 1;
                     let child_path = join_manifest_path(&stack[last].path, &name);
-                    if is_reserved_name(&name) {
+                    // A genuine HELD-ASIDE (or a lock record) stops the walk and
+                    // is named residue; a crate TEMP is a leftover with no
+                    // original, so the removal continues and takes it.
+                    if is_dest_residue_name(&name) {
                         self.note_residue(&child_path);
                         stack[last].outcome = Removal::ResidueLeft;
                         continue 'advance;
@@ -6857,12 +6893,44 @@ fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> 
     Ok(reserved)
 }
 
+/// The DECISIVE test for DESTINATION RESIDUE: a reserved spelling that HOLDS
+/// something the sync must not destroy — a stranded claim-aside
+/// (`.sync-aside.<pid>.<n>`) or the operation-lock record — as opposed to a
+/// CRASHED TEMP.
+///
+/// A temp can inherit the reserved namespace (a destination whose own name
+/// begins `sync-aside.` yields `.sync-aside.<name>.tmp.<pid>.<n>`), but it holds
+/// NO original entry: it is the leftover of an interrupted atomic replace and
+/// the documented recovery is a removal. The distinction is a SUFFIX test on
+/// the temp-name authority's own spelling ([`crate::atomic::is_crate_temp_name`]):
+/// a name the authority would produce carries `.tmp.<pid>.<n>` (or
+/// `.claim.<pid>.<n>`); a genuine claim-aside never does. Only a name in the
+/// reserved namespace is classified here, so an ordinary destination file that
+/// merely ends `.tmp.<pid>.<n>` is untouched by this predicate and stays
+/// ordinary content.
+fn is_dest_residue_path(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| match component {
+            Component::Normal(name) => is_dest_residue_name(name),
+            _ => false,
+        })
+}
+
+/// The single-NAME form of [`is_dest_residue_path`], for the removal walk that
+/// meets live names rather than manifest spellings.
+fn is_dest_residue_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        crate::reserved::is_reserved_name(name) && !crate::atomic::is_crate_temp_name(name)
+    })
+}
+
 /// The reserved paths of a manifest (kind-agnostic), used for destination
 /// residue.
 fn reserved_paths(meta: &TreeMetadata) -> BTreeSet<String> {
     meta.entries
         .iter()
-        .filter(|entry| is_reserved_path(&entry.path))
+        .filter(|entry| is_dest_residue_path(&entry.path))
         .map(|entry| entry.path.clone())
         .collect()
 }
@@ -6933,15 +7001,22 @@ fn reserved_roots(paths: &BTreeSet<String>) -> Vec<String> {
         .collect()
 }
 
-/// Strip every reserved entry from a manifest, recomputing the tree digest so
-/// the manifest stays self-consistent. Reserved names are bookkeeping, never
-/// content: the diff is computed as if they did not exist. `compute_tree_digest`
-/// hashes the serialized metadata INCLUDING `tree_sha256`, so the field is
-/// BLANKED before recomputing: otherwise the new digest would hash the old one
-/// in and depend on the pre-strip value (non-canonical, non-idempotent). Every
-/// other producer of a tree digest blanks the field first.
-fn strip_reserved(mut meta: TreeMetadata) -> TreeMetadata {
-    meta.entries.retain(|entry| !is_reserved_path(&entry.path));
+/// Strip every path matching `reserved` from a manifest, recomputing the tree
+/// digest so the manifest stays self-consistent. Reserved names are
+/// bookkeeping, never content: the diff is computed as if they did not exist.
+///
+/// The predicate is a PARAMETER because the DESTINATION and the SOURCE strip
+/// DIFFERENT sets: a reserved-namespaced TEMP is stripped from the SOURCE
+/// ([`is_reserved_path`]) so it is never replicated, but it is LEFT in the
+/// destination manifest ([`is_dest_residue_path`]) so the diff can classify it
+/// as `extraneous` — the spelling the report doc promises for a crashed temp.
+/// `compute_tree_digest` hashes the serialized metadata INCLUDING
+/// `tree_sha256`, so the field is BLANKED before recomputing: otherwise the new
+/// digest would hash the old one in and depend on the pre-strip value
+/// (non-canonical, non-idempotent). Every other producer of a tree digest
+/// blanks the field first.
+fn strip_reserved(mut meta: TreeMetadata, reserved: fn(&str) -> bool) -> TreeMetadata {
+    meta.entries.retain(|entry| !reserved(&entry.path));
     meta.tree_sha256 = String::new();
     meta.tree_sha256 = compute_tree_digest(&meta);
     meta
@@ -7340,19 +7415,23 @@ impl Side<'_> {
     /// by the unified removal to walk a claimed subtree that is not in the
     /// manifest and to classify every entry it meets. An entry that is not a
     /// regular file, directory, or symlink is refused (an error), never
-    /// silently treated as one of them.
+    /// silently treated as one of them — the SAME rule the local side applies
+    /// to [`crate::atomic::PathKind::Other`], so the two live-kind classifiers
+    /// cannot disagree for a fifo/socket/device (the transports already agree
+    /// on the metadata, and this is the classification built from it).
     fn kind_opt(&self, rel: &RootedRelativePath) -> Result<Option<EntryKind>> {
         match self {
             Side::Local(local) => local.kind_opt(rel),
-            Side::Remote(remote) => Ok(remote.metadata_opt(rel)?.map(|meta| {
-                if meta.is_dir {
-                    EntryKind::Dir
-                } else if meta.is_symlink {
-                    EntryKind::Symlink
-                } else {
-                    EntryKind::File
-                }
-            })),
+            Side::Remote(remote) => match remote.metadata_opt(rel)? {
+                None => Ok(None),
+                Some(meta) if meta.is_dir => Ok(Some(EntryKind::Dir)),
+                Some(meta) if meta.is_symlink => Ok(Some(EntryKind::Symlink)),
+                Some(meta) if meta.is_file => Ok(Some(EntryKind::File)),
+                Some(_) => Err(Error::store(format!(
+                    "destination entry {} has an unsupported kind (not a regular file, a directory, or a symlink)",
+                    rel.display()
+                ))),
+            },
         }
     }
 
