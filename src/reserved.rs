@@ -23,9 +23,13 @@
 //!   by [`crate::sync::Extraneous::Delete`], and is reported for the caller
 //!   (a source collision as a `ReservedName` conflict, a destination entry as
 //!   `SyncReport::residue`);
-//! * a CONSUMER can ask before it fails: [`is_reserved_name`] answers "may I
-//!   use this name?" for a single segment and [`is_reserved_path`] for a
-//!   canonical manifest path.
+//! * a CONSUMER can ask before it fails: [`is_unaddressable_name`] answers
+//!   "may I use this name?" for a single segment and
+//!   [`is_unaddressable_path`] for a canonical manifest path. (The
+//!   byte-exact [`is_reserved_name`] / [`is_reserved_path`] do NOT answer that
+//!   question on their own: they are the narrow reserved MATCH the sync uses
+//!   for stripping, and deliberately leave the application lock record and the
+//!   case/trailing-dot aliases alone.)
 //!
 //! A reserved name is matched as a whole path COMPONENT, byte-exactly: the
 //! check never decodes, normalizes, or case-folds, so a name that merely
@@ -155,8 +159,20 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 /// Whether the id/name rule must REFUSE `name` because it NAMES or can ALIAS
 /// the crate's own bookkeeping on a supported filesystem: a byte-exact
 /// reserved spelling, the application lock record, a case alias of either, a
-/// crate TEMP shape ([`crate::atomic::is_crate_temp_name`]), or a CASE ALIAS
-/// of a crate temp shape.
+/// LOCK-RECORD spelling in the DENIAL fold (case, and the Win32 trailing
+/// dot/space fold — see [`is_lock_record_name`]), a crate TEMP shape
+/// ([`crate::atomic::is_crate_temp_name`]), or a CASE ALIAS of a crate temp
+/// shape.
+///
+/// The [`is_lock_record_name`] arm is the SAME authority the mutating
+/// substrate's guard uses to DENY a lock-record spelling. Consulting it here
+/// closes the trailing-dot hole: on Windows the Win32 layer strips a trailing
+/// `.`/` ` from a final component, so `.dest.operation.lock.` and
+/// `operation.lock.` ARE the lock record the guard denies, and the id rule
+/// must refuse a name that aliases it for the same reason it refuses a case
+/// alias. A fold may only ever make the crate refuse MORE, and this one is
+/// deliberately platform-INDEPENDENT (Linux cannot exhibit the alias), so a
+/// manifest does not mean different things on different hosts.
 ///
 /// This is the predicate [`crate::id::valid_name`] consults, so an identity
 /// the crate accepts can never alias a reserved entry on any filesystem the
@@ -184,6 +200,7 @@ pub fn is_unaddressable_name(name: &str) -> bool {
     is_reserved_name(name)
         || is_application_lock_name(name)
         || is_reserved_case_alias(name)
+        || is_lock_record_name(name)
         || crate::atomic::is_crate_temp_shape(name)
         || is_crate_temp_case_alias(name)
 }
@@ -616,6 +633,50 @@ mod tests {
                 !is_lock_record_name(other),
                 "{other:?} does not name a lock record"
             );
+        }
+    }
+
+    /// B5: the Win32 trailing-dot/space fold the LOCK-RECORD DENIAL already
+    /// applies is ALSO extended to the id rule's authority, so a name that
+    /// ALIASES a lock record is unaddressable and refused as an identity.
+    /// Pre-fix `is_unaddressable_name(".dest.operation.lock.")` was `false`
+    /// and `crate::id::valid_name(".dest.operation.lock.")` was `true` — while
+    /// the mutating guard already denied the spelling as a lock record — so a
+    /// consumer could pass a name the id rule's stated purpose should have
+    /// refused, and on Windows the spelling IS the very record
+    /// `FileLock::acquire` truncates. Refusing it is the fold-for-denial rule
+    /// applied to the id boundary (denial may refuse more), and it is
+    /// deliberately platform-INDEPENDENT so an id does not mean different
+    /// things on different hosts.
+    #[test]
+    fn trailing_dot_and_space_lock_aliases_are_unaddressable() {
+        for alias in [
+            ".dest.operation.lock.",
+            ".dest.operation.lock ",
+            ".dest.operation.lock. . ",
+            "operation.lock.",
+            "operation.lock ",
+            ".DEST.OPERATION.LOCK.",
+            "OPERATION.LOCK ",
+        ] {
+            assert!(
+                is_lock_record_name(alias),
+                "{alias:?} is a lock-record spelling once the Win32 fold applies"
+            );
+            assert!(
+                is_unaddressable_name(alias),
+                "{alias:?} must be unaddressable as an identity"
+            );
+            assert!(
+                !crate::id::valid_name(alias),
+                "the id rule must refuse the lock alias {alias:?}"
+            );
+        }
+        // Genuinely distinct near-misses stay ordinary: the fold does not
+        // over-refuse a spelling whose folded form is not a lock record.
+        for ok in ["operation.lockx", "a.operation.lock", ".operation.lock."] {
+            assert!(!is_unaddressable_name(ok), "{ok:?} must stay ordinary");
+            assert!(crate::id::valid_name(ok), "{ok:?} must stay a valid id");
         }
     }
 

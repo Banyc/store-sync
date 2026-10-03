@@ -17,8 +17,11 @@ caller.
    an entry point whose name states it. A destructive choice is an enum, never a
    boolean. An operation that can take its own lock takes it.
 3. **Addresses are faithful and injective.** A manifest value is byte-exact:
-   names UTF-8 in NFC, symlink targets UTF-8 and separator-free, no CR, LF or
-   TAB. Anything else is refused, never normalized or substituted.
+   names UTF-8 in NFC, no CR, LF or TAB. A symlink target is link DATA, stored
+   UTF-8-verbatim: it may contain `/` and `..`, and a relative target is
+   resolved against the directory CONTAINING the link (POSIX), refused only
+   when it is ABSOLUTE or resolves outside the root. Anything else is refused,
+   never normalized or substituted.
 4. **A view is faithful, or the check does not run.** No lossy decode, no
    trimming, no defaulted field, on any path that decides something. A listing
    carries the live kind of each entry beside its name.
@@ -30,7 +33,9 @@ caller.
    mutation before attempting it, and name it if it fails.
 7. **A run owns its destination.** Take the operation lock wherever it can be
    taken, hold it for the whole run, release it on every exit path. A write made
-   outside that lock is detected and fails the run.
+   outside that lock is DETECTED over the paths the run reads, by re-checking
+   the destination, and fails the run — the detection is not total, so an ABA or
+   a write after the last verification is undetectable.
 8. **Fail closed.** Refuse rather than transform; error rather than guess; a
    check that cannot run is a failure. Never document a guarantee that is not
    implemented.
@@ -59,13 +64,22 @@ The sanctioned route for a partial retention is `Keep` everything and remove
 the unwanted paths out of band through the destination's own removal
 primitives (or make every path you want kept part of the source).
 
-A consumer can ask whether a name is reserved BEFORE it fails:
-`store_sync::is_reserved_name` (one path segment) and
-`store_sync::is_reserved_path` (a canonical manifest path) report the crate's
-reserved spellings — the `.sync-aside.` claim-aside prefix and the
-`.<name>.operation.lock` record. A reserved spelling is refused as an
-identifier, is never transferred by a sync, and is never destroyed by
-`Extraneous::Delete`.
+A consumer can ask whether a name may be used BEFORE it fails. The authority
+is `store_sync::is_unaddressable_name` (one path segment) and its path form
+`store_sync::is_unaddressable_path` (a canonical manifest path): these are the
+predicate the identifier rule `store_sync::id::valid_name` itself consults, so
+`valid_name(s)` is false exactly when `s` is not a single safe segment OR is
+unaddressable. They report every spelling the crate refuses to name — the
+`.sync-aside.` claim-aside prefix, the `.<name>.operation.lock` record, the
+application lock record `operation.lock`, case aliases of any of those, crate
+temp shapes, and the Win32 trailing-dot/space aliases of a lock record (refused
+on every platform, so an id does not mean different things on different hosts).
+`is_reserved_name` / `is_reserved_path` are NARROWER: the byte-exact reserved
+MATCH the sync uses to strip reserved components, and they deliberately leave
+the application lock record and the case/trailing-dot aliases alone — they are
+NOT, on their own, the answer to "may I use this name". An unaddressable
+spelling is refused as an identifier, is never transferred by a sync, and is
+never destroyed by `Extraneous::Delete`.
 
 ## Fidelity scope
 
@@ -88,10 +102,12 @@ that differ only in mtime compare `Same`.
 `store-sync` moves a tree faithfully WITHIN THE MANIFEST MODEL; it is **not a
 backup or checkpoint format**, and it cannot stand in for one:
 
-- A source containing a **hard link** or an **absolute (or escaping) symlink**
-  cannot be snapshotted AT ALL: the strict source manifest refuses the run, so
-  such a tree must be normalized (copy the hard-linked content, make the
-  symlink relative) before it can be pushed.
+- A source containing a **hard link**, an **absolute symlink**, or an
+  **escaping symlink** cannot be snapshotted AT ALL: the strict source manifest
+  refuses the run, so such a tree must be normalized (copy the hard-linked
+  content, make the symlink relative) before it can be pushed. A relative
+  symlink target that contains `/` or `..` but still RESOLVES inside the root
+  (`dir/link -> ../other`) is lawful and is NOT one of these refusals.
 - A **restore drops metadata with the differ blind**: `diff(snapshot, live)` is
   EMPTY while `mtime`, xattrs and sparseness differ. Ownership,
   `security.capability`, ACLs, timestamps, file flags and sparseness are not
@@ -112,10 +128,20 @@ local port's replace is the ONE non-atomic case (no directory fsync; the target
 is removed before the rename) and is unverified. The exact commit points are in
 the `manifest` module's "Durability and atomicity of a written entry".
 
-`EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append: appending 32 bytes to
-a 1 MiB log reads ~3.1 MB and writes ~1 MB, because there is no remote append
-primitive and the append is a compare-and-replace of the whole file. Batch
-small appends, or keep the log outside the synced tree and ship it whole.
+`EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
+remote append primitive and the append is a compare-and-replace of the whole
+file. Measured on Linux release with `strace` byte accounting (kache
+neutralised, load ~1), ONE run that appends 32 bytes to a 1 MiB log reads
+**8,388,768 bytes** and writes **1,048,678 bytes**: three whole reads of the
+1 MiB destination (the destination manifest, the prefix test, and the
+compare-and-replace), three whole reads of the 1 MiB + 32 source (the source
+manifest, the prefix test, and the end-of-run source re-check), and two whole
+reads of the 1 MiB + 32 result for the TWO post-transfer verification passes —
+plus the whole 1 MiB + 32 result written through the atomic temp and the
+70-byte lock record. The old "~3.1 MB read" figure counted only the append
+rule's three whole-file reads and omitted the verification reads. Budget the
+verification, not just the append rule. Batch small appends, or keep the log
+outside the synced tree and ship it whole.
 
 To make a freshly pushed SUBTREE durable, call `fsync_tree(child)` AND
 `fsync_parent(child)` on the transport rooted at the child's PARENT. A
@@ -156,15 +182,22 @@ neither is built here.
 
 **A deep tree is worse than the incremental measurement suggested, and the
 shape depends on fresh vs incremental.** A LOCAL path-based destination
-re-verifies a path's ancestry before mutating it, at O(depth) per probe, so a
-depth-D chain with ONE changed leaf is O(D^2): measured 0.63 s / 3.38 s /
-21.6 s at D = 100 / 200 / 400 (macOS). A FRESH destination installs all D
-entries, and EACH install pays its own O(D^2) probe, so it is O(D^3): measured
-4.855 s / 41.39 s / 582.1 s at the same depths. `canonicalize_tree` alone is
-cheap (2.76 ms / 6.53 ms / 25.4 ms), so the engine's per-path verification is
-the cost, and a checkpoint tool that recreates its destination per snapshot
-should budget the CUBIC. All timings above are the reviewing consumer's
-measurements, not re-measured here.
+re-verifies a path's ancestry before mutating it, at O(depth) per probe. A
+depth-D chain with ONE changed leaf is therefore SUPER-LINEAR in D, and the
+measured exponent is PLATFORM-DEPENDENT: ≈2.0 on Linux (measured 99 / 373 /
+1472 ms at D = 100 / 200 / 400; ratios 3.76 / 3.95) but ≈2.5 on macOS
+(measured 0.64 / 3.44 / 21.2 s at the same depths; ratios 5.4 / 6.2; the
+consumer's earlier 0.63 / 3.38 / 21.6 s agree). The single O(D^2) label was
+wrong on macOS — budget for worse than quadratic. A FRESH destination installs
+all D entries, and EACH install pays its own ancestry probe, so it is O(D^3):
+the cubic shape was verified, over the consumer's 4.855 s / 41.39 s / 582.1 s
+at the same depths. `canonicalize_tree` alone is cheap (2.76 ms / 6.53 ms /
+25.4 ms), so the engine's per-path verification is the cost, and a checkpoint
+tool that recreates its destination per snapshot should budget the CUBIC. The
+Linux and macOS incremental figures above are re-measured under the audit
+(release build, kache neutralised, load ≈0.3 Linux / ≈1.4 macOS); the
+fresh-destination and `canonicalize_tree` figures are the reviewing consumer's,
+not re-measured here.
 
 ## A fresh destination
 
@@ -189,7 +222,8 @@ simplification; removing one means adding back the logic it removes.
   destination is authoritative for the whole run, so work is never ordered
   against an unknown mutation. The crate takes the destination's operation lock
   wherever it can, making this true for cooperating writers; a write made
-  outside that lock is still detected and fails the run.
+  outside that lock is still detected over the paths the run reads (rule 7
+  states the limit — it is not total) and fails the run.
 - **The source does not change during the run.** *Buys:* one read of the source
   describes it for the whole run. Nothing in the crate can prevent a source
   write, so the caller owes this.
@@ -211,18 +245,20 @@ simplification; removing one means adding back the logic it removes.
   `WalkDir` plus `symlink_metadata`/`read` on accumulated PATHS, so a tree
   deeper than the platform's path limit is refused with `ENAMETOOLONG` at the
   first path that overflows. With 1-byte components the path grows 2 bytes per
-  level, so the bound is `floor((PATH_MAX - 1 - base_len)/2)`, where
-  `base_len` is the length in BYTES of the base path AS IT RESOLVES on the
-  filesystem (work in resolved form: on macOS `/tmp` is `/private/tmp`, 4-8
-  bytes longer). The bound has no single number — it is a function of the
-  base. Worked examples, one per platform, each measured one level above where
-  `ENAMETOOLONG` first lands: Linux (`PATH_MAX` 4096) admits depth 2047 at a
-  1-byte base, 2041 at a 13-byte base, and 2040 at a 15-byte base; macOS
-  (`PATH_MAX` 1024) admits depth 511 at a 1-byte base and 482 at a 59-byte
-  resolved base (an unresolved `/tmp/B*59` base measures 478 once `/tmp`
-  resolves to `/private/tmp`). A
-  descriptor-relative manifest walk would lift this; it is not implemented, and
-  this bullet is the statement of the real limit. The descriptor-relative
+  level, so the bound is `floor((L - base_len)/2)`, where `base_len` is the
+  length in BYTES of the base path AS IT RESOLVES on the filesystem and `L` is
+  the longest pathname the kernel accepts for the tree: measured `PATH_MAX - 1`
+  on Linux (4095, because `/tmp` is real) and `PATH_MAX` on macOS (1024). The
+  older form `floor((PATH_MAX - 1 - base_len)/2)` is exact on Linux but
+  under-predicts by one on macOS when `base_len` is EVEN (the parity is hidden
+  when every worked example has an odd base). Worked examples, each measured
+  one level above where `ENAMETOOLONG` first lands: Linux (`PATH_MAX` 4096)
+  admits depth 2047 at a 1-byte base, 2041 at a 13-byte base, and 2040 at a
+  14-byte base; macOS (`PATH_MAX` 1024) admits depth 511 at a 1-byte base, 495
+  at a 34-byte resolved base (EVEN — the old form predicts 494), and 482 at a
+  59-byte resolved base. A descriptor-relative manifest walk would lift this;
+  it is not implemented, and this bullet is the statement of the real limit.
+  The descriptor-relative
   REMOVAL walk (`crate::atomic::remove_dir_contents_fd`) holds one descriptor
   per level and is NOT limited by the path limit, so removal supports deeper
   trees than the walk that describes them — but that advantage is itself
@@ -234,6 +270,23 @@ simplification; removing one means adding back the logic it removes.
   timestamp or sparseness machinery.
 
 ## Rules for changing this crate
+
+**Mechanically enforced today.** The crate has exactly TWO source audits, both
+in `atomic::guard::tests`: `no_libc_reference_outside_the_funnel` fails on any
+new `libc` reference outside `src/atomic/unix.rs` (a mutating symbol, a
+`use libc as alias`, a braced self-alias, a re-export, a glob, or a call broken
+across a newline), and `std_fs_name_mutation_counts_are_pinned` fails when a
+production `std::fs` removal/replace/rename call count changes. Together they
+back the rule that every name mutation goes through the ONE guarded funnel.
+
+**Review conventions, NOT mechanical checks.** The rest of this list is enforced
+by review: in particular "fix the class, not the instance", "an oracle must be
+able to express the failure it is meant to catch", "a document that contradicts
+the code is a defect in whichever is wrong", "a green gate on one platform is
+not evidence for another", and "no assertion is weakened or deleted" have no
+test that would catch their violation. An aspiration presented as an enforcement
+is the same defect as a false claim, so they are labelled here rather than
+implied to be checked.
 
 - A behaviour fix lands with a test that fails before the change. A test that
   cannot fail before says so in its own comment.

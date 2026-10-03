@@ -1948,6 +1948,71 @@ fn pull_makes_local_equal_to_remote() {
     );
 }
 
+/// B1 end to end: a source holding `dir/link -> ../other` (an in-root relative
+/// target that walks up out of the link's directory) is snapshotted and
+/// round-trips through a PUSH and a PULL, and the destination holds the link as
+/// a RELATIVE link with the SAME target, resolving to the copied `other`.
+/// Pre-fix the source manifest refused the whole tree as an escaping symlink,
+/// so nothing could be pushed or pulled at all.
+#[cfg(unix)]
+#[test]
+fn an_in_root_relative_symlink_round_trips_through_push_and_pull() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(src.join("dir")).unwrap();
+    fs::create_dir_all(src.join("other")).unwrap();
+    write(&src.join("other/file"), b"payload");
+    std::os::unix::fs::symlink("../other", src.join("dir/link")).unwrap();
+
+    // PUSH into a fresh local root.
+    let dst = dir.path().join("dst");
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    let link = dst.join("dir/link");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the pushed entry is a link, never followed"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        PathBuf::from("../other"),
+        "the in-root relative target is preserved as a relative link"
+    );
+    assert_eq!(
+        read(&link.join("file")),
+        b"payload",
+        "the link resolves into the copied tree"
+    );
+
+    // PULL the same source into another fresh local root.
+    let pulled = dir.path().join("pulled");
+    let report = sync(
+        Direction::Pull,
+        &pulled,
+        &transport(&src),
+        &ReplaceAll,
+        Keep,
+    )
+    .unwrap();
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    let plink = pulled.join("dir/link");
+    assert!(
+        fs::symlink_metadata(&plink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&plink).unwrap(), PathBuf::from("../other"));
+    assert_eq!(read(&plink.join("file")), b"payload");
+    assert_eq!(
+        canonicalize_tree(&src).unwrap(),
+        canonicalize_tree(&pulled).unwrap()
+    );
+}
+
 #[test]
 fn equal_trees_perform_zero_transfers() {
     let dir = fixture_tmpdir(&env()).unwrap();

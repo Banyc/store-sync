@@ -25,7 +25,7 @@
 //! and the remote wire assembler) apply the same rule, so they accept exactly
 //! the same trees.
 //!
-//! # Symlink targets are bytes: UTF-8 and separator-free, or the tree is refused
+//! # Symlink targets are link data: UTF-8, wire-clean, and non-escaping
 //!
 //! A symlink target is the LINK CONTENT, a byte string the kernel dereferences
 //! literally, and the manifest stores it as a UTF-8 [`String`] on a line- and
@@ -41,10 +41,22 @@
 //! bytes are what the content hash binds, so the two canonicalizers must agree
 //! on them exactly.
 //!
+//! A target is NOT `separator-free`. It may contain `/` (multi-component, e.g.
+//! `sub/target`) and `..`, because it is link DATA the kernel resolves, and a
+//! separator or a `..` is not by itself an escape. What the rules forbid is an
+//! ABSOLUTE target, and a RELATIVE target whose resolution leaves the tree
+//! root — and the resolution base is the directory CONTAINING the link (its own
+//! parent), as POSIX specifies, not the tree root. So `dir/link -> ../other`
+//! resolves to `<root>/other` and is ACCEPTED, while `dir/link ->
+//! ../../outside` resolves outside the root and is REFUSED. A root that is
+//! itself reached through a symlink is canonicalized first, so the base is the
+//! real directory the kernel would resolve against.
+//!
 //! NFC is deliberately NOT required of a target. A name is an index into the
 //! tree, but a target is DATA: the kernel resolves it verbatim, it may contain
-//! `..`, and normalizing it would silently repoint the link (and change the
-//! hash that binds the link's content). Refusing non-NFC targets would reject
+//! `..` and `/` separators, and normalizing it would silently repoint the link
+//! (and change the hash that binds the link's content). Refusing non-NFC
+//! targets would reject
 //! legitimate links that merely happen to spell their target in a decomposed
 //! form; accepting them verbatim is faithful and keeps both canonicalizers in
 //! agreement. Only the UTF-8 half of the NAME rule is applied to targets; the
@@ -209,6 +221,24 @@ pub const TREE_SCHEMA_VERSION: u32 = 1;
 
 fn fmt_mode(m: u32) -> String {
     format!("{:04o}", m & 0o7777)
+}
+
+/// The directory a RELATIVE symlink target must be resolved against: the
+/// directory CONTAINING the link, per POSIX, not the tree root.
+///
+/// `root` is the tree root `link_rel` is relative to, and `link_rel` is the
+/// link's artifact-relative path, so the result is `root` joined with the
+/// link's parent. For the LOCAL walk `root` is the CANONICALIZED root, so a
+/// root that is itself reached through a symlink is resolved before the check
+/// and the target's `..` collapses against the real directory containing the
+/// link; the link's parent components are the on-disk names the walk already
+/// verified as [`Component::Normal`], and the walk does not follow a symlinked
+/// directory, so none of them can be a symlink that would change the answer.
+fn symlink_target_base(root: &Path, link_rel: &Path) -> PathBuf {
+    match link_rel.parent() {
+        Some(parent) => root.join(parent),
+        None => root.to_path_buf(),
+    }
 }
 
 /// Lexically normalize a path, collapsing `.` and `..`, returning `None` if it
@@ -574,8 +604,13 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                     UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
                 }
             } else {
-                // Ensure target resolves inside the artifact root.
-                let resolved = normalize_lexical(&root_c, &target);
+                // A RELATIVE target is resolved against the directory
+                // CONTAINING the link (the link's own parent), per POSIX, not
+                // against the tree root: `dir/link -> ../other` lands in
+                // `<root>/other`, which is inside the root, and must be
+                // accepted. Containment is then tested in the root.
+                let base = symlink_target_base(&root_c, rel_os);
+                let resolved = normalize_lexical(&base, &target);
                 let inside = matches!(resolved.as_ref(), Some(r) if r.starts_with(&root_c));
                 if !inside {
                     let reason = format!("escaping symlink not allowed: {}", path.display());
@@ -971,7 +1006,11 @@ fn canonicalize_remote_entries_with(
                         }),
                     }
                 } else {
-                    let resolved = normalize_lexical(root, &target);
+                    // Same POSIX base as the local walk: the directory
+                    // CONTAINING the link, here spelled relative to the
+                    // far-side root, then tested for containment in that root.
+                    let base = symlink_target_base(root, Path::new(&entry_path));
+                    let resolved = normalize_lexical(&base, &target);
                     let inside = matches!(resolved.as_ref(), Some(r) if r.starts_with(root));
                     if !inside {
                         let reason = format!("escaping symlink not allowed: {entry_path}");
@@ -1870,9 +1909,9 @@ mod tests {
     }
 
     /// A symlink whose target escapes the tree root must be refused by BOTH
-    /// verification paths: the local canonicalizer resolves the target
-    /// lexically against the canonical root, and the remote assembler does
-    /// the same against the remote root. An escaping link would let a
+    /// verification paths: each resolves the relative target lexically against
+    /// the directory CONTAINING the link (its own parent, per POSIX) and then
+    /// tests containment in the root. An escaping link would let a
     /// manifest describe bytes outside the tree.
     #[test]
     fn escaping_symlink_rejected_by_both_canonicalizers() {
@@ -1892,12 +1931,148 @@ mod tests {
         );
 
         // Remote path: the script prints the raw target and the assembler
-        // resolves it against the remote root and rejects the escape.
+        // resolves it from the link's own directory and rejects the escape.
         let out = run_remote_script(&root);
         let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
         assert!(
             remote_err.to_string().contains("escaping symlink"),
             "remote assembler must reject the escaping symlink, got: {remote_err}"
+        );
+    }
+
+    /// B1: a RELATIVE symlink target is resolved against the directory
+    /// CONTAINING the link (its own parent), per POSIX, not against the tree
+    /// root. `dir/up -> ../other` resolves to `<root>/other` and is ACCEPTED by
+    /// BOTH canonicalizers, as is a multi-separator `..` target that walks up
+    /// and back down (`dir/sub/up -> ../../file`). The targets are stored
+    /// VERBATIM as link data. This test FAILS against the pre-fix code, whose
+    /// root-based base refused `dir/up -> ../other` as an "escaping symlink".
+    #[test]
+    fn relative_symlink_targets_resolve_against_the_links_directory() {
+        skip_without_perl!("relative_symlink_targets_resolve_against_the_links_directory");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("dir").join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"ok").unwrap();
+        std::fs::write(root.join("file"), b"top").unwrap();
+
+        // `<root>/dir/up` -> `<root>/dir/../other` = `<root>/other`: IN root.
+        std::os::unix::fs::symlink("../other", root.join("dir/up")).unwrap();
+        // `<root>/dir/sub/up` -> `<root>/dir/sub/../../file` = `<root>/file`:
+        // multiple separators plus a `..` that returns into the root.
+        std::os::unix::fs::symlink("../../file", root.join("dir/sub/up")).unwrap();
+
+        let local = canonicalize_tree(&root)
+            .expect("an in-root `..` target is lawful and must be accepted");
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "dir/up")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("../other"),
+            "an in-root `..` target is stored verbatim"
+        );
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "dir/sub/up")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("../../file"),
+            "a multi-separator `..` target that re-enters the root is stored verbatim"
+        );
+
+        // The wire assembler applies the SAME POSIX base, so it accepts exactly
+        // the same tree and stores the same bytes.
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root)
+            .expect("the wire assembler must accept the same in-root links");
+        assert_eq!(remote.entries, local.entries);
+        assert_eq!(remote.tree_sha256, local.tree_sha256);
+    }
+
+    /// B1, the refusal half: after resolving relative targets from the link's
+    /// own directory, an ABSOLUTE target and a target that genuinely leaves the
+    /// root stay refused by BOTH canonicalizers. `dir/escape -> ../../outside`
+    /// resolves to `<root>/../outside`, which is outside `<root>`.
+    #[test]
+    fn absolute_and_escaping_symlink_targets_stay_refused() {
+        skip_without_perl!("absolute_and_escaping_symlink_targets_stay_refused");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(dir.path().join("outside"), b"secret").unwrap();
+        std::os::unix::fs::symlink("../../outside", root.join("dir/escape")).unwrap();
+
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("escaping symlink"),
+            "the local canonicalizer must still refuse the escape, got: {local_err}"
+        );
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("escaping symlink"),
+            "the wire assembler must still refuse the escape, got: {remote_err}"
+        );
+
+        std::fs::remove_file(root.join("dir/escape")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("dir/abs")).unwrap();
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("absolute symlink"),
+            "the local canonicalizer must still refuse an absolute target, got: {local_err}"
+        );
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("absolute symlink"),
+            "the wire assembler must still refuse an absolute target, got: {remote_err}"
+        );
+    }
+
+    /// B1, the base's own resolution: when the ROOT is reached through a
+    /// symlink, the local walk canonicalizes it before the containment check,
+    /// so the base is the REAL directory the kernel resolves against (as POSIX
+    /// requires) rather than the unresolved spelling.
+    #[test]
+    fn in_root_target_accepted_when_the_root_is_a_symlink() {
+        skip_without_perl!("in_root_target_accepted_when_the_root_is_a_symlink");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("dir")).unwrap();
+        std::fs::create_dir_all(real.join("other")).unwrap();
+        std::fs::write(real.join("other/file"), b"ok").unwrap();
+        std::os::unix::fs::symlink("../other", real.join("dir/up")).unwrap();
+        let link_root = dir.path().join("link-root");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+
+        let local = canonicalize_tree(&link_root)
+            .expect("the canonicalized root is the real directory the link sits in");
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "dir/up")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("../other")
+        );
+        // A target that escapes the RESOLVED root is still refused.
+        std::fs::remove_file(real.join("dir/up")).unwrap();
+        std::os::unix::fs::symlink("../../outside", real.join("dir/escape")).unwrap();
+        std::fs::write(dir.path().join("outside"), b"secret").unwrap();
+        let err = canonicalize_tree(&link_root).unwrap_err();
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the resolved root must still bound the target, got: {err}"
         );
     }
 

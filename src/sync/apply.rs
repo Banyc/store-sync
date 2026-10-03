@@ -1006,12 +1006,17 @@ pub enum EntryPolicy {
     ///
     /// KNOWN COST: an append is O(TOTAL SIZE), not O(appended bytes). There is
     /// no [`Remote::append`](crate::transport::Remote) primitive, so the append
-    /// is realized as a compare-and-replace of the WHOLE file: appending 32
-    /// bytes to a 1 MiB log reads the whole destination to test the prefix
-    /// relation, then reads the whole source and writes the whole result —
-    /// measured at ~3.1 MB read and ~1 MB written for that 32-byte append. A
-    /// caller appending many small records should batch them, or keep the log
-    /// out of the synced tree and ship it as a whole object.
+    /// is realized as a compare-and-replace of the WHOLE file, and the run's
+    /// post-transfer verification re-reads the whole result. Measured on Linux
+    /// release with `strace` byte accounting, ONE run that appends 32 bytes to
+    /// a 1 MiB log reads 8,388,768 bytes and writes 1,048,678 bytes: three
+    /// whole reads of the 1 MiB destination (manifest, prefix test, compare),
+    /// three whole reads of the 1 MiB + 32 source (manifest, prefix test, and
+    /// the end-of-run source re-check), and two whole reads of the 1 MiB + 32
+    /// result for the two verification passes, plus the whole result written
+    /// through the atomic temp and the 70-byte lock record. A caller appending
+    /// many small records should batch them, or keep the log out of the synced
+    /// tree and ship it as a whole object.
     ///
     /// THE COMPARE-AND-APPEND. A write is performed only if the destination
     /// still holds the exact bytes the prefix test read, so a writer that
@@ -2018,10 +2023,11 @@ enum DestinationOwnership {
 ///   depth-D path costs O(D^2) path operations. The run pays that PER PATH,
 ///   which makes the two shapes a checkpoint tool hits different by a whole
 ///   factor of D. **One changed leaf:** the run probes the D ancestors once, so
-///   it is O(D^2) path operations; measured 0.63 s / 3.38 s / 21.6 s at
-///   D = 100 / 200 / 400 (macOS), ~5.4x / 6.4x per doubling — the figures this
-///   paragraph originally stated (0.70 / 3.64 / 22.05 s) to within measurement
-///   noise. That is the case the deep-chain test bounds, and it is NOT the case
+///   the OPERATION count is O(D^2); the measured WALL TIME is SUPER-LINEAR with
+///   a platform-dependent exponent — ≈2.0 on Linux (99 / 373 / 1472 ms at
+///   D = 100 / 200 / 400) and ≈2.5 on macOS (0.64 / 3.44 / 21.2 s; the earlier
+///   0.63 / 3.38 / 21.6 s agree), so budget for WORSE than quadratic on macOS.
+///   That is the case the deep-chain test bounds, and it is NOT the case
 ///   a fresh snapshot hits. **A FRESH destination:** all D entries are
 ///   installed, and EACH install pays its own O(D^2) ancestry probe and listing,
 ///   so the run is O(D^3) path operations; measured 4.855 s / 41.39 s /
@@ -2029,7 +2035,7 @@ enum DestinationOwnership {
 ///   `canonicalize_tree` is NOT the cost (it is 2.76 ms / 6.53 ms / 25.4 ms at
 ///   the same depths); the engine's per-path verification is. A checkpoint tool
 ///   that creates a FRESH destination per snapshot is therefore CUBIC in depth,
-///   not the quadratic the single-changed-leaf measurement suggested; where it
+///   not the shape the single-changed-leaf measurement suggested; where it
 ///   can, it should keep the destination incremental (one changed leaf) rather
 ///   than recreate it. The bound the deep-chain test pins is the OPERATION
 ///   count, not this wall time.
