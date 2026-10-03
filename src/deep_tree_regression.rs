@@ -236,14 +236,16 @@ fn run_walk(root: &Path, mode: &str) -> Result<(), String> {
         "copy_fd" => {
             let owned =
                 crate::atomic::RootDir::open(root).map_err(|e| format!("open root: {e}"))?;
-            crate::atomic::copy_dir_recursive_fd(&owned, &root.join(TOP), Path::new(COPY))
+            let dest = RootedRelativePath::parse(Path::new(COPY)).unwrap();
+            crate::atomic::copy_dir_recursive_fd(&owned, &root.join(TOP), &dest)
                 .map_err(|e| format!("copy_dir_recursive_fd: {e}"))
         }
         // The re-added PUBLIC fd-confined tree fsync.
         "fsync_fd" => {
             let owned =
                 crate::atomic::RootDir::open(root).map_err(|e| format!("open root: {e}"))?;
-            crate::atomic::fsync_tree_recursive_fd(&owned, Path::new(TOP))
+            let tree = RootedRelativePath::parse(Path::new(TOP)).unwrap();
+            crate::atomic::fsync_tree_recursive_fd(&owned, &tree)
                 .map_err(|e| format!("fsync_tree_recursive_fd: {e}"))
         }
         // The test-only RECURSIVE reference copy: the shape the source tool's

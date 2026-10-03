@@ -1157,8 +1157,16 @@ mod tests {
             ("symlink", 0),
             ("link", 0),
             ("mkdir", 0),
-            ("rmdir", 1),
-            ("open", 1),
+            // CHANGED DELIBERATELY (constraint #1): the only `libc::rmdir`
+            // reference was the path-based `remove_dir_all_path`, now
+            // `#[cfg(test)]` (no production caller). No production rmdir
+            // remains; a re-added one must be reviewed and pinned here.
+            ("rmdir", 0),
+            // CHANGED DELIBERATELY (constraint #1): the only `libc::open` path
+            // reference was the path-based `remove_dir_all_path`, now
+            // `#[cfg(test)]`. Production opens all go through the guarded
+            // `openat` funnel instead.
+            ("open", 0),
             ("remove", 0),
         ] {
             assert_eq!(
@@ -1210,7 +1218,12 @@ mod tests {
         }
         let expected: &[(&str, &str, usize)] = &[
             ("src/atomic/mod.rs", "remove_file", 1),
-            ("src/atomic/unix.rs", "remove_file", 1),
+            // CHANGED DELIBERATELY (constraint #1): the path-based
+            // `remove_dir_all_path` became `#[cfg(test)]` (it has no production
+            // caller; the fd-confined `remove_dir_all_fd` is the production
+            // authority), so its `std::fs::remove_file` left the PRODUCTION
+            // count. The remaining `rename` (the manifest walk's own swap) is
+            // unchanged.
             ("src/atomic/unix.rs", "rename", 1),
             ("src/atomic/windows.rs", "remove_dir", 2),
             // TWO production `remove_dir_all` calls since R2: the implicit

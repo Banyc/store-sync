@@ -36,7 +36,7 @@
 //! parent-dir fsync (`sync_parent_dir`), unique temp naming
 //! (`temp_name_for`), the atomic marker/JSONL rewrites
 //! (`write_atomic_replace`, `write_jsonl_atomic`), private permissions
-//! (`set_private`, `ensure_private_dir`), the tree-object directory
+//! (`set_private`), the tree-object directory
 //! copy (`copy_dir_recursive`), and the JSON readers. Two more are the
 //! consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the OWNED
 //! ROOT itself (the empty and `.` child spellings are refused, so residue at
@@ -107,8 +107,8 @@
 //! [`unix`]'s module docs — plus the POSIX parent-directory fsync
 //! durability). That component confinement covers the `_fd` surface only:
 //! [`unix`]'s PATH-BASED free functions (`set_private`,
-//! `write_atomic_replace`, `sync_parent_dir`, `ensure_private_dir`,
-//! `ensure_private_dir_durable`, `copy_dir_recursive`, `remove_dir_all_path`)
+//! `write_atomic_replace`, `sync_parent_dir`,
+//! `ensure_private_dir_durable`, `copy_dir_recursive`)
 //! take an ordinary path and are NOT covered — see [`unix`]'s module docs for
 //! the exact split.
 //! [`windows`] is the path-based implementation with documented weaker
@@ -118,6 +118,7 @@
 //! crate calls the re-exported surface below and never sees the switch.
 
 use crate::error::{Error, ReservedKind, Result};
+use crate::relpath::RootedRelativePath;
 #[cfg(unix)]
 use std::ffi::OsStr;
 #[cfg(unix)]
@@ -145,20 +146,6 @@ pub(crate) use guard::{GuardedRel, OwnedLockRecord, Sanction};
 /// cannot carry one authority and skip the other.
 pub(crate) fn refuse_reserved_mutation(rel: &Path, sanction: Sanction<'_>) -> Result<()> {
     guard::refuse_reserved_mutation(rel, sanction)
-}
-
-/// The NO-SANCTION spelling of the ONE gate: refuse when `rel` NAMES or
-/// descends THROUGH any reserved spelling (a lock record or a residue).
-///
-/// This used to be the lock-record authority ALONE, and its call sites then
-/// diverged from the residue authority by a line each; it is now a thin,
-/// documented alias for [`refuse_reserved_mutation`] with [`Sanction::None`],
-/// so a primitive that reaches for it gets BOTH authorities. There is
-/// deliberately no function that runs only the lock half; the per-component
-/// lock check ([`guard::refuse_lock_record`]) is private, and the residue loop
-/// lives inside the gate.
-pub(crate) fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
-    refuse_reserved_mutation(rel, Sanction::None)
 }
 
 /// The ONE error an implicit recursive removal returns for a residue: an
@@ -264,8 +251,8 @@ pub use windows::*;
 ///   included. That is the confinement an operation can rely on INSTEAD of a
 ///   live path check. The property does NOT extend to [`unix`]'s PATH-BASED
 ///   free functions (`set_private`, `write_atomic_replace`, `sync_parent_dir`,
-///   `ensure_private_dir`, `ensure_private_dir_durable`, `copy_dir_recursive`,
-///   `remove_dir_all_path`): those take an ordinary path, so an intermediate
+///   `ensure_private_dir_durable`, `copy_dir_recursive`): those take an ordinary
+///   path, so an intermediate
 ///   symlink in it IS followed — see [`unix`]'s module docs for the split.
 ///   [`unix::copy_dir_recursive_fd`] is a partial exception: its arbitrary
 ///   out-of-root SOURCE is path-based (followed once, as a read), while its
@@ -339,6 +326,15 @@ fn absent_or_store(e: std::io::Error, path: &Path) -> Result<bool> {
 /// name the crate derives from a destination must stay within it — a temp
 /// that is even one byte longer makes a legal destination untransferable.
 pub const NAME_MAX: usize = 255;
+
+/// The bound on an ancestry walk (the identity-overlap check in
+/// [`copy_dir_recursive_fd`]). A directory chain on the supported platforms is
+/// limited by `PATH_MAX` in practice (each component costs at least two
+/// bytes), so this is far above any reachable depth while still bounding a
+/// filesystem that answered `..` with a different entry forever. SHARED by the
+/// unix and Windows ports: the two implementations enforce the SAME rule, so
+/// the value must agree and lives in ONE place.
+pub(crate) const MAX_ANCESTRY: usize = 1 << 16;
 
 /// The number of bytes [`bounded_temp_trunk`] reserves so its two branches
 /// cannot collide. The truncated branch's trunk is at least
@@ -705,53 +701,18 @@ pub struct RootDir(PathBuf);
 /// spelled `link` is refused. Normalizing before the open makes both
 /// spellings take the same path. A `..` in the root is the caller's own
 /// trusted base and is left intact; a `..` in a ROOT-RELATIVE entry path
-/// is refused by [`validate_rel`].
+/// is refused by the validated [`RootedRelativePath`] boundary.
 fn normalize_root(base: &Path) -> PathBuf {
     base.components().collect()
 }
 
-/// Validate that `path` is a ROOT-RELATIVE entry path, refusing every
-/// spelling that could resolve outside the owned root. Only
-/// [`std::path::Component::Normal`] components are admitted:
-///
-/// * an absolute path contributes a `RootDir`/`Prefix` component, and
-///   `openat` IGNORES the root descriptor for an absolute path (on the
-///   Windows port `Path::join` REPLACES the root instead), so the
-///   operation would resolve against the real filesystem root — a
-///   confinement escape;
-/// * a `..` (`ParentDir`) component walks ABOVE the root;
-/// * `.` (`CurDir`) and the empty path name the root directory itself,
-///   never an entry under it.
-///
-/// Trailing and repeated separators are NOT refused: [`Path`] erases them,
-/// so `a/b/` and `a//b` are the same components as `a/b` and the spellings
-/// keep resolving identically. Every refusal is an
-/// [`std::io::ErrorKind::InvalidInput`] so each caller folds it into its
-/// own path-contextual store error (fail-closed: a path error, never an
-/// interesting resolution).
-fn validate_rel(path: &Path) -> std::io::Result<()> {
-    let mut names_an_entry = false;
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(_) => names_an_entry = true,
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "a root-relative path may contain only normal components \
-                     (no absolute path, no `..`, no `.`)",
-                ));
-            }
-        }
-    }
-    if !names_an_entry {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "a root-relative path must name at least one normal component \
-             (the empty path is refused)",
-        ));
-    }
-    Ok(())
-}
+// THE ROOT-RELATIVE SPELLING RULE now lives in ONE place: the validated
+// [`RootedRelativePath`] type ([`crate::relpath`]), which every `_fd`
+// primitive takes and every boundary parses. The former `validate_rel` helper
+// enforced a LOOSER version of the rule at each primitive that called it (it
+// accepted a non-leading `.` segment, which [`Path::components`] erases); with
+// the type at the boundary the helper has no caller and is gone — see
+// `docs/API-CONSTRAINTS.md` constraint #1.
 
 impl RootDir {
     /// Open the owned root.
@@ -820,7 +781,7 @@ impl RootDir {
 mod tests {
     use super::{
         NAME_MAX, ReplaceOutcome, ReplaceStage, bounded_temp_trunk, is_crate_temp_name,
-        normalize_root, temp_name_for, validate_rel, write_atomic_replace,
+        normalize_root, temp_name_for, write_atomic_replace,
     };
     use crate::error::Error;
     use crate::test_support::{fixture_env, fixture_tmpdir, proptest_cases, slow_tests_enabled};
@@ -1210,25 +1171,35 @@ mod tests {
         assert_eq!(normalize_root(Path::new("//")), PathBuf::from("/"));
     }
 
-    /// The root-relative path guard: trailing and repeated separators are
-    /// accepted (they name the same components), while an absolute path, a
-    /// `..` walk, a `.`, and the empty path are refused as path errors.
+    /// The root-relative spelling rule is the validated type's rule.
+    ///
+    /// This test replaces `validate_rel_accepts_normal_spellings_and_refuses_escapes`,
+    /// which pinned the LOOSER private helper. The helper accepted a
+    /// non-leading `.` segment (`a/./b`) because [`std::path::Path::components`]
+    /// erases it; [`RootedRelativePath::parse`] scans the literal spelling too
+    /// and REFUSES it. That is the ONE deliberate tightening of constraint #1:
+    /// the public boundary is STRICTER than the private check it replaces.
+    /// Every other spelling in the old test is unchanged (trailing and repeated
+    /// separators accepted; empty, absolute, `..`, and `.` refused).
     #[test]
-    fn validate_rel_accepts_normal_spellings_and_refuses_escapes() {
+    fn rooted_relative_path_is_the_only_spelling_authority() {
+        use crate::error::Error;
+        use crate::relpath::RootedRelativePath;
         use std::path::Path;
-        for ok in ["a", "a/b", "a/b/", "a//b", "a/./b", "a/b/c/"] {
+        for ok in ["a", "a/b", "a/b/", "a//b", "a/b/c/"] {
             assert!(
-                validate_rel(Path::new(ok)).is_ok(),
+                RootedRelativePath::parse(Path::new(ok)).is_ok(),
                 "{ok:?} must be accepted"
             );
         }
-        for bad in ["", ".", "./", "..", "../b", "a/../b", "a/..", "/b", "/"] {
-            let err = validate_rel(Path::new(bad))
-                .expect_err("an escaping or empty spelling must be refused");
-            assert_eq!(
-                err.kind(),
-                std::io::ErrorKind::InvalidInput,
-                "{bad:?} must be an invalid-input path error"
+        for bad in [
+            "", ".", "./", "..", "../b", "a/../b", "a/..", "/b", "/", "a/./b", "a/.",
+        ] {
+            let err = RootedRelativePath::parse(Path::new(bad))
+                .expect_err("an escaping, empty, or dot-segment spelling must be refused");
+            assert!(
+                matches!(err, Error::Transport(_)),
+                "{bad:?} must be a transport (path) error, got {err:?}"
             );
         }
     }

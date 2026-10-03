@@ -2299,7 +2299,7 @@ impl Remote for SshTransport {
         // guard runs HERE, before the command is built: every substrate
         // mutation is refused for a lock-record spelling, exactly as its local
         // counterpart is through the atomic funnel.
-        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::None)?;
         self.upload_bytes(rel.as_path(), data, mode)
     }
 
@@ -2318,7 +2318,7 @@ impl Remote for SshTransport {
     }
 
     fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::None)?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&[
             "chmod".into(),
@@ -2384,7 +2384,7 @@ impl Remote for SshTransport {
     }
 
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(link.as_path())?;
+        crate::atomic::refuse_reserved_mutation(link.as_path(), crate::atomic::Sanction::None)?;
         // The target is embedded in a shell command, so a non-UTF-8 target
         // could only be written LOSSILY — creating a link whose target differs
         // from the caller's intent, which the post-transfer `read_link`

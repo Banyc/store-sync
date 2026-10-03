@@ -5,10 +5,11 @@
 //! * no symlink-refusing component-wise resolution (Windows symlinks
 //!   require admin/developer mode, so the injection attack surface is
 //!   smaller);
-//! * every `_fd` path is validated as ROOT-RELATIVE first ([`validate_rel`]):
-//!   an absolute path, a `..`, a `.`, or the empty path is refused as a
-//!   path error, so the spelling of `rel` cannot redirect a `Path::join`
-//!   outside the root — symlinks INSIDE the root are still not refused;
+//! * every `_fd` path arrives as a validated [`RootedRelativePath`]: an
+//!   absolute path, a `..`, a literal `.` segment, or the empty path is
+//!   refused at the boundary, so the spelling of `rel` cannot redirect a
+//!   `Path::join` outside the root — symlinks INSIDE the root are still not
+//!   refused;
 //! * no parent-directory fsync durability (a directory cannot be opened
 //!   as a file on Windows) — the rename is the only commit point;
 //! * a NON-atomic replace (Windows `rename` does not overwrite an
@@ -29,10 +30,10 @@ use std::io::Write;
 /// Windows has no Unix mode bits: the private-permission contract is a
 /// no-op (file ACLs are the privacy mechanism). Documented weaker
 /// guarantee of the Windows port.
-pub fn set_private(path: &Path) -> Result<()> {
+pub(crate) fn set_private(path: &Path) -> Result<()> {
     // The mode change is inode-preserving, but the guard keeps the spelling
     // contract uniform with the Unix port.
-    refuse_lock_record_mutation(path)?;
+    refuse_reserved_mutation(path, Sanction::None)?;
     Ok(())
 }
 
@@ -58,9 +59,9 @@ pub fn write_atomic_replace(
     // F-A1: the PATH-BASED replace removes the target entry before the rename
     // (Windows `rename` does not overwrite), so it DESTROYS the target's inode
     // exactly like the Unix port; consult the ONE guard authority and the FULL
-    // path (see [`refuse_lock_record_mutation`]). Type-checked only here (this
+    // path (see [`refuse_reserved_mutation`]). Type-checked only here (this
     // port is never executed in this repository).
-    refuse_lock_record_mutation(path)?;
+    refuse_reserved_mutation(path, Sanction::None)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
@@ -142,14 +143,12 @@ pub fn write_atomic_replace(
     Ok(ReplaceOutcome::ReplacedDurable)
 }
 
-/// Windows has no directory fsync (a directory cannot be opened as a
-/// file): a no-op. Documented weaker durability guarantee of the Windows
-/// port.
-pub fn sync_parent_dir(_path: &Path) -> Result<()> {
-    Ok(())
-}
+// There is deliberately no path-based `sync_parent_dir` on this port: Windows
+// has no directory fsync (a directory cannot be opened as a file), and the
+// path-based helper had no caller — the descriptor-relative
+// [`sync_parent_dir_fd`] is the one spelling, and it is the documented no-op.
 
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     // Creation only: a residue spelling is permitted (mkdir cannot destroy),
     // and the lock authority still runs.
     refuse_reserved_mutation(path, Sanction::Residue)?;
@@ -163,7 +162,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// ancestor). On Windows there is no parent-directory fsync (the durable
 /// commit is a no-op) — the documented weaker guarantee of the Windows
 /// port. Returns `true` when this call created at least one directory.
-pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
+pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     refuse_reserved_mutation(path, Sanction::Residue)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
@@ -274,14 +273,16 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // weaker guarantees above.
 // =====================================================================
 
-/// Join `rel` under the root path, REFUSING every spelling that could
-/// resolve outside the root first (see [`validate_rel`]). The guard is what
-/// keeps the path-based port under the owned root too: [`Path::join`]
-/// REPLACES the root when `rel` is absolute (`C:\...`, `\...`) and a `..`
-/// component walks out of it, so the join is never performed on an
-/// unvalidated spelling. The root itself is the normalized [`RootDir`] path.
+/// Join `rel` under the root path. The spelling was REFUSED at the validated
+/// boundary ([`RootedRelativePath`]), which is what keeps the path-based port
+/// under the owned root too: [`Path::join`] REPLACES the root when `rel` is
+/// absolute (`C:\...`, `\...`) and a `..` component walks out of it, so a join
+/// is never performed on an unvalidated spelling. The root itself is the
+/// normalized [`RootDir`] path.
 fn rel_join(root: &RootDir, rel: &Path) -> Result<PathBuf> {
-    validate_rel(rel).map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
+    // `rel` is ALREADY VALIDATED: every caller reaches this through a
+    // [`RootedRelativePath`] (or a component derived from one), so a join that
+    // could replace or escape the root is not reachable here.
     Ok(root.path().join(rel))
 }
 
@@ -348,8 +349,8 @@ fn directory_identity(path: &Path) -> Result<(u64, u64)> {
     Ok((u64::from(info.dwVolumeSerialNumber), index))
 }
 
-/// The bound on an ancestry walk (see the Unix port's `MAX_ANCESTRY`).
-const MAX_ANCESTRY: usize = 1 << 16;
+// The ancestry bound is SHARED with the Unix port: [`super::MAX_ANCESTRY`]
+// (single-sourced in `atomic/mod.rs`).
 
 /// Whether `from` IS `target` or is INSIDE it, by walking `from`'s parents and
 /// comparing directory identities. Fails CLOSED on an identity error.
@@ -510,7 +511,12 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 /// Modes are a no-op on this port (`crate::platform::chmod`), so the Unix
 /// port's undo journal has nothing to undo here and the source cannot be
 /// mutated through a mode.
-pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
+pub fn copy_dir_recursive_fd(
+    root: &RootDir,
+    src: &Path,
+    dst_rel: &RootedRelativePath,
+) -> Result<()> {
+    let dst_rel = dst_rel.as_path();
     // Every destination mutation routes through the SAME guarded rel-path
     // primitives the rest of the port uses (`create_dir_fd`,
     // `write_file_new_fd`, `symlink_new_fd`), so the ONE reserved-spelling gate
@@ -597,7 +603,12 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
             .iter()
             .map(|(path, is_link)| (path.as_str(), *is_link)),
     );
-    ensure_private_dir_fd(root, dst_rel)?;
+    // `dst_rel` is a `&Path` here (a derived spelling); it is validated by
+    // construction, so the typed primitive is reached through `from_validated`.
+    ensure_private_dir_fd(
+        root,
+        &RootedRelativePath::from_validated(dst_rel.to_path_buf()),
+    )?;
     crate::platform::chmod(&rel_join(root, dst_rel)?, (root_mode | 0o200) & 0o7777)
         .map_err(|e| Error::store(format!("chmod {}: {e}", dst_rel.display())))?;
 
@@ -629,7 +640,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                 &std::fs::symlink_metadata(&child_src)
                     .map_err(|e| Error::store(format!("stat {}: {e}", child_src.display())))?,
             );
-            create_dir_fd(root, &child_rel)?;
+            create_dir_fd(root, &RootedRelativePath::from_validated(child_rel.clone()))?;
             crate::platform::chmod(&rel_join(root, &child_rel)?, (mode | 0o200) & 0o7777)
                 .map_err(|e| Error::store(format!("chmod {}: {e}", child_rel.display())))?;
             dirs.push((child_rel.clone(), mode));
@@ -717,11 +728,12 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
 /// Path-based equivalent of the Unix `fsync_tree_recursive_fd`.
 ///
 /// DOCUMENTED WEAKER GUARANTEE: the Windows port has no directory-entry fsync
-/// (`sync_parent_dir` is a no-op), so only regular FILES are fsynced here and
+/// (`sync_parent_dir_fd` is a no-op), so only regular FILES are fsynced here and
 /// directory entries rely on the filesystem's own ordering. Symlinks are
 /// skipped. A file in a deep tree is reached by accumulating PATH components,
 /// so the platform path limit applies.
-pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     let start = rel_join(root, rel)?;
     let mut stack: Vec<PathBuf> = vec![start];
     while let Some(dir) = stack.pop() {
@@ -751,11 +763,12 @@ pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// the Unix port).
 pub fn write_atomic_replace_fd(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
-    refuse_lock_record_mutation(rel)?;
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
 }
 
@@ -765,11 +778,12 @@ pub fn write_atomic_replace_fd(
 /// two are identical here).
 pub fn write_atomic_replace_fd_under_existing_parent(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
-    refuse_lock_record_mutation(rel)?;
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     write_atomic_replace(&rel_join(root, rel)?, bytes, fault)
 }
 
@@ -802,12 +816,13 @@ pub enum CompareReplace {
 /// observed one.
 pub fn write_atomic_if_match_fd(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     expected: &[u8],
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CompareReplace> {
-    refuse_lock_record_mutation(rel)?;
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let path = rel_join(root, rel)?;
     match std::fs::read(&path) {
         Ok(existing) if existing == expected => {} // still ours: replace below
@@ -824,8 +839,9 @@ pub fn write_atomic_if_match_fd(
 /// Path-based create-or-compare CAS: the create-new install is the
 /// atomicity primitive (a racing loser fails on AlreadyExists and can
 /// never clobber a winner); there is no parent-directory fsync durability.
-pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+pub fn write_atomic_cas_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> Result<()> {
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let path = rel_join(root, rel)?;
     // If the file exists, its content must be byte-identical.
     match std::fs::read(&path) {
@@ -854,32 +870,36 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
 }
 
 /// Path-based private-directory creation (see [`ensure_private_dir`]).
-pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn ensure_private_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     ensure_private_dir(&rel_join(root, rel)?)
 }
 
 /// Path-based DURABLE private-directory creation (see
 /// [`ensure_private_dir_durable`] — the durable commit is a no-op on
 /// Windows).
-pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool> {
+pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
+    let rel = rel.as_path();
     ensure_private_dir_durable(&rel_join(root, rel)?)
 }
 
 /// Windows has no directory fsync: a no-op (documented weaker durability
 /// guarantee of the Windows port).
-pub fn sync_parent_dir_fd(_root: &RootDir, _rel: &Path) -> Result<()> {
+pub fn sync_parent_dir_fd(_root: &RootDir, _rel: &RootedRelativePath) -> Result<()> {
     Ok(())
 }
 
 /// Path-based private chmod (see [`set_private`] — a no-op on Windows).
-pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn set_private_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     set_private(&rel_join(root, rel)?)
 }
 
 /// Path-based remove of a single file. Refuses a crate lock-record spelling
 /// (the stable-inode discipline's structural guard; see the Unix port).
-pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+pub fn remove_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     std::fs::remove_file(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
 }
@@ -894,9 +914,10 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// ([`crate::sync::retire_destination_lock`] acquires the flock first).
 pub(crate) fn remove_owned_lock_record_fd(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     owned: &OwnedLockRecord,
 ) -> Result<()> {
+    let rel = rel.as_path();
     let guarded = GuardedRel::new_for_owned_lock_record(rel, owned)?;
     if !guarded.is_owned_lock_record() {
         return Err(Error::conflict(format!(
@@ -912,7 +933,8 @@ pub(crate) fn remove_owned_lock_record_fd(
 /// Path-based single-directory creation (`create_dir` semantics), guarded like
 /// the Unix port's `create_dir_fd`: a residue spelling is REFUSED before the
 /// mkdir, exactly as the copy's own destination components are.
-pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn create_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
     std::fs::create_dir(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", rel.display())))
@@ -920,7 +942,8 @@ pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 
 /// Path-based NON-RECURSIVE directory removal (`rmdir` semantics), guarded
 /// like the Unix port's `remove_dir_fd`. A confirmed absence is success.
-pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn remove_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
     match std::fs::remove_dir(rel_join(root, rel)?) {
         Ok(()) => Ok(()),
@@ -932,8 +955,9 @@ pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// Path-based symlink creation (unlink any existing entry first, then link),
 /// guarded like the Unix port's `symlink_fd` (R1). The platform helper
 /// requires admin/developer mode; a failure propagates.
-pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+pub fn symlink_fd(root: &RootDir, target: &Path, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let link = rel_join(root, rel)?;
     if let Some(parent) = link.parent() {
         std::fs::create_dir_all(parent)
@@ -955,7 +979,7 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
 /// is REFUSED and left untouched. `std::fs::symlink` itself fails on an
 /// existing name, but the explicit probe names the clash in the error.
 fn symlink_new_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let link = rel_join(root, rel)?;
     if let Some(parent) = link.parent() {
         std::fs::create_dir_all(parent)
@@ -1061,9 +1085,13 @@ fn refuse_residue_in_tree(root: &Path) -> Result<()> {
 /// Path-based rename of a path under the root to another path under the
 /// root. Windows `rename` does not overwrite an existing target: remove it
 /// first (documented weaker guarantee — not atomic).
-pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
-    let from = GuardedRel::new(from)?;
-    let to = GuardedRel::new(to)?;
+pub fn renameat_paths(
+    root: &RootDir,
+    from: &RootedRelativePath,
+    to: &RootedRelativePath,
+) -> Result<()> {
+    let from = GuardedRel::new(from.as_path())?;
+    let to = GuardedRel::new(to.as_path())?;
     renameat_paths_guarded(root, from, to)
 }
 
@@ -1071,7 +1099,11 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 /// `unix::rename_residue_paths`: both ends may carry a residue spelling (the
 /// engine's own claim-aside rename and `sync::Residue::recover_to`), and the
 /// lock authority still runs on both.
-pub(crate) fn rename_residue_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn rename_residue_paths(
+    root: &RootDir,
+    from: &RootedRelativePath,
+    to: &RootedRelativePath,
+) -> Result<()> {
     // A residue `to` that ALREADY EXISTS is a stranded ORIGINAL the rename
     // would REPLACE: refuse it, exactly as the public rename does. An ABSENT
     // residue `to` is a fresh claim-aside (the engine's own), and a residue
@@ -1082,10 +1114,10 @@ pub(crate) fn rename_residue_paths(root: &RootDir, from: &Path, to: &Path) -> Re
         .is_some_and(crate::reserved::is_residue_name)
         && path_kind_fd(root, to)?.is_some()
     {
-        return Err(residue_refusal(to));
+        return Err(residue_refusal(to.as_path()));
     }
-    let from = GuardedRel::new_for_residue(from)?;
-    let to = GuardedRel::new_for_residue(to)?;
+    let from = GuardedRel::new_for_residue(from.as_path())?;
+    let to = GuardedRel::new_for_residue(to.as_path())?;
     renameat_paths_guarded(root, from, to)
 }
 
@@ -1116,7 +1148,8 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
 /// fails cleanly rather than aborting the host — the same guarantee the Unix
 /// path gets from its own walk. (Windows is type-checked only, never run
 /// here.)
-pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn remove_dir_all_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     // The ONE gate at the entry point refuses a lock-record spelling AND a
     // residue spelling. Without the residue half, `std::fs::remove_dir_all`
     // walked straight over a stranded aside.
@@ -1134,7 +1167,8 @@ pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// Windows twin of `unix::remove_residue_dir_all_fd`: the root's own residue
 /// spelling is permitted, the lock authority still runs, and a NESTED residue
 /// is still refused.
-pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     // The FINAL-residue sanction lets the walk root through; the gate still
     // refuses a lock-record spelling (including a residue-shaped one) and a
     // residue in any NON-final component.
@@ -1151,7 +1185,8 @@ pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()
 /// Windows twin of `unix::remove_residue_file_fd`: the FINAL-residue sanction
 /// lets the strand through, the lock authority still runs, and a residue in any
 /// non-final component is still refused.
-pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::FinalResidue)?;
     require_final_residue(rel)?;
     std::fs::remove_file(rel_join(root, rel)?)
@@ -1160,7 +1195,8 @@ pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 
 /// Remove ONE entry of the sync engine's own CLAIM-ASIDE walk. Residues are
 /// permitted anywhere on the path; the LOCK authority still runs.
-pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::Residue)?;
     std::fs::remove_file(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
@@ -1169,7 +1205,8 @@ pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// The non-recursive `rmdir` of one (already-emptied) directory of the sync
 /// engine's own claim-aside walk; residues are permitted anywhere on the path
 /// (see [`remove_claim_file_fd`]).
-pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::Residue)?;
     match std::fs::remove_dir(rel_join(root, rel)?) {
         Ok(()) => Ok(()),
@@ -1179,8 +1216,9 @@ pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 }
 
 /// Path-based plain file write (create-or-truncate).
-pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> Result<()> {
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     std::fs::write(rel_join(root, rel)?, bytes)
         .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))
 }
@@ -1192,7 +1230,7 @@ pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
 /// it), so no parent creation is attempted here.
 fn write_file_new_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let path = rel_join(root, rel)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1210,7 +1248,8 @@ fn write_file_new_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Read the whole file at `rel` under the root path.
-pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
+pub fn read_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+    let rel = rel.as_path();
     std::fs::read(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("read {}: {e}", rel.display())))
 }
@@ -1220,20 +1259,25 @@ pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
 /// injected into a parent component — the documented weaker guarantee of the
 /// Windows port (Windows symlinks also require admin/developer mode, a
 /// smaller injection surface).
-pub fn read_link_fd(root: &RootDir, rel: &Path) -> Result<PathBuf> {
+pub fn read_link_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<PathBuf> {
+    let rel = rel.as_path();
     std::fs::read_link(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("readlink {}: {e}", rel.display())))
 }
 
 /// [`read_fd`] + JSON deserialization.
-pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) -> Result<T> {
+pub fn read_json_fd<T: serde::de::DeserializeOwned>(
+    root: &RootDir,
+    rel: &RootedRelativePath,
+) -> Result<T> {
     let bytes = read_fd(root, rel)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| Error::store(format!("deserialize {}: {e}", rel.display())))
 }
 
 /// The TRI-STATE existence check under the root path (see [`path_state`]).
-pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
+pub fn path_state_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
+    let rel = rel.as_path();
     path_state(&rel_join(root, rel)?)
 }
 
@@ -1256,7 +1300,8 @@ pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
 ///   uses Rust's `FileType`, which does not surface every reparse tag).
 ///   Windows symlinks also require admin/developer mode, the smaller
 ///   injection surface the Windows port documents elsewhere.
-pub fn path_kind_fd(root: &RootDir, rel: &Path) -> Result<Option<PathKind>> {
+pub fn path_kind_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Option<PathKind>> {
+    let rel = rel.as_path();
     match std::fs::symlink_metadata(rel_join(root, rel)?) {
         Ok(md) => Ok(Some(kind_from_file_type(md.file_type()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1280,10 +1325,11 @@ fn kind_from_file_type(ft: std::fs::FileType) -> PathKind {
 }
 
 /// Read the entries of the directory at `rel` under the root path. `rel` must
-/// name at least one normal component ([`validate_rel`] refuses the empty and
-/// `.` spellings); the OWNED ROOT itself is enumerated with
+/// name at least one normal component (the validated boundary refuses the
+/// empty and `.` spellings); the OWNED ROOT itself is enumerated with
 /// [`read_root_dir_fd`].
-pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
+pub fn read_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Vec<DirEntry>> {
+    let rel = rel.as_path();
     let entries = std::fs::read_dir(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("read_dir {}: {e}", rel.display())))?;
     read_dir_entries(entries)

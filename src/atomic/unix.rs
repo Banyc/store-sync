@@ -6,8 +6,8 @@
 //!
 //! # Which path SPELLINGS are refused
 //!
-//! Every path the DESCRIPTOR-RELATIVE (`_fd`) surface resolves is validated
-//! as ROOT-RELATIVE first ([`validate_rel`]): only normal components are
+//! Every path the DESCRIPTOR-RELATIVE (`_fd`) surface resolves arrives as a
+//! [`RootedRelativePath`], validated at the boundary: only normal components are
 //! admitted, so an ABSOLUTE path (whose `RootDir`/`Prefix` component makes
 //! `openat` ignore the root descriptor) and a `..` component (which walks
 //! ABOVE the root) are refused as path errors, as are `.` and the empty path
@@ -29,11 +29,9 @@
 //! functions take an ordinary [`Path`] and resolve it with
 //! `std::fs`/`std::fs::Permissions`, so an INTERMEDIATE symlink in that path
 //! IS followed. They are [`set_private`], [`write_atomic_replace`],
-//! [`sync_parent_dir`], [`ensure_private_dir`],
-//! [`ensure_private_dir_durable`], [`copy_dir_recursive`], and
-//! [`remove_dir_all_path`] (the manifest walk's root access is path-based by
-//! design). The component confinement claimed below belongs to the `_fd`
-//! surface only, never to these.
+//! [`sync_parent_dir`], [`ensure_private_dir_durable`], and
+//! [`copy_dir_recursive`]. The component confinement claimed below belongs to
+//! the `_fd` surface only, never to these.
 //!
 //! The `_fd` tree copy [`copy_dir_recursive_fd`] is a PARTIAL exception and
 //! is called out here so the list above is not read as exhaustive: it takes an
@@ -122,8 +120,8 @@ fn probe_fsync_replace_parent() {
 #[cfg(not(test))]
 fn probe_fsync_replace_parent() {}
 
-pub fn set_private(path: &Path) -> Result<()> {
-    refuse_lock_record_mutation(path)?;
+pub(crate) fn set_private(path: &Path) -> Result<()> {
+    refuse_reserved_mutation(path, Sanction::None)?;
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms)
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
@@ -145,8 +143,8 @@ pub fn write_atomic_replace(
     // `_fd` replace (F-A1): replacing the lock record would swap its inode
     // and let a later acquisition flock a fresh inode while a live holder
     // still holds the old one. The guard consults the ONE authority and the
-    // FULL path (see [`refuse_lock_record_mutation`]).
-    refuse_lock_record_mutation(path)?;
+    // FULL path (see [`refuse_reserved_mutation`]).
+    refuse_reserved_mutation(path, Sanction::None)?;
     if let Some(parent) = path.parent() {
         // DURABLE creation of the parent chain: every directory created here
         // has its own entry fsynced into its parent BEFORE the temp write and
@@ -253,7 +251,7 @@ pub fn write_atomic_replace(
 /// Durable directory sync: fsync the parent directory of `path` so a
 /// rename/removal inside it survives power loss. Errors PROPAGATE (a
 /// failed dir sync means the change may not be durable).
-pub fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::store(format!("sync parent of {}: no parent", path.display())))?;
@@ -263,26 +261,15 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("fsync parent dir {}: {e}", parent.display())))
 }
 
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    // Creation only: a residue spelling is permitted (mkdir cannot destroy),
-    // and the lock authority still runs.
-    refuse_reserved_mutation(path, Sanction::Residue)?;
-    std::fs::create_dir_all(path)
-        .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
-    let perms = std::fs::Permissions::from_mode(0o700);
-    std::fs::set_permissions(path, perms)
-        .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
-}
-
 /// DURABLE private directory creation: create `path` (and every missing
-/// ancestor) with the same private chmod as [`ensure_private_dir`], then make
+/// ancestor) at the private 0o700 chmod, then make
 /// EVERY newly created directory entry durable BEFORE the call returns — fsync
 /// the parent directory of each component this call created (deepest first), and
 /// then the parent of the new path's own parent (the entry that names the
 /// directory HOLDING the new path). The store case this exists for is the FIRST
 /// ledger append on a NEW target: the walk creates `targets/<target>/` while
-/// `targets/` itself was already created (UNSYNCED) by the store open's
-/// [`ensure_private_dir`], so the append must fsync BOTH the `targets/<target>/`
+/// `targets/` itself was already created (UNSYNCED) by the store open, so
+/// the append must fsync BOTH the `targets/<target>/`
 /// entry (inside `targets/`) AND the `targets/` entry (inside the base) before
 /// it reports success — otherwise a power loss could lose the directories while
 /// the reported ledger survives.
@@ -297,7 +284,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// Returns `true` when this call created at least one directory (and therefore
 /// ran the syncs), `false` when everything already existed (the fast path of
 /// every later append: nothing created, nothing to sync).
-pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
+pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     refuse_reserved_mutation(path, Sanction::Residue)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
@@ -320,8 +307,8 @@ pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     // Create the chain TOP-DOWN (parents before their children) with the
-    // private 0o700 chmod, exactly as `create_dir_all` + `ensure_private_dir`
-    // would — one component at a time so the caller knows what was created. A
+    // private 0o700 chmod, exactly as `create_dir_all` would — one component
+    // at a time so the caller knows what was created. A
     // racing creation of an ancestor is tolerated (it exists; the chmod is
     // idempotent). NOTE: the chmod must be 0o700 (never [`set_private`]'s
     // 0o600) — a directory without its execute bit denies every subsequent
@@ -444,15 +431,18 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // for); the store's OWN mutations route through the `_fd` variants below.
 // =====================================================================
 
-/// Split a ROOT-RELATIVE path into its components, refusing every spelling
-/// that could resolve outside the owned root (see [`validate_rel`]) and
-/// returning the remaining components as raw bytes for the `openat`/
-/// `mkdirat` loops. [`Path::components`] has already erased trailing and
-/// repeated separators, so `a/b/` and `a//b` yield the same `a`, `b` as
-/// `a/b` and keep resolving identically.
-fn rel_components(rel: &Path) -> std::io::Result<Vec<&[u8]>> {
-    validate_rel(rel)?;
-    Ok(rel.components().map(|c| c.as_os_str().as_bytes()).collect())
+/// Split a ROOT-RELATIVE path into its components as raw bytes for the
+/// `openat`/`mkdirat` loops.
+///
+/// The path is ALREADY VALIDATED: every caller reaches this through a
+/// [`RootedRelativePath`] (the public boundary) or a component derived from
+/// one (a parent, a final name, or a generated temp name), so the spelling
+/// rule is enforced once, at the boundary, and is not re-derived here.
+/// [`Path::components`] has already erased trailing and repeated separators,
+/// so `a/b/` and `a//b` yield the same `a`, `b` as `a/b` and keep resolving
+/// identically.
+fn rel_components(rel: &Path) -> Vec<&[u8]> {
+    rel.components().map(|c| c.as_os_str().as_bytes()).collect()
 }
 
 /// Open `rel` relative to `dir_fd` COMPONENT-WISE with `O_NOFOLLOW`: every
@@ -470,6 +460,19 @@ fn rel_components(rel: &Path) -> std::io::Result<Vec<&[u8]>> {
 /// context.
 pub fn openat_no_follow_io(
     dir_fd: &OwnedFd,
+    rel: &RootedRelativePath,
+    flags: i32,
+    mode: u32,
+) -> std::io::Result<OwnedFd> {
+    openat_no_follow_io_path(dir_fd, rel.as_path(), flags, mode)
+}
+
+/// [`openat_no_follow_io`] for an INTERNAL, already-validated `&Path`: a
+/// component derived from a [`RootedRelativePath`] (a parent, a final name, or
+/// a generated temp name). It is PRIVATE because the public boundary is the
+/// validated type — an arbitrary caller-supplied spelling cannot reach it.
+fn openat_no_follow_io_path(
+    dir_fd: &OwnedFd,
     rel: &Path,
     flags: i32,
     mode: u32,
@@ -481,10 +484,11 @@ pub fn openat_no_follow_io(
     // is guarded without its author remembering to be. A read-only open
     // (`O_RDONLY` is 0) is untouched.
     if open_flags_mutate(flags) {
-        refuse_lock_record_mutation(rel).map_err(|e| std::io::Error::other(e.to_string()))?;
+        refuse_reserved_mutation(rel, Sanction::None)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
     }
     let mut cur: OwnedFd = dir_fd.try_clone()?;
-    let comps = rel_components(rel)?;
+    let comps = rel_components(rel);
     for (i, comp) in comps.iter().enumerate() {
         let is_last = i == comps.len() - 1;
         let f = if is_last {
@@ -516,8 +520,19 @@ fn open_flags_mutate(flags: i32) -> bool {
 
 /// [`openat_no_follow_io`] with the path context folded into the store
 /// error.
-pub fn openat_no_follow(dir_fd: &OwnedFd, rel: &Path, flags: i32, mode: u32) -> Result<OwnedFd> {
-    openat_no_follow_io(dir_fd, rel, flags, mode)
+pub fn openat_no_follow(
+    dir_fd: &OwnedFd,
+    rel: &RootedRelativePath,
+    flags: i32,
+    mode: u32,
+) -> Result<OwnedFd> {
+    openat_no_follow_path(dir_fd, rel.as_path(), flags, mode)
+}
+
+/// [`openat_no_follow`] for an INTERNAL, already-validated `&Path` (see
+/// [`openat_no_follow_io_path`]).
+fn openat_no_follow_path(dir_fd: &OwnedFd, rel: &Path, flags: i32, mode: u32) -> Result<OwnedFd> {
+    openat_no_follow_io_path(dir_fd, rel, flags, mode)
         .map_err(|e| Error::store(format!("openat {}: {e}", rel.display())))
 }
 
@@ -537,7 +552,7 @@ pub fn openat_no_follow(dir_fd: &OwnedFd, rel: &Path, flags: i32, mode: u32) -> 
 /// by [`openat_no_follow_io`], so a final-component symlink is refused (ELOOP)
 /// before the classification.
 fn openat_readable_regular(dir_fd: &OwnedFd, rel: &Path, flags: i32) -> std::io::Result<OwnedFd> {
-    let opened = openat_no_follow_io(dir_fd, rel, flags | libc::O_NONBLOCK, 0)?;
+    let opened = openat_no_follow_io_path(dir_fd, rel, flags | libc::O_NONBLOCK, 0)?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(opened.as_raw_fd(), &mut st) } < 0 {
         return Err(std::io::Error::last_os_error());
@@ -557,23 +572,18 @@ fn openat_readable_regular(dir_fd: &OwnedFd, rel: &Path, flags: i32) -> std::io:
 }
 
 /// Open the parent directory of `rel` relative to `root` (component-wise
-/// with O_NOFOLLOW), returning the parent fd and the final file name. The
-/// full `rel` is validated as ROOT-RELATIVE FIRST ([`rel_components`]):
-/// without that guard `rel.parent()` alone would let `/b` (whose parent is
-/// `/`) and `a/../b` (whose parent is `a/..`) resolve an OUTSIDE directory.
+/// with O_NOFOLLOW), returning the parent fd and the final file name.
+///
+/// `rel` is ALREADY VALIDATED, so `rel.parent()` cannot point outside the
+/// root: the boundary refused `/b` (whose parent is `/`) and `a/../b` (whose
+/// parent is `a/..`) before this is reached.
 fn parent_fd_of<'a>(root: &OwnedFd, rel: &'a Path) -> Result<(OwnedFd, &'a OsStr)> {
-    if let Err(e) = rel_components(rel) {
-        return Err(Error::store(format!(
-            "refusing path {}: {e}",
-            rel.display()
-        )));
-    }
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     let parent_fd = if parent_rel.as_os_str().is_empty() {
         root.try_clone()
             .map_err(|e| Error::store(format!("dup root dir: {e}")))?
     } else {
-        openat_no_follow(root, parent_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+        openat_no_follow_path(root, parent_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
     };
     let file_name = rel
         .file_name()
@@ -716,9 +726,10 @@ fn unlinkat_fd_owned(dir_fd: &OwnedFd, name: &OsStr) -> Result<()> {
 /// protocol. The primitive itself does not take the flock.
 pub(crate) fn remove_owned_lock_record_fd(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     owned: &OwnedLockRecord,
 ) -> Result<()> {
+    let rel = rel.as_path();
     let guarded = GuardedRel::new_for_owned_lock_record(rel, owned)?;
     if !guarded.is_owned_lock_record() {
         return Err(Error::conflict(format!(
@@ -958,10 +969,11 @@ fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Er
 /// cleanup point (the temp name no longer exists).
 pub fn write_atomic_replace_fd(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    let rel = rel.as_path();
     match replace_core(root, rel, None, true, bytes, fault)? {
         CoreReplace::Replaced(outcome) => Ok(outcome),
         CoreReplace::Mismatch => unreachable!("no expected content was supplied"),
@@ -978,10 +990,11 @@ pub fn write_atomic_replace_fd(
 /// otherwise identical (temp, fsync, rename, parent fsync).
 pub fn write_atomic_replace_fd_under_existing_parent(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
+    let rel = rel.as_path();
     match replace_core(root, rel, None, false, bytes, fault)? {
         CoreReplace::Replaced(outcome) => Ok(outcome),
         CoreReplace::Mismatch => unreachable!("no expected content was supplied"),
@@ -1057,7 +1070,7 @@ fn replace_core(
     // A replace whose TARGET is a lock-record spelling would rename a fresh
     // inode over the record and so admit a second holder (F2); the guard is
     // the SAME authority the removal primitives consult.
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     // The parent directory is created if missing — the same
     // `create_dir_all(parent)` the path-based protocol runs first —
     // component-wise with O_NOFOLLOW (a symlink injected into any parent
@@ -1073,7 +1086,7 @@ fn replace_core(
         // name AND durable across power loss") is true for the WHOLE chain,
         // not only for the final entry's parent. The non-durable helper used
         // to leave the created directories' entries unsynced (A1).
-        ensure_private_dir_durable_fd(root, parent_rel)?;
+        ensure_private_dir_durable_fd_path(root, parent_rel)?;
     }
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     // The FIRST compare: fail before writing a temp if the destination already
@@ -1092,7 +1105,7 @@ fn replace_core(
     }
     // A failed CREATE means the temp was never created (or the name belongs
     // to another writer): nothing to clean up, so the error propagates as-is.
-    let tmp_fd = openat_no_follow(
+    let tmp_fd = openat_no_follow_path(
         &parent_fd,
         Path::new(&tmp_name),
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
@@ -1115,7 +1128,7 @@ fn replace_core(
     if let Some(e) = fault(ReplaceStage::Sync) {
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
-    let f = match openat_no_follow(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
+    let f = match openat_no_follow_path(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
         Ok(fd) => std::fs::File::from(fd),
         Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
     };
@@ -1130,7 +1143,7 @@ fn replace_core(
     drop(f);
     // Private BEFORE visible: the temp carries 0o600 before the rename, so
     // no reader ever observes the marker with default permissions.
-    let f = match openat_no_follow(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
+    let f = match openat_no_follow_path(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
         Ok(fd) => std::fs::File::from(fd),
         Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
     };
@@ -1193,11 +1206,12 @@ fn replace_core(
 /// residual window between the second check and the `renameat`.
 pub fn write_atomic_if_match_fd(
     root: &RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     expected: &[u8],
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CompareReplace> {
+    let rel = rel.as_path();
     match replace_core(root, rel, Some(expected), true, bytes, fault)? {
         CoreReplace::Replaced(outcome) => Ok(CompareReplace::Replaced(outcome)),
         CoreReplace::Mismatch => Ok(CompareReplace::Mismatch),
@@ -1209,10 +1223,11 @@ pub fn write_atomic_if_match_fd(
 /// `root` with `openat(O_NOFOLLOW)`. A symlink injected at the final
 /// component is REFUSED (ELOOP) — never followed, never compared against
 /// its target.
-pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic_cas_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> Result<()> {
+    let rel = rel.as_path();
     // A CAS that would CREATE the record (or rewrite it) is a mutation of the
     // same spelling the id rule refuses; consult the ONE guard authority.
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     // If the file exists, its content must be byte-identical (an identical
     // rewrite is an idempotent success; a symlink at the final component is
@@ -1240,7 +1255,7 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
     let tmp_name = temp_file_name(file_name);
     // A failed CREATE means the temp was never created (or the name belongs
     // to another writer): nothing to clean up, so the error propagates as-is.
-    let tmp_fd = openat_no_follow(
+    let tmp_fd = openat_no_follow_path(
         &parent_fd,
         Path::new(&tmp_name),
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
@@ -1310,11 +1325,12 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
 /// The descriptor-relative private-directory creation: create `rel` (and
 /// every missing ancestor) component-wise relative to `root` with
 /// `mkdirat`/`openat(O_NOFOLLOW)`, chmodding the FINAL directory to 0o700
-/// (the same contract as [`ensure_private_dir`]). A symlink at any
-/// component is refused (ELOOP) — never followed.
-pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    let comps = rel_components(rel)
-        .map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
+/// (the private-directory contract: create the missing chain at 0o700 and
+/// chmod the FINAL directory to 0o700). A symlink at any component is refused
+/// (ELOOP) — never followed.
+pub fn ensure_private_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
+    let comps = rel_components(rel);
     let mut cur: OwnedFd = root
         .as_fd()
         .try_clone()
@@ -1341,9 +1357,14 @@ pub fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// parent of each created component (deepest first), then the parent of the
 /// new path's own parent — all through directory fds. Returns `true` when
 /// this call created at least one directory.
-pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool> {
-    let comps = rel_components(rel)
-        .map_err(|e| Error::store(format!("refusing path {}: {e}", rel.display())))?;
+pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
+    ensure_private_dir_durable_fd_path(root, rel.as_path())
+}
+
+/// [`ensure_private_dir_durable_fd`] for an INTERNAL, already-validated
+/// `&Path` (a parent derived from a [`RootedRelativePath`]).
+fn ensure_private_dir_durable_fd_path(root: &RootDir, rel: &Path) -> Result<bool> {
+    let comps = rel_components(rel);
     let mut dirs: Vec<OwnedFd> = Vec::with_capacity(comps.len());
     let mut cur: OwnedFd = root
         .as_fd()
@@ -1436,14 +1457,15 @@ pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool>
 
 /// The descriptor-relative parent-directory fsync: fsync the directory
 /// holding `rel` (the durability commit of a rename/removal inside it).
-pub fn sync_parent_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn sync_parent_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     let parent_fd = if parent_rel.as_os_str().is_empty() {
         root.as_fd()
             .try_clone()
             .map_err(|e| Error::store(format!("dup root dir: {e}")))?
     } else {
-        openat_no_follow(
+        openat_no_follow_path(
             root.as_fd(),
             parent_rel,
             libc::O_RDONLY | libc::O_DIRECTORY,
@@ -1461,12 +1483,13 @@ pub fn sync_parent_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// directory descriptor and the chmod would strip the directory's execute bit
 /// (0o600), leaving it unenterable. The opened inode is therefore classified
 /// and only [`PathKind::File`] is accepted.
-pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn set_private_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     // G4: the PATH-BASED `set_private` already consults the guard; this
     // descriptor-relative twin must too, so the two cannot disagree about the
     // record's spelling. A chmod preserves the inode (no holder split), but
     // consistency at the ONE authority is the point.
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = std::fs::File::from(openat_readable_regular(
         &parent_fd,
@@ -1494,7 +1517,7 @@ pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// symlink is never followed — and refuse if ANY entry's name is a lock-record
 /// spelling (F-A2).
 ///
-/// `refuse_lock_record_mutation` guards the path the caller NAMES; it cannot
+/// [`refuse_reserved_mutation`] guards the path the caller NAMES; it cannot
 /// see a record UNDER a directory the caller moves or removes. A `renameat` of
 /// an ancestor moves the record's inode with the directory, freeing the old
 /// path so a successor acquisition creates a SECOND inode — two simultaneous
@@ -1508,12 +1531,12 @@ pub fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// or absent `rel` needs no walk (there is no subtree to move into or out of
 /// it), and a symlink is never descended.
 fn refuse_lock_record_in_moved_subtree(root: &RootDir, rel: &Path) -> Result<()> {
-    match path_kind_fd(root, rel)? {
+    match path_kind_fd_path(root, rel)? {
         Some(PathKind::Dir) => {}
         _ => return Ok(()),
     }
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
-    let dir_fd = openat_no_follow(
+    let dir_fd = openat_no_follow_path(
         &parent_fd,
         Path::new(name),
         libc::O_RDONLY | libc::O_DIRECTORY,
@@ -1530,7 +1553,7 @@ fn refuse_lock_record_in_moved_subtree(root: &RootDir, rel: &Path) -> Result<()>
             let mode = fstatat_mode_io(&dir_fd, &entry)
                 .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
             if (mode & libc::S_IFMT) == libc::S_IFDIR {
-                let sub = openat_no_follow(
+                let sub = openat_no_follow_path(
                     &dir_fd,
                     Path::new(child_name),
                     libc::O_RDONLY | libc::O_DIRECTORY,
@@ -1545,7 +1568,8 @@ fn refuse_lock_record_in_moved_subtree(root: &RootDir, rel: &Path) -> Result<()>
 
 /// The descriptor-relative remove of a single file (or symlink — the
 /// symlink itself is removed, never its target).
-pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn remove_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     unlinkat_fd(&parent_fd, name, Sanction::None)
@@ -1558,7 +1582,13 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// demands a [`GuardedRel`] for each end — unforgeable tokens that only
 /// [`GuardedRel::new`] can mint — so no new primitive can name a rename
 /// without running the guard (R2, lens-g).
-pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+pub fn renameat_paths(
+    root: &RootDir,
+    from: &RootedRelativePath,
+    to: &RootedRelativePath,
+) -> Result<()> {
+    let from = from.as_path();
+    let to = to.as_path();
     // BOTH ends: renaming the record AWAY destroys the inode under the path a
     // successor acquires, and renaming ONTO it replaces the record's entry.
     // The public rename ALSO applies the residue authority at both ends, so a
@@ -1573,7 +1603,13 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
 /// carry a residue spelling (that is the point — the claim-aside IS the
 /// destination, the stranded aside IS the source), and the lock authority still
 /// runs on both.
-pub(crate) fn rename_residue_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn rename_residue_paths(
+    root: &RootDir,
+    from: &RootedRelativePath,
+    to: &RootedRelativePath,
+) -> Result<()> {
+    let from = from.as_path();
+    let to = to.as_path();
     // A residue `to` that ALREADY EXISTS is a stranded ORIGINAL the rename
     // would REPLACE: refuse it, exactly as the public rename does. An ABSENT
     // residue `to` is a fresh claim-aside (the engine's own), and a residue
@@ -1584,7 +1620,7 @@ pub(crate) fn rename_residue_paths(root: &RootDir, from: &Path, to: &Path) -> Re
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(crate::reserved::is_residue_name)
-        && path_kind_fd(root, to)?.is_some()
+        && path_kind_fd_path(root, to)?.is_some()
     {
         return Err(super::residue_refusal(to));
     }
@@ -1621,7 +1657,8 @@ fn renameat_paths_guarded(
 /// removed as the entry itself, never followed), subdirectories are
 /// recursed into, and the tree root is removed last. A symlink injected at
 /// any component is refused (ELOOP) — never followed.
-pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn remove_dir_all_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     // ONE gate: this refuses a lock-record spelling AND a residue spelling, on
     // the walk ROOT (the walk itself refuses every nested spelling).
     refuse_reserved_mutation(rel, Sanction::None)?;
@@ -1633,7 +1670,7 @@ pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// itself refuses every nested residue.
 fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
-    let dir_fd = openat_no_follow(
+    let dir_fd = openat_no_follow_path(
         &parent_fd,
         Path::new(name),
         libc::O_RDONLY | libc::O_DIRECTORY,
@@ -1655,7 +1692,8 @@ fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -
 /// lock-record spelling is still refused. This is the only sanctioned break of
 /// the implicit-removal residue guard, and it is reachable only through the
 /// caller's explicit discard.
-pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     // The FINAL-residue sanction lets the walk root through; the gate still
     // refuses a lock-record spelling (including a residue-shaped one) and a
     // residue in any NON-final component.
@@ -1671,7 +1709,8 @@ pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()
 /// `sync::Residue::discard`. The FINAL-residue sanction lets the strand
 /// through; the gate still refuses a lock-record spelling and a residue in any
 /// non-final component.
-pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::FinalResidue)?;
     require_final_residue(rel)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
@@ -1682,7 +1721,8 @@ pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// necessarily includes the residue root the sync renamed aside, so residues
 /// are permitted ANYWHERE on it (the engine's walk has already stopped on a
 /// nested strand); the LOCK authority still runs.
-pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::Residue)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     unlinkat_fd(&parent_fd, name, Sanction::Residue)
@@ -1691,7 +1731,8 @@ pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// The non-recursive `rmdir` of one (already-emptied) directory of the sync
 /// engine's own claim-aside walk; residues are permitted anywhere on the path
 /// (see [`remove_claim_file_fd`]), the LOCK authority still runs.
-pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     remove_dir_fd_inner(root, rel, Sanction::Residue)
 }
 
@@ -1706,7 +1747,13 @@ pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// stranded original. The previous `Sanction::Residue` here was dead (the
 /// chokepoint refused) and its comment claimed a create the copy must never
 /// make.
-pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn create_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    create_dir_fd_path(root, rel.as_path())
+}
+
+/// [`create_dir_fd`] for an INTERNAL, already-validated `&Path` (a child
+/// derived from a [`RootedRelativePath`]).
+fn create_dir_fd_path(root: &RootDir, rel: &Path) -> Result<()> {
     refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     mkdirat_fd(&parent_fd, name)
@@ -1719,7 +1766,8 @@ pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 ///
 /// This is the ONE rmdir authority: it guards the full path AND the syscall
 /// chokepoint guards the final name, so no caller can rmdir the record.
-pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn remove_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     remove_dir_fd_inner(root, rel, Sanction::None)
 }
 
@@ -1731,7 +1779,7 @@ fn remove_dir_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Re
             .try_clone()
             .map_err(|e| Error::store(format!("dup root dir: {e}")))?
     } else {
-        match openat_no_follow_io(
+        match openat_no_follow_io_path(
             root.as_fd(),
             parent_rel,
             libc::O_RDONLY | libc::O_DIRECTORY,
@@ -1763,11 +1811,12 @@ fn remove_dir_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Re
 /// This is the ONE symlink authority. The lock-record guard runs on the full
 /// path AND the `unlinkat`/`symlinkat` chokepoints guard the final name, so a
 /// call that names the record cannot destroy it and install a link (R1).
-pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+pub fn symlink_fd(root: &RootDir, target: &Path, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     if !parent_rel.as_os_str().is_empty() {
-        ensure_private_dir_durable_fd(root, parent_rel)?;
+        ensure_private_dir_durable_fd_path(root, parent_rel)?;
     }
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     match unlinkat_fd_io(&parent_fd, name, Sanction::None) {
@@ -1935,8 +1984,7 @@ fn refuse_overlapping_copy(
 /// closed): it is never a directory the copy could write into, and the guarded
 /// create would refuse it too.
 fn open_destination_anchor(root: &RootDir, dst_rel: &Path) -> Result<(OwnedFd, bool)> {
-    let comps = rel_components(dst_rel)
-        .map_err(|e| Error::store(format!("refusing path {}: {e}", dst_rel.display())))?;
+    let comps = rel_components(dst_rel);
     let mut cur: OwnedFd = root
         .as_fd()
         .try_clone()
@@ -2013,11 +2061,9 @@ fn dir_chain_contains(from: &OwnedFd, target: (u64, u64)) -> Result<bool> {
     )))
 }
 
-/// The bound on an ancestry walk. A directory chain on the supported platforms
-/// is limited by `PATH_MAX` in practice (each component costs at least two
-/// bytes), so this is far above any reachable depth while still bounding a
-/// filesystem that answered `..` with a different entry forever.
-const MAX_ANCESTRY: usize = 1 << 16;
+// The ancestry bound is SHARED with the Windows port: [`super::MAX_ANCESTRY`]
+// (single-sourced in `atomic/mod.rs`, next to the other shared atomic
+// constants).
 
 /// The ONE name gate the copy applies to every entry name BEFORE it lands:
 /// the crate's name authority ([`crate::manifest::validate_entry_path`], the
@@ -2100,8 +2146,7 @@ fn fd_entry_identity(fd: &OwnedFd) -> std::io::Result<crate::atomic::guard::Entr
 /// [`ensure_private_dir_fd`] does (the `mkdirat` mode is subject to the process
 /// umask).
 fn create_destination_chain(root: &RootDir, dst_rel: &Path) -> Result<(Option<u32>, Vec<PathBuf>)> {
-    let comps = rel_components(dst_rel)
-        .map_err(|e| Error::store(format!("refusing path {}: {e}", dst_rel.display())))?;
+    let comps = rel_components(dst_rel);
     let mut cur: OwnedFd = root
         .as_fd()
         .try_clone()
@@ -2479,7 +2524,12 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// shared directory-creation authority); only the FINAL directory gets the
 /// source's mode, and an intermediate staging directory's mode is outside the
 /// copied tree, so it is not part of a staged-object digest.
-pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
+pub fn copy_dir_recursive_fd(
+    root: &RootDir,
+    src: &Path,
+    dst_rel: &RootedRelativePath,
+) -> Result<()> {
+    let dst_rel = dst_rel.as_path();
     struct Frame {
         dst_rel: PathBuf,
         src_dir: OwnedFd,
@@ -2649,11 +2699,11 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                 // the call's own, so the undo journal restores it to 0o700 on a
                 // failure (making the partial tree removable) and the finalize
                 // gives it the source's exact mode on success.
-                create_dir_fd(root, &child_rel)?;
+                create_dir_fd_path(root, &child_rel)?;
                 undo.plan(&child_rel, 0o700);
                 set_dir_mode_fd(root, &child_rel, (mode | 0o200) & 0o7777)?;
                 dirs.push((child_rel.clone(), mode));
-                let child_fd = openat_no_follow_io(
+                let child_fd = openat_no_follow_io_path(
                     &top.src_dir,
                     Path::new(name_str),
                     libc::O_RDONLY | libc::O_DIRECTORY,
@@ -2745,7 +2795,7 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                 // Create-new-only through the mutating `openat` chokepoint
                 // (which runs the lock-record guard); a pre-existing entry is
                 // refused (O_EXCL), matching the source tool.
-                let dst_fd = openat_no_follow(
+                let dst_fd = openat_no_follow_path(
                     root.as_fd(),
                     &child_rel,
                     libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
@@ -2837,8 +2887,8 @@ fn copy_file_streaming(
 /// lock holder), but the lock-record spelling is still refused so a copy
 /// cannot even retune the record's mode.
 fn set_dir_mode_fd(root: &RootDir, rel: &Path, mode: u32) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
-    let fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
+    let fd = openat_no_follow_path(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     std::fs::File::from(fd)
         .set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))
@@ -2876,11 +2926,12 @@ fn set_dir_mode_fd(root: &RootDir, rel: &Path, mode: u32) -> Result<()> {
 /// fail-closed, error-propagating, deepest-first, and ITERATIVE (a deep tree
 /// surfaces a clean `Err`, never an abort). A caller fsyncing trees deeper than
 /// a few hundred levels should prefer a streaming walk.
-pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
+pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
+    let rel = rel.as_path();
     let mut dirs: Vec<PathBuf> = vec![rel.to_path_buf()];
     let mut stack: Vec<PathBuf> = vec![rel.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in read_dir_fd(root, &dir)? {
+        for entry in read_dir_fd_path(root, &dir)? {
             let child = dir.join(&entry.name);
             if entry.is_dir {
                 dirs.push(child.clone());
@@ -2889,8 +2940,8 @@ pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
                 // Symlinks and other entry kinds are SKIPPED (their
                 // durability is their directory entry, covered by the
                 // parent's fsync below); only a regular file is fsynced.
-                if let Some(PathKind::File) = path_kind_fd(root, &child)? {
-                    let fd = openat_no_follow(root.as_fd(), &child, libc::O_RDONLY, 0)?;
+                if let Some(PathKind::File) = path_kind_fd_path(root, &child)? {
+                    let fd = openat_no_follow_path(root.as_fd(), &child, libc::O_RDONLY, 0)?;
                     std::fs::File::from(fd)
                         .sync_all()
                         .map_err(|e| Error::store(format!("fsync {}: {e}", child.display())))?;
@@ -2902,7 +2953,7 @@ pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
     // that names it is fsynced.
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     for dir in dirs {
-        let fd = openat_no_follow(root.as_fd(), &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let fd = openat_no_follow_path(root.as_fd(), &dir, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         fsync_dir_fd(&fd)?;
     }
     Ok(())
@@ -2984,7 +3035,7 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
             let mode = fstatat_mode_io(&top.fd, &name)
                 .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
             if (mode & libc::S_IFMT) == libc::S_IFDIR {
-                let sub = openat_no_follow(
+                let sub = openat_no_follow_path(
                     &top.fd,
                     Path::new(child_name),
                     libc::O_RDONLY | libc::O_DIRECTORY,
@@ -3029,7 +3080,8 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 /// Semantics follow the Unix `std::fs::remove_dir_all` the transport relied
 /// on: a MISSING `path` is a successful no-op (idempotent removal), and a
 /// symlink at `path` is unlinked as the entry itself, never followed.
-pub fn remove_dir_all_path(path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn remove_dir_all_path(path: &Path) -> Result<()> {
     // The ONE gate covers both authorities: the lock-record spelling AND the
     // residue spelling (this path-based primitive walked straight over a
     // stranded aside before).
@@ -3087,11 +3139,12 @@ pub fn remove_dir_all_path(path: &Path) -> Result<()> {
 /// No in-crate production caller uses this primitive; it remains for the
 /// confinement tests (which exercise the create-or-truncate open's refusal of
 /// a symlink and a traversal spelling).
-pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> Result<()> {
+    let rel = rel.as_path();
     // Create-or-truncate would rewrite the record's content in place.
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
-    let f = openat_no_follow(
+    let f = openat_no_follow_path(
         &parent_fd,
         Path::new(name),
         libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
@@ -3126,7 +3179,8 @@ pub fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
 /// the root the descriptor pins. `O_NONBLOCK` (a no-op for a regular file)
 /// plus the `fstat` classification of the OPENED inode refuse a FIFO/socket/
 /// device promptly instead of hanging forever on a FIFO (A2).
-pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
+pub fn read_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+    let rel = rel.as_path();
     let f = openat_readable_regular(root.as_fd(), rel, libc::O_RDONLY)
         .map_err(|e| Error::store(format!("openat {}: {e}", rel.display())))?;
     read_fd_to_end(&f)
@@ -3139,7 +3193,8 @@ pub fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
 /// read with `readlinkat` without following it. A final component that is not a
 /// symlink is an error, and a missing entry is the same [`Error::store`] class
 /// the other `_fd` primitives report.
-pub fn read_link_fd(root: &RootDir, rel: &Path) -> Result<PathBuf> {
+pub fn read_link_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<PathBuf> {
+    let rel = rel.as_path();
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let c = CString::new(name.as_bytes())
         .map_err(|_| Error::store("readlink path component with NUL"))?;
@@ -3171,7 +3226,10 @@ pub fn read_link_fd(root: &RootDir, rel: &Path) -> Result<PathBuf> {
 
 /// [`read_fd`] + JSON deserialization (the descriptor-relative mirror of
 /// [`read_json`] for the store's own record reads).
-pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) -> Result<T> {
+pub fn read_json_fd<T: serde::de::DeserializeOwned>(
+    root: &RootDir,
+    rel: &RootedRelativePath,
+) -> Result<T> {
     let bytes = read_fd(root, rel)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| Error::store(format!("deserialize {}: {e}", rel.display())))
@@ -3185,7 +3243,8 @@ pub fn read_json_fd<T: serde::de::DeserializeOwned>(root: &RootDir, rel: &Path) 
 /// error is a real failure → [`Error::store`], NEVER treated as absence.
 /// The final open is `O_NONBLOCK` and the OPENED inode is classified, so a
 /// FIFO is refused promptly (A2) instead of blocking the open forever.
-pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
+pub fn path_state_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
+    let rel = rel.as_path();
     match openat_readable_regular(root.as_fd(), rel, libc::O_RDONLY) {
         Ok(fd) => {
             let f = std::fs::File::from(fd);
@@ -3216,7 +3275,13 @@ pub fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
 /// [`Error::store`].
 ///
 /// [`parent_fd_of`]: super::parent_fd_of
-pub fn path_kind_fd(root: &RootDir, rel: &Path) -> Result<Option<PathKind>> {
+pub fn path_kind_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Option<PathKind>> {
+    path_kind_fd_path(root, rel.as_path())
+}
+
+/// [`path_kind_fd`] for an INTERNAL, already-validated `&Path` (a child
+/// derived from a [`RootedRelativePath`]).
+fn path_kind_fd_path(root: &RootDir, rel: &Path) -> Result<Option<PathKind>> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let c = CString::new(name.as_bytes()).map_err(|_| Error::store("path component with NUL"))?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -3255,17 +3320,25 @@ fn kind_from_mode(mode: libc::mode_t) -> PathKind {
 /// at any component is refused — ELOOP — never followed). Each entry is
 /// classified with `fstatat(AT_SYMLINK_NOFOLLOW)` (a symlink entry is
 /// reported as a non-directory, never followed). `rel` must name at least one
-/// normal component: [`validate_rel`] refuses the empty and `.` spellings, so
-/// the OWNED ROOT itself is enumerated with [`read_root_dir_fd`] instead.
-pub fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
-    let dir_fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+/// normal component: the validated boundary refuses the empty and `.`
+/// spellings, so the OWNED ROOT itself is enumerated with [`read_root_dir_fd`]
+/// instead.
+pub fn read_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Vec<DirEntry>> {
+    read_dir_fd_path(root, rel.as_path())
+}
+
+/// [`read_dir_fd`] for an INTERNAL, already-validated `&Path` (a directory
+/// derived from a [`RootedRelativePath`]).
+fn read_dir_fd_path(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
+    let dir_fd = openat_no_follow_path(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     read_dir_of_opened_fd(&dir_fd, rel)
 }
 
 /// Read the entries of the OWNED ROOT itself.
 ///
-/// `read_dir_fd(root, "")` and `read_dir_fd(root, ".")` are refused by
-/// [`validate_rel`] — those spellings name the root, not an entry UNDER it —
+/// `read_dir_fd(root, "")` and `read_dir_fd(root, ".")` are refused by the
+/// validated [`RootedRelativePath`] boundary — those spellings name the root,
+/// not an entry UNDER it —
 /// so before this function a consumer had NO public way to enumerate the root
 /// and could not reach residue sitting directly at the store root (a crashed
 /// temp, a stray file). The root descriptor is already pinned by the
@@ -3316,17 +3389,23 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, Sanction, copy_dir_recursive_fd,
-        fsync_tree_recursive_fd, openat_no_follow, parent_fd_of, path_kind_fd, read_dir_fd,
-        read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_dir_all_path,
-        remove_dir_fd, remove_file_fd, remove_owned_lock_record_fd, remove_residue_dir_all_fd,
-        remove_residue_file_fd, rename_residue_paths, renameat_fd, renameat_paths,
-        replace_order_probe, set_private_fd, symlink_fd, write_atomic_cas_fd, write_atomic_replace,
-        write_atomic_replace_fd, write_file_fd,
+        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, RootedRelativePath, Sanction,
+        copy_dir_recursive_fd, fsync_tree_recursive_fd, openat_no_follow, parent_fd_of,
+        path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd,
+        remove_dir_all_path, remove_dir_fd, remove_file_fd, remove_owned_lock_record_fd,
+        remove_residue_dir_all_fd, remove_residue_file_fd, rename_residue_paths, renameat_fd,
+        renameat_paths, replace_order_probe, set_private_fd, symlink_fd, write_atomic_cas_fd,
+        write_atomic_replace, write_atomic_replace_fd, write_file_fd,
     };
     use crate::error::ReservedKind;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+
+    /// A validated root-relative path for the tests: the primitives take the
+    /// validated type, so a test spelling is parsed at the boundary too.
+    fn rp(s: &str) -> RootedRelativePath {
+        RootedRelativePath::parse(Path::new(s)).unwrap()
+    }
 
     /// The entry names DIRECTLY under the path-based directory `dir`, sorted:
     /// a failed replace must leave NOTHING but the names the test seeded.
@@ -3341,7 +3420,7 @@ mod tests {
 
     /// The entry names directly under the descriptor-relative directory `rel`
     /// (through the module's own walk), sorted.
-    fn dir_names_fd(root: &RootDir, rel: &Path) -> Vec<String> {
+    fn dir_names_fd(root: &RootDir, rel: &RootedRelativePath) -> Vec<String> {
         let mut names: Vec<String> = read_dir_fd(root, rel)
             .unwrap()
             .into_iter()
@@ -3391,7 +3470,7 @@ mod tests {
         let (dir, root) = owned_root();
         std::os::unix::fs::symlink("target.txt", dir.path().join("link")).unwrap();
         assert_eq!(
-            read_link_fd(&root, Path::new("link")).unwrap(),
+            read_link_fd(&root, &rp("link")).unwrap(),
             PathBuf::from("target.txt")
         );
     }
@@ -3406,7 +3485,7 @@ mod tests {
         std::os::unix::fs::symlink("OUTSIDE-TARGET", outside.join("secret")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.path().join("sub")).unwrap();
 
-        let err = read_link_fd(&root, Path::new("sub/secret"))
+        let err = read_link_fd(&root, &rp("sub/secret"))
             .expect_err("a read through a symlink-injected parent must be refused");
         assert!(
             matches!(err, Error::Store(_)),
@@ -3434,7 +3513,7 @@ mod tests {
     fn read_link_fd_errors_when_the_final_component_is_not_a_symlink() {
         let (dir, root) = owned_root();
         std::fs::write(dir.path().join("plain.txt"), b"x").unwrap();
-        let err = read_link_fd(&root, Path::new("plain.txt"))
+        let err = read_link_fd(&root, &rp("plain.txt"))
             .expect_err("a non-symlink final component must be an error");
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
         assert!(
@@ -3448,8 +3527,7 @@ mod tests {
     #[test]
     fn read_link_fd_reports_a_missing_entry_as_a_store_error() {
         let (_dir, root) = owned_root();
-        let err =
-            read_link_fd(&root, Path::new("missing")).expect_err("a missing entry must error");
+        let err = read_link_fd(&root, &rp("missing")).expect_err("a missing entry must error");
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
     }
 
@@ -3475,32 +3553,32 @@ mod tests {
         );
 
         assert_eq!(
-            path_kind_fd(&root, Path::new("file")).unwrap(),
+            path_kind_fd(&root, &rp("file")).unwrap(),
             Some(PathKind::File),
             "a regular file is File"
         );
         assert_eq!(
-            path_kind_fd(&root, Path::new("dir")).unwrap(),
+            path_kind_fd(&root, &rp("dir")).unwrap(),
             Some(PathKind::Dir),
             "a directory is Dir"
         );
         assert_eq!(
-            path_kind_fd(&root, Path::new("link")).unwrap(),
+            path_kind_fd(&root, &rp("link")).unwrap(),
             Some(PathKind::Symlink),
             "a symlink is Symlink, never its target's kind"
         );
         assert_eq!(
-            path_kind_fd(&root, Path::new("dirlink")).unwrap(),
+            path_kind_fd(&root, &rp("dirlink")).unwrap(),
             Some(PathKind::Symlink),
             "a symlink TO A DIRECTORY must still be Symlink, never Dir"
         );
         assert_eq!(
-            path_kind_fd(&root, Path::new("fifo")).unwrap(),
+            path_kind_fd(&root, &rp("fifo")).unwrap(),
             Some(PathKind::Other),
             "a FIFO is Other"
         );
         assert_eq!(
-            path_kind_fd(&root, Path::new("missing")).unwrap(),
+            path_kind_fd(&root, &rp("missing")).unwrap(),
             None,
             "a missing path is absence"
         );
@@ -3517,7 +3595,7 @@ mod tests {
         std::fs::write(outside.join("secret"), b"OUTSIDE").unwrap();
         std::os::unix::fs::symlink(&outside, dir.path().join("sub")).unwrap();
 
-        let err = path_kind_fd(&root, Path::new("sub/secret"))
+        let err = path_kind_fd(&root, &rp("sub/secret"))
             .expect_err("a parent-component symlink must be refused, not followed");
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
         assert!(
@@ -3527,11 +3605,13 @@ mod tests {
     }
 
     /// An absolute path, a `..` walk, a `.`, and the empty path are refused
-    /// by the ROOT-RELATIVE guard — before any `fstatat` — exactly as the
-    /// other `_fd` primitives refuse them.
+    /// by the VALIDATED BOUNDARY ([`RootedRelativePath::parse`]) — the ONE
+    /// place a root-relative spelling is checked now that the primitives take
+    /// the type. The primitive can no longer be handed such a spelling at all,
+    /// so the refusal is asserted where it happens.
     #[test]
     fn path_kind_fd_refuses_escaping_spellings() {
-        let (dir, root) = owned_root();
+        let (dir, _root) = owned_root();
         let absolute = dir.path().join("outside").as_os_str().to_os_string();
         for spelling in [
             PathBuf::from("/etc"),
@@ -3542,11 +3622,11 @@ mod tests {
             PathBuf::from("."),
             PathBuf::new(),
         ] {
-            let err = path_kind_fd(&root, &spelling)
+            let err = RootedRelativePath::parse(&spelling)
                 .expect_err("an escaping or empty spelling must be refused");
             assert!(
-                matches!(err, Error::Store(_)) && err.to_string().contains("normal component"),
-                "{spelling:?} must be refused by the root-relative guard, got: {err}"
+                matches!(err, Error::Transport(_)),
+                "{spelling:?} must be refused by the validated boundary, got: {err}"
             );
         }
     }
@@ -3608,9 +3688,9 @@ mod tests {
 
     /// The root-relative spelling rule, pinned: trailing and repeated
     /// separators name the SAME in-root entry, while an absolute path, a
-    /// `..` walk, `.`, and the empty path are refused by the ROOT-RELATIVE
-    /// GUARD — not incidentally by a missing or symlinked outside entry —
-    /// and so can never resolve to an outside entry.
+    /// `..` walk, a literal `.` segment, and the empty path are refused by the
+    /// VALIDATED BOUNDARY — not incidentally by a missing or symlinked outside
+    /// entry — and so can never resolve to an outside entry.
     #[test]
     fn relative_path_spelling_resolves_identically_or_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3619,13 +3699,22 @@ mod tests {
         let root = RootDir::open(&root_path).expect("open the owned root");
         std::fs::create_dir_all(root_path.join("a")).unwrap();
         std::fs::write(root_path.join("a/b"), b"IN-ROOT").unwrap();
-        for spelling in ["a/b", "a/b/", "a//b", "a/./b"] {
+        for spelling in ["a/b", "a/b/", "a//b"] {
             assert_eq!(
-                read_fd(&root, Path::new(spelling)).unwrap(),
+                read_fd(&root, &rp(spelling)).unwrap(),
                 b"IN-ROOT".to_vec(),
                 "{spelling:?} must name the same entry as a/b"
             );
         }
+        // THE DELIBERATE TIGHTENING (constraint #1): `a/./b` used to resolve
+        // to `a/b` through the looser `validate_rel` guard (which inherited
+        // `Path::components`' erasure of a non-leading `.`). The validated
+        // boundary scans the literal spelling and REFUSES it, so it is no
+        // longer an accepted spelling.
+        assert!(
+            RootedRelativePath::parse(Path::new("a/./b")).is_err(),
+            "a literal `.` segment must be refused by the validated boundary"
+        );
 
         // A real OUTSIDE file a `..` walk would reach if it were resolved:
         // the root lives one level down, so `../outside-secret` is a real
@@ -3643,19 +3732,19 @@ mod tests {
             PathBuf::new(),
             Path::new(&absolute).to_path_buf(),
         ] {
-            let err = read_fd(&root, &spelling)
+            let err = RootedRelativePath::parse(&spelling)
                 .expect_err("an escaping or empty spelling must be refused");
-            let text = err.to_string();
             assert!(
-                matches!(err, Error::Store(_)) && text.contains("normal component"),
-                "{spelling:?} must be refused by the root-relative guard, got: {text}"
+                matches!(err, Error::Transport(_)),
+                "{spelling:?} must be refused by the validated boundary, got: {err}"
             );
         }
 
         // A mutation spelling is refused the same way: nothing lands outside.
-        let err = super::write_file_fd(&root, Path::new("../outside-secret"), b"NOPE")
-            .expect_err("a `..` mutation spelling must be refused");
-        assert!(err.to_string().contains("normal component"), "got: {err}");
+        assert!(
+            RootedRelativePath::parse(Path::new("../outside-secret")).is_err(),
+            "a `..` mutation spelling must be refused by the validated boundary"
+        );
         assert_eq!(
             std::fs::read(&outside).unwrap().as_slice(),
             b"OUTSIDE-SECRET",
@@ -3707,7 +3796,7 @@ mod tests {
     /// temp entry in the parent directory.
     #[test]
     fn failed_fd_replace_at_each_pre_rename_stage_leaves_no_temp_and_old_content() {
-        let rel = Path::new("sub/marker.json");
+        let rel = &rp("sub/marker.json");
         for stage in [
             ReplaceStage::Write,
             ReplaceStage::Sync,
@@ -3727,7 +3816,7 @@ mod tests {
                 "{stage:?}: the OLD content must stay visible"
             );
             assert_eq!(
-                dir_names_fd(&root, Path::new("sub")),
+                dir_names_fd(&root, &rp("sub")),
                 only("marker.json"),
                 "{stage:?}: a failed replace must leave no stray temp"
             );
@@ -3762,12 +3851,11 @@ mod tests {
     fn real_fd_rename_failure_onto_a_directory_leaves_no_temp() {
         let (dir, root) = owned_root();
         std::fs::create_dir_all(dir.path().join("sub/marker.json")).unwrap();
-        let err =
-            write_atomic_replace_fd(&root, Path::new("sub/marker.json"), b"NEW", &mut |_| None)
-                .unwrap_err();
+        let err = write_atomic_replace_fd(&root, &rp("sub/marker.json"), b"NEW", &mut |_| None)
+            .unwrap_err();
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
         assert_eq!(
-            dir_names_fd(&root, Path::new("sub")),
+            dir_names_fd(&root, &rp("sub")),
             only("marker.json"),
             "a real renameat failure must leave no stray temp"
         );
@@ -3800,7 +3888,7 @@ mod tests {
     #[test]
     fn post_rename_fsync_fault_leaves_new_content_and_no_temp_fd() {
         let (dir, root) = owned_root();
-        let rel = Path::new("marker.json");
+        let rel = &rp("marker.json");
         std::fs::write(dir.path().join("marker.json"), b"OLD").unwrap();
         let outcome = write_atomic_replace_fd(&root, rel, b"NEW", &mut |s| {
             (s == ReplaceStage::DirSync).then(|| Error::store("injected dir fsync fault"))
@@ -3830,14 +3918,11 @@ mod tests {
         assert_eq!(entry_names(dir.path()), only("marker.json"));
 
         let (_dir, root) = owned_root();
-        let rel = Path::new("nested/marker.json");
+        let rel = &rp("nested/marker.json");
         let outcome = write_atomic_replace_fd(&root, rel, b"NEW", &mut |_| None).unwrap();
         assert!(matches!(outcome, ReplaceOutcome::ReplacedDurable));
         assert_eq!(read_fd(&root, rel).unwrap(), b"NEW".to_vec());
-        assert_eq!(
-            dir_names_fd(&root, Path::new("nested")),
-            only("marker.json")
-        );
+        assert_eq!(dir_names_fd(&root, &rp("nested")), only("marker.json"));
     }
 
     /// The cleanup is best-effort but NOT silent: when the temp cannot be
@@ -3895,13 +3980,13 @@ mod tests {
     #[test]
     fn committed_replace_and_cas_leave_no_temp() {
         let (dir, root) = owned_root();
-        let rel = Path::new("marker.json");
+        let rel = &rp("marker.json");
         write_atomic_replace_fd(&root, rel, b"NEW", &mut |_| None).unwrap();
         assert_eq!(entry_names(dir.path()), only("marker.json"));
         assert_eq!(read_fd(&root, rel).unwrap(), b"NEW".to_vec());
 
         let (dir, root) = owned_root();
-        let rel = Path::new("cas.json");
+        let rel = &rp("cas.json");
         write_atomic_cas_fd(&root, rel, b"FIRST").unwrap();
         assert_eq!(entry_names(dir.path()), only("cas.json"));
         write_atomic_cas_fd(&root, rel, b"FIRST").unwrap();
@@ -3916,7 +4001,7 @@ mod tests {
     #[test]
     fn refusing_cas_leaves_only_the_destination() {
         let (dir, root) = owned_root();
-        let rel = Path::new("cas.json");
+        let rel = &rp("cas.json");
         std::fs::write(dir.path().join("cas.json"), b"OLD").unwrap();
         let err = write_atomic_cas_fd(&root, rel, b"NEW").unwrap_err();
         assert!(
@@ -4029,7 +4114,7 @@ mod tests {
         let (_dir, root) = owned_root();
         replace_order_probe::begin();
         let outcome =
-            write_atomic_replace_fd(&root, Path::new("newdir/sub/file.txt"), b"x", &mut |_| None)
+            write_atomic_replace_fd(&root, &rp("newdir/sub/file.txt"), b"x", &mut |_| None)
                 .unwrap();
         let events = replace_order_probe::take();
         assert!(
@@ -4095,19 +4180,20 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Residue sitting DIRECTLY at the store root used to be unreachable: the
-    /// empty and `.` spellings are refused by `validate_rel`. The dedicated
-    /// root enumerator reaches it, while those child spellings stay refused.
+    /// empty and `.` spellings are refused by the validated boundary. The
+    /// dedicated root enumerator reaches it, while those child spellings stay
+    /// refused.
     #[test]
     fn the_owned_root_is_enumerable_and_root_child_spellings_stay_refused() {
         let (dir, root) = owned_root();
         std::fs::write(dir.path().join("root-residue"), b"x").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         assert!(
-            read_dir_fd(&root, Path::new("")).is_err(),
+            RootedRelativePath::parse(Path::new("")).is_err(),
             "the empty spelling names the root, not an entry under it"
         );
         assert!(
-            read_dir_fd(&root, Path::new(".")).is_err(),
+            RootedRelativePath::parse(Path::new(".")).is_err(),
             "the `.` spelling names the root, not an entry under it"
         );
         let mut names: Vec<String> = read_root_dir_fd(&root)
@@ -4169,7 +4255,7 @@ mod tests {
         let path = dir.path().join("operation.lock");
         let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
         let inode_a = std::fs::metadata(&path).unwrap().ino();
-        let err = remove_file_fd(&root, Path::new("operation.lock"))
+        let err = remove_file_fd(&root, &rp("operation.lock"))
             .expect_err("removing the crate's lock record through the substrate must be refused");
         assert!(
             matches!(err, Error::Conflict(_)),
@@ -4191,7 +4277,7 @@ mod tests {
         );
         drop(holder);
         // The case ALIAS of the record is protected too (A3/A5).
-        let alias_err = remove_file_fd(&root, Path::new(".Destroot.Operation.Lock"))
+        let alias_err = remove_file_fd(&root, &rp(".Destroot.Operation.Lock"))
             .expect_err("a case alias of the lock record must be refused");
         assert!(matches!(alias_err, Error::Conflict(_)), "{alias_err:?}");
     }
@@ -4208,11 +4294,8 @@ mod tests {
         let path = dir.path().join("operation.lock");
         let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
         let inode_a = std::fs::metadata(&path).unwrap().ino();
-        let err =
-            write_atomic_replace_fd(&root, Path::new("operation.lock"), b"evil", &mut |_| None)
-                .expect_err(
-                    "replacing the crate's lock record through the substrate must be refused",
-                );
+        let err = write_atomic_replace_fd(&root, &rp("operation.lock"), b"evil", &mut |_| None)
+            .expect_err("replacing the crate's lock record through the substrate must be refused");
         assert!(
             matches!(err, Error::Conflict(_)),
             "the replace refusal is a conflict: {err:?}"
@@ -4232,10 +4315,10 @@ mod tests {
         );
         // Every mutating primitive that could reach the record consults the
         // SAME authority: the CAS and the plain write refuse too.
-        let cas = write_atomic_cas_fd(&root, Path::new(".Destroot.Operation.Lock"), b"evil")
+        let cas = write_atomic_cas_fd(&root, &rp(".Destroot.Operation.Lock"), b"evil")
             .expect_err("a CAS of a case alias of the record must be refused");
         assert!(matches!(cas, Error::Conflict(_)), "{cas:?}");
-        let plain = write_file_fd(&root, Path::new("OPERATION.LOCK"), b"evil")
+        let plain = write_file_fd(&root, &rp("OPERATION.LOCK"), b"evil")
             .expect_err("a plain write of an alias of the record must be refused");
         assert!(matches!(plain, Error::Conflict(_)), "{plain:?}");
         drop(holder);
@@ -4255,7 +4338,7 @@ mod tests {
         let path = dir.path().join("state/operation.lock");
         let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
         let inode_a = std::fs::metadata(&path).unwrap().ino();
-        let err = remove_dir_all_fd(&root, Path::new("state"))
+        let err = remove_dir_all_fd(&root, &rp("state"))
             .expect_err("removing an ancestor of the lock record must be refused");
         assert!(
             matches!(err, Error::Conflict(_)),
@@ -4333,7 +4416,7 @@ mod tests {
         let path = dir.path().join("state/inner/operation.lock");
         let holder = crate::lock::FileLock::acquire(&path, "op-A").expect("A acquires");
         let inode_a = std::fs::metadata(&path).unwrap().ino();
-        let err = renameat_paths(&root, Path::new("state"), Path::new("state2"))
+        let err = renameat_paths(&root, &rp("state"), &rp("state2"))
             .expect_err("renaming an ancestor of the lock record must be refused");
         assert!(
             matches!(err, Error::Conflict(_)),
@@ -4367,7 +4450,7 @@ mod tests {
         let (dir, root) = owned_root();
         std::fs::create_dir_all(dir.path().join("state/inner")).unwrap();
         std::fs::write(dir.path().join("state/inner/data"), b"x").unwrap();
-        renameat_paths(&root, Path::new("state"), Path::new("state2"))
+        renameat_paths(&root, &rp("state"), &rp("state2"))
             .expect("a record-free directory rename must still succeed");
         assert!(dir.path().join("state2/inner/data").exists());
         assert!(!dir.path().join("state").exists());
@@ -4387,7 +4470,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        let err = set_private_fd(&root, Path::new("sub"))
+        let err = set_private_fd(&root, &rp("sub"))
             .expect_err("chmodding a directory to 0o600 must be refused");
         assert!(matches!(err, Error::Store(_)), "got: {err:?}");
         let mode = std::fs::metadata(dir.path().join("sub"))
@@ -4402,7 +4485,7 @@ mod tests {
         std::fs::write(dir.path().join("f"), b"x").unwrap();
         std::fs::set_permissions(dir.path().join("f"), std::fs::Permissions::from_mode(0o644))
             .unwrap();
-        set_private_fd(&root, Path::new("f")).expect("a regular file is chmodded");
+        set_private_fd(&root, &rp("f")).expect("a regular file is chmodded");
         let file_mode = std::fs::metadata(dir.path().join("f"))
             .unwrap()
             .permissions()
@@ -4420,7 +4503,7 @@ mod tests {
     fn set_private_fd_refuses_the_lock_record() {
         let (dir, root) = owned_root();
         std::fs::write(dir.path().join("operation.lock"), b"HELD").unwrap();
-        let err = set_private_fd(&root, Path::new("operation.lock"))
+        let err = set_private_fd(&root, &rp("operation.lock"))
             .expect_err("the descriptor-relative chmod must refuse the lock record");
         assert!(
             format!("{err}").contains("lock record"),
@@ -4489,7 +4572,7 @@ mod tests {
         std::fs::write(dir.path().join("operation.lock"), b"HELD-BY-A").unwrap();
         let err = openat_no_follow(
             root.as_fd(),
-            Path::new("operation.lock"),
+            &rp("operation.lock"),
             libc::O_WRONLY | libc::O_TRUNC,
             0,
         )
@@ -4504,7 +4587,7 @@ mod tests {
             "the record's content must be intact"
         );
         // A READ-ONLY open is unaffected (the guard is keyed on the flags).
-        let fd = openat_no_follow(root.as_fd(), Path::new("operation.lock"), libc::O_RDONLY, 0)
+        let fd = openat_no_follow(root.as_fd(), &rp("operation.lock"), libc::O_RDONLY, 0)
             .expect("a read-only open of the record is not a mutation");
         drop(fd);
     }
@@ -4526,7 +4609,7 @@ mod tests {
         std::fs::write(&stranded, b"precious").unwrap();
 
         // (a) Removing the ANCESTOR walks over the aside without the guard.
-        let err = remove_dir_all_fd(&root, Path::new("victim"))
+        let err = remove_dir_all_fd(&root, &rp("victim"))
             .expect_err("removing an ancestor of a stranded aside must be refused");
         assert!(
             matches!(
@@ -4562,7 +4645,7 @@ mod tests {
         assert!(aside_abs.exists(), "the aside survives the refused removal");
 
         // (c) The descriptor-relative primitive, for the same root spelling.
-        let err = remove_dir_all_fd(&root, Path::new("victim/.sync-aside.1234.0"))
+        let err = remove_dir_all_fd(&root, &rp("victim/.sync-aside.1234.0"))
             .expect_err("removing the stranded aside itself must be refused");
         assert!(
             matches!(
@@ -4580,7 +4663,7 @@ mod tests {
         // authority (the residue guard must not have replaced it).
         std::fs::create_dir_all(dir.path().join("other")).unwrap();
         std::fs::write(dir.path().join("other/.dest.operation.lock"), b"held").unwrap();
-        let err = remove_dir_all_fd(&root, Path::new("other"))
+        let err = remove_dir_all_fd(&root, &rp("other"))
             .expect_err("a lock record in the removed tree is still refused");
         assert!(format!("{err}").contains("lock record"), "{err}");
     }
@@ -4628,18 +4711,18 @@ mod tests {
         };
         let owned = crate::atomic::OwnedLockRecord::local(dir.path(), &layout);
 
-        remove_owned_lock_record_fd(&root, Path::new(".gone.operation.lock"), &owned)
+        remove_owned_lock_record_fd(&root, &rp(".gone.operation.lock"), &owned)
             .expect("the owned record is retired");
         assert!(!dir.path().join(".gone.operation.lock").exists());
 
-        let err = remove_owned_lock_record_fd(&root, Path::new(".keep.operation.lock"), &owned)
+        let err = remove_owned_lock_record_fd(&root, &rp(".keep.operation.lock"), &owned)
             .expect_err("a record the authority does not own must be refused");
         assert!(matches!(err, Error::Conflict(_)), "{err:?}");
         assert!(dir.path().join(".keep.operation.lock").exists());
 
         std::fs::write(dir.path().join("ordinary"), b"data").unwrap();
         assert!(
-            remove_owned_lock_record_fd(&root, Path::new("ordinary"), &owned).is_err(),
+            remove_owned_lock_record_fd(&root, &rp("ordinary"), &owned).is_err(),
             "ordinary content is not reachable through the retirement primitive"
         );
         assert!(dir.path().join("ordinary").exists());
@@ -4656,7 +4739,7 @@ mod tests {
         std::fs::write(dir.path().join(".sync-aside.7.0/nested/deep/f"), b"x").unwrap();
 
         // The IMPLICIT removal still refuses it.
-        assert!(remove_dir_all_fd(&root, Path::new(".sync-aside.7.0")).is_err());
+        assert!(remove_dir_all_fd(&root, &rp(".sync-aside.7.0")).is_err());
 
         // A NESTED strand stops the discard.
         std::fs::create_dir_all(dir.path().join(".sync-aside.7.0/nested/.sync-aside.9.9")).unwrap();
@@ -4666,7 +4749,7 @@ mod tests {
             b"y",
         )
         .unwrap();
-        let err = remove_residue_dir_all_fd(&root, Path::new(".sync-aside.7.0"))
+        let err = remove_residue_dir_all_fd(&root, &rp(".sync-aside.7.0"))
             .expect_err("a nested strand stops a discard");
         assert!(
             format!("{err}").contains(crate::reserved::RESIDUE_BELOW),
@@ -4680,12 +4763,12 @@ mod tests {
 
         // Once the nested strand is gone, the discard removes the outer one.
         std::fs::remove_dir_all(dir.path().join(".sync-aside.7.0/nested/.sync-aside.9.9")).unwrap();
-        remove_residue_dir_all_fd(&root, Path::new(".sync-aside.7.0")).unwrap();
+        remove_residue_dir_all_fd(&root, &rp(".sync-aside.7.0")).unwrap();
         assert!(std::fs::symlink_metadata(dir.path().join(".sync-aside.7.0")).is_err());
 
         // Ordinary content is not discardable by the same primitive.
         std::fs::write(dir.path().join("ordinary"), b"data").unwrap();
-        let err = remove_residue_dir_all_fd(&root, Path::new("ordinary"))
+        let err = remove_residue_dir_all_fd(&root, &rp("ordinary"))
             .expect_err("a discard only ever removes a residue");
         assert!(
             format!("{err}").contains(crate::reserved::RESIDUE_BELOW),
@@ -4701,7 +4784,7 @@ mod tests {
     #[test]
     fn every_mutating_primitive_refuses_an_existing_strand_file() {
         use std::os::unix::fs::PermissionsExt;
-        let strand = Path::new(".sync-aside.1.0");
+        let strand = &rp(".sync-aside.1.0");
         let seed = || {
             let (dir, root) = owned_root();
             std::fs::write(dir.path().join(strand), b"precious original").unwrap();
@@ -4768,7 +4851,7 @@ mod tests {
         // 5. renameat_paths — ordinary content renamed ONTO the strand.
         let (dir, root) = seed();
         std::fs::write(dir.path().join("ordinary"), b"ordinary").unwrap();
-        assert_residue(renameat_paths(&root, Path::new("ordinary"), strand).unwrap_err());
+        assert_residue(renameat_paths(&root, &rp("ordinary"), strand).unwrap_err());
         intact(&dir);
         assert!(dir.path().join("ordinary").exists(), "the source survives");
 
@@ -4780,7 +4863,7 @@ mod tests {
         // 7. remove_dir_fd — an EMPTY strand DIRECTORY.
         let (dir, root) = owned_root();
         std::fs::create_dir(dir.path().join(".sync-aside.2.0")).unwrap();
-        assert_residue(remove_dir_fd(&root, Path::new(".sync-aside.2.0")).unwrap_err());
+        assert_residue(remove_dir_fd(&root, &rp(".sync-aside.2.0")).unwrap_err());
         assert!(dir.path().join(".sync-aside.2.0").is_dir());
 
         // The ONE sanctioned break still works: the explicit file discard.
@@ -4794,9 +4877,9 @@ mod tests {
         // claim-aside rename.
         let (dir, root) = seed();
         std::fs::write(dir.path().join("ordinary2"), b"ordinary2").unwrap();
-        assert_residue(rename_residue_paths(&root, Path::new("ordinary2"), strand).unwrap_err());
+        assert_residue(rename_residue_paths(&root, &rp("ordinary2"), strand).unwrap_err());
         intact(&dir);
-        rename_residue_paths(&root, Path::new("ordinary2"), Path::new(".sync-aside.5.0")).unwrap();
+        rename_residue_paths(&root, &rp("ordinary2"), &rp(".sync-aside.5.0")).unwrap();
         assert!(!dir.path().join("ordinary2").exists());
         assert_eq!(
             std::fs::read(dir.path().join(".sync-aside.5.0")).unwrap(),
@@ -4836,7 +4919,7 @@ mod tests {
     fn copy_dir_recursive_fd_carries_content_modes_and_symlinks() {
         use std::os::unix::fs::PermissionsExt;
         let (base, root, src) = out_of_root_fixture();
-        copy_dir_recursive_fd(&root, &src, Path::new("dst")).unwrap();
+        copy_dir_recursive_fd(&root, &src, &rp("dst")).unwrap();
 
         assert_eq!(
             std::fs::read(base.path().join("root/dst/file.txt")).unwrap(),
@@ -4877,7 +4960,7 @@ mod tests {
         );
 
         // A subtree fsync must accept the copied tree (and skip the symlink).
-        fsync_tree_recursive_fd(&root, Path::new("dst")).unwrap();
+        fsync_tree_recursive_fd(&root, &rp("dst")).unwrap();
     }
 
     /// A symlink injected into a DESTINATION component of the copy is refused
@@ -4890,7 +4973,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, base.path().join("root/escape")).unwrap();
 
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("escape/nested"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("escape/nested"))
             .expect_err("a symlink-injected destination component must be refused");
         assert!(
             matches!(err, Error::Store(_)),
@@ -4924,7 +5007,7 @@ mod tests {
     fn copy_dir_recursive_fd_refuses_a_lock_record_name() {
         let (base, root, src) = out_of_root_fixture();
         std::fs::write(src.join("operation.lock"), b"content").unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a lock-record spelling must be refused on the destination side");
         assert!(
             matches!(err, Error::Store(_)),
@@ -4949,7 +5032,7 @@ mod tests {
         std::fs::create_dir(base.path().join("root/real")).unwrap();
         std::fs::write(base.path().join("root/real/f"), b"x").unwrap();
         std::os::unix::fs::symlink("real", base.path().join("root/alias")).unwrap();
-        let err = fsync_tree_recursive_fd(&root, Path::new("alias/f"))
+        let err = fsync_tree_recursive_fd(&root, &rp("alias/f"))
             .expect_err("a symlink component must be refused");
         let msg = err.to_string();
         // The named condition: ELOOP from the component-wise `O_NOFOLLOW` open,
@@ -4996,7 +5079,7 @@ mod tests {
         let src_path = src.clone();
         std::thread::spawn(move || {
             let owned = RootDir::open(&root_path).expect("open the owned root");
-            let r = copy_dir_recursive_fd(&owned, &src_path, Path::new("dst"));
+            let r = copy_dir_recursive_fd(&owned, &src_path, &rp("dst"));
             let _ = tx.send(r.map_err(|e| e.to_string()));
         });
         let outcome = rx
@@ -5031,7 +5114,7 @@ mod tests {
         let (base, root, src) = out_of_root_fixture();
         let sock = src.join("sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a socket in the source must be refused");
         let msg = err.to_string();
         assert!(
@@ -5053,7 +5136,7 @@ mod tests {
     fn copy_dir_recursive_fd_refuses_a_crate_temp_name() {
         let (base, root, src) = out_of_root_fixture();
         std::fs::write(src.join(".victim.tmp.1.2"), b"live content").unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a crate-temp-shaped name must be refused, not landed");
         assert!(
             err.to_string().contains("unaddressable") && err.to_string().contains("recovery sweep"),
@@ -5072,7 +5155,7 @@ mod tests {
     fn copy_dir_recursive_fd_refuses_a_reserved_source_name() {
         let (base, root, src) = out_of_root_fixture();
         std::fs::write(src.join(".sync-aside.1.2"), b"live content").unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a reserved spelling must be refused");
         assert!(err.to_string().contains("unaddressable"), "{err}");
         assert!(!base.path().join("root/dst/.sync-aside.1.2").exists());
@@ -5095,7 +5178,7 @@ mod tests {
             // case's landed entries collide (`O_EXCL`) before this case's name
             // is reached.
             let dst = format!("dst-{rep}");
-            let err = copy_dir_recursive_fd(&root, &src, Path::new(&dst))
+            let err = copy_dir_recursive_fd(&root, &src, &rp(&dst))
                 .expect_err("a wire-unrepresentable name must be refused");
             assert!(
                 err.to_string().contains("wire-unrepresentable"),
@@ -5119,7 +5202,7 @@ mod tests {
         // `e` + COMBINING ACUTE ACCENT: NFD, not NFC.
         let decomposed = "e\u{301}";
         std::fs::write(src.join(decomposed), b"x").unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a non-NFC name must be refused");
         assert!(
             err.to_string().contains("NFC"),
@@ -5142,7 +5225,7 @@ mod tests {
             );
             return;
         }
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a non-UTF-8 name must be refused");
         assert!(
             err.to_string().contains("not valid UTF-8"),
@@ -5175,7 +5258,7 @@ mod tests {
         std::fs::create_dir(src.join("dir with space")).unwrap();
         std::fs::write(src.join("dir with space/inner"), b"inner").unwrap();
 
-        copy_dir_recursive_fd(&root, &src, Path::new("dst")).unwrap();
+        copy_dir_recursive_fd(&root, &src, &rp("dst")).unwrap();
         for name in names {
             assert_eq!(
                 std::fs::read(base.path().join("root/dst").join(name)).unwrap(),
@@ -5209,7 +5292,7 @@ mod tests {
         std::fs::create_dir(tree.join("d")).unwrap();
         std::fs::write(tree.join("d/inner"), b"inner").unwrap();
 
-        let err = copy_dir_recursive_fd(&root, &tree, Path::new("tree/sub"))
+        let err = copy_dir_recursive_fd(&root, &tree, &rp("tree/sub"))
             .expect_err("a destination inside the source must be refused");
         assert!(
             err.to_string().contains("overlap"),
@@ -5229,7 +5312,7 @@ mod tests {
         std::fs::create_dir_all(base.path().join("root/tree/sub")).unwrap();
         std::fs::write(base.path().join("root/tree/sub/f"), b"f").unwrap();
         let inner = base.path().join("root/tree/sub");
-        let err = copy_dir_recursive_fd(&root, &inner, Path::new("tree"))
+        let err = copy_dir_recursive_fd(&root, &inner, &rp("tree"))
             .expect_err("a source inside the destination must be refused");
         assert!(err.to_string().contains("overlap"), "{err}");
     }
@@ -5244,7 +5327,7 @@ mod tests {
         let tree = base.path().join("root/tree");
         std::fs::create_dir(&tree).unwrap();
         std::fs::write(tree.join("f"), b"f").unwrap();
-        copy_dir_recursive_fd(&root, &tree, Path::new("copy")).unwrap();
+        copy_dir_recursive_fd(&root, &tree, &rp("copy")).unwrap();
         assert_eq!(
             std::fs::read(base.path().join("root/copy/f")).unwrap(),
             b"f"
@@ -5254,7 +5337,7 @@ mod tests {
         let twin = base.path().join("root2");
         std::fs::create_dir(&twin).unwrap();
         std::fs::write(twin.join("g"), b"g").unwrap();
-        copy_dir_recursive_fd(&root, &twin, Path::new("copy2")).unwrap();
+        copy_dir_recursive_fd(&root, &twin, &rp("copy2")).unwrap();
         assert_eq!(
             std::fs::read(base.path().join("root/copy2/g")).unwrap(),
             b"g"
@@ -5274,7 +5357,7 @@ mod tests {
     fn copy_dir_recursive_fd_refuses_an_escaping_symlink_and_keeps_the_tree_canonicalizable() {
         let (base, root, src) = out_of_root_fixture();
         std::os::unix::fs::symlink("../../outside", src.join("esc")).unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("an escaping symlink target must be refused");
         assert!(
             err.to_string().contains("escaping symlink"),
@@ -5286,7 +5369,7 @@ mod tests {
         // (`link -> file.txt`, seeded by the fixture) copies, and the whole
         // destination canonicalizes cleanly.
         std::fs::remove_file(src.join("esc")).unwrap();
-        copy_dir_recursive_fd(&root, &src, Path::new("dst2")).unwrap();
+        copy_dir_recursive_fd(&root, &src, &rp("dst2")).unwrap();
         assert_eq!(
             std::fs::read_link(base.path().join("root/dst2/link")).unwrap(),
             Path::new("file.txt")
@@ -5307,7 +5390,7 @@ mod tests {
         std::fs::create_dir(base.path().join("root/real")).unwrap();
         // From `dst/esc`, `../outside-link` lands on `<root>/outside-link`.
         std::os::unix::fs::symlink("../outside-link", src.join("esc")).unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a target through an outside symlink component must be refused");
         assert!(
             err.to_string().contains("escaping symlink"),
@@ -5464,7 +5547,7 @@ mod tests {
         std::fs::create_dir_all(base.path().join("root/outside")).unwrap();
         std::fs::write(base.path().join("root/outside/secret"), b"SECRET").unwrap();
 
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a full-fold-equal symlink component must be refused");
         assert!(
             err.to_string().contains("escaping symlink"),
@@ -5497,7 +5580,7 @@ mod tests {
         // `dst/esc -> evil/secret` walks through the pre-existing `dst/evil`.
         std::os::unix::fs::symlink("evil/secret", src.join("esc")).unwrap();
 
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a destination-only symlink component must be refused");
         assert!(
             err.to_string().contains("escaping symlink"),
@@ -5538,7 +5621,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         std::fs::create_dir(base.path().join("root")).unwrap();
         let root = RootDir::open(&base.path().join("root")).unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("the copy must reach the manifest's SAME verdict");
         assert!(
             err.to_string().contains("escaping symlink"),
@@ -5567,7 +5650,7 @@ mod tests {
             "the manifest refusal must name the escape, got: {manifest_err}"
         );
 
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("the copy must reach the manifest's SAME verdict");
         assert!(
             err.to_string().contains("escaping symlink"),
@@ -5604,7 +5687,7 @@ mod tests {
                 "the manifest refusal must name the escape, got: {manifest_err}"
             );
 
-            let copy_err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            let copy_err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
                 .expect_err("the copy must reach the manifest's SAME verdict");
             assert!(
                 copy_err.to_string().contains("escaping symlink"),
@@ -5643,7 +5726,7 @@ mod tests {
         }
         // `out_of_root_fixture`'s source holds `link`, so the destination is
         // enumerated and the unreadable subtree is reached.
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("an unenumerable destination must fail closed");
         assert!(
             err.to_string().contains("enumerate"),
@@ -5666,7 +5749,7 @@ mod tests {
     fn copy_dir_recursive_fd_refuses_a_residue_destination_with_no_partial_state() {
         let (base, root, src) = out_of_root_fixture();
 
-        let err = copy_dir_recursive_fd(&root, &src, Path::new(".sync-aside.probe/inner"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp(".sync-aside.probe/inner"))
             .expect_err("a residue-spelled destination component must be refused");
         assert_eq!(err.reserved_kind(), Some(ReservedKind::ResidueBelow));
         let msg = err.to_string();
@@ -5684,7 +5767,7 @@ mod tests {
         );
 
         // The single-component spelling is refused the same way.
-        let err = copy_dir_recursive_fd(&root, &src, Path::new(".sync-aside.probe"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp(".sync-aside.probe"))
             .expect_err("a residue-spelled destination root must be refused");
         assert_eq!(err.reserved_kind(), Some(ReservedKind::ResidueBelow));
         assert!(!base.path().join("root/.sync-aside.probe").exists());
@@ -5695,7 +5778,7 @@ mod tests {
     #[test]
     fn copy_dir_recursive_fd_still_refuses_a_lock_record_destination() {
         let (base, root, src) = out_of_root_fixture();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new(".dest.operation.lock"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp(".dest.operation.lock"))
             .expect_err("a lock-record destination must be refused");
         assert!(
             err.to_string().contains("lock record"),
@@ -5715,7 +5798,7 @@ mod tests {
     fn copy_dir_recursive_fd_refuses_a_hard_link_source() {
         let (base, root, src) = out_of_root_fixture();
         std::fs::hard_link(src.join("file.txt"), src.join("hard")).unwrap();
-        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
             .expect_err("a hard link must be refused, not duplicated");
         assert!(
             err.to_string().contains("hard link"),

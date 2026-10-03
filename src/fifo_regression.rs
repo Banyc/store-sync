@@ -116,7 +116,7 @@ fn fifo_child() {
         );
     }
     let owned = RootDir::open(&root).expect("open the owned root");
-    let rel = Path::new("fifo");
+    let rel = &crate::relpath::RootedRelativePath::parse(Path::new("fifo")).unwrap();
 
     // The four probes, in the order the review measured them.
     probe("state", || crate::atomic::path_state_fd(&owned, rel));

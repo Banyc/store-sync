@@ -62,6 +62,7 @@
 
 use crate::atomic::{self, PathKind, RootDir};
 use crate::error::{Error, ReservedKind, Result};
+use crate::relpath::RootedRelativePath;
 use std::path::{Path, PathBuf};
 
 /// One stranded claim-aside at a LOCAL destination root, identified by its own
@@ -73,7 +74,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug)]
 pub struct Residue {
     root: PathBuf,
-    aside: PathBuf,
+    aside: RootedRelativePath,
 }
 
 impl Residue {
@@ -87,7 +88,9 @@ impl Residue {
     /// underlying primitives (no absolute path, no `..`).
     pub fn detect(root: impl AsRef<Path>, aside: impl AsRef<Path>) -> Result<Residue> {
         let root = root.as_ref().to_path_buf();
-        let aside = aside.as_ref().to_path_buf();
+        // Parse the spelling ONCE, at this boundary: the validated type is the
+        // only thing the descriptor-relative primitives accept.
+        let aside = RootedRelativePath::parse(aside.as_ref())?;
         let final_is_residue = aside
             .file_name()
             .and_then(|name| name.to_str())
@@ -122,7 +125,7 @@ impl Residue {
 
     /// The stranded aside's root-relative spelling.
     pub fn aside(&self) -> &Path {
-        &self.aside
+        self.aside.as_path()
     }
 
     /// RECOVER: move the stranded aside back to `target` (also root-relative),
@@ -135,7 +138,8 @@ impl Residue {
     /// synced (the rename's durability), and the result is verified against the
     /// live filesystem before `Ok` is returned.
     pub fn recover_to(&self, target: impl AsRef<Path>) -> Result<()> {
-        let target = target.as_ref();
+        // Parse the target ONCE, at this boundary.
+        let target = RootedRelativePath::parse(target.as_ref())?;
         // SERIALIZE against a cooperating writer. A sync run holds the
         // destination's operation lock for its whole duration, so recovering a
         // strand takes the SAME lock through the SAME authority
@@ -175,7 +179,7 @@ impl Residue {
         // the symlink-occupant case a TYPED conflict, exactly like a regular
         // occupant, instead of a `Store("openat ... ELOOP")` a consumer cannot
         // classify.
-        if atomic::path_kind_fd(&dir, target)?.is_some() {
+        if atomic::path_kind_fd(&dir, &target)?.is_some() {
             return Err(Error::reserved(
                 ReservedKind::RecoverTargetOccupied,
                 format!(
@@ -194,12 +198,12 @@ impl Residue {
         // residue-movement primitive: recovering a strand is the whole point of
         // this operation, so the aside's own residue spelling is permitted (the
         // public `renameat_paths` refuses it).
-        atomic::rename_residue_paths(&dir, &self.aside, target)?;
+        atomic::rename_residue_paths(&dir, &self.aside, &target)?;
         // The rename's DURABILITY: fsync the parent directory (the aside and the
         // target are siblings in ONE directory, so this covers both the removal
         // of the aside and the appearance of the target). A recovery a crash can
         // undo would be a poor recovery.
-        atomic::sync_parent_dir_fd(&dir, target)?;
+        atomic::sync_parent_dir_fd(&dir, &target)?;
         // Read back: a rename that reported success but did not land would
         // otherwise be an `Ok` naming a recovered original that is not there.
         if atomic::path_kind_fd(&dir, &self.aside)?.is_some() {
@@ -209,7 +213,7 @@ impl Residue {
                 self.aside.display()
             )));
         }
-        if atomic::path_kind_fd(&dir, target)?.is_none() {
+        if atomic::path_kind_fd(&dir, &target)?.is_none() {
             return Err(Error::store(format!(
                 "recovering the residue {} reported success, but a read-back confirms the target \
                  {} is ABSENT: no original was restored",
@@ -277,6 +281,11 @@ mod tests {
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A validated root-relative path for the tests.
+    fn rp(s: &str) -> RootedRelativePath {
+        RootedRelativePath::parse(Path::new(s)).unwrap()
     }
 
     /// The detection boundary: a genuine claim-aside is accepted; a crate temp
@@ -421,7 +430,7 @@ mod tests {
         write(&root.join(".dest.operation.lock"), b"lock");
         let forged = Residue {
             root: root.to_path_buf(),
-            aside: PathBuf::from("ordinary"),
+            aside: RootedRelativePath::from_validated(PathBuf::from("ordinary")),
         };
         let err = forged.discard().unwrap_err();
         assert!(
@@ -437,7 +446,7 @@ mod tests {
         assert!(root.join("ordinary").is_file());
         let forged = Residue {
             root: root.to_path_buf(),
-            aside: PathBuf::from(".dest.operation.lock"),
+            aside: RootedRelativePath::from_validated(PathBuf::from(".dest.operation.lock")),
         };
         assert!(forged.discard().is_err());
         assert!(root.join(".dest.operation.lock").is_file());
@@ -511,7 +520,7 @@ mod tests {
         let root = dir.path();
         write(&root.join(".sync-aside.7.0"), b"precious");
         let owned = RootDir::open(root).unwrap();
-        let err = atomic::remove_file_fd(&owned, Path::new(".sync-aside.7.0")).unwrap_err();
+        let err = atomic::remove_file_fd(&owned, &rp(".sync-aside.7.0")).unwrap_err();
         assert_eq!(err.reserved_kind(), Some(ReservedKind::ResidueBelow));
         assert!(
             err.to_string().contains(crate::reserved::RESIDUE_BELOW),

@@ -34,6 +34,7 @@ pub mod id;
 pub mod lock;
 pub mod manifest;
 pub mod platform;
+pub mod relpath;
 pub mod reserved;
 pub mod root;
 pub mod sync;
@@ -60,6 +61,7 @@ mod fifo_regression;
 pub use ::serde as __serde;
 
 pub use error::{Error, Result};
+pub use relpath::RootedRelativePath;
 pub use reserved::{
     APPLICATION_LOCK_NAME, ASIDE_PREFIX, OPERATION_LOCK_SUFFIX, RESIDUE_BELOW,
     is_application_lock_name, is_lock_record_name, is_reserved_case_alias, is_reserved_name,

@@ -19,12 +19,19 @@
 use std::path::{Path, PathBuf};
 
 use storekit::Error;
+use storekit::RootedRelativePath;
 use storekit::atomic::{
     RootDir, path_state_fd, read_fd, renameat_paths, write_atomic_cas_fd, write_atomic_replace,
     write_atomic_replace_fd, write_file_fd,
 };
 use storekit::lock::FileLock;
 use storekit::root::{EndpointKey, OwnedRoot};
+
+/// A validated root-relative path: the mutating primitives take the validated
+/// type, so a test spelling is parsed at the boundary too.
+fn rp(s: &str) -> RootedRelativePath {
+    RootedRelativePath::parse(Path::new(s)).unwrap()
+}
 
 /// Known content of the outside file an injected symlink points at; a leak of
 /// these bytes through a refused read, or a mutation of them through a
@@ -76,12 +83,9 @@ fn middle_component_symlink_refuses_a_mutation_and_leaves_outside_empty() {
     let outside = outside_dir(tmp.path());
     std::os::unix::fs::symlink(&outside, owned.canonical().join("targets")).unwrap();
 
-    let err = write_atomic_replace_fd(
-        &root,
-        Path::new("targets/t1/file.json"),
-        b"payload",
-        &mut |_| None,
-    )
+    let err = write_atomic_replace_fd(&root, &rp("targets/t1/file.json"), b"payload", &mut |_| {
+        None
+    })
     .expect_err("a mutation through a symlink-injected component must be refused");
     assert_open_refusal(&err, "openat");
     assert_eq!(
@@ -104,11 +108,11 @@ fn middle_component_symlink_refuses_a_read_and_never_returns_outside_content() {
     std::fs::write(outside.join("t1/file.json"), OUTSIDE_BYTES).unwrap();
     std::os::unix::fs::symlink(&outside, owned.canonical().join("targets")).unwrap();
 
-    let err = read_fd(&root, Path::new("targets/t1/file.json"))
+    let err = read_fd(&root, &rp("targets/t1/file.json"))
         .expect_err("a read through a symlink-injected component must be refused");
     assert_open_refusal(&err, "openat");
 
-    let err = path_state_fd(&root, Path::new("targets/t1/file.json"))
+    let err = path_state_fd(&root, &rp("targets/t1/file.json"))
         .expect_err("a symlink-injected component must be refused, never treated as absence");
     assert_open_refusal(&err, "openat");
 
@@ -132,7 +136,7 @@ fn final_component_symlink_refuses_a_read_and_never_returns_outside_content() {
     std::fs::write(&outside_file, OUTSIDE_BYTES).unwrap();
     std::os::unix::fs::symlink(&outside_file, owned.canonical().join("entry")).unwrap();
 
-    let err = read_fd(&root, Path::new("entry"))
+    let err = read_fd(&root, &rp("entry"))
         .expect_err("a read of a symlink final component must be refused");
     assert_open_refusal(&err, "openat entry");
     assert_eq!(
@@ -155,14 +159,14 @@ fn final_component_symlink_refuses_create_new_writes_and_never_touches_outside()
     let entry = owned.canonical().join("entry");
     std::os::unix::fs::symlink(&outside_file, &entry).unwrap();
 
-    let err = write_file_fd(&root, Path::new("entry"), b"IN-ROOT-NEW")
+    let err = write_file_fd(&root, &rp("entry"), b"IN-ROOT-NEW")
         .expect_err("a create-or-truncate write to a symlink final component must be refused");
     assert_open_refusal(&err, "openat entry");
 
     // The CAS refusal text names `open` (the CAS opens the final component
     // directly and formats its own error), not `openat` — asserted as it
     // really is, not as the source's mutation path phrases it.
-    let err = write_atomic_cas_fd(&root, Path::new("entry"), b"IN-ROOT-NEW")
+    let err = write_atomic_cas_fd(&root, &rp("entry"), b"IN-ROOT-NEW")
         .expect_err("a creating CAS write to a symlink final component must be refused");
     assert_open_refusal(&err, "open entry");
 
@@ -203,7 +207,7 @@ fn final_component_symlink_replace_does_not_escape_the_root() {
     let entry = owned.canonical().join("entry");
     std::os::unix::fs::symlink(&outside_file, &entry).unwrap();
 
-    let outcome = write_atomic_replace_fd(&root, Path::new("entry"), b"IN-ROOT-NEW", &mut |_| None);
+    let outcome = write_atomic_replace_fd(&root, &rp("entry"), b"IN-ROOT-NEW", &mut |_| None);
 
     // THE ESCAPE THIS FORBIDS: a replace that followed the link would leave
     // the new bytes in the outside file. It must be byte-identical.
@@ -305,7 +309,7 @@ fn renameat_paths_cannot_move_an_ancestor_of_the_lock_record() {
     let record = owned.canonical().join("state/operation.lock");
     let holder = FileLock::acquire(&record, "A").expect("A acquires the record");
     let ino_a = std::fs::metadata(&record).unwrap().ino();
-    let err = renameat_paths(&root, Path::new("state"), Path::new("state2"))
+    let err = renameat_paths(&root, &rp("state"), &rp("state2"))
         .expect_err("renaming an ancestor of the lock record must be refused");
     assert!(
         matches!(err, Error::Conflict(_)),

@@ -81,7 +81,7 @@ pub const OPERATION_LOCK_SUFFIX: &str = ".operation.lock";
 /// The ONE spelling of the residue refusal, shared by the sync's
 /// [`crate::sync::ConflictReason::ResidueBelow`] and the atomic substrate's
 /// refusal of an IMPLICIT recursive removal
-/// ([`crate::atomic::remove_dir_all_path`] and its siblings). A consumer that
+/// ([`crate::atomic::remove_dir_all_fd`] and its siblings). A consumer that
 /// matches the reason on the sync side and the conflict token on the
 /// substrate side therefore reads ONE vocabulary rather than two. The
 /// substrate's refusal is an [`crate::error::Error::Reserved`] whose message
@@ -290,7 +290,7 @@ pub fn is_residue_path(path: &str) -> bool {
 /// `symlinkat`, `mkdirat`, and a mutating `openat`) rather than by
 /// enumerating call sites. The rel-path mutators
 /// ([`crate::atomic::remove_file_fd`], [`crate::atomic::remove_dir_all_fd`]
-/// and each entry its walk unlinks, [`crate::atomic::remove_dir_all_path`],
+/// and each entry its walk unlinks,
 /// the PATH-BASED [`crate::atomic::write_atomic_replace`],
 /// [`crate::atomic::write_atomic_replace_fd`],
 /// [`crate::atomic::write_atomic_if_match_fd`],
@@ -328,7 +328,7 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   spelling but unsound for authorizing a mutation, because it would grant
 ///   ownership of a different on-disk entry a live holder owns.
 /// * the PATH-BASED helpers the manifest/retention machinery uses take an
-///   ordinary path. `set_private`, `ensure_private_dir`,
+///   ordinary path. `set_private`,
 ///   `ensure_private_dir_durable`, the PATH-BASED `write_atomic_replace`, and
 ///   the descriptor-relative `set_private_fd` now consult the guard too; the
 ///   remaining unguarded `std::fs` mutations are the local transport's

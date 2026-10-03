@@ -1181,8 +1181,7 @@ pub enum ConflictReason {
     /// the removal of every entry below it — is refused and reported. Nothing
     /// is mutated. The SAME refusal is stated at the substrate authority every
     /// recursive removal passes through
-    /// ([`crate::atomic::remove_dir_all_path`] and
-    /// [`crate::atomic::remove_dir_all_fd`] refuse and carry
+    /// ([`crate::atomic::remove_dir_all_fd`] refuses and carries
     /// [`crate::reserved::RESIDUE_BELOW`] in the conflict message), so a
     /// caller that reaches the crate's durable primitive directly sees ONE
     /// vocabulary rather than a second one. Recover or deliberately discard the
@@ -1357,8 +1356,7 @@ pub struct SyncReport {
     /// is occupied, so a target that itself holds data is never overwritten),
     /// and [`Residue::discard`](crate::sync::Residue::discard) removes it as the
     /// caller's explicit decision. The implicit recursive-removal primitives
-    /// REFUSE a residue ([`crate::atomic::remove_dir_all_path`],
-    /// [`crate::atomic::remove_file_fd`], and the transport's
+    /// REFUSE a residue ([`crate::atomic::remove_file_fd`], and the transport's
     /// [`Remote::remove_file`](crate::transport::Remote::remove_file) /
     /// [`Remote::remove_dir_all`](crate::transport::Remote::remove_dir_all) all
     /// carry the refusal — the remote `remove_dir_all` checks the strand's
@@ -1806,13 +1804,14 @@ pub fn retire_destination_lock(dest_root: &Path) -> Result<RetireOutcome> {
     // this derived record (rooted at its parent), so the guard's owned-record
     // constructor decides by resolved IDENTITY. This is the same explicit
     // declaration the guard documents as the only way to build the authority.
+    let rel = RootedRelativePath::from_validated(PathBuf::from(name));
     let layout = Layout {
-        lock: RootedRelativePath::from_validated(PathBuf::from(name)),
+        lock: rel.clone(),
         ..Layout::empty()
     };
     let owned = crate::atomic::OwnedLockRecord::local(parent, &layout);
     let root = crate::atomic::RootDir::open(parent)?;
-    crate::atomic::remove_owned_lock_record_fd(&root, Path::new(name), &owned)?;
+    crate::atomic::remove_owned_lock_record_fd(&root, &rel, &owned)?;
     // The record is gone; the held flock is released by the drop below (on the
     // now-unlinked inode, which admits no successor because the destination is
     // gone).
@@ -8097,29 +8096,29 @@ impl LocalSide {
 
     /// The current mode of an entry, or `None` when it is absent.
     fn mode_opt(&self, rel: &RootedRelativePath, kind: EntryKind) -> Result<Option<Mode>> {
-        if !crate::atomic::path_state_fd(self.root_dir()?, rel.as_path())? {
+        if !crate::atomic::path_state_fd(self.root_dir()?, rel)? {
             return Ok(None);
         }
         Ok(Some(self.mode(rel, kind)?))
     }
 
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
-        crate::atomic::read_fd(self.root_dir()?, rel.as_path())
+        crate::atomic::read_fd(self.root_dir()?, rel)
     }
 
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
-        crate::atomic::read_link_fd(self.root_dir()?, rel.as_path())
+        crate::atomic::read_link_fd(self.root_dir()?, rel)
     }
 
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::ensure_private_dir_durable_fd(self.root_for_mutation()?, rel.as_path())?;
+        crate::atomic::ensure_private_dir_durable_fd(self.root_for_mutation()?, rel)?;
         Ok(())
     }
 
     fn write_file(&self, rel: &RootedRelativePath, bytes: &[u8], mode: Mode) -> Result<()> {
         match crate::atomic::write_atomic_replace_fd(
             self.root_for_mutation()?,
-            rel.as_path(),
+            rel,
             bytes,
             &mut |_| None,
         )? {
@@ -8150,7 +8149,7 @@ impl LocalSide {
             // The caller read the destination as ABSENT: it must still be
             // absent, or the destination changed in the window and NOTHING may
             // be written.
-            if crate::atomic::path_kind_fd(self.root_for_mutation()?, rel.as_path())?.is_some() {
+            if crate::atomic::path_kind_fd(self.root_for_mutation()?, rel)?.is_some() {
                 return Ok(CheckedWrite::Mismatch);
             }
             self.write_file(rel, bytes, mode)?;
@@ -8158,7 +8157,7 @@ impl LocalSide {
         };
         match crate::atomic::write_atomic_if_match_fd(
             self.root_for_mutation()?,
-            rel.as_path(),
+            rel,
             expected,
             bytes,
             &mut |_| None,
@@ -8188,7 +8187,7 @@ impl LocalSide {
     fn dir_mode(&self, rel: &RootedRelativePath) -> Result<Mode> {
         let fd = crate::atomic::openat_no_follow(
             self.root_dir()?.as_fd(),
-            rel.as_path(),
+            rel,
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
@@ -8210,12 +8209,7 @@ impl LocalSide {
     /// followed).
     #[cfg(unix)]
     fn file_mode(&self, rel: &RootedRelativePath) -> Result<Mode> {
-        let fd = crate::atomic::openat_no_follow(
-            self.root_dir()?.as_fd(),
-            rel.as_path(),
-            libc::O_RDONLY,
-            0,
-        )?;
+        let fd = crate::atomic::openat_no_follow(self.root_dir()?.as_fd(), rel, libc::O_RDONLY, 0)?;
         let meta = std::fs::File::from(fd)
             .metadata()
             .map_err(|e| Error::store(format!("fstat {}: {e}", rel.display())))?;
@@ -8239,11 +8233,11 @@ impl LocalSide {
     /// directory between the caller's probe and this call is REFUSED by the
     /// filesystem, never recursively destroyed. A confirmed absence is success.
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
-        match crate::atomic::remove_file_fd(self.root_dir()?, rel.as_path()) {
+        match crate::atomic::remove_file_fd(self.root_dir()?, rel) {
             Ok(()) => Ok(()),
             // A race may have removed the entry between the caller's live probe
             // and this call; a CONFIRMED absence is the contract's success.
-            Err(error) => match crate::atomic::path_kind_fd(self.root_dir()?, rel.as_path())? {
+            Err(error) => match crate::atomic::path_kind_fd(self.root_dir()?, rel)? {
                 None => Ok(()),
                 Some(_) => Err(error),
             },
@@ -8260,23 +8254,23 @@ impl LocalSide {
     #[cfg(unix)]
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         // The ONE guarded rmdir authority; a confirmed absence is success.
-        crate::atomic::remove_dir_fd(self.root_dir()?, rel.as_path())
+        crate::atomic::remove_dir_fd(self.root_dir()?, rel)
     }
 
     #[cfg(not(unix))]
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         // R4: the non-Unix seam routes through the SAME guarded atomic funnel
         // instead of a bare `std::fs::remove_dir`.
-        crate::atomic::remove_dir_fd(self.root_dir()?, rel.as_path())
+        crate::atomic::remove_dir_fd(self.root_dir()?, rel)
     }
 
     /// Remove a FILE (or symlink) that IS the sync's own stranded claim-aside,
     /// through the residue-sanctioning primitive. Only
     /// [`Applier::remove_subtree`]'s `OwnClaim` walk root reaches this.
     fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
-        match crate::atomic::remove_claim_file_fd(self.root_dir()?, rel.as_path()) {
+        match crate::atomic::remove_claim_file_fd(self.root_dir()?, rel) {
             Ok(()) => Ok(()),
-            Err(error) => match crate::atomic::path_kind_fd(self.root_dir()?, rel.as_path())? {
+            Err(error) => match crate::atomic::path_kind_fd(self.root_dir()?, rel)? {
                 None => Ok(()),
                 Some(_) => Err(error),
             },
@@ -8286,19 +8280,19 @@ impl LocalSide {
     /// Remove the (already-emptied) DIRECTORY that IS the sync's own stranded
     /// claim-aside, through the residue-sanctioning `rmdir` primitive.
     fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::remove_claim_dir_fd(self.root_dir()?, rel.as_path())
+        crate::atomic::remove_claim_dir_fd(self.root_dir()?, rel)
     }
 
     /// Whether any entry exists at `rel` (kind-agnostic, so a symlink counts
     /// and a non-file/dir/symlink entry still counts as present).
     fn exists(&self, rel: &RootedRelativePath) -> Result<bool> {
-        Ok(crate::atomic::path_kind_fd(self.root_dir()?, rel.as_path())?.is_some())
+        Ok(crate::atomic::path_kind_fd(self.root_dir()?, rel)?.is_some())
     }
 
     /// The live kind of the entry at `rel`, classified WITHOUT following a
     /// final-component symlink.
     fn kind_opt(&self, rel: &RootedRelativePath) -> Result<Option<EntryKind>> {
-        match crate::atomic::path_kind_fd(self.root_dir()?, rel.as_path())? {
+        match crate::atomic::path_kind_fd(self.root_dir()?, rel)? {
             None => Ok(None),
             Some(crate::atomic::PathKind::File) => Ok(Some(EntryKind::File)),
             Some(crate::atomic::PathKind::Dir) => Ok(Some(EntryKind::Dir)),
@@ -8341,7 +8335,7 @@ impl LocalSide {
         // name-only kind would make `verify_directory_listings` see a symlink
         // where the manifest says `File` and report a spurious mismatch.
         let root = self.root_dir()?;
-        let entries = crate::atomic::read_dir_fd(root, rel.as_path())?;
+        let entries = crate::atomic::read_dir_fd(root, rel)?;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.is_dir {
@@ -8349,7 +8343,7 @@ impl LocalSide {
                 continue;
             }
             let child = rel.join(&entry.name)?;
-            let kind = match crate::atomic::path_kind_fd(root, child.as_path())? {
+            let kind = match crate::atomic::path_kind_fd(root, &child)? {
                 Some(crate::atomic::PathKind::Symlink) => EntryKind::Symlink,
                 Some(crate::atomic::PathKind::File) => EntryKind::File,
                 Some(crate::atomic::PathKind::Dir) => EntryKind::Dir,
@@ -8409,7 +8403,7 @@ impl LocalSide {
     /// The SANCTIONED residue-movement rename: the claim-aside spelling is the
     /// point of the operation.
     fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
-        crate::atomic::rename_residue_paths(self.root_dir()?, from.as_path(), to.as_path())
+        crate::atomic::rename_residue_paths(self.root_dir()?, from, to)
     }
 }
 
@@ -8429,7 +8423,7 @@ fn set_local_mode(
         EntryKind::Dir => libc::O_RDONLY | libc::O_DIRECTORY,
         EntryKind::File | EntryKind::Symlink => libc::O_RDONLY,
     };
-    let fd = crate::atomic::openat_no_follow(root.as_fd(), rel.as_path(), flags, 0)?;
+    let fd = crate::atomic::openat_no_follow(root.as_fd(), rel, flags, 0)?;
     std::fs::File::from(fd)
         .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
         .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))
@@ -8468,7 +8462,7 @@ fn symlink_local(
     target: &Path,
     rel: &RootedRelativePath,
 ) -> Result<()> {
-    crate::atomic::symlink_fd(root, target, rel.as_path())
+    crate::atomic::symlink_fd(root, target, rel)
 }
 
 /// The Windows port's best-effort symlink creation, routed through the SAME
@@ -8481,7 +8475,7 @@ fn symlink_local(
     target: &Path,
     rel: &RootedRelativePath,
 ) -> Result<()> {
-    crate::atomic::symlink_fd(root, target, rel.as_path())
+    crate::atomic::symlink_fd(root, target, rel)
 }
 
 #[cfg(test)]

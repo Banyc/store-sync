@@ -1,11 +1,16 @@
-//! The validated relative path that crosses the transport boundary.
+//! The validated relative path that names every entry a mutation touches.
 //!
-//! Every path a [`Remote`](crate::transport::Remote) operation
-//! receives is a [`RootedRelativePath`]: validated at construction to reject
-//! ABSOLUTE paths, `.`/`..` components, and EMPTY paths, so a transport's
+//! This module sits BELOW [`crate::atomic`] and [`crate::sync`]: it has no
+//! dependencies inside the crate, so the descriptor-relative primitives and
+//! the transport can both name a path with the same validated type. It is
+//! re-exported from [`crate::transport`] and from the crate root, so no
+//! existing consumer path changes.
+//!
+//! A [`RootedRelativePath`] is validated at construction to reject ABSOLUTE
+//! paths, `.`/`..` components, a literal `.` SEGMENT, and EMPTY paths, so a
 //! `root.join(rel)` is safe by construction — a caller can never escape the
-//! deployment root through a transport operation, and a traversal path can
-//! never be joined onto the root.
+//! deployment root through a transport operation or a mutating primitive, and
+//! a traversal path can never be joined onto the root.
 //!
 //! The traversal/absolute decision is made with the PLATFORM's own path
 //! model ([`Path::components`]) rather than a hardcoded separator, so a `\`
@@ -24,12 +29,13 @@
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
 
-/// A validated RELATIVE path that stays inside the deployment root: never
-/// empty, never absolute, and free of `.`/`..` components. A caller-supplied
-/// [`Layout`](crate::transport::Layout) produces these from validated
-/// identities; every path that crosses the
-/// [`Remote`](crate::transport::Remote) trait boundary is one, so
-/// `root.join(rel)` in a transport is safe by construction.
+/// A validated RELATIVE path that stays inside an owned root: never empty,
+/// never absolute, and free of `.`/`..` components (including a literal `.`
+/// segment). A caller-supplied [`Layout`](crate::transport::Layout) produces
+/// these from validated identities; every path that crosses the
+/// [`Remote`](crate::transport::Remote) trait boundary AND every
+/// root-relative argument of a mutating primitive is one, so `root.join(rel)`
+/// is safe by construction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RootedRelativePath(PathBuf);
 
@@ -199,6 +205,25 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    /// THE DELTA between the former private `validate_rel` guard and this
+    /// type, pinned: `Path::components` ERASES a non-leading `.` segment, so a
+    /// pure component-model check accepts `a/./b`; this type scans the literal
+    /// spelling and REFUSES it. That is the one input the two disagree on, in
+    /// the STRICTER direction, and the reason adopting the boundary is a
+    /// behaviour change rather than a refactor.
+    #[test]
+    fn a_literal_dot_segment_is_invisible_to_components_but_refused_here() {
+        let p = Path::new("a/./b");
+        assert!(
+            p.components().all(|c| matches!(c, Component::Normal(_))),
+            "Path::components erases the `.`, which is why a component-model guard accepts it"
+        );
+        assert!(
+            RootedRelativePath::parse(p).is_err(),
+            "the literal `.` segment must still be refused"
+        );
     }
 
     /// Joining re-validates: a safe component joins, an absolute or

@@ -26,8 +26,15 @@
 
 use std::path::{Path, PathBuf};
 
+use storekit::RootedRelativePath;
 use storekit::atomic::{RootDir, copy_dir_recursive_fd, remove_dir_all_fd};
 use storekit::manifest::canonicalize_tree;
+
+/// A validated root-relative path: the mutating primitives take the validated
+/// type, so a test spelling is parsed at the boundary too.
+fn rp(s: &str) -> RootedRelativePath {
+    RootedRelativePath::parse(Path::new(s)).unwrap()
+}
 
 /// Announce a SKIPPED assertion on the real console (libtest discards the
 /// captured output of a PASSING test, which would make a skip look like a
@@ -88,7 +95,7 @@ fn a_trailing_separator_does_not_let_a_symlink_source_be_followed() {
     // component as an intermediate one, so `lstat("srclink/")` follows the
     // link and reports a directory — the very thing the refusal exists to
     // stop. PRE-FIX the copy FOLLOWED it and returned `Ok`.
-    let err = copy_dir_recursive_fd(&root, &base.path().join("srclink/"), Path::new("dst"))
+    let err = copy_dir_recursive_fd(&root, &base.path().join("srclink/"), &rp("dst"))
         .expect_err("a symlink source must be refused regardless of a trailing separator");
     let msg = err.to_string();
     assert!(
@@ -107,7 +114,7 @@ fn a_symlink_source_without_a_trailing_separator_is_refused() {
     let root = RootDir::open(base.path()).unwrap();
     std::fs::create_dir_all(base.path().join("real")).unwrap();
     std::os::unix::fs::symlink("real", base.path().join("srclink")).unwrap();
-    let err = copy_dir_recursive_fd(&root, &base.path().join("srclink"), Path::new("dst"))
+    let err = copy_dir_recursive_fd(&root, &base.path().join("srclink"), &rp("dst"))
         .expect_err("a symlink source must be refused");
     assert!(err.to_string().contains("is a symlink"), "{err}");
 }
@@ -118,7 +125,7 @@ fn a_genuine_directory_source_with_a_trailing_separator_still_copies() {
     let root = RootDir::open(base.path()).unwrap();
     std::fs::create_dir_all(base.path().join("real")).unwrap();
     std::fs::write(base.path().join("real/f"), b"f").unwrap();
-    copy_dir_recursive_fd(&root, &base.path().join("real/"), Path::new("dst")).unwrap();
+    copy_dir_recursive_fd(&root, &base.path().join("real/"), &rp("dst")).unwrap();
     assert_eq!(std::fs::read(base.path().join("dst/f")).unwrap(), b"f");
 }
 
@@ -133,7 +140,7 @@ fn an_ordinary_destination_inside_the_source_is_still_refused() {
     let tree = base.path().join("tree");
     std::fs::create_dir_all(tree.join("d")).unwrap();
     std::fs::write(tree.join("d/inner"), b"inner").unwrap();
-    let err = copy_dir_recursive_fd(&root, &tree, Path::new("tree/sub"))
+    let err = copy_dir_recursive_fd(&root, &tree, &rp("tree/sub"))
         .expect_err("a destination inside the source must be refused");
     assert!(err.to_string().contains("overlap"), "{err}");
     assert!(!tree.join("sub").exists());
@@ -146,7 +153,7 @@ fn an_ordinary_source_inside_the_destination_is_still_refused() {
     let inner = base.path().join("tree/sub");
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("f"), b"f").unwrap();
-    let err = copy_dir_recursive_fd(&root, &inner, Path::new("tree"))
+    let err = copy_dir_recursive_fd(&root, &inner, &rp("tree"))
         .expect_err("a source inside the destination must be refused");
     assert!(err.to_string().contains("overlap"), "{err}");
 }
@@ -158,7 +165,7 @@ fn a_non_overlapping_source_still_copies() {
     let tree = base.path().join("tree");
     std::fs::create_dir(&tree).unwrap();
     std::fs::write(tree.join("f"), b"f").unwrap();
-    copy_dir_recursive_fd(&root, &tree, Path::new("copy")).unwrap();
+    copy_dir_recursive_fd(&root, &tree, &rp("copy")).unwrap();
     assert_eq!(std::fs::read(base.path().join("copy/f")).unwrap(), b"f");
 }
 
@@ -187,7 +194,7 @@ fn a_fold_equal_destination_is_refused_by_identity_and_never_mutates_the_source(
     }
 
     let before = mode_of(&src);
-    let result = copy_dir_recursive_fd(&root, &src, Path::new("TREE"));
+    let result = copy_dir_recursive_fd(&root, &src, &rp("TREE"));
     let after = mode_of(&src);
     let _ = result.map_err(|e| e.to_string());
     set_mode(&src, 0o755);
@@ -217,7 +224,7 @@ fn a_failed_copy_restores_the_modes_it_widened_and_leaves_a_removable_destinatio
     // directory (and the widened mode is what a failure must restore).
     set_mode(&src.join("keep"), 0o555);
 
-    let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+    let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
         .expect_err("the escaping symlink must refuse the copy");
     assert!(err.to_string().contains("escaping symlink"), "{err}");
 
@@ -233,7 +240,7 @@ fn a_failed_copy_restores_the_modes_it_widened_and_leaves_a_removable_destinatio
     // And the crate's own recursive removal must succeed on the partial.
     // Capture the partial's digest BEFORE removing it.
     let partial = canonicalize_tree(&base.path().join("dst"));
-    remove_dir_all_fd(&root, Path::new("dst"))
+    remove_dir_all_fd(&root, &rp("dst"))
         .expect("remove_dir_all_fd must remove the failed copy's partial destination");
     assert!(!base.path().join("dst").exists());
 
@@ -244,7 +251,7 @@ fn a_failed_copy_restores_the_modes_it_widened_and_leaves_a_removable_destinatio
     set_mode(&src.join("keep"), 0o755);
     std::fs::remove_file(src.join("keep/esc")).unwrap();
     std::os::unix::fs::symlink("inner", src.join("keep/esc")).unwrap();
-    copy_dir_recursive_fd(&root, &src, Path::new("dst2")).unwrap();
+    copy_dir_recursive_fd(&root, &src, &rp("dst2")).unwrap();
     let complete = canonicalize_tree(&base.path().join("dst2")).unwrap();
     match partial {
         Err(_) => {}
@@ -265,7 +272,7 @@ fn a_failed_nested_copy_restores_modes_and_keeps_the_created_ancestors_removable
     std::os::unix::fs::symlink("../../../../../outside", src.join("keep/esc")).unwrap();
     set_mode(&src.join("keep"), 0o555);
 
-    let err = copy_dir_recursive_fd(&root, &src, Path::new("p/q/dst"))
+    let err = copy_dir_recursive_fd(&root, &src, &rp("p/q/dst"))
         .expect_err("the escaping symlink must refuse the copy");
     let _ = err;
 
@@ -273,13 +280,13 @@ fn a_failed_nested_copy_restores_modes_and_keeps_the_created_ancestors_removable
     // decision), and the partial subtree is removable because its modes were
     // restored.
     assert_eq!(mode_of(&base.path().join("p/q/dst/keep")), 0o700);
-    remove_dir_all_fd(&root, Path::new("p/q/dst"))
+    remove_dir_all_fd(&root, &rp("p/q/dst"))
         .expect("remove_dir_all_fd must remove the failed copy at a nested destination");
     assert!(!base.path().join("p/q/dst").exists());
     //
     // The empty ancestors the call created are removable too, through the
     // crate's non-recursive rmdir, once the subtree is gone.
-    remove_dir_all_fd(&root, Path::new("p")).expect("the created ancestors remain removable");
+    remove_dir_all_fd(&root, &rp("p")).expect("the created ancestors remain removable");
     // Leave the fixture removable for `TempDir::drop`.
     set_mode(&src.join("keep"), 0o755);
 }
@@ -306,7 +313,7 @@ fn a_mode_0000_source_directory_fails_closed_before_creating_anything() {
         );
         return;
     }
-    let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+    let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
         .expect_err("an unenumerable source subtree must fail the copy closed");
     assert!(err.to_string().contains("enumerate"), "{err}");
     assert!(
@@ -330,7 +337,7 @@ fn a_copied_symlink_never_replaces_a_live_destination_file() {
     std::fs::create_dir(base.path().join("dst")).unwrap();
     std::fs::write(base.path().join("dst/clash"), b"ORIGINAL").unwrap();
 
-    let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+    let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
         .expect_err("a copied symlink must refuse a pre-existing destination entry");
     assert!(
         err.to_string().contains("refusing to replace"),
@@ -421,7 +428,7 @@ fn every_kind_pair_refuses_to_replace_a_live_destination_entry() {
         create(src_kind, &src.join("clash"));
         create(dst_kind, &dst.join("clash"));
 
-        let result = copy_dir_recursive_fd(&root, &src, Path::new("dst"));
+        let result = copy_dir_recursive_fd(&root, &src, &rp("dst"));
         match result {
             Ok(()) => panic!("{src_kind:?} over {dst_kind:?} must refuse, not replace"),
             Err(err) => {
@@ -466,7 +473,7 @@ fn a_firmlink_alias_of_the_root_is_refused_by_identity() {
     // PRE-FIX the walk recursed into its own source; bound the damage with a low
     // descriptor limit so the pre-fix run fails FAST instead of filling the disk.
     let saved = set_nofile_soft(64).unwrap();
-    let result = copy_dir_recursive_fd(&root, &aliased, Path::new("sub"));
+    let result = copy_dir_recursive_fd(&root, &aliased, &rp("sub"));
     restore_nofile(saved).unwrap();
     let err = result.expect_err("a firmlink alias of the root must be refused by identity");
     assert!(err.to_string().contains("overlap"), "{err}");
@@ -617,7 +624,7 @@ fn copy_emfile_child() {
     build_deep_tree(&root_path, DEPTH).expect("build the deep tree");
     let root = RootDir::open(&root_path).expect("open the owned root");
     let saved = set_nofile_soft(NOFILE).expect("lower RLIMIT_NOFILE");
-    let result = copy_dir_recursive_fd(&root, &root_path.join("deep"), Path::new("out"));
+    let result = copy_dir_recursive_fd(&root, &root_path.join("deep"), &rp("out"));
     restore_nofile(saved).expect("restore RLIMIT_NOFILE");
     let err = result.expect_err("the copy must surface a clean Err at the lowered limit");
     let msg = format!("{err}");

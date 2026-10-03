@@ -70,13 +70,12 @@
 //! is the caller-supplied [`Layout`]; the receiver identity is the opaque
 //! [`ReceiverId`].
 
-mod rooted;
 mod runner;
 #[cfg(test)]
 pub(crate) mod scripted;
 mod ssh;
 
-pub use rooted::RootedRelativePath;
+pub use crate::relpath::RootedRelativePath;
 #[cfg(unix)]
 pub use runner::kill_process_group;
 pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
@@ -1942,7 +1941,7 @@ impl LocalTransport {
         let Some(parent) = rel.parent() else {
             return Ok(());
         };
-        match crate::atomic::path_kind_fd(root, parent.as_path()) {
+        match crate::atomic::path_kind_fd(root, &parent) {
             Ok(Some(crate::atomic::PathKind::Dir)) => Ok(()),
             Ok(Some(_)) => Err(Error::transport(format!(
                 "mkdir {}: a parent component exists but is not a directory",
@@ -1951,11 +1950,9 @@ impl LocalTransport {
             // A missing parent component (or any other failure resolving the
             // final entry) is handled by the fd-safe create below, which
             // REFUSES a symlink at any component.
-            Ok(None) | Err(_) => {
-                crate::atomic::ensure_private_dir_durable_fd(root, parent.as_path())
-                    .map(|_| ())
-                    .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
-            }
+            Ok(None) | Err(_) => crate::atomic::ensure_private_dir_durable_fd(root, &parent)
+                .map(|_| ())
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display()))),
         }
     }
 
@@ -1983,7 +1980,7 @@ impl LocalTransport {
         // a clean success.
         match crate::atomic::write_atomic_replace_fd_under_existing_parent(
             &root,
-            rel.as_path(),
+            rel,
             data,
             &mut |_| None,
         )
@@ -2000,7 +1997,7 @@ impl LocalTransport {
         if mode != 0 {
             let fd = crate::atomic::openat_no_follow(
                 root.as_fd(),
-                rel.as_path(),
+                rel,
                 libc::O_RDONLY | libc::O_NOFOLLOW,
                 0,
             )?;
@@ -2019,7 +2016,7 @@ impl LocalTransport {
                 rel.display()
             ))
         })?;
-        match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+        match crate::atomic::path_kind_fd(&root, rel) {
             // An EXISTING directory (whatever its mode) is left exactly as it
             // is: `create_dir_all` never chmods an existing directory.
             Ok(Some(crate::atomic::PathKind::Dir)) => return Ok(()),
@@ -2033,7 +2030,7 @@ impl LocalTransport {
             // create below, which refuses a symlink at any component.
             Ok(None) | Err(_) => {}
         }
-        crate::atomic::ensure_private_dir_durable_fd(&root, rel.as_path())
+        crate::atomic::ensure_private_dir_durable_fd(&root, rel)
             .map(|_| ())
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
@@ -2049,7 +2046,7 @@ impl LocalTransport {
         })?;
         let fd = crate::atomic::openat_no_follow(
             root.as_fd(),
-            rel.as_path(),
+            rel,
             libc::O_RDONLY | libc::O_NOFOLLOW,
             0,
         )?;
@@ -2070,7 +2067,7 @@ impl LocalTransport {
         // it, best-effort); creating it here is component-wise with
         // `O_NOFOLLOW`.
         self.ensure_dir_confined(&root, to)?;
-        crate::atomic::renameat_paths(&root, from.as_path(), to.as_path()).map_err(|e| {
+        crate::atomic::renameat_paths(&root, from, to).map_err(|e| {
             Error::transport(format!(
                 "rename {} -> {}: {e}",
                 from.display(),
@@ -2092,7 +2089,7 @@ impl LocalTransport {
                 link.display()
             ))
         })?;
-        crate::atomic::symlink_fd(&root, target, link.as_path()).map_err(|e| {
+        crate::atomic::symlink_fd(&root, target, link).map_err(|e| {
             Error::transport(format!(
                 "symlink {} -> {}: {e}",
                 link.display(),
@@ -2106,22 +2103,19 @@ impl LocalTransport {
         let Some(root) = self.root_dir(false)? else {
             return Ok(());
         };
-        match crate::atomic::remove_file_fd(&root, rel.as_path()) {
+        match crate::atomic::remove_file_fd(&root, rel) {
             Ok(()) => Ok(()),
-            Err(error) => match crate::atomic::openat_no_follow_io(
-                root.as_fd(),
-                rel.as_path(),
-                libc::O_RDONLY,
-                0,
-            ) {
-                // A missing entry OR a missing parent component is the
-                // old path-based `remove_file`'s tolerated `NotFound`.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                _ => Err(Error::transport(format!(
-                    "remove {}: {error}",
-                    rel.display()
-                ))),
-            },
+            Err(error) => {
+                match crate::atomic::openat_no_follow_io(root.as_fd(), rel, libc::O_RDONLY, 0) {
+                    // A missing entry OR a missing parent component is the
+                    // old path-based `remove_file`'s tolerated `NotFound`.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    _ => Err(Error::transport(format!(
+                        "remove {}: {error}",
+                        rel.display()
+                    ))),
+                }
+            }
         }
     }
 
@@ -2130,20 +2124,17 @@ impl LocalTransport {
         let Some(root) = self.root_dir(false)? else {
             return Ok(());
         };
-        match crate::atomic::remove_dir_all_fd(&root, rel.as_path()) {
+        match crate::atomic::remove_dir_all_fd(&root, rel) {
             Ok(()) => Ok(()),
-            Err(error) => match crate::atomic::openat_no_follow_io(
-                root.as_fd(),
-                rel.as_path(),
-                libc::O_RDONLY,
-                0,
-            ) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                _ => Err(Error::transport(format!(
-                    "rmdir {}: {error}",
-                    rel.display()
-                ))),
-            },
+            Err(error) => {
+                match crate::atomic::openat_no_follow_io(root.as_fd(), rel, libc::O_RDONLY, 0) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    _ => Err(Error::transport(format!(
+                        "rmdir {}: {error}",
+                        rel.display()
+                    ))),
+                }
+            }
         }
     }
 
@@ -2158,7 +2149,7 @@ impl LocalTransport {
             return Ok(());
         };
         // The ONE guarded rmdir authority; a confirmed absence is success.
-        crate::atomic::remove_dir_fd(&root, rel.as_path())
+        crate::atomic::remove_dir_fd(&root, rel)
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))
     }
 
@@ -2167,7 +2158,7 @@ impl LocalTransport {
         let Some(root) = self.root_dir(false)? else {
             return Ok(Vec::new());
         };
-        let entries = match crate::atomic::read_dir_fd(&root, rel.as_path()) {
+        let entries = match crate::atomic::read_dir_fd(&root, rel) {
             Ok(entries) => entries,
             Err(error) => {
                 // Preserve the absent-directory-enumerates-as-empty contract;
@@ -2177,7 +2168,7 @@ impl LocalTransport {
                 // propagated.
                 return match crate::atomic::openat_no_follow_io(
                     root.as_fd(),
-                    rel.as_path(),
+                    rel,
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
                     0,
                 ) {
@@ -2192,7 +2183,7 @@ impl LocalTransport {
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             let child = rel.join(&entry.name)?;
-            let (is_dir, is_symlink) = match crate::atomic::path_kind_fd(&root, child.as_path())? {
+            let (is_dir, is_symlink) = match crate::atomic::path_kind_fd(&root, &child)? {
                 Some(crate::atomic::PathKind::Dir) => (true, false),
                 Some(crate::atomic::PathKind::Symlink) => (false, true),
                 Some(crate::atomic::PathKind::File) | Some(crate::atomic::PathKind::Other) => {
@@ -2235,7 +2226,7 @@ impl LocalTransport {
         if !is_symlink {
             let fd = crate::atomic::openat_no_follow(
                 root.as_fd(),
-                child.as_path(),
+                child,
                 libc::O_RDONLY | libc::O_NOFOLLOW,
                 0,
             )?;
@@ -2267,15 +2258,16 @@ impl LocalTransport {
     ) -> Result<Option<RemoteMeta>> {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
-        let path = rel.as_path();
-        let name = path
+        let name = rel
             .file_name()
             .ok_or_else(|| Error::transport(format!("lstat {}: no file name", rel.display())))?;
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        // The PARENT is named by the validated type's own parent, so the open is
+        // component-wise and cannot resolve off the root.
+        let parent = rel.parent();
         let parent_fd = match parent {
             Some(parent) => match crate::atomic::openat_no_follow_io(
                 root.as_fd(),
-                parent,
+                &parent,
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 0,
             ) {
@@ -2413,7 +2405,7 @@ impl Remote for LocalTransport {
                 rel.display()
             )));
         };
-        crate::atomic::read_fd(&root, rel.as_path())
+        crate::atomic::read_fd(&root, rel)
             .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
     }
 
@@ -2484,9 +2476,9 @@ impl Remote for LocalTransport {
     fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("remove residue {}: {e}", rel.display())))?;
-        match crate::atomic::remove_claim_file_fd(&root, rel.as_path()) {
+        match crate::atomic::remove_claim_file_fd(&root, rel) {
             Ok(()) => Ok(()),
-            Err(error) => match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+            Err(error) => match crate::atomic::path_kind_fd(&root, rel) {
                 Ok(None) => Ok(()),
                 _ => Err(Error::transport(format!(
                     "remove residue {}: {error}",
@@ -2501,7 +2493,7 @@ impl Remote for LocalTransport {
     fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("rmdir residue {}: {e}", rel.display())))?;
-        crate::atomic::remove_claim_dir_fd(&root, rel.as_path())
+        crate::atomic::remove_claim_dir_fd(&root, rel)
             .map_err(|e| Error::transport(format!("rmdir residue {}: {e}", rel.display())))
     }
 
@@ -2511,7 +2503,7 @@ impl Remote for LocalTransport {
     fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("rename aside {}: {e}", from.display())))?;
-        crate::atomic::rename_residue_paths(&root, from.as_path(), to.as_path()).map_err(|e| {
+        crate::atomic::rename_residue_paths(&root, from, to).map_err(|e| {
             Error::transport(format!(
                 "rename aside {} -> {}: {e}",
                 from.display(),
@@ -2531,10 +2523,10 @@ impl Remote for LocalTransport {
         if let Some(parent) = rel.parent()
             && !parent.as_path().as_os_str().is_empty()
         {
-            crate::atomic::ensure_private_dir_fd(&root, parent.as_path())
+            crate::atomic::ensure_private_dir_fd(&root, &parent)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
         }
-        crate::atomic::write_file_fd(&root, rel.as_path(), data)
+        crate::atomic::write_file_fd(&root, rel, data)
             .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
         if mode != 0 {
             crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
@@ -2549,7 +2541,7 @@ impl Remote for LocalTransport {
         // confinement and the lock-record guard).
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))?;
-        crate::atomic::create_dir_fd(&root, rel.as_path())
+        crate::atomic::create_dir_fd(&root, rel)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
@@ -2557,7 +2549,7 @@ impl Remote for LocalTransport {
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))?;
-        crate::atomic::ensure_private_dir_fd(&root, rel.as_path())
+        crate::atomic::ensure_private_dir_fd(&root, rel)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
@@ -2576,7 +2568,7 @@ impl Remote for LocalTransport {
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("rename {}: {e}", from.display())))?;
-        crate::atomic::renameat_paths(&root, from.as_path(), to.as_path()).map_err(|e| {
+        crate::atomic::renameat_paths(&root, from, to).map_err(|e| {
             Error::transport(format!(
                 "rename {} -> {}: {e}",
                 from.display(),
@@ -2589,7 +2581,7 @@ impl Remote for LocalTransport {
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("symlink {}: {e}", link.display())))?;
-        crate::atomic::symlink_fd(&root, target, link.as_path()).map_err(|e| {
+        crate::atomic::symlink_fd(&root, target, link).map_err(|e| {
             Error::transport(format!(
                 "symlink {} -> {}: {e}",
                 link.display(),
@@ -2610,7 +2602,7 @@ impl Remote for LocalTransport {
                 rel.display()
             )));
         };
-        crate::atomic::read_link_fd(&root, rel.as_path())
+        crate::atomic::read_link_fd(&root, rel)
             .map_err(|e| Error::transport(format!("readlink {}: {e}", rel.display())))
     }
 
@@ -2627,10 +2619,10 @@ impl Remote for LocalTransport {
         // tolerated no-op).
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("remove {}: {e}", rel.display())))?;
-        match crate::atomic::remove_file_fd(&root, rel.as_path()) {
+        match crate::atomic::remove_file_fd(&root, rel) {
             Ok(()) => Ok(()),
             // A confirmed absence is the tolerated no-op.
-            Err(error) => match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+            Err(error) => match crate::atomic::path_kind_fd(&root, rel) {
                 Ok(None) => Ok(()),
                 _ => Err(Error::transport(format!(
                     "remove {}: {error}",
@@ -2695,10 +2687,10 @@ impl Remote for LocalTransport {
         // entry is the idempotent no-op it always was.
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))?;
-        match crate::atomic::remove_dir_all_fd(&root, rel.as_path()) {
+        match crate::atomic::remove_dir_all_fd(&root, rel) {
             Ok(()) => Ok(()),
             // A confirmed absence is the tolerated no-op.
-            Err(error) => match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+            Err(error) => match crate::atomic::path_kind_fd(&root, rel) {
                 Ok(None) => Ok(()),
                 _ => Err(Error::transport(format!(
                     "rmdir {}: {error}",
@@ -2712,7 +2704,7 @@ impl Remote for LocalTransport {
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))?;
-        crate::atomic::remove_dir_fd(&root, rel.as_path())
+        crate::atomic::remove_dir_fd(&root, rel)
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))
     }
 
