@@ -132,6 +132,6 @@ pub use apply::{
     destination_lock_path, retire_destination_lock, sync,
 };
 pub use diff::{
-    EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests, diff_trees,
-    local_manifest, remote_manifest,
+    EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests,
+    diff_source_and_destination, diff_trees, local_manifest, remote_manifest,
 };

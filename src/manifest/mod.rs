@@ -306,7 +306,82 @@ use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
+/// The entry kind, a VALIDATED value in the manifest's domain.
+///
+/// The wire form is the three canonical strings `"file"`, `"dir"`, and
+/// `"symlink"`; only the serde boundary translates between that form and this
+/// type, so a reader of the manifest never RE-PARSES a kind string into the
+/// value a decision needs. Before this type the field was a `String` and every
+/// consumer projected it with a fallible `EntryKind::of` — the mode/kind
+/// re-reads API constraint #7 removes. A wire value outside the canonical set
+/// is refused by `Deserialize` (fail closed), exactly as the old projection
+/// refused it, and the emitted bytes are unchanged (see
+/// `manifest_entries_serialize_byte_identically_to_the_wire_strings`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+}
+
+impl EntryKind {
+    /// The canonical manifest `type` string for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntryKind::File => "file",
+            EntryKind::Dir => "dir",
+            EntryKind::Symlink => "symlink",
+        }
+    }
+}
+
+impl Serialize for EntryKind {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EntryKind {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        match spelling.as_str() {
+            "file" => Ok(EntryKind::File),
+            "dir" => Ok(EntryKind::Dir),
+            "symlink" => Ok(EntryKind::Symlink),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown manifest entry type {other:?}: expected one of \"file\", \"dir\", \"symlink\""
+            ))),
+        }
+    }
+}
+
 /// One entry in a canonical tree object.
+///
+/// The `entry_type` and `mode` fields are part of the manifest's VALIDATED
+/// domain, not wire spellings: the wire strings (`"file"`/`"dir"`/`"symlink"`
+/// and `"0755"`) exist only across serde. API constraint #7: a type that is
+/// read (a wire spelling) is not the type that is used (the validated value),
+/// so no consumer re-parses a kind or a mode. The wrong direction is a
+/// compile error:
+///
+/// ```compile_fail
+/// use storekit::manifest::TreeEntry;
+/// // The wire spellings do not typecheck into the validated entry: no producer
+/// // inside or outside the crate can emit an entry whose kind is outside the
+/// // canonical set or whose mode is a non-octal string.
+/// let _entry = TreeEntry {
+///     path: "x".to_string(),
+///     entry_type: "file".to_string(),
+///     mode: "0644".to_string(),
+///     content_sha256: None,
+///     symlink_target: None,
+/// };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
     /// The entry's ON-DISK name, in NFC over UTF-8, `/`-separated relative
@@ -317,11 +392,13 @@ pub struct TreeEntry {
     /// literal `\` inside one component is an ordinary name character (legal
     /// on Unix) and is preserved verbatim, so readers must split on `/` only.
     pub path: String,
-    /// `file`, `dir`, or `symlink`.
+    /// `file`, `dir`, or `symlink`, as the VALIDATED [`EntryKind`].
     #[serde(rename = "type")]
-    pub entry_type: String,
-    /// Octal mode string, e.g. `"0755"`.
-    pub mode: String,
+    pub entry_type: EntryKind,
+    /// The entry's permission mode as its low twelve bits, serialized as the
+    /// four-digit octal STRING the manifest always used (e.g. `"0755"`).
+    #[serde(with = "mode_octal")]
+    pub mode: u32,
     /// For files: SHA-256 of contents. For symlinks: SHA-256 of the target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
@@ -344,8 +421,36 @@ pub struct TreeMetadata {
 /// record refuses any other version (fail closed).
 pub const TREE_SCHEMA_VERSION: u32 = 1;
 
-fn fmt_mode(m: u32) -> String {
-    format!("{:04o}", m & 0o7777)
+/// The low twelve permission bits of a platform mode, the only bits the
+/// manifest carries.
+fn mode_bits(m: u32) -> u32 {
+    m & 0o7777
+}
+
+/// Serde for a [`TreeEntry::mode`]: the wire form is the four-digit octal
+/// STRING the canonicalizers always emitted (e.g. `"0755"`), and a value that
+/// is not four-or-fewer octal digits is refused at deserialization. This is
+/// the ONE place a mode spelling is parsed; before this the field was a
+/// `String` and every consumer re-parsed it with a fallible `parse_mode`, the
+/// mode re-reads API constraint #7 removes.
+mod mode_octal {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        mode: &u32,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{:04o}", mode & 0o7777))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<u32, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        u32::from_str_radix(&spelling, 8)
+            .map(|mode| mode & 0o7777)
+            .map_err(|_| serde::de::Error::custom(format!("invalid manifest mode {spelling:?}")))
+    }
 }
 
 /// Why a RELATIVE symlink target is refused.
@@ -479,7 +584,7 @@ impl<'a> SymlinkContainmentIndex<'a> {
         Self::from_pairs(
             entries
                 .iter()
-                .map(|e| (e.path.as_str(), e.entry_type == "symlink")),
+                .map(|e| (e.path.as_str(), e.entry_type == EntryKind::Symlink)),
         )
     }
 
@@ -914,7 +1019,7 @@ pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<
 /// manifest-and-hash model; reusing a caller-supplied previous manifest would
 /// remove it but is not implemented.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
-    Ok(canonicalize_tree_with(root, UnsupportedPolicy::Refuse)?.meta)
+    canonicalize_tree_with(root, RefuseUnsupported)
 }
 
 /// One DESTINATION entry that the manifest model can carry as PRESENT but that
@@ -950,20 +1055,76 @@ pub struct UnsupportedEntry {
     pub reason: String,
 }
 
-/// The result of canonicalizing a DESTINATION tree: the manifest plus the
-/// entries the strict rules would have refused.
+/// The result of canonicalizing a DESTINATION tree: the destination's own
+/// observation plus the entries the strict rules would have refused.
 ///
-/// `meta` is a DESTINATION OBSERVATION, not a canonical tree object: an entry
-/// named in `unsupported` may not be one the strict canonicalizer would emit
-/// (its symlink target may be absolute, or it may be a hard link recorded as
-/// an ordinary file). Never serialize it as a `tree.json`, never feed it to
-/// [`verify_tree_metadata`], and never use it as a SOURCE manifest — the
-/// source side must stay strict, so a tree this crate cannot represent
-/// faithfully is a loud failure rather than a silent transformation.
+/// The observation is a DESTINATION-ROLE value, not a canonical tree object,
+/// and the type now says so. An entry named in [`Self::unsupported`] may not
+/// be one the strict canonicalizer would emit (its symlink target may be
+/// absolute, or it may be a hard link recorded as an ordinary file). The
+/// canonical metadata is therefore `pub(crate)`: the ONLY way to obtain a
+/// [`TreeMetadata`] here is inside the crate, so a consumer cannot serialize a
+/// destination observation as a `tree.json`, cannot feed it to
+/// [`verify_tree_metadata`], and cannot use it as a SOURCE manifest — the
+/// directions API constraint #7 keeps apart. A consumer that needs the
+/// destination's entries or digest uses the role-named accessors
+/// ([`Self::entries`], [`Self::tree_sha256`]) or, to build the engine's own
+/// diff, `crate::sync::diff::diff_source_and_destination`.
+///
+/// Compile-checked: each wrong direction below is a `compile_fail` example.
+///
+/// A destination observation is not a source manifest:
+///
+/// ```compile_fail
+/// use storekit::manifest::{canonicalize_tree_destination, verify_tree_metadata};
+/// let destination = canonicalize_tree_destination(std::path::Path::new("/tmp")).unwrap();
+/// // `verify_tree_metadata` takes the canonical SOURCE type; the destination
+/// // observation has no `Deref` and no public metadata field, so it cannot be
+/// // passed as one.
+/// let _ = verify_tree_metadata(std::path::Path::new("/tmp"), &destination);
+/// ```
+///
+/// A destination observation is not a SOURCE manifest, in either position of
+/// the direction-typed diff:
+///
+/// ```compile_fail
+/// use storekit::manifest::{canonicalize_tree, canonicalize_tree_destination};
+/// use storekit::sync::diff::diff_source_and_destination;
+/// let source = canonicalize_tree(std::path::Path::new("/tmp")).unwrap();
+/// let destination = canonicalize_tree_destination(std::path::Path::new("/tmp")).unwrap();
+/// // The first position is the SOURCE, which must be canonical metadata. A
+/// // destination observation does not coerce to it.
+/// let _ = diff_source_and_destination(&destination, &source);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DestinationTree {
-    pub meta: TreeMetadata,
+    pub(crate) meta: TreeMetadata,
     pub unsupported: Vec<UnsupportedEntry>,
+}
+
+impl DestinationTree {
+    /// The destination's entries, under their observed spellings and LIVE
+    /// kinds. A destination-role read; it does not hand back a canonical
+    /// `TreeMetadata`.
+    pub fn entries(&self) -> &[TreeEntry] {
+        &self.meta.entries
+    }
+
+    /// The digest of the observed entry set, computed exactly as a source
+    /// manifest's digest is. Returned as a string rather than as a manifest.
+    pub fn tree_sha256(&self) -> &str {
+        &self.meta.tree_sha256
+    }
+
+    /// The destination record's schema version.
+    pub fn tree_schema_version(&self) -> u32 {
+        self.meta.tree_schema_version
+    }
+
+    /// The destination record's hash algorithm.
+    pub fn hash_algorithm(&self) -> &str {
+        &self.meta.hash_algorithm
+    }
 }
 
 /// Canonicalize a destination tree, TOLERATING the address-fidelity refusals
@@ -981,21 +1142,93 @@ pub struct DestinationTree {
 /// [`canonicalize_tree`], so an unrepresentable SOURCE entry still fails the
 /// run.
 pub fn canonicalize_tree_destination(root: &Path) -> Result<DestinationTree> {
-    canonicalize_tree_with(root, UnsupportedPolicy::Tolerate)
+    canonicalize_tree_with(root, RecordUnsupported::default())
 }
 
-/// Whether the shared walk REFUSES an unrepresentable entry (the strict source
-/// semantics) or RECORDS it and keeps going (the destination semantics).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnsupportedPolicy {
-    Refuse,
-    Tolerate,
+/// What a canonicalizing walk does when the address-fidelity rules refuse an
+/// entry — a TYPE, not a runtime mode.
+///
+/// The SOURCE walk ([`RefuseUnsupported`]) refuses; the DESTINATION walk
+/// ([`RecordUnsupported`]) records the refusal and keeps the entry. Because the
+/// policy is a type, the strict path has NO `unsupported` list and NO per-entry
+/// "was this tolerated" state: the mode/enum re-read and the deferred
+/// `Option` push that the shared `match policy` used to need are gone, and the
+/// strict constructor cannot return the destination type by construction.
+///
+/// [`canonicalize_tree`] returns [`TreeMetadata`];
+/// [`canonicalize_tree_destination`] returns [`DestinationTree`].
+trait UnsupportedSink {
+    /// The result this walk produces.
+    type Output;
+    /// Record or refuse one address-fidelity refusal. `path` is the manifest
+    /// spelling of the entry; the strict sink ignores it (the reason already
+    /// names the entry) and the tolerant sink records it.
+    fn tolerate(&mut self, path: &str, kind: MaterializationKind, reason: String) -> Result<()>;
+    /// Finish the walk from its assembled, unsorted entry list.
+    fn finish(self, entries: Vec<TreeEntry>) -> Self::Output;
 }
 
-fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<DestinationTree> {
+/// The strict SOURCE sink: any refusal is the walk's error.
+struct RefuseUnsupported;
+
+impl UnsupportedSink for RefuseUnsupported {
+    type Output = TreeMetadata;
+
+    fn tolerate(&mut self, _path: &str, kind: MaterializationKind, reason: String) -> Result<()> {
+        Err(Error::materialization_kind(kind, reason))
+    }
+
+    fn finish(self, entries: Vec<TreeEntry>) -> TreeMetadata {
+        build_metadata(entries)
+    }
+}
+
+/// The tolerant DESTINATION sink: record the refusal and keep the entry.
+#[derive(Default)]
+struct RecordUnsupported {
+    unsupported: Vec<UnsupportedEntry>,
+}
+
+impl UnsupportedSink for RecordUnsupported {
+    type Output = DestinationTree;
+
+    fn tolerate(&mut self, path: &str, kind: MaterializationKind, reason: String) -> Result<()> {
+        self.unsupported.push(UnsupportedEntry {
+            path: path.to_string(),
+            kind,
+            reason,
+        });
+        Ok(())
+    }
+
+    fn finish(self, entries: Vec<TreeEntry>) -> DestinationTree {
+        let mut unsupported = self.unsupported;
+        unsupported.sort_by(|a, b| a.path.cmp(&b.path));
+        DestinationTree {
+            meta: build_metadata(entries),
+            unsupported,
+        }
+    }
+}
+
+/// Assemble the canonical metadata (sorted entries, digest computed) exactly
+/// as every producer does. Shared so a source and a destination observation
+/// cannot disagree about the format.
+fn build_metadata(mut entries: Vec<TreeEntry>) -> TreeMetadata {
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut meta = TreeMetadata {
+        tree_schema_version: TREE_SCHEMA_VERSION,
+        hash_algorithm: "sha256".to_string(),
+        tree_sha256: String::new(),
+        entries,
+    };
+    meta.tree_sha256 = compute_tree_digest(&meta);
+    meta
+}
+
+fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Result<S::Output> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut unsupported: Vec<UnsupportedEntry> = Vec::new();
 
     let root_c = root
         .canonicalize()
@@ -1042,42 +1275,28 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| Error::materialization(format!("stat {}: {e}", path.display())))?;
 
-        let entry_type;
+        let entry_type: EntryKind;
         // Symlink entries carry a fixed canonical mode (0777) — the mode is
         // never read through the (symlink-following) platform helper, which
         // would fail on a dangling link. Dirs/files read their mode via the
         // platform helper (a documented 0o644 constant on Windows).
         let mut mode = if meta.is_symlink() {
-            "0777".to_string()
+            0o777
         } else {
-            fmt_mode(crate::platform::file_mode(path)?)
+            mode_bits(crate::platform::file_mode(path)?)
         };
         let mut content_sha256 = None;
         let mut symlink_target = None;
-        // Set when a strict address-fidelity rule refused this entry under
-        // `UnsupportedPolicy::Tolerate`; the entry is still recorded (under
-        // its live kind) and the reason joins `unsupported`.
-        let mut unsupported_reason: Option<(MaterializationKind, String)> = None;
 
         if meta.is_dir() {
-            entry_type = "dir";
+            entry_type = EntryKind::Dir;
         } else if meta.is_symlink() {
-            entry_type = "symlink";
+            entry_type = EntryKind::Symlink;
             let target = std::fs::read_link(path)
                 .map_err(|e| Error::materialization(format!("readlink {}: {e}", path.display())))?;
             if target.is_absolute() {
                 let reason = format!("absolute symlink not allowed: {}", path.display());
-                match policy {
-                    UnsupportedPolicy::Refuse => {
-                        return Err(Error::materialization_kind(
-                            MaterializationKind::AbsoluteSymlink,
-                            reason,
-                        ));
-                    }
-                    UnsupportedPolicy::Tolerate => {
-                        unsupported_reason = Some((MaterializationKind::AbsoluteSymlink, reason))
-                    }
-                }
+                sink.tolerate(&entry_path, MaterializationKind::AbsoluteSymlink, reason)?;
             }
             // A RELATIVE target is resolved against the directory CONTAINING
             // the link (the link's own parent), per POSIX, not against the
@@ -1105,25 +1324,15 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
             })?;
             symlink_target = Some(validate_symlink_target(&entry_path, target_str)?);
             content_sha256 = Some(sha256_bytes(&target_bytes));
-            mode = "0777".to_string();
+            mode = 0o777;
         } else if meta.is_file() {
-            entry_type = "file";
+            entry_type = EntryKind::File;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
                 if meta.nlink() > 1 {
                     let reason = format!("hard links not allowed: {}", path.display());
-                    match policy {
-                        UnsupportedPolicy::Refuse => {
-                            return Err(Error::materialization_kind(
-                                MaterializationKind::HardLink,
-                                reason,
-                            ));
-                        }
-                        UnsupportedPolicy::Tolerate => {
-                            unsupported_reason = Some((MaterializationKind::HardLink, reason))
-                        }
-                    }
+                    sink.tolerate(&entry_path, MaterializationKind::HardLink, reason)?;
                 }
             }
             let data = std::fs::read(path)
@@ -1136,17 +1345,9 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
             ));
         }
 
-        if let Some((kind, reason)) = unsupported_reason.take() {
-            unsupported.push(UnsupportedEntry {
-                path: entry_path.clone(),
-                kind,
-                reason,
-            });
-        }
-
         entries.push(TreeEntry {
             path: entry_path,
-            entry_type: entry_type.to_string(),
+            entry_type,
             mode,
             content_sha256,
             symlink_target,
@@ -1160,16 +1361,15 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
     // assembler reach the same verdict for the same tree on every host. See
     // the module docs for the fold and the erring direction it costs.
     let needs_containment = entries.iter().any(|e| {
-        e.entry_type == "symlink"
+        e.entry_type == EntryKind::Symlink
             && e.symlink_target
                 .as_deref()
                 .is_some_and(|t| !Path::new(t).is_absolute())
     });
     if needs_containment {
         let index = SymlinkContainmentIndex::from_entries(&entries);
-        let mut containment_unsupported: Vec<UnsupportedEntry> = Vec::new();
         for entry in &entries {
-            if entry.entry_type != "symlink" {
+            if entry.entry_type != EntryKind::Symlink {
                 continue;
             }
             let Some(target) = entry.symlink_target.as_deref() else {
@@ -1190,34 +1390,12 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                     &root.join(&entry.path).display().to_string(),
                     target,
                 );
-                match policy {
-                    UnsupportedPolicy::Refuse => {
-                        return Err(Error::materialization_kind(
-                            MaterializationKind::EscapingSymlink,
-                            reason,
-                        ));
-                    }
-                    UnsupportedPolicy::Tolerate => containment_unsupported.push(UnsupportedEntry {
-                        path: entry.path.clone(),
-                        kind: MaterializationKind::EscapingSymlink,
-                        reason,
-                    }),
-                }
+                sink.tolerate(&entry.path, MaterializationKind::EscapingSymlink, reason)?;
             }
         }
-        unsupported.extend(containment_unsupported);
     }
 
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    unsupported.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut meta = TreeMetadata {
-        tree_schema_version: TREE_SCHEMA_VERSION,
-        hash_algorithm: "sha256".to_string(),
-        tree_sha256: String::new(),
-        entries,
-    };
-    meta.tree_sha256 = compute_tree_digest(&meta);
-    Ok(DestinationTree { meta, unsupported })
+    Ok(sink.finish(entries))
 }
 
 /// The remote tree-verification script: walks a tree on the remote and
@@ -1432,7 +1610,7 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// THE WIRE FORMAT (the far side would print a final sentinel line), so it is
 /// deliberately NOT done here: the exit status already carries the evidence.
 pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
-    Ok(canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Refuse)?.meta)
+    canonicalize_remote_entries_with(output, root, RefuseUnsupported)
 }
 
 /// The CHECKED constructor for a remote SOURCE listing: it takes the far-side
@@ -1470,7 +1648,7 @@ pub(crate) fn canonicalize_remote_entries_destination(
     output: &str,
     root: &Path,
 ) -> Result<DestinationTree> {
-    canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Tolerate)
+    canonicalize_remote_entries_with(output, root, RecordUnsupported::default())
 }
 
 /// The DESTINATION-side checked constructor: [`canonicalize_remote_entries_checked`]
@@ -1505,14 +1683,13 @@ fn require_complete_walk(exited_zero: bool) -> Result<()> {
     ))
 }
 
-fn canonicalize_remote_entries_with(
+fn canonicalize_remote_entries_with<S: UnsupportedSink>(
     output: &str,
     _root: &Path,
-    policy: UnsupportedPolicy,
-) -> Result<DestinationTree> {
+    mut sink: S,
+) -> Result<S::Output> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut unsupported: Vec<UnsupportedEntry> = Vec::new();
     for line in output.split('\n') {
         // The script terminates every line with a single LF and never emits a
         // CR. `str::lines()` would fold a CR that immediately precedes the LF,
@@ -1575,8 +1752,8 @@ fn canonicalize_remote_entries_with(
         let entry = match entry_type {
             "d" => TreeEntry {
                 path: entry_path,
-                entry_type: "dir".to_string(),
-                mode: fmt_mode(mode),
+                entry_type: EntryKind::Dir,
+                mode: mode_bits(mode),
                 content_sha256: None,
                 symlink_target: None,
             },
@@ -1586,19 +1763,7 @@ fn canonicalize_remote_entries_with(
                 })?;
                 if n > 1 {
                     let reason = format!("hard links not allowed: {entry_path}");
-                    match policy {
-                        UnsupportedPolicy::Refuse => {
-                            return Err(Error::materialization_kind(
-                                MaterializationKind::HardLink,
-                                reason,
-                            ));
-                        }
-                        UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
-                            path: entry_path.clone(),
-                            kind: MaterializationKind::HardLink,
-                            reason,
-                        }),
-                    }
+                    sink.tolerate(&entry_path, MaterializationKind::HardLink, reason)?;
                 }
                 if content_hash.is_empty() {
                     return Err(Error::materialization(format!(
@@ -1614,8 +1779,8 @@ fn canonicalize_remote_entries_with(
                 validate_wire_hash(content_hash, &entry_path)?;
                 TreeEntry {
                     path: entry_path,
-                    entry_type: "file".to_string(),
-                    mode: fmt_mode(mode),
+                    entry_type: EntryKind::File,
+                    mode: mode_bits(mode),
                     content_sha256: Some(content_hash.to_string()),
                     symlink_target: None,
                 }
@@ -1644,19 +1809,7 @@ fn canonicalize_remote_entries_with(
                 let symlink_target = validate_symlink_target(&entry_path, symlink_target)?;
                 if Path::new(&symlink_target).is_absolute() {
                     let reason = format!("absolute symlink not allowed: {entry_path}");
-                    match policy {
-                        UnsupportedPolicy::Refuse => {
-                            return Err(Error::materialization_kind(
-                                MaterializationKind::AbsoluteSymlink,
-                                reason,
-                            ));
-                        }
-                        UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
-                            path: entry_path.clone(),
-                            kind: MaterializationKind::AbsoluteSymlink,
-                            reason,
-                        }),
-                    }
+                    sink.tolerate(&entry_path, MaterializationKind::AbsoluteSymlink, reason)?;
                 }
                 // A RELATIVE target's containment is checked in a POST-PASS,
                 // because the rule needs the KIND of every entry the target's
@@ -1672,8 +1825,8 @@ fn canonicalize_remote_entries_with(
                 }
                 TreeEntry {
                     path: entry_path,
-                    entry_type: "symlink".to_string(),
-                    mode: "0777".to_string(),
+                    entry_type: EntryKind::Symlink,
+                    mode: 0o777,
                     content_sha256: Some(recomputed),
                     symlink_target: Some(symlink_target),
                 }
@@ -1703,7 +1856,7 @@ fn canonicalize_remote_entries_with(
     // disagree about the same tree.
     let index = SymlinkContainmentIndex::from_entries(&entries);
     for entry in &entries {
-        if entry.entry_type != "symlink" {
+        if entry.entry_type != EntryKind::Symlink {
             continue;
         }
         let Some(target) = entry.symlink_target.as_deref() else {
@@ -1719,31 +1872,10 @@ fn canonicalize_remote_entries_with(
         {
             let reason =
                 symlink_target_refusal_message(refusal, &entry.path, &target.to_string_lossy());
-            match policy {
-                UnsupportedPolicy::Refuse => {
-                    return Err(Error::materialization_kind(
-                        MaterializationKind::EscapingSymlink,
-                        reason,
-                    ));
-                }
-                UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
-                    path: entry.path.clone(),
-                    kind: MaterializationKind::EscapingSymlink,
-                    reason,
-                }),
-            }
+            sink.tolerate(&entry.path, MaterializationKind::EscapingSymlink, reason)?;
         }
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    unsupported.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut meta = TreeMetadata {
-        tree_schema_version: TREE_SCHEMA_VERSION,
-        hash_algorithm: "sha256".to_string(),
-        tree_sha256: String::new(),
-        entries,
-    };
-    meta.tree_sha256 = compute_tree_digest(&meta);
-    Ok(DestinationTree { meta, unsupported })
+    Ok(sink.finish(entries))
 }
 
 /// Verify that a stored [`TreeMetadata`] is EXACTLY the canonical metadata of
@@ -1812,13 +1944,13 @@ pub fn verify_tree_metadata(root: &Path, stored: &TreeMetadata) -> Result<TreeMe
                 "stored tree metadata at {} does not match the canonical metadata of the tree content: entry {i} ({:?}) type {:?} != {:?}",
                 root.display(),
                 se.path,
-                se.entry_type,
-                ce.entry_type
+                se.entry_type.as_str(),
+                ce.entry_type.as_str()
             )));
         }
         if se.mode != ce.mode {
             return Err(Error::integrity(format!(
-                "stored tree metadata at {} does not match the canonical metadata of the tree content: entry {i} ({:?}) mode {:?} != {:?}",
+                "stored tree metadata at {} does not match the canonical metadata of the tree content: entry {i} ({:?}) mode {:04o} != {:04o}",
                 root.display(),
                 se.path,
                 se.mode,
@@ -2061,6 +2193,41 @@ mod tests {
             before.entries, after.entries,
             "mutating one byte must change the canonical entry"
         );
+    }
+
+    /// The WIRE FORM is unchanged by the typed manifest fields (API constraint
+    /// #7): the `type` field is the canonical string and the `mode` field is
+    /// the four-digit octal STRING, exactly as before the fields became
+    /// validated values. The point of the typing is that this spelling exists
+    /// ONLY across serde; `TreeEntry` itself carries `EntryKind` and a `u32`,
+    /// so no consumer re-parses them.
+    #[test]
+    fn manifest_entries_serialize_to_the_same_wire_strings() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), b"content").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("sub/file.txt", root.join("link")).unwrap();
+        let meta = canonicalize_tree(&root).unwrap();
+        for entry in &meta.entries {
+            let wire = serde_json::to_value(entry).unwrap();
+            assert_eq!(
+                wire["type"].as_str().unwrap(),
+                entry.entry_type.as_str(),
+                "the wire `type` must be the canonical string for {} kinds",
+                entry.entry_type.as_str()
+            );
+            assert_eq!(
+                wire["mode"].as_str().unwrap(),
+                format!("{:04o}", entry.mode),
+                "the wire `mode` must be the four-digit octal string"
+            );
+        }
+        // And the whole record round-trips through the wire unchanged.
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let back: TreeMetadata = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, meta, "a manifest must round-trip byte-stably");
     }
 
     /// A legitimate filename containing `..` as a SUBSTRING (e.g. `a..b`,
@@ -2720,7 +2887,7 @@ mod tests {
             tree.meta
                 .entries
                 .iter()
-                .any(|e| e.path == "abs" && e.entry_type == "symlink"),
+                .any(|e| e.path == "abs" && e.entry_type == EntryKind::Symlink),
             "{:?}",
             tree.meta.entries
         );
@@ -2728,7 +2895,7 @@ mod tests {
             tree.meta
                 .entries
                 .iter()
-                .any(|e| e.path == "esc" && e.entry_type == "symlink")
+                .any(|e| e.path == "esc" && e.entry_type == EntryKind::Symlink)
         );
 
         // A hard link, likewise: both names have nlink > 1 and are recorded.
@@ -2751,7 +2918,12 @@ mod tests {
                 .iter()
                 .all(|u| u.kind == crate::error::MaterializationKind::HardLink)
         );
-        assert!(tree.meta.entries.iter().all(|e| e.entry_type == "file"));
+        assert!(
+            tree.meta
+                .entries
+                .iter()
+                .all(|e| e.entry_type == EntryKind::File)
+        );
     }
 
     /// F2 (destination tolerance, REMOTE): the same tolerance through the
@@ -4603,7 +4775,11 @@ mod tests {
                             entry.path, parent
                         )
                     });
-                assert_eq!(p.entry_type, "dir", "parent {parent} must be a dir");
+                assert_eq!(
+                    p.entry_type,
+                    EntryKind::Dir,
+                    "parent {parent} must be a dir"
+                );
             }
         }
     }
@@ -4637,7 +4813,11 @@ mod tests {
                             entry.path, parent
                         )
                     });
-                assert_eq!(p.entry_type, "dir", "parent {parent} must be a dir");
+                assert_eq!(
+                    p.entry_type,
+                    EntryKind::Dir,
+                    "parent {parent} must be a dir"
+                );
             }
         }
     }
@@ -4683,8 +4863,8 @@ mod tests {
             Mutation::HashAlgorithm => meta.hash_algorithm = "sha512".to_string(),
             Mutation::SchemaVersion => meta.tree_schema_version += 1,
             Mutation::EntryPath => meta.entries[0].path = "mutated.txt".to_string(),
-            Mutation::EntryType => meta.entries[0].entry_type = "dir".to_string(),
-            Mutation::EntryMode => meta.entries[0].mode = "0000".to_string(),
+            Mutation::EntryType => meta.entries[0].entry_type = EntryKind::Dir,
+            Mutation::EntryMode => meta.entries[0].mode = 0o000,
             Mutation::EntryContentSha256 => {
                 meta.entries[0].content_sha256 = Some("0".repeat(64));
             }
@@ -4698,8 +4878,8 @@ mod tests {
             }
             Mutation::AddEntry => meta.entries.push(TreeEntry {
                 path: "bogus.txt".to_string(),
-                entry_type: "file".to_string(),
-                mode: "0644".to_string(),
+                entry_type: EntryKind::File,
+                mode: 0o644,
                 content_sha256: Some("0".repeat(64)),
                 symlink_target: None,
             }),

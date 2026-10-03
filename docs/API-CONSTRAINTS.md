@@ -16,7 +16,7 @@ sentences disappear from `src/`.
 | 4 | **Every condition a caller must branch on is a typed value.** Each class whose conditions a caller must tell apart carries a public kind enum and every error variant names it: `ReservedKind` (reserved-spelling refusals), `MaterializationKind` (address-fidelity and wire refusals, plus `RootsOverlap`/`ParentNotClosed`), `StoreKind` (the tree copy's source-audit refusals, the residue gate, and visible-but-unconfirmed durability), and `TransportKind` (the manifest-failure LAYERS — unreachable host vs far-side script vs missing `perl` vs output-drain vs undetermined — the receiver-marker conditions, a non-directory root, and remote durability). The message is preserved VERBATIM so a text-matching caller keeps working; `with_context` preserves the kind. | string matching in callers (the manifest-failure layer tests, the copy-source-audit tests, the roots-overlap test and the receiver-marker tests all had to match message substrings to tell two conditions apart), and the mutation where two layers collapsed onto one kind stayed green under message assertions but is caught by the kind assertions. | **done** (`ReservedKind`, `MaterializationKind`, `StoreKind`, `TransportKind`) |
 | 5 | **The reserved spellings a break may touch are a value, unforgeable outside the crate.** | the residual list as prose. | done (`Sanction`, `GuardedRel`) |
 | 6 | **Every bound is a constant with its reason stated**, and no derived value feeds a length-limited resource unbounded. | ad-hoc length arithmetic at each site. | done |
-| 7 | **One direction of data flow per type**: a type that is read is not the same type that is written. | mode/kind re-reads, and the checks that exist only to catch a caller passing the wrong one. | planned |
+| 7 | **One direction of data flow per type**: a type that is read is not the same type that is written. | mode/kind re-reads, and the checks that exist only to catch a caller passing the wrong one. | **done** (see "What constraint 7 closed" below) |
 | 8 | **The crate's own contract is not reachable by accident**: the weak, unverified or unenforced path is reachable only through a name that states it. | the "documented but not enforced" bullets. | **done** (see "What constraint 8 closed" below; one stated residual remains by decision) |
 
 ## What constraint 8 closed
@@ -80,8 +80,9 @@ named AT the item with its reach).
   OWNS by an identity-checked `OwnedLockRecord` capability, so a public caller
   cannot break a record the protocol does not own.
 * **R — `remote` weaker paths already named at the item**: the destination
-  tolerance is reachable only through the `*_destination` names (`UnsupportedPolicy`
-  is private); the Windows port's weaker guarantees are stated on every
+  tolerance is reachable only through the `*_destination` names (the tolerant
+  sink `RecordUnsupported` is private); the Windows port's weaker guarantees
+  are stated on every
   primitive and in `atomic::COMPONENT_CONFINED`; `Remote::copy_tree`'s SSH
   `cp -a` asymmetry is stated on the trait method; `EntryPolicy::AppendTail`
   carries its lost-update warning.
@@ -98,6 +99,62 @@ The pin move this pass first made — gating the unconfined replace test-only on
 Unix removed its `std::fs::rename` from the production count — was REVERSED
 when the demotion was; `docs/CONSISTENCY.md` ("I") records both the move and
 the reversal.
+
+## What constraint 7 closed
+
+The manifest is produced, serialized, transferred, and read back, so the same
+facts cross the wire in both directions. Three places let one type carry both
+directions; each is now two.
+
+* **The entry kind and mode are VALIDATED values, not wire spellings.**
+  `TreeEntry.entry_type` is an `EntryKind` and `TreeEntry.mode` is a `u32`;
+  the strings `"file"`/`"dir"`/`"symlink"` and the four-digit octal mode exist
+  only across `Serialize`/`Deserialize`. **Removed:** the
+  per-consumer projections — nine `EntryKind::of` sites (six fallible, two
+  silently DROPPING a path with `let Ok(..) else { continue }`, one filtering)
+  and seven `parse_mode(&entry.mode)` re-reads, plus the raw kind-string
+  comparisons the typed field replaces. **Refusals moved:** the
+  `unknown manifest entry type` refusal and the `invalid manifest mode`
+  refusal now fire at the ONE wire boundary (`Deserialize`), so a malformed
+  record cannot become a `TreeEntry` at all. **Wire format:**
+  byte-identical; pinned by
+  `manifest_entries_serialize_to_the_same_wire_strings` (the `type` string and
+  the octal `mode`) and by the local/remote byte-identity test.
+  `EntryKind` now lives in `manifest` (re-exported from `sync::diff`), and
+  `EntryKind::of`/`from_manifest` are gone — the field IS the value.
+* **The destination observation is a distinct type.** `DestinationTree`'s
+  canonical payload is `pub(crate)`, so a destination observation cannot be
+  serialized as a `tree.json`, cannot be fed to `verify_tree_metadata`, and
+  cannot be used as a SOURCE manifest at the public boundary. It exposes only
+  destination-role accessors (`entries`, `tree_sha256`, ...). **The direction
+  is a TYPE at the entry points:** `diff_source_and_destination(&TreeMetadata,
+  &DestinationTree)` and `apply_manifests(&TreeMetadata, &DestinationTree)`
+  take the destination type in the destination position, while `diff_trees`
+  stays for two canonical manifests. Two `compile_fail` doctests prove the
+  wrong direction does not typecheck, each `E0308`
+  (`expected &TreeMetadata, found &DestinationTree`; and the swap is
+  `expected &DestinationTree, found &TreeMetadata`). `DestinationTree.meta`
+  becoming `pub(crate)` is a breaking change to that field — the direction is
+  the point — and `unsupported` stays public; `tests/consumer_fit.rs` does not
+  use either and still compiles and passes.
+* **The strict SOURCE walk no longer builds the destination type.**
+  `UnsupportedPolicy` (a runtime mode, re-read at three `match` sites in each
+  of the local walk and the wire assembler) and the deferred
+  `unsupported_reason: Option<...>` per-entry state are gone. The policy is a
+  TYPE (`UnsupportedSink`: `RefuseUnsupported` / `RecordUnsupported`), so the
+  strict path allocates no `unsupported` list, keeps no per-entry "was this
+  tolerated" state, and returns `TreeMetadata` by construction —
+  `canonicalize_tree` and `canonicalize_remote_entries` cannot produce a
+  `DestinationTree`.
+
+**The delta, measured.** The typed field is STRICTER at the boundary in one
+way and identical everywhere else: a mode string longer than the twelve
+permission bits (or any non-octal spelling) is refused by `Deserialize` rather
+than masked by `parse_mode` at first use — the refusal is the same, its SITE
+moved. No input the old projections accepted is now refused, and no branch that
+was load-bearing (the guard, the lock, the audit, the copy) was touched. The
+source audits' pinned maps are unchanged: no `libc` or `std::fs` symbol was
+added or removed.
 
 ## Rules for adding a constraint
 

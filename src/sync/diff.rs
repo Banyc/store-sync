@@ -50,53 +50,16 @@ use std::time::Duration;
 /// while still bounding a hung remote.
 pub const REMOTE_MANIFEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The entry kind, projected from the canonical manifest's `type` string.
+/// The entry kind.
 ///
-/// The three strings are the ones [`crate::manifest::canonicalize_tree`] and
-/// [`crate::manifest::canonicalize_remote_entries`] write for the local walk
-/// and the remote assembler respectively; the two producers agree by
-/// construction (there is a `manifest` test asserting it), so a policy keyed
-/// on this kind sees the same value no matter which side produced the
-/// manifest. The mapping is not guessed: the `sync` suite canonicalizes a
-/// fixture containing each kind and asserts the strings match
-/// [`EntryKind::as_str`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum EntryKind {
-    File,
-    Dir,
-    Symlink,
-}
-
-impl EntryKind {
-    /// The canonical manifest `type` string for this kind.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EntryKind::File => "file",
-            EntryKind::Dir => "dir",
-            EntryKind::Symlink => "symlink",
-        }
-    }
-
-    /// Project a manifest entry-kind string. A value outside the canonical set
-    /// is an integrity failure — the canonicalizers never emit one, so seeing
-    /// one means the manifest was tampered with or produced by a divergent
-    /// producer.
-    pub fn from_manifest(entry_type: &str) -> Result<EntryKind> {
-        match entry_type {
-            "file" => Ok(EntryKind::File),
-            "dir" => Ok(EntryKind::Dir),
-            "symlink" => Ok(EntryKind::Symlink),
-            other => Err(Error::integrity(format!(
-                "unknown manifest entry type {other:?}: expected one of \"file\", \"dir\", \"symlink\""
-            ))),
-        }
-    }
-
-    /// The kind of a manifest entry.
-    pub fn of(entry: &TreeEntry) -> Result<EntryKind> {
-        EntryKind::from_manifest(&entry.entry_type)
-    }
-}
+/// Defined in [`crate::manifest`] and re-exported here because the kind is a
+/// property of a manifest ENTRY, not of the diff: typing the field
+/// ([`TreeEntry::entry_type`]) is what removes the "project the `type` string
+/// into a kind" re-read at every consumer (API constraint #7). A policy keyed
+/// on this kind sees the value the canonicalizer wrote without re-parsing it,
+/// and the wire strings the two producers emit still agree by construction
+/// (the `manifest` suite pins both the bytes and the accepted spellings).
+pub use crate::manifest::EntryKind;
 
 /// The classification of one path present in either manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,10 +343,24 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
 ///
 /// The tree digest is recomputed so each returned manifest stays
 /// self-consistent.
-pub fn apply_manifests(source: &TreeMetadata, dest: &TreeMetadata) -> (TreeMetadata, TreeMetadata) {
+///
+/// The destination is a [`DestinationTree`], NOT a bare `&TreeMetadata`: the
+/// destination side of a transfer is an OBSERVATION, and API constraint #7
+/// keeps the two directions apart in the type. A `&TreeMetadata` in this
+/// position no longer typechecks, so a caller cannot feed a canonical SOURCE
+/// manifest where the destination is expected (see the `compile_fail` example
+/// on [`DestinationTree`]).
+pub fn apply_manifests(
+    source: &TreeMetadata,
+    dest: &DestinationTree,
+) -> (TreeMetadata, DestinationTree) {
+    let stripped_dest = strip_reserved(dest.meta.clone(), crate::reserved::is_residue_path);
     (
         strip_reserved(source.clone(), crate::reserved::is_unaddressable_path),
-        strip_reserved(dest.clone(), crate::reserved::is_residue_path),
+        DestinationTree {
+            meta: stripped_dest,
+            unsupported: dest.unsupported.clone(),
+        },
     )
 }
 
@@ -775,6 +752,19 @@ fn far_side_script_failed(out: &ExecOutcome) -> bool {
         .any(|prefix| stderr_line_starts_with(&out.stderr, prefix))
 }
 
+/// The DIRECTION-TYPED diff: a canonical SOURCE manifest against a
+/// [`DestinationTree`] observation, producing exactly [`diff_trees`]'s result.
+///
+/// [`diff_trees`] stays for two canonical manifests (a snapshot against a live
+/// tree, say). This entry point exists so the destination position takes the
+/// destination TYPE: a caller cannot pass the destination observation as the
+/// source (that is a `compile_fail` example on [`DestinationTree`]), and cannot
+/// accidentally diff a source manifest against another source manifest while
+/// believing one side is the destination.
+pub fn diff_source_and_destination(source: &TreeMetadata, dest: &DestinationTree) -> TreeDiff {
+    diff_trees(source, &dest.meta)
+}
+
 /// Classify every path in the union of `source` and `dest`, sorted by path.
 ///
 /// This is the RAW differ: it classifies exactly the manifests it is given, so
@@ -974,7 +964,7 @@ mod tests {
         let source = remote_manifest(&src_t).unwrap();
         let destination = remote_destination_manifest(&dst_t).unwrap();
 
-        let raw = diff_trees(&source, &destination.meta);
+        let raw = diff_source_and_destination(&source, &destination);
         assert_eq!(
             raw.classify(".sync-aside.7.0"),
             Some(EntryDiff::Missing),
@@ -986,8 +976,8 @@ mod tests {
             "the RAW destination diff shows a stranded aside as deletable"
         );
 
-        let (source_stripped, dest_stripped) = apply_manifests(&source, &destination.meta);
-        let decision = diff_trees(&source_stripped, &dest_stripped);
+        let (source_stripped, dest_stripped) = apply_manifests(&source, &destination);
+        let decision = diff_source_and_destination(&source_stripped, &dest_stripped);
         assert_eq!(
             decision.classify(".sync-aside.7.0"),
             None,
@@ -1027,7 +1017,7 @@ mod tests {
         );
         assert!(probe.prepared.load(Ordering::SeqCst));
         assert_eq!(probe.execs.load(Ordering::SeqCst), 2);
-        assert!(destination.meta.entries.is_empty());
+        assert!(destination.entries().is_empty());
     }
 
     /// Build a tree containing one entry of EACH kind so the kind-string
@@ -1043,8 +1033,8 @@ mod tests {
 
     /// The mapping from manifest `type` string to [`EntryKind`] is derived
     /// from the canonicalizer, not guessed: canonicalize a tree with a file, a
-    /// directory, and a symlink and assert each entry's string projects back
-    /// to the kind and equals [`EntryKind::as_str`].
+    /// directory, and a symlink and assert each entry's VALIDATED kind equals
+    /// [`EntryKind::as_str`].
     #[test]
     fn entry_kind_strings_match_the_canonicalizer() {
         let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
@@ -1053,8 +1043,9 @@ mod tests {
         let meta = canonicalize_tree(&root).unwrap();
         let mut seen = BTreeSet::new();
         for entry in &meta.entries {
-            let kind = EntryKind::of(entry).unwrap();
-            assert_eq!(entry.entry_type, kind.as_str());
+            let kind = entry.entry_type;
+            let wire = serde_json::to_value(entry).unwrap();
+            assert_eq!(wire["type"], kind.as_str());
             seen.insert(kind);
         }
         assert_eq!(
@@ -1064,10 +1055,20 @@ mod tests {
         );
     }
 
-    /// A manifest entry kind outside the canonical set is refused.
+    /// A manifest entry kind outside the canonical set is refused, and the
+    /// refusal now lives at the WIRE boundary (`Deserialize`) rather than in a
+    /// per-consumer projection: a JSON record naming an unknown kind cannot
+    /// become a [`crate::manifest::TreeEntry`] at all.
     #[test]
-    fn unknown_entry_type_is_refused() {
-        assert!(EntryKind::from_manifest("socket").is_err());
+    fn unknown_entry_type_is_refused_at_deserialization() {
+        let json = r#"{"path":"x","type":"socket","mode":"0644"}"#;
+        assert!(
+            serde_json::from_str::<crate::manifest::TreeEntry>(json).is_err(),
+            "a kind outside the canonical set must not deserialize"
+        );
+        let ok = r#"{"path":"x","type":"file","mode":"0644","content_sha256":"ab"}"#;
+        let entry = serde_json::from_str::<crate::manifest::TreeEntry>(ok).unwrap();
+        assert_eq!(entry.entry_type, EntryKind::File);
     }
 
     /// Every path in the union is classified, and the classes are:

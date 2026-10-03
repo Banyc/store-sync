@@ -932,8 +932,8 @@ use crate::manifest::{
     compute_tree_digest, symlink_target_refusal_message,
 };
 use crate::sync::diff::{
-    EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_trees, remote_destination_manifest,
-    remote_manifest,
+    EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_source_and_destination, diff_trees,
+    remote_destination_manifest, remote_manifest,
 };
 use crate::transport::{Layout, Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
@@ -3218,8 +3218,6 @@ fn run(
         Ok(tree) => tree,
         Err(error) => return Err(SyncError::from(error)),
     };
-    let dest_unsupported = destination.unsupported;
-    let dest_meta = destination.meta;
     // The reserved claim-aside namespace is bookkeeping, never content. Strip it
     // from BOTH manifests BEFORE the diff, so residue is never classified as
     // source content (transferred) or destination content (removed), and carry
@@ -3240,13 +3238,17 @@ fn run(
     // residue: it holds no original, so it stays in the destination manifest
     // and the diff reports it as destination-only (`extraneous`) — the spelling
     // the report doc promises.
-    let dest_residue = reserved_paths(&dest_meta);
+    let dest_residue = reserved_paths(&destination.meta);
     // The strip is the PUBLIC diff surface's own authority
     // ([`apply_manifests`]), so a consumer that builds a status on the raw
     // manifest primitives can reproduce exactly this decision surface instead
     // of risking a stranded aside being classified `Extraneous` (deletable).
-    let (source_meta, dest_meta) = apply_manifests(&source_meta, &dest_meta);
-    let diff = diff_trees(&source_meta, &dest_meta);
+    // The destination stays a [`DestinationTree`] through the strip and the
+    // diff: API constraint #7 keeps the source and destination directions in
+    // distinct types, so the observation can never be fed as a source.
+    let (source_meta, destination) = apply_manifests(&source_meta, &destination);
+    let dest_unsupported = destination.unsupported.clone();
+    let diff = diff_source_and_destination(&source_meta, &destination);
     // F2: an unsupported DESTINATION entry may be DELETED under a sanction
     // (`Extraneous::Delete`, when the source does not hold that path), but the
     // run must never WRITE a source entry over one. The diff cannot express
@@ -3284,7 +3286,7 @@ fn run(
     // use `Extraneous::Delete` when the source does not hold the path, or remove
     // the source link, and re-run.
     let needs_result_containment = source_meta.entries.iter().any(|e| {
-        e.entry_type == "symlink"
+        e.entry_type == EntryKind::Symlink
             && e.symlink_target
                 .as_deref()
                 .is_some_and(|t| !Path::new(t).is_absolute())
@@ -3296,8 +3298,8 @@ fn run(
             .map(|e| e.path.as_str())
             .collect();
         let mut result: Vec<(&str, bool)> =
-            Vec::with_capacity(dest_meta.entries.len() + source_meta.entries.len());
-        for entry in &dest_meta.entries {
+            Vec::with_capacity(diff.dest.entries.len() + source_meta.entries.len());
+        for entry in &diff.dest.entries {
             // The source's own entry SHADOWS the destination entry at the same
             // path (it is installed over it, or already matches it).
             if source_paths.contains(entry.path.as_str()) {
@@ -3308,14 +3310,14 @@ fn run(
             if extraneous == Extraneous::Delete {
                 continue;
             }
-            result.push((entry.path.as_str(), entry.entry_type == "symlink"));
+            result.push((entry.path.as_str(), entry.entry_type == EntryKind::Symlink));
         }
         for entry in &source_meta.entries {
-            result.push((entry.path.as_str(), entry.entry_type == "symlink"));
+            result.push((entry.path.as_str(), entry.entry_type == EntryKind::Symlink));
         }
         let index = SymlinkContainmentIndex::from_pairs(result);
         for entry in &source_meta.entries {
-            if entry.entry_type != "symlink" {
+            if entry.entry_type != EntryKind::Symlink {
                 continue;
             }
             let Some(target) = entry.symlink_target.as_deref() else {
@@ -4080,7 +4082,7 @@ impl Applier<'_, '_> {
             let Some(entry) = self.dest_entry_at(&ancestor) else {
                 return Ok(true);
             };
-            if entry.entry_type != EntryKind::Dir.as_str() {
+            if entry.entry_type != EntryKind::Dir {
                 return Ok(true);
             }
             // The ancestor IS an existing directory. It blocks only when
@@ -4159,8 +4161,7 @@ impl Applier<'_, '_> {
             // can need widening: a directory this sync creates is created
             // writable, and a non-directory ancestor is resolved (or blocked)
             // by the entry that owns it.
-            let Some(existing_kind) = self.dest_entry_at(dir).map(EntryKind::of).transpose()?
-            else {
+            let Some(existing_kind) = self.dest_entry_at(dir).map(|entry| entry.entry_type) else {
                 continue;
             };
             if existing_kind != EntryKind::Dir {
@@ -5270,7 +5271,7 @@ impl Applier<'_, '_> {
                     )));
                 }
             }
-            let kind = EntryKind::of(entry)?;
+            let kind = entry.entry_type;
             let policy = self.policy.for_path(path, kind);
             if policy == EntryPolicy::Refuse {
                 // The conflict is the prohibition: the entry's OWN mode is left
@@ -5302,17 +5303,14 @@ impl Applier<'_, '_> {
             let mode_only_replace = kind == EntryKind::File
                 && policy == EntryPolicy::Replace
                 && dest_entries.get(path).is_some_and(|dest| {
-                    dest.entry_type == EntryKind::File.as_str()
+                    dest.entry_type == EntryKind::File
                         && dest.content_sha256.as_deref() == entry.content_sha256.as_deref()
                 });
             // The need is derived from what the transfer will ACTUALLY do
             // against the destination kind, so a directory-over-directory mode
             // change is not blocked by a refused directory that only had to be
             // traversable (its own mode is never widened).
-            let dest_kind = match dest_entries.get(path) {
-                Some(entry) => Some(EntryKind::of(entry)?),
-                None => None,
-            };
+            let dest_kind = dest_entries.get(path).map(|entry| entry.entry_type);
             if !defers_to_append
                 && !mode_only_replace
                 && self.forbidden_ancestor_blocks_write(path, parent_need(kind, dest_kind))?
@@ -5380,7 +5378,7 @@ impl Applier<'_, '_> {
         rel: &RootedRelativePath,
         dest_kind: Option<EntryKind>,
     ) -> Result<()> {
-        let mode = parse_mode(&entry.mode)?;
+        let mode = entry.mode;
         // The snapshot `dest_kind` selects the ROUTE (mode-only over an
         // existing directory, or a kind-changing claim+create). It is NOT a
         // destructive dispatch: a CLAIM carries no kind and the removal
@@ -5478,11 +5476,11 @@ impl Applier<'_, '_> {
                 if let (Some(dest), Some(EntryKind::File)) = (dest_entry, dest_kind)
                     && dest.content_sha256.as_deref() == Some(expected.as_str())
                 {
-                    let mode = parse_mode(&entry.mode)?;
+                    let mode = entry.mode;
                     let original = self
                         .dest
                         .mode_opt(rel, EntryKind::File)?
-                        .unwrap_or(parse_mode(&dest.mode)?);
+                        .unwrap_or(dest.mode);
                     self.journal
                         .note_first_touch(&entry.path, EntryKind::File, Some(original));
                     self.guard_destination(
@@ -5528,10 +5526,11 @@ impl Applier<'_, '_> {
                 }
                 self.widen_ancestors(&entry.path, ParentNeed::Private)?;
                 // Parse the source mode BEFORE the claim window opens: a
-                // malformed manifest mode must not strand the claimed aside
-                // with no rollback (a fallible call inside the window would
-                // otherwise exit without restoring the original).
-                let mode = parse_mode(&entry.mode)?;
+                // The manifest mode is a VALIDATED value, so it cannot be
+                // malformed and no fallible call sits inside the claim window
+                // (such a call would otherwise exit without restoring the
+                // original).
+                let mode = entry.mode;
                 // A KIND-CHANGING replacement claims the stale entry by
                 // renaming it aside, installs the new entry at the real name,
                 // and only then deletes the aside. Removing first would destroy
@@ -5791,7 +5790,7 @@ impl Applier<'_, '_> {
         rel: &RootedRelativePath,
         observed_bytes: &[u8],
     ) -> Result<AppendAttempt> {
-        let mode = parse_mode(&entry.mode)?;
+        let mode = entry.mode;
         let Some(dest) = dest_entry else {
             self.outcomes.insert(entry.path.clone(), Outcome::Skipped);
             return Ok(AppendAttempt::Done);
@@ -5822,7 +5821,7 @@ impl Applier<'_, '_> {
         let current = self
             .dest
             .mode_opt(rel, EntryKind::File)?
-            .unwrap_or(parse_mode(&dest.mode)?);
+            .unwrap_or(dest.mode);
         if current == mode {
             self.outcomes.insert(entry.path.clone(), Outcome::Skipped);
             return Ok(AppendAttempt::Done);
@@ -5873,7 +5872,7 @@ impl Applier<'_, '_> {
             );
             return Ok(AppendAttempt::Done);
         }
-        let mode = parse_mode(&entry.mode)?;
+        let mode = entry.mode;
         self.widen_ancestors(&entry.path, ParentNeed::Private)?;
         let original = match dest_kind {
             Some(EntryKind::File) => self.dest.mode_opt(rel, EntryKind::File)?,
@@ -6279,7 +6278,7 @@ impl Applier<'_, '_> {
         let mut entries: Vec<(String, EntryKind)> = Vec::new();
         for entry in &self.diff.dest.entries {
             if self.diff.classify(&entry.path) == Some(EntryDiff::Extraneous) {
-                entries.push((entry.path.clone(), EntryKind::of(entry)?));
+                entries.push((entry.path.clone(), entry.entry_type));
             }
         }
         entries.sort_by(|a, b| {
@@ -6440,11 +6439,7 @@ impl Applier<'_, '_> {
                 Some(Outcome::Skipped) => self.touched_dirs.contains(&parent_manifest(&entry.path)),
                 None => false,
             })
-            .filter_map(|entry| {
-                EntryKind::of(entry)
-                    .ok()
-                    .map(|kind| (entry.path.clone(), kind))
-            })
+            .map(|entry| (entry.path.clone(), entry.entry_type))
             .collect();
         // One listing per parent directory, no matter how many children it
         // holds: the check is derived from ONE pass over the destinations, and
@@ -6648,9 +6643,7 @@ impl Applier<'_, '_> {
                 ) {
                     continue;
                 }
-                let Ok(kind) = EntryKind::of(entry) else {
-                    continue;
-                };
+                let kind = entry.entry_type;
                 let Some(name) = file_name_bytes(&entry.path) else {
                     continue;
                 };
@@ -6808,9 +6801,7 @@ impl Applier<'_, '_> {
             if !claimed {
                 continue;
             }
-            let Ok(kind) = EntryKind::of(entry) else {
-                continue;
-            };
+            let kind = entry.entry_type;
             candidates.push((entry.path.clone(), kind, entry.content_sha256.clone()));
         }
         for (path, kind, expected_hash) in candidates {
@@ -7161,7 +7152,7 @@ impl Applier<'_, '_> {
             let member = CaseMember {
                 path: entry.path.clone(),
                 name: name.to_string(),
-                kind: EntryKind::of(entry)?,
+                kind: entry.entry_type,
                 eligible: matches!(
                     self.diff.classify(&entry.path),
                     Some(EntryDiff::Missing) | Some(EntryDiff::Changed)
@@ -7576,7 +7567,7 @@ fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> 
     let mut reserved = BTreeMap::new();
     for entry in &meta.entries {
         if is_reserved_path(&entry.path) {
-            reserved.insert(entry.path.clone(), EntryKind::of(entry)?);
+            reserved.insert(entry.path.clone(), entry.entry_type);
         }
     }
     Ok(reserved)
@@ -7730,15 +7721,10 @@ fn require_hash(entry: &TreeEntry) -> Result<&str> {
     entry.content_sha256.as_deref().ok_or_else(|| {
         Error::integrity(format!(
             "manifest entry {} ({}) has no content hash",
-            entry.path, entry.entry_type
+            entry.path,
+            entry.entry_type.as_str()
         ))
     })
-}
-
-fn parse_mode(mode: &str) -> Result<Mode> {
-    u32::from_str_radix(mode, 8)
-        .map(|mode| mode & 0o7777)
-        .map_err(|_| Error::integrity(format!("invalid manifest mode {mode:?}")))
 }
 
 /// Normalize a local root spelling ONCE: drop trailing separators (and collapse
@@ -8629,17 +8615,15 @@ impl LocalSide {
     /// The direct children of the local directory at `rel`, classified WITHOUT
     /// following a final-component symlink.
     ///
-    /// A NON-directory child is reported as [`EntryKind::File`], so a symlink
-    /// is reported as a file. That is deliberate and SAFE because the kind this
-    /// method returns never SELECTS a removal primitive: the one caller
-    /// ([`Applier::remove_subtree`]) uses the listing only to decide whether to
-    /// DESCEND (a `Dir`, from the authoritative `is_dir` that
-    /// `atomic::read_dir_fd` derived with `fstatat(AT_SYMLINK_NOFOLLOW)`), and
-    /// the walk re-reads the LIVE kind at its own entry before choosing a
-    /// primitive. `atomic::read_dir_fd`'s `DirEntry` exposes only `is_dir`, so
-    /// recovering the symlink kind here would need a second descriptor walk; a
-    /// caller that needs the exact kind MUST read it with
-    /// [`LocalSide::kind_opt`] rather than trust this value.
+    /// Every child carries its EXACT live kind: a symlink-to-directory is
+    /// [`EntryKind::Symlink`], never [`EntryKind::Dir`], and a symlink is
+    /// never reported as a regular file. `atomic::read_dir_fd`'s `DirEntry`
+    /// exposes only `is_dir` (from `fstatat(AT_SYMLINK_NOFOLLOW)`), so a
+    /// non-directory child is classified with a second `path_kind_fd` probe,
+    /// and a kind outside the canonical three
+    /// ([`crate::atomic::PathKind::Other`]) is refused. The listing CARRIES kinds, so `verify_directory_listings`
+    /// compares like with like: a name-only kind would make it see a symlink
+    /// where the manifest says `File` and report a spurious mismatch.
     fn list(&self, rel: &RootedRelativePath) -> Result<Vec<(OsString, EntryKind)>> {
         if rel.as_path().as_os_str().is_empty() {
             // The destination ROOT itself: `atomic::read_dir_fd` refuses the

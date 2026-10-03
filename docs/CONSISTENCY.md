@@ -283,3 +283,35 @@ branch by KIND, not message text. It is a genuine guard, not a document: a
 control that removed the two names failed to COMPILE with `E0432` (unresolved
 import `write_atomic_replace`) and `E0599` (`no method named exists`), which is
 the failure mode we want — a deletion breaks the build, not a migration.
+
+**D — one type carried both directions of the manifest. FIXED (API
+constraint #7).** `TreeEntry.entry_type` was a `String` and `mode` an octal
+`String` — the WIRE spellings — and every consumer re-projected them:
+`EntryKind::of` at nine production sites (six fallible, two silently dropping a
+path with `let Ok(..) else { continue }`, one filtering) and
+`parse_mode(&entry.mode)` at seven, each a fallible branch. The field is
+now the VALIDATED value (`EntryKind`, `u32`); the wire strings exist only
+across serde, and the `unknown manifest entry type` / `invalid manifest mode`
+refusals moved to the one wire boundary. The same shape held for the
+tree-view family: `DestinationTree.meta` was a plain `TreeMetadata`, so the
+destination observation could be serialized as a `tree.json`, fed to
+`verify_tree_metadata`, or used as a source — the crate's own doc forbade all
+three and NO runtime check existed to catch any of them (the count of such
+guards was zero, which is why the fix is a TYPE, not a branch deletion, at
+that edge). `DestinationTree`'s payload is now `pub(crate)` and the diff/apply
+entry points are direction-typed. Proof: two `compile_fail` doctests, each
+`E0308` (`expected &TreeMetadata, found &DestinationTree`). The one branch
+class the split DID delete is the walk's runtime policy mode
+(`UnsupportedPolicy` plus the deferred `unsupported_reason: Option<...>`),
+now a `UnsupportedSink` type.
+
+**A — a listing's doc described a kind it no longer reports. FIXED.** The doc
+on `LocalSide::list` said "a NON-directory child is reported as
+`EntryKind::File`, so a symlink is reported as a file ... recovering the
+symlink kind here would need a second descriptor walk". The body directly
+below the doc performs exactly that second walk
+(`path_kind_fd`), reports `EntryKind::Symlink`, and refuses
+`PathKind::Other`; `list_pinned_root` agrees. The stale paragraph is replaced
+with the behaviour the code has. This is the axis-D trap the constraint is
+about in miniature: a name (and a doc) saying one thing while the value says
+another.
