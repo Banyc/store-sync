@@ -939,6 +939,10 @@ pub struct UnsupportedEntry {
     /// The manifest spelling of the entry, exactly as it appears in the
     /// returned manifest.
     pub path: String,
+    /// WHICH strict rule tolerated this entry, as a type. A caller that must
+    /// decide what to do about an unsupported destination entry branches on
+    /// this, never on the message.
+    pub kind: MaterializationKind,
     /// The strict rule's refusal message (e.g. `absolute symlink not allowed:
     /// <path>`), preserved verbatim so a caller sees the same reason the
     /// strict canonicalizer would have reported.
@@ -1052,7 +1056,7 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
         // Set when a strict address-fidelity rule refused this entry under
         // `UnsupportedPolicy::Tolerate`; the entry is still recorded (under
         // its live kind) and the reason joins `unsupported`.
-        let mut unsupported_reason: Option<String> = None;
+        let mut unsupported_reason: Option<(MaterializationKind, String)> = None;
 
         if meta.is_dir() {
             entry_type = "dir";
@@ -1069,7 +1073,9 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                             reason,
                         ));
                     }
-                    UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
+                    UnsupportedPolicy::Tolerate => {
+                        unsupported_reason = Some((MaterializationKind::AbsoluteSymlink, reason))
+                    }
                 }
             }
             // A RELATIVE target is resolved against the directory CONTAINING
@@ -1113,7 +1119,9 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                                 reason,
                             ));
                         }
-                        UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
+                        UnsupportedPolicy::Tolerate => {
+                            unsupported_reason = Some((MaterializationKind::HardLink, reason))
+                        }
                     }
                 }
             }
@@ -1127,9 +1135,10 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
             ));
         }
 
-        if let Some(reason) = unsupported_reason.take() {
+        if let Some((kind, reason)) = unsupported_reason.take() {
             unsupported.push(UnsupportedEntry {
                 path: entry_path.clone(),
+                kind,
                 reason,
             });
         }
@@ -1189,6 +1198,7 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                     }
                     UnsupportedPolicy::Tolerate => containment_unsupported.push(UnsupportedEntry {
                         path: entry.path.clone(),
+                        kind: MaterializationKind::EscapingSymlink,
                         reason,
                     }),
                 }
@@ -1536,6 +1546,7 @@ fn canonicalize_remote_entries_with(
                         }
                         UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
                             path: entry_path.clone(),
+                            kind: MaterializationKind::HardLink,
                             reason,
                         }),
                     }
@@ -1593,6 +1604,7 @@ fn canonicalize_remote_entries_with(
                         }
                         UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
                             path: entry_path.clone(),
+                            kind: MaterializationKind::AbsoluteSymlink,
                             reason,
                         }),
                     }
@@ -1667,6 +1679,7 @@ fn canonicalize_remote_entries_with(
                 }
                 UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
                     path: entry.path.clone(),
+                    kind: MaterializationKind::EscapingSymlink,
                     reason,
                 }),
             }
@@ -2636,7 +2649,7 @@ mod tests {
         assert!(
             tree.unsupported
                 .iter()
-                .all(|u| u.reason.contains("hard links not allowed"))
+                .all(|u| u.kind == crate::error::MaterializationKind::HardLink)
         );
         assert!(tree.meta.entries.iter().all(|e| e.entry_type == "file"));
     }

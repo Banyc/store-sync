@@ -1521,21 +1521,7 @@ pub struct SyncReport {
     /// the source is `skipped` (the run correctly mutates nothing), and this
     /// field is the ONLY signal that the two names are aliased by a hard link,
     /// which the caller must break before the source can be mirrored faithfully.
-    pub unsupported_destination: Vec<UnsupportedDestination>,
-}
-
-/// One tolerated unsupported destination entry, as recorded in
-/// [`SyncReport::unsupported_destination`]: the manifest spelling and the
-/// strict address-fidelity rule's reason, preserved verbatim from
-/// [`crate::manifest::UnsupportedEntry`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsupportedDestination {
-    /// The manifest spelling of the entry, exactly as it appears in the
-    /// destination manifest.
-    pub path: String,
-    /// The strict rule's refusal message (e.g. `absolute symlink not allowed:
-    /// <path>` or `hard links not allowed: <path>`).
-    pub reason: String,
+    pub unsupported_destination: Vec<crate::manifest::UnsupportedEntry>,
 }
 
 /// [`SyncError`]-carrying result: on failure the partial [`SyncReport`] is
@@ -3570,14 +3556,11 @@ impl Applier<'_, '_> {
             .chain(verify_failures.iter().map(String::as_str))
             .chain(indeterminate.iter().map(String::as_str))
             .collect();
-        let unsupported_destination: Vec<UnsupportedDestination> = self
+        let unsupported_destination: Vec<crate::manifest::UnsupportedEntry> = self
             .dest_unsupported
             .iter()
             .filter(|entry| named.contains(entry.path.as_str()))
-            .map(|entry| UnsupportedDestination {
-                path: entry.path.clone(),
-                reason: entry.reason.clone(),
-            })
+            .cloned()
             .collect();
         SyncReport {
             applied: applied.into_iter().collect(),

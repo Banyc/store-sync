@@ -123,7 +123,7 @@ pub use residue::Residue;
 pub use apply::{
     Conflict, ConflictReason, DestinationOwnership, Direction, EntryPolicy, Extraneous,
     LockedDestination, Policy, ReplaceAll, RetireOutcome, SyncError, SyncReport, SyncResult,
-    UnsupportedDestination, destination_lock_path, retire_destination_lock, sync,
+    destination_lock_path, retire_destination_lock, sync,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests, diff_trees,

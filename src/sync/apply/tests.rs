@@ -741,6 +741,12 @@ fn assert_report_lists_disjoint(report: &SyncReport) {
             !entry.reason.is_empty(),
             "an unsupported-destination annotation must carry the strict rule's reason: {entry:?}"
         );
+        assert_ne!(
+            entry.kind,
+            crate::error::MaterializationKind::Unclassified,
+            "an unsupported-destination annotation must name WHICH strict rule tolerated it, not \
+             just carry a message: {entry:?}"
+        );
     }
     let unsupported_paths: Vec<&str> = report
         .unsupported_destination
