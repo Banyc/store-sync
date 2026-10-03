@@ -37,7 +37,9 @@
 //! (`temp_name_for`), the atomic marker/JSONL rewrites
 //! (`write_atomic_replace`, `write_jsonl_atomic`), private permissions
 //! (`set_private`), the tree-object directory
-//! copy (`copy_dir_recursive`), and the JSON readers. Two more are the
+//! copy (`copy_dir_recursive_fd` for a root-confined landing, and the
+//! deliberately-named, tolerant `copy_tree_verbatim` for a clone that is NOT
+//! landing into a store root), and the JSON readers. Two more are the
 //! consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the OWNED
 //! ROOT itself (the empty and `.` child spellings are refused, so residue at
 //! the root was otherwise unreachable) and [`is_crate_temp_name`] recognises
@@ -108,7 +110,7 @@
 //! durability). That component confinement covers the `_fd` surface only:
 //! [`unix`]'s PATH-BASED free functions (`set_private`,
 //! `write_atomic_replace`, `sync_parent_dir`,
-//! `ensure_private_dir_durable`, `copy_dir_recursive`)
+//! `ensure_private_dir_durable`, `copy_tree_verbatim`)
 //! take an ordinary path and are NOT covered — see [`unix`]'s module docs for
 //! the exact split.
 //! [`windows`] is the path-based implementation with documented weaker
@@ -274,7 +276,7 @@ pub use windows::*;
 ///   included. That is the confinement an operation can rely on INSTEAD of a
 ///   live path check. The property does NOT extend to [`unix`]'s PATH-BASED
 ///   free functions (`set_private`, `write_atomic_replace`, `sync_parent_dir`,
-///   `ensure_private_dir_durable`, `copy_dir_recursive`): those take an ordinary
+///   `ensure_private_dir_durable`, `copy_tree_verbatim`): those take an ordinary
 ///   path, so an intermediate
 ///   symlink in it IS followed — see [`unix`]'s module docs for the split.
 ///   [`unix::copy_dir_recursive_fd`] is a partial exception: its arbitrary
@@ -731,6 +733,74 @@ pub struct RootDir(PathBuf);
 /// is refused by the validated [`RootedRelativePath`] boundary.
 fn normalize_root(base: &Path) -> PathBuf {
     base.components().collect()
+}
+
+/// Refuse a VERBATIM tree copy whose source and destination resolve to
+/// overlapping directories, so the walk cannot copy a tree into its own
+/// subtree. Shared by both platform ports (it needs only `std::fs`), so the
+/// rule cannot drift between them.
+///
+/// The decision is made from the CANONICAL spellings: the source is
+/// [`std::fs::canonicalize`]d, and the destination is canonicalized up to its
+/// LONGEST EXISTING ANCESTOR with the non-existent tail appended, so a
+/// destination that does not exist yet is compared at the path it WOULD occupy
+/// and a symlinked component cannot hide the relationship. Equal, inside, or
+/// above all refuse with [`StoreKind::CopyOverlap`].
+///
+/// WHAT IT STILL CANNOT CATCH: two spellings of one tree that canonicalize to
+/// DIFFERENT paths (some overlay/network filesystems, or a bind mount whose
+/// canonical path is not unified) — the strict, root-confined
+/// [`copy_dir_recursive_fd`] closes those with a `(st_dev, st_ino)` IDENTITY
+/// comparison; this primitive is path-based by design and states the limit
+/// rather than pretending to close it.
+pub(crate) fn refuse_verbatim_overlap(src: &Path, dst: &Path) -> Result<()> {
+    let src_canon = std::fs::canonicalize(src)
+        .map_err(|e| Error::store(format!("canonicalize {}: {e}", src.display())))?;
+    // The deepest existing ancestor of `dst` (or `dst` itself when it exists).
+    // The loop stops at an EMPTY ancestor for a relative path, whose implicit
+    // parent is the current directory.
+    let mut anchor = dst.to_path_buf();
+    while !anchor.exists() {
+        match anchor.parent() {
+            Some(parent) if parent != anchor => anchor = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    let anchor_abs = if anchor.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        anchor.clone()
+    };
+    let anchor_canon = std::fs::canonicalize(&anchor_abs)
+        .map_err(|e| Error::store(format!("canonicalize {}: {e}", anchor_abs.display())))?;
+    // The non-existent tail under the anchor; when `anchor` is empty (a
+    // relative path with no existing ancestor) the WHOLE spelling is joined
+    // onto the canonical current directory.
+    let tail = dst.strip_prefix(&anchor).unwrap_or(Path::new(""));
+    let dst_canon = if tail.as_os_str().is_empty() {
+        anchor_canon
+    } else {
+        anchor_canon.join(tail)
+    };
+    let overlap = if dst_canon == src_canon {
+        "they are the same directory"
+    } else if dst_canon.starts_with(&src_canon) {
+        "the destination is inside the source"
+    } else if src_canon.starts_with(&dst_canon) {
+        "the source is inside the destination"
+    } else {
+        return Ok(());
+    };
+    Err(Error::store_kind(
+        StoreKind::CopyOverlap,
+        format!(
+            "copy_tree_verbatim: refusing to copy {} to {} — the source and the destination \
+             overlap ({overlap}), so the walk would copy the tree into itself without bound; the \
+             decision is made from the canonical spellings",
+            src.display(),
+            dst.display()
+        ),
+    ))
 }
 
 // THE ROOT-RELATIVE SPELLING RULE now lives in ONE place: the validated

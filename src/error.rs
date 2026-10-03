@@ -270,6 +270,15 @@ pub enum TransportKind {
     /// publish (rename) committed, but a later directory fsync failed. The
     /// remote counterpart of [`StoreKind::DurabilityUnconfirmed`].
     DurabilityUnconfirmed,
+    /// The OPERATION-SCOPED SIDECAR record stayed contended for the whole
+    /// deadline, so its critical section never ran —
+    /// [`crate::transport::with_operation_lock_sidecar`] gave up after
+    /// [`crate::transport::SIDECAR_WAIT_TIMEOUT`]. Distinct from a real
+    /// `flock`/lock-open failure (which also stays [`Error::Transport`]): the
+    /// caller's remedy for THIS condition is to retry later or investigate
+    /// the stuck holder, not to fix a broken record. A caller branches on
+    /// this kind instead of string-matching the message.
+    SidecarWaitTimeout,
     /// A condition with no distinction any caller branches on; the message is
     /// for a human.
     Unclassified,

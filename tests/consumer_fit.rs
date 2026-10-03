@@ -38,12 +38,14 @@ use std::path::Path;
 
 use storekit::RootedRelativePath;
 use storekit::atomic::{
-    ReplaceOutcome, RootDir, copy_dir_recursive_fd, fsync_tree_recursive_fd, write_atomic_replace,
-    write_atomic_replace_fd,
+    ReplaceOutcome, RootDir, copy_dir_recursive_fd, copy_tree_verbatim, fsync_tree_recursive_fd,
+    write_atomic_replace, write_atomic_replace_fd,
 };
 use storekit::env::SysEnv;
 use storekit::sync::{DestinationOwnership, Direction, Extraneous, ReplaceAll, SyncReport, sync};
-use storekit::transport::{Layout, LocalTransport, Remote};
+use storekit::transport::{
+    Layout, LocalTransport, Remote, SIDECAR_WAIT_TIMEOUT, with_operation_lock_sidecar,
+};
 
 /// A validated root-relative path (the only spelling authority for a
 /// root-confined mutation), parsed at the boundary like a consumer must.
@@ -201,6 +203,47 @@ fn tree_pair_out_of_root_source_into_confined_staging() {
             "the refusal must be a typed StoreKind, not message text: {err:?}"
         );
     }
+}
+
+/// The two consumer-required names the migration added, exercised through the
+/// PUBLIC API only: the operation-scoped sidecar critical section (`deploy`'s
+/// `remote::helper::recover` fallback needs a blocking-with-deadline form over
+/// the already-open, read-only record) and the tolerant verbatim copy
+/// (`deploy`'s retention checkpoint clones a live base that holds
+/// `operation.lock`). A future deletion of either is a COMPILE failure here.
+#[test]
+fn sidecar_critical_section_and_tolerant_clone_are_public() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("base");
+    std::fs::create_dir_all(&base).expect("create the base");
+
+    // The operation-scoped sidecar: the consumer supplies the base root and
+    // the layout's sidecar record; the closure runs under the flock.
+    let layout = Layout::empty();
+    let mut ran = false;
+    with_operation_lock_sidecar(&base, &layout.lock_sidecar, || {
+        ran = true;
+        Ok(())
+    })
+    .expect("the sidecar critical section runs");
+    assert!(ran, "the critical section must run");
+    assert_eq!(
+        SIDECAR_WAIT_TIMEOUT,
+        std::time::Duration::from_secs(2),
+        "the public deadline is the record's documented one"
+    );
+
+    // The tolerant clone: a reserved spelling is carried verbatim.
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).expect("create the source");
+    std::fs::write(src.join("operation.lock"), b"RESERVED").expect("seed the lock record");
+    let dst = tmp.path().join("clone");
+    copy_tree_verbatim(&src, &dst).expect("the tolerant clone runs");
+    assert_eq!(
+        std::fs::read(dst.join("operation.lock")).unwrap(),
+        b"RESERVED",
+        "the tolerant clone carries the reserved name verbatim"
+    );
 }
 
 /// A `Layout` construction through the PUBLIC field shape (and the

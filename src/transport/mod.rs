@@ -104,7 +104,10 @@ use walkdir::WalkDir;
 ///   both; neither path composes the other.
 /// * [`Layout::lock_sidecar`] — the flock mutex file serializing mutations of
 ///   [`Layout::lock`]. Created once durably and never removed, so every
-///   participant flocks the same inode.
+///   participant flocks the same inode. A caller that must hold this critical
+///   section in-line (rather than through a whole [`Remote`] mutation) uses
+///   the public [`with_operation_lock_sidecar`], which takes the SAME record
+///   with the SAME wait policy the transport's own lock mutations use.
 /// * [`Layout::receiver_marker`] — the OPTIONAL immutable receiver-id marker.
 ///   When `Some`, `provision_layout` creates it once and `read_receiver_id`
 ///   reads it back; when `None` the transport has no receiver identity.
@@ -1138,14 +1141,20 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// permissions would silently depend on the caller's umask.
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
 
-/// How long a contender waits for the sidecar mutex before failing: a
-/// MONOTONIC deadline (not an attempt count). Ordinary critical sections
-/// (file syncs inside the flock) finish well within it; a holder that is
-/// still alive after the deadline is a genuinely stuck/unbounded operation.
-pub(crate) const SIDECAR_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a contender waits for the operation-scoped sidecar mutex before
+/// failing: a MONOTONIC deadline (not an attempt count). Ordinary critical
+/// sections (file syncs inside the flock) finish well within it; a holder that
+/// is still alive after the deadline is a genuinely stuck/unbounded operation.
+///
+/// PUBLIC because it is part of the contract of the public
+/// [`with_operation_lock_sidecar`]: a caller that wants to bound its own
+/// critical section (or to reason about the wait it will observe) names the
+/// SAME value instead of guessing a second one.
+pub const SIDECAR_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The sleep between non-blocking flock retries (bounded by the remaining
-/// time to the deadline, so no retry ever extends past it).
-pub(crate) const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+/// time to the deadline, so no retry ever extends past it). PUBLIC for the
+/// same reason as [`SIDECAR_WAIT_TIMEOUT`].
+pub const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 // Thread-local re-entrancy depth for the sidecar critical section. When
 // `>0`, the current thread already holds the sidecar flock, so nested
@@ -1198,14 +1207,70 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(
     }
 }
 
-/// Run `f` while holding an exclusive `flock` on the sidecar mutex file.
-/// The sidecar is ensured durably before locking. Uses non-blocking
-/// `LOCK_EX|LOCK_NB` with a monotonic deadline (`SIDECAR_WAIT_TIMEOUT`)
-/// and a 5ms sleep between attempts (bounded by the remaining time to the
-/// deadline); a contended sidecar after the deadline fails with an explicit
-/// transport error, never hangs. Re-entrant: if the current thread already
-/// holds the sidecar (depth>0), `f` runs directly.
-pub(crate) fn with_operation_lock_sidecar<R>(
+/// Run `f` while holding an exclusive `flock` on the operation-scoped sidecar
+/// record under `base` — the WAITING, re-entrant critical section used for the
+/// ONE in-root operation-lock record a transport's [`Layout`] names.
+///
+/// # The record: the SAME file, and the SAME inode, as the transport's own
+///
+/// `sidecar` is the caller's [`Layout::lock_sidecar`] (by convention
+/// `state/operation.lock.mutex`) and `base` is the transport root. This is the
+/// same critical section [`Remote::remove_file_if`] and [`Remote::try_write_new`]
+/// run their lock-record mutations under, not a parallel one:
+///
+/// * the SAME DERIVATION (`base.join(sidecar)`) picks the record, so a caller
+///   that passes the layout's own field contended with the transport on ONE
+///   file;
+/// * the file is created ONCE with `create_new` (so a concurrent creator is
+///   never truncated), `fsync`ed, and its parent directory `fsync`ed; it is
+///   never removed, renamed, or replaced. The inode is therefore STABLE, and
+///   every participant flocks the SAME inode — an `unlink`/`recreate` split is
+///   not expressible;
+/// * the lock is taken over an ALREADY-OPEN, READ-ONLY descriptor (the record
+///   is opened `read(true)`; it is never opened writable), so acquisition
+///   cannot mutate the record.
+///
+/// # The wait, and the typed timeout
+///
+/// Acquisition is NON-BLOCKING (`flock(LOCK_EX|LOCK_NB)` / `LockFileEx` with
+/// `LOCKFILE_FAIL_IMMEDIATELY`), retried against a MONOTONIC deadline of
+/// [`SIDECAR_WAIT_TIMEOUT`] with a [`SIDECAR_RETRY_INTERVAL`] sleep between
+/// attempts (each sleep bounded by the remaining time, so no retry crosses the
+/// deadline). A LIVE holder is therefore WAITED for, unlike the non-blocking,
+/// path-creating [`crate::lock::FileLock::acquire`] (which refuses immediately
+/// with [`Error::LockContended`]). If the record is still contended when the
+/// deadline passes the call returns [`Error::Transport`] with the TYPED
+/// [`TransportKind::SidecarWaitTimeout`] — it NEVER hangs. A `flock` failure
+/// that is not contention fails immediately with the same class and its errno
+/// in the message.
+///
+/// # Re-entrancy, and release on every exit path
+///
+/// Re-entrant PER THREAD: while THIS thread already holds the sidecar a nested
+/// call runs `f` directly, without re-locking (the `flock` is not recursive and
+/// re-locking would deadlock). The lock and the re-entrancy depth are released
+/// by an RAII guard on EVERY exit path — an ordinary return, an error return,
+/// and a PANIC unwinding through `f` — so a caught panic cannot leave the
+/// thread believing it still holds a lock it released.
+///
+/// # What it does NOT do
+///
+/// * It does not create a STORE, a destination ROOT, or any
+///   [`Layout::bootstrap_dirs`] entry. The only things it creates are the
+///   sidecar record and its parent chain.
+/// * It does not take the application lock ([`crate::lock::FileLock`]) or a
+///   `sync` destination's sibling record, and it does not compose with them,
+///   so it does not exclude a `sync` or a second store owner. It serializes
+///   mutations of the ONE record [`Layout::lock`] names.
+/// * It grants no ownership and makes NO durability promise about what `f`
+///   wrote: it is a mutex, not a commit point.
+/// * It is ADVISORY. A non-cooperating writer that never opens this record is
+///   not excluded, and the lock is not a lease (it lives exactly as long as
+///   this call's descriptor).
+///
+/// `f` runs with the sidecar held; its value (or error) is propagated
+/// unchanged.
+pub fn with_operation_lock_sidecar<R>(
     base: &Path,
     sidecar: &RootedRelativePath,
     f: impl FnOnce() -> Result<R>,
@@ -1236,11 +1301,31 @@ pub(crate) fn with_operation_lock_sidecar<R>(
         Instant::now,
         std::thread::sleep,
     )?;
+    // RAII release: restore the re-entrancy depth and unlock on EVERY exit
+    // path, including a panic. The previous manual release left the depth
+    // raised after a caught panic, so a later call on the SAME thread would
+    // have skipped the lock while another holder was live.
     SIDECAR_DEPTH.with(|c| c.set(depth + 1));
-    let res = f();
-    SIDECAR_DEPTH.with(|c| c.set(depth));
-    crate::lock::unlock(&file);
-    res
+    let _hold = SidecarHold {
+        file: &file,
+        prev_depth: depth,
+    };
+    f()
+}
+
+/// The RAII release for [`with_operation_lock_sidecar`]: restores the
+/// thread-local re-entrancy depth and unlocks the sidecar `flock` when it
+/// drops, so a panic unwinding through the critical section cannot leak either.
+struct SidecarHold<'a> {
+    file: &'a std::fs::File,
+    prev_depth: usize,
+}
+
+impl Drop for SidecarHold<'_> {
+    fn drop(&mut self) {
+        SIDECAR_DEPTH.with(|c| c.set(self.prev_depth));
+        crate::lock::unlock(self.file);
+    }
 }
 
 /// The flock-contention wait, with the OS interactions injected so the
@@ -1270,11 +1355,14 @@ pub(crate) fn wait_for_sidecar_flock(
             x if x == crate::lock::contended_errno() => {
                 let cur = now();
                 if cur >= deadline {
-                    return Err(Error::transport(format!(
-                        "sidecar mutex remained contended for {:?}: {}",
-                        timeout,
-                        path.display()
-                    )));
+                    return Err(Error::transport_kind(
+                        TransportKind::SidecarWaitTimeout,
+                        format!(
+                            "sidecar mutex remained contended for {:?}: {}",
+                            timeout,
+                            path.display()
+                        ),
+                    ));
                 }
                 sleep(interval.min(deadline - cur));
             }
@@ -5320,6 +5408,209 @@ mod tests {
             sleeps.borrow().is_empty(),
             "EINTR must retry without sleeping"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The PUBLIC operation-scoped sidecar critical section
+    // ([`with_operation_lock_sidecar`]): the read-only acquisition, the
+    // wait-and-retry against a LIVE holder, the TYPED timeout, per-thread
+    // re-entrancy, and release on a panic unwind.
+    // -----------------------------------------------------------------
+
+    /// A fixture base plus the conventional sidecar record, and the raw
+    /// read-only descriptor a LIVE holder flocks (the SAME record the
+    /// transport uses, opened exactly as the critical section opens it).
+    fn sidecar_fixture() -> (tempfile::TempDir, PathBuf, RootedRelativePath) {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let sidecar = Layout::empty().lock_sidecar;
+        (dir, base, sidecar)
+    }
+
+    /// Hold the sidecar record with a fresh READ-ONLY descriptor (a real live
+    /// holder: `flock` is per open-file-description, so a second open in the
+    /// same process contends). Returns the file; drop it to release.
+    fn hold_sidecar(base: &Path, sidecar: &RootedRelativePath) -> std::fs::File {
+        let p = base.join(sidecar.as_path());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&p)
+            .unwrap_or_else(|e| {
+                panic!("the sidecar record must exist first ({e}); the critical section creates it")
+            });
+        assert!(
+            matches!(
+                crate::lock::try_lock(&f),
+                crate::lock::LockAttempt::Acquired
+            ),
+            "the test holder must actually hold the sidecar flock"
+        );
+        f
+    }
+
+    /// THE READ-ONLY ACQUISITION. The record is pre-created `0o400` (so a
+    /// writable open would fail with `EACCES`), and the critical section must
+    /// still run and leave the bytes untouched: the `flock` is taken over an
+    /// already-open, READ-ONLY descriptor, which cannot mutate the record.
+    #[cfg(unix)]
+    #[test]
+    fn operation_lock_sidecar_acquires_over_an_already_open_read_only_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, base, sidecar) = sidecar_fixture();
+        let p = base.join(sidecar.as_path());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"SENTINEL").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut ran = false;
+        with_operation_lock_sidecar(&base, &sidecar, || {
+            ran = true;
+            Ok(())
+        })
+        .expect("a read-only sidecar record must lock and run the critical section");
+        assert!(ran, "the critical section must actually run");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"SENTINEL",
+            "the acquisition must not write, truncate, or replace the record"
+        );
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "the record's mode must be untouched"
+        );
+    }
+
+    /// THE WAIT. A live holder makes the critical section RETRY rather than
+    /// fail: it must not run before the holder releases, and it must succeed
+    /// (well within the deadline) once the release happens.
+    #[test]
+    fn operation_lock_sidecar_waits_for_a_live_holder_and_retries() {
+        let (_dir, base, sidecar) = sidecar_fixture();
+        // Create the record through the critical section first, so the holder
+        // can open it.
+        with_operation_lock_sidecar(&base, &sidecar, || Ok(())).unwrap();
+        let holder = hold_sidecar(&base, &sidecar);
+
+        let started = Instant::now();
+        let base_for_thread = base.clone();
+        let sidecar_for_thread = sidecar.clone();
+        let waiter =
+            std::thread::spawn(move || {
+                with_operation_lock_sidecar(&base_for_thread, &sidecar_for_thread, || {
+                    Ok(Instant::now())
+                })
+            });
+        std::thread::sleep(Duration::from_millis(150));
+        crate::lock::unlock(&holder);
+        drop(holder);
+
+        let acquired_at = waiter
+            .join()
+            .expect("the waiter thread must not panic")
+            .expect("the waiter must acquire once the holder releases");
+        assert!(
+            acquired_at.duration_since(started) >= Duration::from_millis(100),
+            "the critical section must have CONTENDED and retried, not acquired immediately"
+        );
+    }
+
+    /// THE TYPED TIMEOUT. A holder that outlives the deadline makes the call
+    /// return the TYPED [`TransportKind::SidecarWaitTimeout`] after (and only
+    /// after) [`SIDECAR_WAIT_TIMEOUT`], with the closure never run — it never
+    /// hangs.
+    #[test]
+    fn operation_lock_sidecar_times_out_with_a_typed_error_instead_of_hanging() {
+        let (_dir, base, sidecar) = sidecar_fixture();
+        with_operation_lock_sidecar(&base, &sidecar, || Ok(())).unwrap();
+        let holder = hold_sidecar(&base, &sidecar);
+
+        let mut ran = false;
+        let started = Instant::now();
+        let err = with_operation_lock_sidecar(&base, &sidecar, || {
+            ran = true;
+            Ok(())
+        })
+        .expect_err("a holder that outlives the deadline must be reported, not waited on forever");
+        let elapsed = started.elapsed();
+        assert!(!ran, "the critical section must never run after a timeout");
+        assert_eq!(
+            err.transport_reason(),
+            Some(TransportKind::SidecarWaitTimeout),
+            "the timeout must be a TYPED transport kind, not message text: {err:?}"
+        );
+        assert!(
+            elapsed >= SIDECAR_WAIT_TIMEOUT,
+            "the failure must happen only after the full deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= SIDECAR_WAIT_TIMEOUT + Duration::from_secs(2),
+            "the failure must be bounded, not a hang: {elapsed:?}"
+        );
+        drop(holder);
+    }
+
+    /// RE-ENTRANCY, per thread: a nested call on the SAME thread runs `f`
+    /// directly (the `flock` is not recursive, so re-locking would deadlock).
+    #[test]
+    fn operation_lock_sidecar_is_re_entrant_on_one_thread() {
+        let (_dir, base, sidecar) = sidecar_fixture();
+        let mut inner_ran = false;
+        with_operation_lock_sidecar(&base, &sidecar, || {
+            with_operation_lock_sidecar(&base, &sidecar, || {
+                inner_ran = true;
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .expect("a nested call on the holding thread must run directly");
+        assert!(inner_ran, "the nested critical section must run");
+    }
+
+    /// RELEASE ON A PANIC UNWIND, and re-entrancy depth restored. A panicking
+    /// `f` (caught here) must leave the sidecar FREE and the thread's
+    /// re-entrancy depth back to zero: a later call on the SAME thread must
+    /// contend with a live holder instead of skipping the lock.
+    #[test]
+    fn operation_lock_sidecar_releases_and_resets_depth_after_a_panic() {
+        let (_dir, base, sidecar) = sidecar_fixture();
+        with_operation_lock_sidecar(&base, &sidecar, || Ok(())).unwrap();
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_operation_lock_sidecar(&base, &sidecar, || -> Result<()> {
+                panic!("injected panic inside the sidecar critical section")
+            });
+        }));
+        assert!(caught.is_err(), "the injected panic must unwind");
+
+        // A live holder now. If the panic had leaked the re-entrancy depth,
+        // the next call would see depth > 0 and run its closure WITHOUT
+        // locking; with the RAII release restored it contends and waits.
+        let holder = hold_sidecar(&base, &sidecar);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_for_waiter = std::sync::Arc::clone(&ran);
+        let base_for_thread = base.clone();
+        let sidecar_for_thread = sidecar.clone();
+        let waiter = std::thread::spawn(move || {
+            with_operation_lock_sidecar(&base_for_thread, &sidecar_for_thread, || {
+                ran_for_waiter.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the post-panic call must CONTEND (the depth was reset), not run unlocked"
+        );
+        crate::lock::unlock(&holder);
+        drop(holder);
+        waiter
+            .join()
+            .expect("the waiter must not panic")
+            .expect("the waiter must acquire after the holder releases");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// FIDELITY SCOPE PINS.

@@ -336,10 +336,15 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   crate-INTERNAL staged-publish rename/remove/create on its own temp/swap
 ///   names, the destination-root `create_dir_all`, and the ssh hostkey cache
 ///   — none of which a caller can steer to the record's spelling.
-///   `copy_dir_recursive` is `#[cfg(test)]` on BOTH ports
-///   (`src/atomic/unix.rs` and `src/atomic/windows.rs`), so it is a
-///   test-only path-based copy and never reaches a production build on any
-///   platform — the residual does not list it as a production hole. The
+///   `copy_tree_verbatim` is the ONE production path-based copy that
+///   deliberately CARRIES reserved and temp spellings into its destination, so
+///   it does not consult the guard — and does not need to. It never REMOVES,
+///   RENAMES or REPLACES a destination entry (every entry is created new and a
+///   pre-existing one is refused), so it cannot free or swap the record's
+///   inode and cannot split a holder; and its destination is documented NOT to
+///   be a store root. The NAME states the weakness (API constraint #8,
+///   verdict N), while the strict, root-confined [`copy_dir_recursive_fd`]
+///   still refuses every unaddressable name. The
 ///   lock's assumption section already states that a caller acting outside
 ///   the substrate (a foreign process, a raw `std::fs` call the caller writes
 ///   itself) is not stopped.

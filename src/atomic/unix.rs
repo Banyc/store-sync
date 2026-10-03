@@ -32,7 +32,7 @@
 //! deliberately-named [`write_atomic_replace`] (`set_private` serves the
 //! unconfined replace),
 //! [`sync_parent_dir`], [`ensure_private_dir_durable`], and
-//! [`copy_dir_recursive`]. The component confinement claimed below belongs to
+//! [`copy_tree_verbatim`]. The component confinement claimed below belongs to
 //! the `_fd` surface only, never to these.
 //!
 //! The `_fd` tree copy [`copy_dir_recursive_fd`] is a PARTIAL exception and
@@ -67,7 +67,7 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 /// TEST-ONLY ORDERING PROBE for the atomic replace (A1). It records, on the
 /// calling thread only, the sequence of directory-entry commits the durable
@@ -363,72 +363,303 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// TEST-ONLY path-based recursive tree copy: a path-based walk that must not
-/// recurse one Rust frame per level (a deep test-only store clone would
-/// otherwise exhaust the C stack and abort the test process). It copies a
-/// whole tree to a fresh path and holds no root descriptor; the store's own
-/// fd-confined copy is the generic [`crate::transport::Remote::copy_tree`]
-/// walk (`copy_tree_walk`).
+/// THE TOLERANT, VERBATIM TREE COPY — the weak, deliberately-NAMED sibling of
+/// the strict, root-confined [`copy_dir_recursive_fd`].
 ///
-/// The traversal descends into a subdirectory the moment it is encountered,
-/// so its visit order is EXACTLY the pre-rewrite recursion's depth-first
-/// pre-order (files and subdirectories interleaved in `readdir` order) —
-/// not "every file at a level, then every subdirectory" — which keeps the
-/// partial-failure state and the error ordering identical to the
-/// recursion's. The `copy_dir_recursive_visits_in_recursive_preorder` test
-/// pins this order.
-#[cfg(test)]
-pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Both take an arbitrary source and copy a whole tree, but they answer
+/// DIFFERENT questions and must not be confused:
+///
+/// * [`copy_dir_recursive_fd`] LANDS a tree into a store root, so it refuses
+///   every name the store cannot address ([`crate::reserved::is_unaddressable_name`]:
+///   a reserved spelling, the application lock record, a case/trailing-dot
+///   alias of either, or one of the crate's own temp shapes) with
+///   [`StoreKind::CopyUnlandableName`]. That refusal is CORRECT for a landing.
+/// * `copy_tree_verbatim` copies a tree VERBATIM — reserved spellings, the
+///   application lock record, and crate-temp shapes included. It exists for
+///   the case the landing rule is wrong for: CLONING a live base (a retention
+///   checkpoint's copy of a previously-locked store base, which holds
+///   `operation.lock` and crash residue) to a path that is **not** a store
+///   root.
+///
+/// # The consequence, stated: the destination is NOT a store root
+///
+/// A tree this primitive produces can contain names the crate refuses to
+/// address, and names its own recovery sweep ([`crate::atomic::is_crate_temp_name`])
+/// would REMOVE. A caller must therefore NOT use the destination as a store
+/// root, must NOT run the documented recovery sweep over it, and must rename
+/// or relocate it before expecting the crate's manifest machinery to accept
+/// it. The names are copied because the caller asked for a VERBATIM copy;
+/// making them addressable again is the caller's problem, not a silent
+/// transformation here.
+///
+/// # Confinement: none, by design
+///
+/// `src` and `dst` are ordinary absolute paths. This is the ONE copy that does
+/// NOT land into an owned root, so neither side is descriptor-confined and no
+/// component is resolved with `O_NOFOLLOW`; an intermediate symlink in either
+/// spelling IS followed. What IS refused is OVERLAP: a destination that
+/// resolves onto, inside, or above the source is refused with
+/// [`StoreKind::CopyOverlap`] (decided from the CANONICAL spellings), because
+/// a destination inside the source makes `read_dir` re-yield it and the walk
+/// run without bound.
+///
+/// # What is carried, and what is refused
+///
+/// * **names, content, kind** — copied byte-for-byte. No name is validated,
+///   normalized, or refused for being reserved; a non-UTF-8 name is copied as
+///   the platform spelling it is.
+/// * **symlinks** — recreated as symlinks (the link DATA is copied verbatim,
+///   never followed and never containment-checked). An absolute or escaping
+///   target is reproduced exactly: this is not a landing, so the store's
+///   symlink rules do not apply.
+/// * **modes** — a file takes its source mode EXACTLY (including
+///   setuid/setgid/sticky); a directory is created writable for the walk and
+///   takes its source mode DEEPEST-FIRST at the end, so a read-only source
+///   tree copies cleanly. A PRE-EXISTING destination directory keeps its own
+///   mode; a directory this call CREATED takes the source's mode.
+/// * **hard links** — REFUSED with [`StoreKind::CopyHardLink`]. The crate
+///   refuses hard links by rule, so silently duplicating one into an
+///   independent regular file would be the unfaithful choice; reproducing the
+///   link (`linkat`) is deliberately not done here.
+/// * **special files** (a FIFO, socket, or device) — REFUSED with
+///   [`StoreKind::CopySourceNotRegular`]. The source is opened
+///   `O_NONBLOCK` and the OPENED inode classified, so a FIFO cannot block the
+///   copy. Nothing is SKIPPED: an entry this primitive cannot reproduce
+///   faithfully fails the whole copy.
+/// * **ownership, xattrs, ACLs, timestamps, file flags, sparseness** — NOT
+///   carried (the crate's fidelity scope). The caller restores them.
+///
+/// # Landing is ALL-OR-NOTHING; the copy is NOT atomic or durable
+///
+/// Every destination entry is created NEW: a pre-existing file, directory,
+/// or symlink at a copied name is REFUSED (
+/// `O_EXCL`/`mkdir`/`symlink` `EEXIST`) and left byte-identical. Nothing is
+/// ever removed or replaced, so this primitive can never destroy a live entry
+/// — in particular it can never split a lock holder. The top-level `dst`
+/// directory MAY pre-exist (it is reused); every entry BELOW it must be new.
+///
+/// There is no temp directory and no final rename, so an error mid-walk leaves
+/// a PARTIAL destination tree. Directories this call created are left at their
+/// WALK mode (writable) until the final mode pass, so a partial tree is
+/// removable; a pre-existing destination directory keeps its own mode. The
+/// primitive does not fsync; a caller that needs durability calls
+/// [`fsync_tree_recursive_fd`]-style fsyncs itself (it cannot, because the
+/// destination is not under an owned root).
+///
+/// # Source quiescence
+///
+/// The walk holds no source lock and re-enumerates nothing, so a source that
+/// changes shape mid-copy can be copied inconsistently. A caller that cannot
+/// guarantee a quiescent source must serialize it itself. The traversal
+/// descends into a subdirectory the moment it encounters one, so a
+/// mid-walk failure leaves the same depth-first pre-order partial state the
+/// historical recursion left; `copy_tree_verbatim_visits_in_recursive_preorder`
+/// pins that order.
+///
+/// # Windows (the path-based port)
+///
+/// The Windows twin copies the same fields but carries the port's documented
+/// weaker guarantees: no Unix mode bits are applied, a symlink is recreated
+/// best-effort through [`crate::platform::symlink`] (which needs
+/// admin/developer mode), and HARD LINKS ARE NOT DETECTED, so a hard-linked
+/// source file is duplicated into an independent regular file. The overlap
+/// refusal is shared.
+pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
     struct Frame {
         dst: PathBuf,
         entries: std::vec::IntoIter<std::fs::DirEntry>,
     }
 
-    fn open_frame(src: &Path, dst: &Path) -> Result<Frame> {
-        std::fs::create_dir_all(dst)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
-        let entries = std::fs::read_dir(src)
-            .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|e| Error::store(format!("entry: {e}")))?;
-        Ok(Frame {
-            dst: dst.to_path_buf(),
-            entries: entries.into_iter(),
-        })
+    /// Open a copy SOURCE read-only and classify the OPENED inode, so a FIFO,
+    /// socket, or device is REFUSED instead of blocking in `open(2)` and the
+    /// refusal cannot be raced by a kind swap between `file_type()` and the
+    /// open (`O_NONBLOCK` is a no-op for the regular file we accept).
+    fn open_verbatim_source(path: &Path) -> Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| Error::store(format!("open {}: {e}", path.display())))?;
+        let meta = f
+            .metadata()
+            .map_err(|e| Error::store(format!("stat {}: {e}", path.display())))?;
+        if !meta.file_type().is_file() {
+            return Err(Error::store_kind(
+                StoreKind::CopySourceNotRegular,
+                format!(
+                    "copy_tree_verbatim: refusing to copy {}: the opened entry is not a regular \
+                     file (a FIFO, socket, or device is not copied faithfully)",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(f)
     }
 
-    let mut stack: Vec<Frame> = vec![open_frame(src, dst)?];
+    let src = normalize_root(src);
+    let dst = normalize_root(dst);
+    let src_meta = std::fs::symlink_metadata(&src)
+        .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
+    if src_meta.file_type().is_symlink() {
+        return Err(Error::store_kind(
+            StoreKind::CopySourceIsSymlink,
+            format!(
+                "copy_tree_verbatim: source {} is a symlink (refusing to follow a symlink source)",
+                src.display()
+            ),
+        ));
+    }
+    if !src_meta.is_dir() {
+        return Err(Error::store_kind(
+            StoreKind::CopySourceNotADirectory,
+            format!(
+                "copy_tree_verbatim: source {} is not a directory",
+                src.display()
+            ),
+        ));
+    }
+    let root_mode = src_meta.permissions().mode() & 0o7777;
+
+    // Refuse an overlapping source and destination BEFORE creating anything.
+    super::refuse_verbatim_overlap(&src, &dst)?;
+
+    // The destination ROOT may pre-exist (and keeps its mode); a root this
+    // call creates is made writable for the walk and takes the source's mode
+    // in the final pass.
+    let root_preexisting = match std::fs::symlink_metadata(&dst) {
+        Ok(m) if m.is_dir() => true,
+        Ok(_) => {
+            return Err(Error::store(format!(
+                "copy_tree_verbatim: destination {} exists and is not a directory",
+                dst.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(Error::store(format!("stat {}: {e}", dst.display()))),
+    };
+    if !root_preexisting {
+        std::fs::create_dir_all(&dst)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::store(format!("chmod {}: {e}", dst.display())))?;
+    }
+
+    // `(path, final_mode)` for every directory this call CREATED, applied
+    // deepest-first at the end. A pre-existing directory is never recorded,
+    // so its mode is never touched.
+    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+    if !root_preexisting {
+        dirs.push((dst.clone(), root_mode));
+    }
+    let entries = std::fs::read_dir(&src)
+        .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| Error::store(format!("read_dir entry: {e}")))?;
+    let mut stack: Vec<Frame> = vec![Frame {
+        dst: dst.clone(),
+        entries: entries.into_iter(),
+    }];
+
     while let Some(top) = stack.last_mut() {
-        let next = top.entries.next();
-        let Some(entry) = next else {
+        let Some(entry) = top.entries.next() else {
             stack.pop();
             continue;
         };
-        let descend: Option<Frame> = {
-            let top = stack.last().expect("the frame just examined");
-            let path = entry.path();
-            let ft = entry
-                .file_type()
-                .map_err(|e| Error::store(format!("file_type: {e}")))?;
-            let target = top.dst.join(entry.file_name());
-            if ft.is_dir() {
-                Some(open_frame(&path, &target)?)
-            } else if ft.is_symlink() {
-                let link = std::fs::read_link(&path)
-                    .map_err(|e| Error::store(format!("readlink {}: {e}", path.display())))?;
-                let _ = std::fs::remove_file(&target);
-                std::os::unix::fs::symlink(&link, &target)
-                    .map_err(|e| Error::store(format!("symlink {}: {e}", target.display())))?;
-                None
-            } else {
-                std::fs::copy(&path, &target)
-                    .map_err(|e| Error::store(format!("copy {}: {e}", path.display())))?;
-                None
+        let ft = entry
+            .file_type()
+            .map_err(|e| Error::store(format!("file_type {}: {e}", entry.path().display())))?;
+        let from = entry.path();
+        let to = top.dst.join(entry.file_name());
+        if ft.is_dir() {
+            let meta = entry
+                .metadata()
+                .map_err(|e| Error::store(format!("stat {}: {e}", from.display())))?;
+            match std::fs::create_dir(&to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(Error::store(format!(
+                        "copy_tree_verbatim: refusing to replace the existing destination entry \
+                         {} (every copied entry is created new; the copy is all-or-nothing)",
+                        to.display()
+                    )));
+                }
+                Err(e) => return Err(Error::store(format!("mkdir {}: {e}", to.display()))),
             }
-        };
-        if let Some(frame) = descend {
-            stack.push(frame);
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::store(format!("chmod {}: {e}", to.display())))?;
+            dirs.push((to.clone(), meta.permissions().mode() & 0o7777));
+            let child_entries = std::fs::read_dir(&from)
+                .map_err(|e| Error::store(format!("read_dir {}: {e}", from.display())))?
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|e| Error::store(format!("read_dir entry: {e}")))?;
+            stack.push(Frame {
+                dst: to,
+                entries: child_entries.into_iter(),
+            });
+        } else if ft.is_symlink() {
+            let link = std::fs::read_link(&from)
+                .map_err(|e| Error::store(format!("readlink {}: {e}", from.display())))?;
+            crate::platform::symlink(&link, &to).map_err(|e| {
+                Error::store(format!(
+                    "copy_tree_verbatim: refusing to replace the existing destination entry {} \
+                     with a symlink ({e})",
+                    to.display()
+                ))
+            })?;
+        } else if ft.is_file() {
+            let meta = entry
+                .metadata()
+                .map_err(|e| Error::store(format!("stat {}: {e}", from.display())))?;
+            if meta.nlink() > 1 {
+                return Err(Error::store_kind(
+                    StoreKind::CopyHardLink,
+                    format!(
+                        "copy_tree_verbatim: refusing to copy {}: it is a hard link (link count \
+                         {}); the crate refuses hard links by rule, so a copy must not silently \
+                         duplicate one into an independent regular file",
+                        from.display(),
+                        meta.nlink()
+                    ),
+                ));
+            }
+            let mut src_f = open_verbatim_source(&from)?;
+            let mut dst_f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&to)
+                .map_err(|e| {
+                    Error::store(format!(
+                        "copy_tree_verbatim: refusing to replace the existing destination entry \
+                         {} ({e}); every copied entry is created new",
+                        to.display()
+                    ))
+                })?;
+            copy_file_streaming(&mut src_f, &mut dst_f, &from)?;
+            dst_f
+                .set_permissions(std::fs::Permissions::from_mode(
+                    meta.permissions().mode() & 0o7777,
+                ))
+                .map_err(|e| Error::store(format!("chmod {}: {e}", to.display())))?;
+        } else {
+            return Err(Error::store_kind(
+                StoreKind::CopySourceNotRegular,
+                format!(
+                    "copy_tree_verbatim: refusing to copy {}: it is not a regular file, directory, \
+                     or symlink (a FIFO, socket, or device is not copied faithfully)",
+                    from.display()
+                ),
+            ));
         }
+    }
+
+    // Apply the EXACT source modes for every directory this call created,
+    // deepest-first (a directory is finalised only after everything inside it),
+    // so a read-only source tree copies cleanly and the tree is faithful.
+    dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+    for (p, mode) in dirs {
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| Error::store(format!("chmod {}: {e}", p.display())))?;
     }
     Ok(())
 }
@@ -3454,12 +3685,13 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, RootedRelativePath, Sanction,
-        copy_dir_recursive_fd, fsync_tree_recursive_fd, openat_no_follow, parent_fd_of,
-        path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd,
-        remove_dir_all_path, remove_dir_fd, remove_file_fd, remove_owned_lock_record_fd,
-        remove_residue_dir_all_fd, remove_residue_file_fd, rename_residue_paths, renameat_fd,
-        renameat_paths, replace_order_probe, set_private_fd, symlink_fd, write_atomic_cas_fd,
-        write_atomic_replace, write_atomic_replace_fd, write_file_fd,
+        copy_dir_recursive_fd, copy_tree_verbatim, fsync_tree_recursive_fd, openat_no_follow,
+        parent_fd_of, path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd,
+        remove_dir_all_fd, remove_dir_all_path, remove_dir_fd, remove_file_fd,
+        remove_owned_lock_record_fd, remove_residue_dir_all_fd, remove_residue_file_fd,
+        rename_residue_paths, renameat_fd, renameat_paths, replace_order_probe, set_private_fd,
+        symlink_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
+        write_file_fd,
     };
     use crate::error::{ReservedKind, StoreKind};
     use std::os::unix::ffi::OsStrExt;
@@ -4089,7 +4321,7 @@ mod tests {
     /// `any_non_vacuous` guard then fails the test loudly if no iteration
     /// could observe the order at all.
     #[test]
-    fn copy_dir_recursive_visits_in_recursive_preorder() {
+    fn copy_tree_verbatim_visits_in_recursive_preorder() {
         let (sub_name, file_name) = probe_sub_before_file_names();
         let mut any_non_vacuous = false;
         for sub_created_first in [true, false] {
@@ -4122,7 +4354,7 @@ mod tests {
             // directory, so `std::fs::copy` fails once the walk reaches it.
             std::fs::create_dir_all(dst.join(&file_name)).unwrap();
 
-            let res = super::copy_dir_recursive(&src, &dst);
+            let res = super::copy_tree_verbatim(&src, &dst);
             assert!(res.is_err(), "a mid-copy failure must surface as an Err");
 
             // Recursive order copies the subdirectory whenever it precedes
@@ -5300,6 +5532,180 @@ mod tests {
             !base.path().join("root/dst/.victim.tmp.1.2").exists(),
             "the temp-shaped name was never landed"
         );
+    }
+
+    /// THE STRICT-vs-TOLERANT DISTINCTION, on the SAME inputs. The tolerant
+    /// [`copy_tree_verbatim`] carries the application lock record and a
+    /// crate-temp-shaped name (and an ABSOLUTE symlink target) VERBATIM, with
+    /// bytes and kinds intact; the strict, root-confined
+    /// [`copy_dir_recursive_fd`] still REFUSES those names with the typed
+    /// [`StoreKind::CopyUnlandableName`]. Neither path is weakened by the
+    /// other: the tolerant name is the one that states what it does.
+    #[test]
+    fn copy_tree_verbatim_carries_reserved_and_temp_names_verbatim() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("operation.lock"), b"LOCK-RECORD").unwrap();
+        std::fs::write(src.join(".victim.tmp.1.2"), b"LIVE-TEMP").unwrap();
+        std::fs::write(src.join("plain.txt"), b"PLAIN").unwrap();
+        std::fs::set_permissions(
+            src.join("plain.txt"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::fs::write(src.join("sub/inner"), b"INNER").unwrap();
+        // An ABSOLUTE symlink target: the strict copy refuses it, the verbatim
+        // copy reproduces the link DATA exactly.
+        std::os::unix::fs::symlink("/verbatim/absolute/target", src.join("abs-link")).unwrap();
+
+        let dst = tmp.path().join("dst");
+        copy_tree_verbatim(&src, &dst).expect("the verbatim copy carries every name and kind");
+
+        assert_eq!(
+            std::fs::read(dst.join("operation.lock")).unwrap(),
+            b"LOCK-RECORD"
+        );
+        assert!(
+            crate::reserved::is_application_lock_name("operation.lock"),
+            "premise: the carried name really is the application lock record"
+        );
+        assert_eq!(
+            std::fs::read(dst.join(".victim.tmp.1.2")).unwrap(),
+            b"LIVE-TEMP"
+        );
+        assert!(
+            crate::atomic::is_crate_temp_name(".victim.tmp.1.2"),
+            "premise: the carried name really is a crate-temp shape"
+        );
+        assert_eq!(std::fs::read(dst.join("plain.txt")).unwrap(), b"PLAIN");
+        assert_eq!(
+            std::fs::symlink_metadata(dst.join("plain.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640,
+            "the exact source mode is carried"
+        );
+        assert_eq!(std::fs::read(dst.join("sub/inner")).unwrap(), b"INNER");
+        let link = std::fs::symlink_metadata(dst.join("abs-link")).unwrap();
+        assert!(link.file_type().is_symlink(), "the symlink stays a symlink");
+        assert_eq!(
+            std::fs::read_link(dst.join("abs-link")).unwrap(),
+            Path::new("/verbatim/absolute/target"),
+            "the link DATA is reproduced verbatim, absolute target included"
+        );
+    }
+
+    /// The strict side of the SAME distinction: a source carrying the lock
+    /// record or a crate-temp shape is refused by the root-confined copy with
+    /// the typed [`StoreKind::CopyUnlandableName`], and nothing is landed.
+    #[test]
+    fn copy_dir_recursive_fd_still_refuses_the_reserved_and_temp_names() {
+        for name in ["operation.lock", ".victim.tmp.1.2"] {
+            let base = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(base.path().join("root")).unwrap();
+            let root = RootDir::open(&base.path().join("root")).expect("open the owned root");
+            let src = base.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join(name), b"content").unwrap();
+
+            let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
+                .expect_err("the strict, root-confined copy must refuse the name");
+            assert_eq!(
+                err.store_reason(),
+                Some(StoreKind::CopyUnlandableName),
+                "the strict refusal must be the TYPED kind for {name}: {err:?}"
+            );
+            assert!(
+                !base.path().join("root/dst").join(name).exists(),
+                "the strict copy must not land the refused name {name}"
+            );
+        }
+    }
+
+    /// `copy_tree_verbatim` REFUSES what it cannot reproduce faithfully rather
+    /// than skipping it: a HARD LINK is [`StoreKind::CopyHardLink`], a FIFO is
+    /// [`StoreKind::CopySourceNotRegular`] (and the copy must not block), and an
+    /// overlapping destination is [`StoreKind::CopyOverlap`].
+    #[test]
+    fn copy_tree_verbatim_refuses_what_it_cannot_copy_faithfully() {
+        use std::os::unix::fs::MetadataExt;
+        // A hard link.
+        {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("a"), b"A").unwrap();
+            std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
+            assert_eq!(
+                std::fs::metadata(src.join("a")).unwrap().nlink(),
+                2,
+                "premise"
+            );
+            let err = copy_tree_verbatim(&src, &tmp.path().join("dst"))
+                .expect_err("a hard link must be refused, not duplicated");
+            assert_eq!(err.store_reason(), Some(StoreKind::CopyHardLink), "{err:?}");
+        }
+        // A FIFO, refused promptly (never opened blocking).
+        {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let fifo = src.join("pipe");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+            let dst = tmp.path().join("dst");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(copy_tree_verbatim(&src, &dst).map_err(|e| e.store_reason()));
+            });
+            let outcome = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    panic!("copy_tree_verbatim blocked on a FIFO: the open is not O_NONBLOCK")
+                });
+            assert_eq!(
+                outcome.expect_err("a FIFO must be refused"),
+                Some(StoreKind::CopySourceNotRegular)
+            );
+        }
+        // An overlapping destination (inside the source).
+        {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(src.join("sub")).unwrap();
+            std::fs::write(src.join("f"), b"F").unwrap();
+            let err = copy_tree_verbatim(&src, &src.join("sub"))
+                .expect_err("a destination inside the source must be refused");
+            assert_eq!(err.store_reason(), Some(StoreKind::CopyOverlap), "{err:?}");
+            let err =
+                copy_tree_verbatim(&src, &src).expect_err("an equal destination must be refused");
+            assert_eq!(err.store_reason(), Some(StoreKind::CopyOverlap), "{err:?}");
+        }
+        // A PRE-EXISTING destination entry is refused, never replaced.
+        {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("plain.txt"), b"SOURCE").unwrap();
+            let dst = tmp.path().join("dst");
+            std::fs::create_dir_all(&dst).unwrap();
+            std::fs::write(dst.join("plain.txt"), b"PRE-EXISTING").unwrap();
+            let err = copy_tree_verbatim(&src, &dst)
+                .expect_err("a pre-existing destination entry must be refused");
+            assert!(
+                err.to_string().contains("refusing to replace"),
+                "the refusal must name the all-or-nothing landing, got: {err}"
+            );
+            assert_eq!(
+                std::fs::read(dst.join("plain.txt")).unwrap(),
+                b"PRE-EXISTING",
+                "the pre-existing entry must be left byte-identical"
+            );
+        }
     }
 
     /// A reserved SPELLING (the claim-aside namespace) is refused for the

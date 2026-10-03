@@ -207,68 +207,149 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// TEST-ONLY path-based recursive tree copy (the retention checkpoint's
-/// test-only store clone). On Windows, symlinks are copied as their
-/// target's content (Windows symlinks require admin/developer mode) — the
-/// documented weaker guarantee of the Windows port.
+/// THE TOLERANT, VERBATIM TREE COPY (the Windows twin of the Unix
+/// [`copy_tree_verbatim`]): copies a whole tree WITHOUT the reserved/temp-name
+/// refusal the root-confined [`copy_dir_recursive_fd`] applies, so a live
+/// base holding `operation.lock` or crash residue can be cloned to a path that
+/// is NOT a store root. See the Unix port's doc for the full contract; the
+/// Windows port carries its documented weaker guarantees:
+///
+/// * no Unix mode bits (nothing is chmodded);
+/// * a symlink is recreated best-effort through [`crate::platform::symlink`]
+///   (Windows symlinks need admin/developer mode; a failure is a propagated
+///   `Err`, never a silent materialization);
+/// * HARD LINKS ARE NOT DETECTED, so a hard-linked source file is duplicated
+///   into an independent regular file (Unix refuses them);
+/// * the shared overlap refusal and the all-or-nothing create-new landing
+///   apply identically.
 ///
 /// The walk queues each directory on an explicit heap `Vec` instead of
 /// recursing one Rust frame per level, so a deep tree fails cleanly (or
-/// succeeds) rather than exhausting the C stack and aborting the host
-/// process. It descends into a subdirectory the moment it is encountered, so
-/// its visit order matches the pre-rewrite recursion's depth-first
-/// pre-order (files and subdirectories interleaved in `readdir` order).
-#[cfg(test)]
-pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// succeeds) rather than exhausting the C stack and aborting the host process.
+/// It descends into a subdirectory the moment it is encountered, so its visit
+/// order matches the Unix port's depth-first pre-order.
+pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
     struct Frame {
         dst: PathBuf,
         entries: std::vec::IntoIter<std::fs::DirEntry>,
     }
 
-    fn open_frame(src: &Path, dst: &Path) -> Result<Frame> {
-        std::fs::create_dir_all(dst)
+    let src = super::normalize_root(src);
+    let dst = super::normalize_root(dst);
+    let src_meta = std::fs::symlink_metadata(&src)
+        .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?;
+    if src_meta.file_type().is_symlink() {
+        return Err(Error::store_kind(
+            StoreKind::CopySourceIsSymlink,
+            format!(
+                "copy_tree_verbatim: source {} is a symlink (refusing to follow a symlink source)",
+                src.display()
+            ),
+        ));
+    }
+    if !src_meta.is_dir() {
+        return Err(Error::store_kind(
+            StoreKind::CopySourceNotADirectory,
+            format!(
+                "copy_tree_verbatim: source {} is not a directory",
+                src.display()
+            ),
+        ));
+    }
+    // Refuse an overlapping source and destination BEFORE creating anything
+    // (the shared, canonical-spelling rule).
+    super::refuse_verbatim_overlap(&src, &dst)?;
+
+    let root_preexisting = match std::fs::symlink_metadata(&dst) {
+        Ok(m) if m.is_dir() => true,
+        Ok(_) => {
+            return Err(Error::store(format!(
+                "copy_tree_verbatim: destination {} exists and is not a directory",
+                dst.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(Error::store(format!("stat {}: {e}", dst.display()))),
+    };
+    if !root_preexisting {
+        std::fs::create_dir_all(&dst)
             .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
-        let entries = std::fs::read_dir(src)
-            .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|e| Error::store(format!("entry: {e}")))?;
-        Ok(Frame {
-            dst: dst.to_path_buf(),
-            entries: entries.into_iter(),
-        })
     }
 
-    let mut stack: Vec<Frame> = vec![open_frame(src, dst)?];
+    let entries = std::fs::read_dir(&src)
+        .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| Error::store(format!("read_dir entry: {e}")))?;
+    let mut stack: Vec<Frame> = vec![Frame {
+        dst: dst.clone(),
+        entries: entries.into_iter(),
+    }];
+
     while let Some(top) = stack.last_mut() {
-        let next = top.entries.next();
-        let Some(entry) = next else {
+        let Some(entry) = top.entries.next() else {
             stack.pop();
             continue;
         };
-        let descend: Option<Frame> = {
-            let top = stack.last().expect("the frame just examined");
-            let path = entry.path();
-            let ft = entry
-                .file_type()
-                .map_err(|e| Error::store(format!("file_type: {e}")))?;
-            let target = top.dst.join(entry.file_name());
-            if ft.is_dir() {
-                Some(open_frame(&path, &target)?)
-            } else if ft.is_symlink() {
-                let link = std::fs::read_link(&path)
-                    .map_err(|e| Error::store(format!("readlink {}: {e}", path.display())))?;
-                let _ = std::fs::remove_file(&target);
-                std::fs::copy(&link, &target)
-                    .map_err(|e| Error::store(format!("copy {}: {e}", target.display())))?;
-                None
-            } else {
-                std::fs::copy(&path, &target)
-                    .map_err(|e| Error::store(format!("copy {}: {e}", target.display())))?;
-                None
+        let ft = entry
+            .file_type()
+            .map_err(|e| Error::store(format!("file_type {}: {e}", entry.path().display())))?;
+        let from = entry.path();
+        let to = top.dst.join(entry.file_name());
+        if ft.is_dir() {
+            match std::fs::create_dir(&to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(Error::store(format!(
+                        "copy_tree_verbatim: refusing to replace the existing destination entry \
+                         {} (every copied entry is created new; the copy is all-or-nothing)",
+                        to.display()
+                    )));
+                }
+                Err(e) => return Err(Error::store(format!("mkdir {}: {e}", to.display()))),
             }
-        };
-        if let Some(frame) = descend {
-            stack.push(frame);
+            let child_entries = std::fs::read_dir(&from)
+                .map_err(|e| Error::store(format!("read_dir {}: {e}", from.display())))?
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|e| Error::store(format!("read_dir entry: {e}")))?;
+            stack.push(Frame {
+                dst: to,
+                entries: child_entries.into_iter(),
+            });
+        } else if ft.is_symlink() {
+            let link = std::fs::read_link(&from)
+                .map_err(|e| Error::store(format!("readlink {}: {e}", from.display())))?;
+            crate::platform::symlink(&link, &to).map_err(|e| {
+                Error::store(format!(
+                    "copy_tree_verbatim: refusing to replace the existing destination entry {} \
+                     with a symlink ({e})",
+                    to.display()
+                ))
+            })?;
+        } else if ft.is_file() {
+            let mut src_f = std::fs::File::open(&from)
+                .map_err(|e| Error::store(format!("open {}: {e}", from.display())))?;
+            let mut dst_f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&to)
+                .map_err(|e| {
+                    Error::store(format!(
+                        "copy_tree_verbatim: refusing to replace the existing destination entry \
+                         {} ({e}); every copied entry is created new",
+                        to.display()
+                    ))
+                })?;
+            std::io::copy(&mut src_f, &mut dst_f)
+                .map_err(|e| Error::store(format!("copy {}: {e}", from.display())))?;
+        } else {
+            return Err(Error::store_kind(
+                StoreKind::CopySourceNotRegular,
+                format!(
+                    "copy_tree_verbatim: refusing to copy {}: it is not a regular file, directory, \
+                     or symlink (a FIFO, socket, or device is not copied faithfully)",
+                    from.display()
+                ),
+            ));
         }
     }
     Ok(())

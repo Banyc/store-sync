@@ -57,10 +57,21 @@ Names not UTF-8 or not NFC · names or targets containing CR, LF or TAB ·
 absolute or escaping symlink targets · a relative target that walks through a
 symlink component (the kernel follows it, so a lexical collapse past it is not
 its resolution) · hard links · devices, sockets, FIFOs ·
-reserved-name collisions · overlapping roots (equal is an idempotent no-op;
-ancestor or descendant is refused) · any root or entry reached through a symlink
-component — where a destination's lock cannot be taken, a component swapped
-between the check and the operation is a stated residual, not a guarantee.
+reserved-name collisions · overlapping roots, decided per operation rather than
+once: a `sync` requires its SOURCE and DESTINATION to be DISJOINT — a strict
+ancestor/descendant nesting is refused, while EQUAL roots are allowed and the
+run is an idempotent no-op (the two manifests are identical, so the diff is
+empty) — whereas `root::OwnedRoot::parse` refuses two roots on one endpoint
+whenever they are EQUAL or one is an ancestor/descendant of the other, and the
+root-confined tree copy (`atomic::copy_dir_recursive_fd`) refuses an
+overlapping source and destination (equal included) by directory IDENTITY ·
+a DESTINATION root or entry reached through a symlink component (every PARENT
+component of an in-root mutation, and the FINAL component of a root open or an
+open/create-new) — with two stated exceptions: the atomic REPLACE cannot follow
+the final entry (it installs with `renameat`), and a SOURCE spelling may resolve
+its own intermediate symlink components, which the fd tree copy reads once —
+where a destination's lock cannot be taken, a component swapped between the
+check and the operation is a stated residual, not a guarantee.
 
 As a DESTINATION member, an absolute/escaping symlink or a hard link is not
 refused: the destination manifest records it, the diff reports it extraneous,
@@ -558,6 +569,27 @@ directory on `dst_rel`) is compared with the opened source; a component that
   Windows port is path-based with the port's documented weaker guarantee, and
   it materializes each file whole through `std::fs::read` (the Unix port
   streams through a 64 KiB heap buffer).
+
+**The tolerant sibling, for the case the landing rule is WRONG for.** The
+refusal above is correct for LANDING a tree into a store root, and wrong for
+CLONING a live base that already holds `operation.lock` or crash residue. That
+second case is served by the deliberately-named PUBLIC
+`atomic::copy_tree_verbatim(src, dst)` — the weak/tolerant path (API constraint
+#8, verdict N), which copies reserved spellings and crate-temp shapes
+VERBATIM, recreates symlinks (absolute and escaping targets included, with no
+containment check), carries modes exactly (two-phase, so a read-only source
+copies), and REFUSES what it cannot reproduce faithfully rather than skipping
+it (a hard link is `StoreKind::CopyHardLink`, a FIFO/socket/device is
+`StoreKind::CopySourceNotRegular`, opened `O_NONBLOCK` so it cannot block). Its
+consequence is stated at the primitive and is not negotiable: the destination
+**must not be used as a store root** and must not be handed to the documented
+recovery sweep, because the names it carries are exactly the ones the sweep
+removes. Landing is all-or-nothing (every entry is created new; a pre-existing
+one is refused, never replaced), so the tolerant copy can never destroy a live
+entry or split a lock holder; source/destination OVERLAP is refused by the
+canonical spellings with `StoreKind::CopyOverlap`. `deploy`'s retention
+checkpoint clones a live base with it (its local test helper and the documented
+gap at `deploy/src/retention/checkpoint/mod.rs` are what this closes).
 
 ## Rules for changing this crate
 
