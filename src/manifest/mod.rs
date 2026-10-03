@@ -69,12 +69,61 @@
 //! guess where a follow ends.
 //!
 //! The walk is over root-RELATIVE paths and never builds an absolute base, so
-//! it does not depend on the root's spelling, and the LOCAL walk and the
-//! far-side wire assembler apply exactly the same rule: the local walk answers
-//! "is this component a symlink?" with `symlink_metadata` of the live tree, and
-//! the assembler answers it with the `symlink` entries it assembled from the
-//! far side. Neither canonicalizes the root, so a root reached through a
-//! symlink can no longer make the two verdicts differ.
+//! it does not depend on the root's spelling. BOTH call sites now answer "does
+//! this component resolve to a symlink?" from the SAME
+//! [`SymlinkContainmentIndex`] they build from their own entry list — the local
+//! walk from the entries its `WalkDir` produced, the assembler from the entries
+//! the far side's listing produced — and both apply the crate's ONE
+//! component-identity fold (Unicode NFC, Unicode lowercase, trailing `.`/space;
+//! see [`fold_component`]). Neither canonicalizes the root, so a root reached
+//! through a symlink can no longer make the two verdicts differ, and because
+//! the fold is platform-independent the two views cannot disagree about the
+//! same tree on any host. (Before this the local walk asked `symlink_metadata`
+//! of the live tree while the assembler compared the listing's spellings
+//! byte-exactly, so on a case- or normalization-folding filesystem the local
+//! view refused a target the wire view accepted: an exact-string lookup is not
+//! the kernel's resolution, and the divergence was an under-refusal by the
+//! wire view.)
+//!
+//! # The fold, and the residual it costs
+//!
+//! The fold is deliberately PLATFORM-INDEPENDENT, exactly like the crate's
+//! reserved-name rules ([`crate::reserved::is_unaddressable_name`]): a manifest
+//! must mean the same thing on every host, and a manifest accepted against a
+//! case-SENSITIVE source must not escape when it is materialized on a
+//! case-/normalization-folding destination. An EXACT entry always WINS over a
+//! fold-equal one, so a lawful tree that merely has a case-variant sibling
+//! (`Sub` a directory and `sub` a symlink, which can coexist only on a
+//! case-sensitive filesystem) is still accepted when the target names the
+//! non-symlink entry. What the fold costs is the choice of ERRING DIRECTION: a
+//! target component that has NO exact entry but fold-matches a symlink entry is
+//! REFUSED even on a case-sensitive filesystem, where the kernel would instead
+//! fail the lookup (`ENOENT`) and the link would simply dangle. That is a
+//! fail-closed over-refusal, and it is the residual this rule accepts rather
+//! than letting the two views — or two hosts — disagree about the same tree.
+//!
+//! This section is also the corrected RESIDUAL LIST for the physical-walk
+//! change. The previous revision claimed no legitimate tree was newly refused
+//! except the target that ends at a symlink and the target that reaches an
+//! exactly-spelled symlink component; that list was INCOMPLETE. The complete
+//! list of what this rule refuses is:
+//!
+//! 1. A relative target that ends at a symlink, or that reaches a symlink
+//!    component with an exact spelling.
+//! 2. A relative target whose spelled walk reaches a component with NO exact
+//!    entry that FOLD-MATCHES a symlink entry (the fold residual above): refused
+//!    on EVERY host, including a case-sensitive one where the link would dangle.
+//! 3. An EMPTY symlink target, refused by BOTH views
+//!    ([`validate_symlink_target`]). Before this the local walk accepted `""`
+//!    (an empty path has no components) while the wire assembler refused it, so
+//!    a macOS source (APFS stores an empty-target link) was accepted by one
+//!    view and refused by the other.
+//! 4. A SOURCE link whose target walks through a component that a DESTINATION
+//!    symlink occupies under `Extraneous::Keep`: the RUN refuses, because
+//!    containment is a property of the RESULT, not of the source alone (see
+//!    `crate::sync`). The destination entry is never silently removed — removal
+//!    is the caller's `Extraneous` decision — so a `Keep` run refuses and the
+//!    caller must clear the component (or the source link) first.
 //!
 //! The root-relative walk is also the only rule that keeps containment
 //! PORTABLE, which is the property a manifest must have: a target that stays in
@@ -272,12 +321,122 @@ fn fmt_mode(m: u32) -> String {
 /// path. The kernel also follows the FINAL component, so a target that ends at
 /// a symlink can leave the root even when its spelling does not.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SymlinkTargetRefusal {
+pub(crate) enum SymlinkTargetRefusal {
     /// The spelled target pops above the tree root.
     EscapesRoot,
     /// A component the walk reaches (final or intermediate) is a symlink the
     /// kernel would follow, so the spelled location is not the physical one.
     ThroughSymlink(PathBuf),
+}
+
+/// The crate's ONE component-identity fold for the containment walk.
+///
+/// A component is folded by taking its Unicode NFC form, applying the Unicode
+/// lowercase fold (`str::to_lowercase` — the SAME fold the reserved-name
+/// authority uses, see [`crate::reserved::is_unaddressable_name`]), and
+/// stripping any trailing `.`/space (the Win32 name fold
+/// [`crate::reserved`] already models for the lock record). The fold is
+/// deliberately PLATFORM-INDEPENDENT, exactly like the reserved-name rules: a
+/// manifest must mean the same thing on every host, so the walk cannot ask the
+/// host filesystem what it folds without making the manifest's verdict depend
+/// on which filesystem happened to describe it.
+fn fold_component(name: &str) -> String {
+    let nfc: String = name.nfc().collect();
+    nfc.to_lowercase().trim_end_matches(['.', ' ']).to_string()
+}
+
+/// The fold of a `/`-joined manifest path: each component folded, joined with
+/// `/`. A component can never itself contain `/` (it is the separator), and
+/// the fold never introduces one, so the key is unambiguous.
+fn fold_path(path: &str) -> String {
+    let mut out = String::new();
+    for (i, component) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&fold_component(component));
+    }
+    out
+}
+
+/// What a SPELLED root-relative path resolves to in one view of a tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComponentResolution {
+    /// Neither an exact entry nor a fold-equal symlink exists: the kernel's
+    /// `lstat` of the spelled path would fail.
+    Absent,
+    /// An EXACT entry that is not a symlink.
+    NotSymlink,
+    /// A symlink the kernel would follow (either the exact entry, or a
+    /// fold-equal entry when no exact entry exists).
+    Symlink,
+}
+
+/// A prebuilt view of a tree's entries for the containment walk: the EXACT
+/// path set (with each path's symlink-ness) and the set of FOLDED paths that
+/// name a symlink.
+///
+/// Both the local walk and the wire assembler build this from their entry
+/// list and run [`check_relative_symlink_target`] over it, so the two views
+/// apply ONE rule over ONE view and cannot disagree. See the module docs for
+/// the fold and the erring direction it costs.
+pub(crate) struct SymlinkContainmentIndex<'a> {
+    /// Exact manifest path -> is-symlink. Borrowed from the entry list.
+    exact: BTreeMap<&'a str, bool>,
+    /// Folded paths that name a symlink, so a spelled component the kernel
+    /// would fold onto a symlink is detected even when the exact spelling is
+    /// absent.
+    folded_symlinks: BTreeSet<String>,
+}
+
+impl<'a> SymlinkContainmentIndex<'a> {
+    /// Build the index from `(manifest path, is-symlink)` pairs.
+    pub(crate) fn from_pairs<I: IntoIterator<Item = (&'a str, bool)>>(pairs: I) -> Self {
+        let mut exact: BTreeMap<&'a str, bool> = BTreeMap::new();
+        let mut folded_symlinks: BTreeSet<String> = BTreeSet::new();
+        for (path, is_symlink) in pairs {
+            exact.insert(path, is_symlink);
+            if is_symlink {
+                folded_symlinks.insert(fold_path(path));
+            }
+        }
+        SymlinkContainmentIndex {
+            exact,
+            folded_symlinks,
+        }
+    }
+
+    /// Build the index from a canonical entry list.
+    pub(crate) fn from_entries(entries: &'a [TreeEntry]) -> Self {
+        Self::from_pairs(
+            entries
+                .iter()
+                .map(|e| (e.path.as_str(), e.entry_type == "symlink")),
+        )
+    }
+
+    /// Resolve one SPELLED root-relative path.
+    ///
+    /// An EXACT entry WINS: on a case-SENSITIVE filesystem two case-distinct
+    /// entries (`Sub` a directory, `sub` a symlink) legitimately coexist and a
+    /// target that names the non-symlink one must be accepted, so the exact
+    /// spelling is answered first. Only when the exact spelling is ABSENT does
+    /// the fold apply, so a fold-equal symlink the kernel would follow is
+    /// refused rather than missed.
+    fn resolve(&self, rel: &Path) -> ComponentResolution {
+        let spelled = rel_path_string(rel);
+        if let Some(&is_symlink) = self.exact.get(spelled.as_str()) {
+            return if is_symlink {
+                ComponentResolution::Symlink
+            } else {
+                ComponentResolution::NotSymlink
+            };
+        }
+        if self.folded_symlinks.contains(&fold_path(&spelled)) {
+            return ComponentResolution::Symlink;
+        }
+        ComponentResolution::Absent
+    }
 }
 
 /// Decide whether a RELATIVE symlink target may be accepted, using the SAME
@@ -287,22 +446,21 @@ enum SymlinkTargetRefusal {
 /// and `target` is its raw relative link target. The walk starts at the link's
 /// CONTAINING directory, per POSIX. Every component it reaches is checked:
 /// a `..` pops one component and refuses if it would pop above the root, and a
-/// `Component::Normal` that names a symlink is refused, because the kernel
-/// follows it and the physical location is then not the spelled one.
+/// `Component::Normal` that resolves to a symlink is refused, because the
+/// kernel follows it and the physical location is then not the spelled one.
 ///
-/// `is_symlink` answers, for a ROOT-RELATIVE spelling, whether that path names
-/// a symlink in the tree. Both call sites work in root-RELATIVE paths, so
-/// neither depends on the root's spelling and the two cannot disagree: the
-/// local walk answers with `symlink_metadata` of the live tree, and the wire
-/// assembler answers with the set of `symlink` entries it assembled. (The
-/// previous rule built an ABSOLUTE base from the root and collapsed the target
+/// `resolve` answers, for a ROOT-RELATIVE spelling, what the tree view holds
+/// there (see [`SymlinkContainmentIndex::resolve`]). Both call sites work in
+/// root-RELATIVE paths over the SAME [`SymlinkContainmentIndex`], so neither
+/// depends on the root's spelling and the two cannot disagree. (The previous
+/// rule built an ABSOLUTE base from the root and collapsed the target
 /// lexically; that made the local walk canonicalize the root while the
 /// assembler could not, so a symlinked root made the two disagree, and the
 /// collapse itself never followed a symlink component.)
 fn check_relative_symlink_target(
     link_rel: &Path,
     target: &Path,
-    is_symlink: &mut dyn FnMut(&Path) -> bool,
+    resolve: &mut dyn FnMut(&Path) -> ComponentResolution,
 ) -> std::result::Result<(), SymlinkTargetRefusal> {
     let mut current = PathBuf::new();
     if let Some(parent) = link_rel.parent() {
@@ -331,7 +489,7 @@ fn check_relative_symlink_target(
             }
             Component::Normal(name) => {
                 current.push(name);
-                if is_symlink(&current) {
+                if matches!(resolve(&current), ComponentResolution::Symlink) {
                     return Err(SymlinkTargetRefusal::ThroughSymlink(current.clone()));
                 }
             }
@@ -340,11 +498,24 @@ fn check_relative_symlink_target(
     Ok(())
 }
 
+/// Run [`check_relative_symlink_target`] for `target` against a prebuilt
+/// [`SymlinkContainmentIndex`]. The ONE entry point both canonicalizers (and
+/// the applier's destination-aware re-check) use, so every caller applies the
+/// same rule with the same fold.
+pub(crate) fn check_relative_symlink_target_indexed(
+    link_rel: &Path,
+    target: &Path,
+    index: &SymlinkContainmentIndex<'_>,
+) -> std::result::Result<(), SymlinkTargetRefusal> {
+    let mut resolve = |rel: &Path| index.resolve(rel);
+    check_relative_symlink_target(link_rel, target, &mut resolve)
+}
+
 /// The refusal message for [`SymlinkTargetRefusal`], naming the offending
 /// entry and the symlink component the walk reached (when there is one). The
 /// `escaping symlink` prefix is the crate's single classification for a
 /// relative target that cannot be shown to stay inside the root.
-fn symlink_target_refusal_message(
+pub(crate) fn symlink_target_refusal_message(
     refusal: SymlinkTargetRefusal,
     link_display: &str,
     target: &str,
@@ -519,10 +690,19 @@ fn validate_entry_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-/// Validate a symlink target exactly as the wire requires: valid UTF-8 (the
-/// manifest's [`TreeEntry::symlink_target`] is a string), and free of every
-/// [`WIRE_UNREPRESENTABLE_CHARS`] character (NUL, LF, CR, or TAB). The target
-/// is returned UNCHANGED.
+/// Validate a symlink target exactly as the wire requires: non-empty, valid
+/// UTF-8 (the manifest's [`TreeEntry::symlink_target`] is a string), and free
+/// of every [`WIRE_UNREPRESENTABLE_CHARS`] character (NUL, LF, CR, or TAB).
+/// The target is returned UNCHANGED.
+///
+/// An EMPTY target is refused by BOTH canonicalizers: it is degenerate link
+/// data that cannot be a faithful address (the kernel refuses it on Linux and
+/// APFS stores it as a dangling link), and the two views must accept exactly
+/// the same trees. Before this check the local walk accepted `""` (its
+/// component walk over an empty path reaches nothing) while the wire assembler
+/// refused it (`missing symlink target`), so a macOS source was accepted by
+/// one view and refused by the other — a third violation of the two-views
+/// contract. Refusing on both is the fail-closed choice.
 ///
 /// NFC is NOT required: a target is not an addressable NAME but the link's
 /// DATA — the kernel dereferences it verbatim, it may legitimately contain `..`,
@@ -531,6 +711,11 @@ fn validate_entry_path(path: &str) -> Result<String> {
 /// it is refused rather than lossily converted (which would install a link to a
 /// different path). `entry_path` names the offending entry in every error.
 fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
+    if target.is_empty() {
+        return Err(Error::materialization(format!(
+            "symlink target of entry {entry_path} is empty; an empty relative target cannot be a faithful address and the kernel refuses it",
+        )));
+    }
     if let Some(c) = first_unrepresentable_char(target) {
         return Err(Error::materialization(format!(
             "symlink target of entry {entry_path} contains {} (a wire-unrepresentable character; the manifest wire refuses NUL/LF/CR/TAB): {target:?}",
@@ -717,38 +902,17 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                     UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
                     UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
                 }
-            } else {
-                // A RELATIVE target is resolved against the directory
-                // CONTAINING the link (the link's own parent), per POSIX, not
-                // against the tree root: `dir/link -> ../other` lands in
-                // `<root>/other`, which is inside the root, and is ACCEPTED.
-                // Containment is decided PHYSICALLY, on the target's spelled
-                // components: the kernel follows a symlink component (final or
-                // intermediate), so a target whose walk reaches one is refused
-                // rather than collapsed lexically. `root_c` is the real
-                // directory the kernel resolves against, so the `lstat` sees
-                // the live tree; the walk itself is root-relative and does not
-                // depend on the root's spelling (see
-                // [`check_relative_symlink_target`]).
-                let mut is_symlink = |rel: &Path| -> bool {
-                    std::fs::symlink_metadata(root_c.join(rel))
-                        .map(|m| m.is_symlink())
-                        .unwrap_or(false)
-                };
-                if let Err(refusal) =
-                    check_relative_symlink_target(rel_os, &target, &mut is_symlink)
-                {
-                    let reason = symlink_target_refusal_message(
-                        refusal,
-                        &path.display().to_string(),
-                        &target.to_string_lossy(),
-                    );
-                    match policy {
-                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
-                        UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
-                    }
-                }
             }
+            // A RELATIVE target is resolved against the directory CONTAINING
+            // the link (the link's own parent), per POSIX, not against the
+            // tree root: `dir/link -> ../other` lands in `<root>/other`, which
+            // is inside the root, and is ACCEPTED. Containment is decided
+            // PHYSICALLY, on the target's spelled components, and is checked
+            // in the POST-PASS below once every entry is known (a target may
+            // name an entry that appears later in the walk, and the rule needs
+            // the KIND of every entry it reaches). The post-pass uses the SAME
+            // [`SymlinkContainmentIndex`] and [`check_relative_symlink_target`]
+            // the wire assembler uses, so the two views apply one rule.
             // The target is LINK CONTENT, so it must be stored faithfully or
             // the tree refused: a lossy conversion would install a link to a
             // different path. It is validated as UTF-8 (the manifest stores a
@@ -800,6 +964,55 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
             content_sha256,
             symlink_target,
         });
+    }
+
+    // POST-PASS: the ONE containment rule, over the SAME view the wire
+    // assembler builds. It runs AFTER the walk so every entry the target's
+    // spelled walk reaches is known, and it uses the crate's platform
+    // -independent component fold, so the local walk and the far-side
+    // assembler reach the same verdict for the same tree on every host. See
+    // the module docs for the fold and the erring direction it costs.
+    let needs_containment = entries.iter().any(|e| {
+        e.entry_type == "symlink"
+            && e.symlink_target
+                .as_deref()
+                .is_some_and(|t| !Path::new(t).is_absolute())
+    });
+    if needs_containment {
+        let index = SymlinkContainmentIndex::from_entries(&entries);
+        let mut containment_unsupported: Vec<UnsupportedEntry> = Vec::new();
+        for entry in &entries {
+            if entry.entry_type != "symlink" {
+                continue;
+            }
+            let Some(target) = entry.symlink_target.as_deref() else {
+                continue;
+            };
+            let target_path = Path::new(target);
+            if target_path.is_absolute() {
+                // Already classified (and tolerated or refused) above.
+                continue;
+            }
+            if let Err(refusal) =
+                check_relative_symlink_target_indexed(Path::new(&entry.path), target_path, &index)
+            {
+                // The link is DISPLAYED by the path the walk used, so the
+                // message is byte-identical to the pre-post-pass one.
+                let reason = symlink_target_refusal_message(
+                    refusal,
+                    &root.join(&entry.path).display().to_string(),
+                    target,
+                );
+                match policy {
+                    UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                    UnsupportedPolicy::Tolerate => containment_unsupported.push(UnsupportedEntry {
+                        path: entry.path.clone(),
+                        reason,
+                    }),
+                }
+            }
+        }
+        unsupported.extend(containment_unsupported);
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -969,9 +1182,13 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// computed from the assembled metadata, so a corrupted or divergent remote
 /// tree produces a digest mismatch without any content transfer. A SYMLINK's
 /// RELATIVE target is checked with the SAME root-relative walk the local
-/// canonicalizer uses, driven by the kinds the far side reported: a component
-/// the listing marks `symlink` is refused, exactly as the local walk's
-/// `symlink_metadata` refuses it. `root` is accepted for compatibility but the
+/// canonicalizer uses, over the SAME kind of [`SymlinkContainmentIndex`]: a
+/// component whose EXACT entry the listing marks `symlink`, or that the crate's
+/// component fold resolves to a `symlink` entry when no exact entry exists, is
+/// refused — exactly as the local walk refuses the same component from its own
+/// entry list. (Before this the assembler compared the listing's spellings
+/// byte-exactly, so a case- or normalization-folding far side accepted a target
+/// the local walk refused.) `root` is accepted for compatibility but the
 /// symlink check does NOT consult it: the far side's root cannot be
 /// canonicalized from here, and because the walk is root-relative it does not
 /// need to be, so the local and wire verdicts agree even when the root is
@@ -983,6 +1200,47 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// assemble the short or empty listing. Only a complete walk — including an
 /// existing empty directory, whose empty stdout is the empty manifest — may
 /// be assembled here.
+///
+/// # The completeness precondition is on INFORMATION this function does not
+/// carry, so a direct caller must enforce it
+///
+/// This function is `pub`, but its SIGNATURE is `(&str, &Path)`: the far side's
+/// EXIT STATUS — the only evidence that the walk covered the whole tree —
+/// belongs to the `Output`/`Remote::exec` result the caller holds and is NOT
+/// passed here. The crate's own remote path
+/// ([`crate::sync::diff::remote_manifest`] and
+/// [`crate::sync::diff::remote_destination_manifest`]) checks `out.success()`
+/// and refuses a non-zero exit BEFORE calling this function, and
+/// [`remote_tree_verify_script`] is the only producer whose `die` vocabulary
+/// makes that check meaningful, so the crate can never assemble an incomplete
+/// listing. A caller that reads a listing from anywhere else (its own script, a
+/// proxy, a buffer) MUST make the same check itself, or establish completeness
+/// some other way; there is no guard inside this function that can.
+///
+/// What an INCOMPLETE listing does, stated precisely, because the previous
+/// revision of this doc overstated it as an outright unsupported precondition
+/// without saying what happens when it is violated: an omitted entry makes the
+/// manifest MIS-DESCRIBE the tree — the omitted path is absent from the diff,
+/// so a source-only entry is not transferred and a destination-only one is not
+/// classified — but it does NOT create an escape. Every entry the listing DOES
+/// contain is assembled under the kind the listing itself reported, and the
+/// applier materializes exactly that kind (or leaves the path absent); a path
+/// the listing omits is therefore never materialized as a symlink the listing
+/// did not describe. In particular, an omitted `l` entry is materialized as
+/// whatever its PARENT listing says (a directory, or nothing), so a
+/// source-symlink containment walk can never be satisfied by a kind the
+/// manifest does not contain. The defect is a faithful-to-the-listing,
+/// non-escaping manifest that mis-describes the tree — a correctness/
+/// completeness bug at the caller, never a containment hole here.
+///
+/// A CHEAP GUARD, if one is wanted: the completeness evidence is the exit
+/// status, so the honest fix is a fallible constructor that takes the status
+/// (e.g. `canonicalize_remote_entries_checked(output, root, exited_zero: bool)`)
+/// and refuses `false`, letting the crate's own path stop threading the check
+/// by hand. A completeness TERMINATOR on the wire would also work but CHANGES
+/// THE WIRE FORMAT (the far side would print a final sentinel line), so it is
+/// deliberately NOT done here: this change does not alter the format, and the
+/// crate's own path already refuses a non-zero exit before assembly.
 pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
     Ok(canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Refuse)?.meta)
 }
@@ -1173,18 +1431,16 @@ fn canonicalize_remote_entries_with(
     // satisfies this, and a hand-built or proxied line that does not is
     // refused rather than implicitly creating an unnamed parent.
     require_parent_closed(&entries)?;
-    // The SAME relative-target rule as the local walk, applied with the KINDS
-    // the far side reported. The walk is over root-RELATIVE paths, so `root`
-    // is deliberately NOT consulted: the far side cannot be canonicalized from
-    // here, and neither side needs to, because the rule never builds an
-    // absolute base. A component counts as a symlink exactly when the listing
-    // says `symlink` at that path — the same fact the local walk's `lstat`
-    // reads — so a symlinked root can no longer make the two verdicts differ.
-    let symlink_paths: BTreeSet<String> = entries
-        .iter()
-        .filter(|e| e.entry_type == "symlink")
-        .map(|e| e.path.clone())
-        .collect();
+    // The SAME relative-target rule as the local walk, over the SAME
+    // [`SymlinkContainmentIndex`] the local walk builds and with the crate's
+    // platform-independent component fold. The walk is over root-RELATIVE
+    // paths, so `root` is deliberately NOT consulted: the far side cannot be
+    // canonicalized from here, and neither side needs to, because the rule
+    // never builds an absolute base. A component resolves to a symlink exactly
+    // when the listing's EXACT entry at that spelling is one, or when the
+    // spelling fold-matches a `symlink` entry, so the two views cannot
+    // disagree about the same tree.
+    let index = SymlinkContainmentIndex::from_entries(&entries);
     for entry in &entries {
         if entry.entry_type != "symlink" {
             continue;
@@ -1197,9 +1453,8 @@ fn canonicalize_remote_entries_with(
             // Already classified (and tolerated or refused) at the field.
             continue;
         }
-        let mut is_symlink = |rel: &Path| -> bool { symlink_paths.contains(&rel_path_string(rel)) };
         if let Err(refusal) =
-            check_relative_symlink_target(Path::new(&entry.path), target, &mut is_symlink)
+            check_relative_symlink_target_indexed(Path::new(&entry.path), target, &index)
         {
             let reason =
                 symlink_target_refusal_message(refusal, &entry.path, &target.to_string_lossy());
@@ -2425,6 +2680,275 @@ mod tests {
         assert!(
             remote_err.to_string().contains("escaping symlink"),
             "the wire assembler must reach the SAME refuse verdict, got: {remote_err}"
+        );
+    }
+
+    /// Whether THIS filesystem folds ASCII case, probed with a REAL create and
+    /// a case-flipped lookup (never a platform guess). macOS APFS folds;
+    /// Linux/ext4 does not. The fold-based containment rule is
+    /// platform-INDEPENDENT, but this probe is what gates the assertion that
+    /// the escape is real on the live tree.
+    fn filesystem_folds_ascii_case() -> bool {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let written = dir.path().join("Fold-Probe");
+        std::fs::write(&written, b"probe").unwrap();
+        std::fs::symlink_metadata(dir.path().join("fOLD-pROBE")).is_ok()
+    }
+
+    /// Whether THIS filesystem resolves the composed and decomposed forms of a
+    /// name to the same entry (macOS APFS does; Linux/ext4 does not). Probed
+    /// with a REAL write + a cross-spelling lookup.
+    fn filesystem_resolves_both_normalization_forms() -> bool {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        std::fs::write(dir.path().join("caf\u{e9}"), b"probe").unwrap();
+        std::fs::symlink_metadata(dir.path().join("cafe\u{301}")).is_ok()
+    }
+
+    /// Whether two ASCII-case-distinct entries can COEXIST here (`Sub` a
+    /// directory and `sub` a second, distinct entry). Only a case-sensitive
+    /// filesystem can hold both, and only there is the exact-match-wins rule
+    /// observable.
+    fn filesystem_distinguishes_ascii_case() -> bool {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        std::fs::create_dir_all(dir.path().join("Case-Probe")).unwrap();
+        let folded_resolves = std::fs::symlink_metadata(dir.path().join("cASE-pROBE")).is_ok();
+        let twin_created = std::fs::create_dir_all(dir.path().join("cASE-pROBE")).is_ok();
+        let two_entries = std::fs::read_dir(dir.path())
+            .map(|entries| entries.count() == 2)
+            .unwrap_or(false);
+        !folded_resolves && twin_created && two_entries
+    }
+
+    /// Whether `symlink("")` is representable here: APFS stores it (a dangling
+    /// link with an empty target), Linux refuses it with `ENOENT`. Probed with
+    /// a REAL create, never a platform guess.
+    fn filesystem_stores_an_empty_symlink_target() -> bool {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        std::os::unix::fs::symlink("", dir.path().join("empty-target-probe")).is_ok()
+    }
+
+    /// G1: an exact-string lookup is NOT the kernel's resolution on a
+    /// case-folding filesystem. `R/dir/sub -> ../other` and `R/dir/link ->
+    /// Sub/../../outside`: the kernel resolves the spelled `Sub` onto the
+    /// on-disk `sub` (a symlink), so the walk reaches a symlink and the target
+    /// escapes the root. The wire assembler's exact-string set lookup used to
+    /// miss that fold and ACCEPT the tree while the local walk refused it, so
+    /// the two predicates did not compute the same function. Both views now
+    /// fold every walked component with the crate's name-identity fold, so
+    /// both refuse and name the component the walk reached.
+    ///
+    /// The fold is platform-INDEPENDENT (the crate's name rules deliberately
+    /// are), so on a case-SENSITIVE filesystem both views refuse the same tree
+    /// even though the spelled path does not resolve there; that over-refusal
+    /// is the erring direction this fix chooses, and it keeps the two views in
+    /// agreement. The live-escape premise is asserted only where the filesystem
+    /// really folds.
+    #[test]
+    fn case_folded_symlink_component_is_refused_by_both_canonicalizers() {
+        skip_without_perl!("case_folded_symlink_component_is_refused_by_both_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(dir.path().join("outside/secret"), b"SECRET").unwrap();
+        std::os::unix::fs::symlink("../other", root.join("dir/sub")).unwrap();
+        std::os::unix::fs::symlink("Sub/../../outside", root.join("dir/link")).unwrap();
+
+        if filesystem_folds_ascii_case() {
+            assert_eq!(
+                std::fs::read(root.join("dir/link/secret")).unwrap(),
+                b"SECRET",
+                "the escape must be real on a folding live tree for this test to mean anything"
+            );
+        }
+
+        let local_msg = canonicalize_tree(&root).unwrap_err().to_string();
+        assert!(
+            local_msg.contains("escaping symlink") && local_msg.contains("Sub"),
+            "the local walk must refuse the fold-equal symlink component, naming it, got: {local_msg}"
+        );
+        let out = run_remote_script(&root);
+        let remote_msg = canonicalize_remote_entries(&out, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            remote_msg.contains("escaping symlink") && remote_msg.contains("Sub"),
+            "the wire assembler must refuse the SAME tree with the same fold, naming it, got: {remote_msg}"
+        );
+    }
+
+    /// G1, the normalization half: an NFD target spelling must reach the NFC
+    /// on-disk symlink through the same fold, on BOTH views. `dir/caf\u{e9}` is
+    /// the on-disk (NFC) symlink and `dir/link -> cafe\u{301}/../../outside`
+    /// spells it decomposed, so an exact-string lookup misses while the kernel
+    /// (APFS folds normalization) resolves through the link. Both views refuse.
+    #[test]
+    fn nfd_target_spelling_reaching_an_nfc_symlink_component_is_refused_by_both() {
+        skip_without_perl!(
+            "nfd_target_spelling_reaching_an_nfc_symlink_component_is_refused_by_both"
+        );
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(dir.path().join("outside/secret"), b"SECRET").unwrap();
+        std::os::unix::fs::symlink("../other", root.join("dir/caf\u{e9}")).unwrap();
+        std::os::unix::fs::symlink("cafe\u{301}/../../outside", root.join("dir/link")).unwrap();
+
+        if filesystem_resolves_both_normalization_forms() {
+            assert_eq!(
+                std::fs::read(root.join("dir/link/secret")).unwrap(),
+                b"SECRET",
+                "the escape must be real where the filesystem folds normalization"
+            );
+        }
+
+        let local_msg = canonicalize_tree(&root).unwrap_err().to_string();
+        assert!(
+            local_msg.contains("escaping symlink") && local_msg.contains("dir/cafe"),
+            "the local walk must refuse the NFD-spelled component, naming it, got: {local_msg}"
+        );
+        let out = run_remote_script(&root);
+        let remote_msg = canonicalize_remote_entries(&out, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            remote_msg.contains("escaping symlink") && remote_msg.contains("dir/cafe"),
+            "the wire assembler must refuse the SAME tree, naming it, got: {remote_msg}"
+        );
+    }
+
+    /// G1, the ACCEPT direction: a fold-equal component that is NOT a symlink
+    /// must still be accepted, and the two views must produce byte-identical
+    /// manifests. `link -> Sub/file` with the on-disk `sub` a real directory:
+    /// the fold resolves `Sub` to `sub`, which is not a symlink, so the target
+    /// is lawful. This is the tree that "exercises the fold" without an
+    /// escape.
+    #[test]
+    fn fold_equal_non_symlink_component_is_accepted_by_both_and_manifests_agree() {
+        skip_without_perl!(
+            "fold_equal_non_symlink_component_is_accepted_by_both_and_manifests_agree"
+        );
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file"), b"payload").unwrap();
+        std::os::unix::fs::symlink("Sub/file", root.join("link")).unwrap();
+
+        let local = canonicalize_tree(&root)
+            .expect("a fold-equal NON-symlink component is lawful and must be accepted");
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root)
+            .expect("the wire assembler must reach the SAME accept verdict");
+        assert_eq!(
+            remote.entries, local.entries,
+            "the two views must describe the fold-exercising tree identically"
+        );
+        assert_eq!(remote.tree_sha256, local.tree_sha256);
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "link")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("Sub/file"),
+            "the target is DATA and is stored verbatim"
+        );
+    }
+
+    /// G1, the legitimate case the fold must NOT break: on a
+    /// case-SENSITIVE filesystem two case-distinct entries (`Sub` a directory,
+    /// `sub` a symlink) can legitimately coexist, and a target naming the
+    /// non-symlink `Sub` must be ACCEPTED by both views. The EXACT entry wins
+    /// over a fold-equal one, so the fold never refuses a lawful tree that
+    /// merely has a case-variant sibling. Skipped where the filesystem folds,
+    /// where the two entries cannot coexist.
+    #[test]
+    fn exact_entry_wins_over_a_fold_equal_symlink_on_a_case_sensitive_filesystem() {
+        skip_without_perl!(
+            "exact_entry_wins_over_a_fold_equal_symlink_on_a_case_sensitive_filesystem"
+        );
+        if !filesystem_distinguishes_ascii_case() {
+            announce_skip(
+                "this filesystem folds ASCII case, so `Sub` (a directory) and `sub` (a \
+                 symlink) cannot coexist and the exact-match-wins rule is untestable here",
+            );
+            return;
+        }
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("Sub")).unwrap();
+        std::fs::write(root.join("Sub/file"), b"payload").unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        // A fold-equal SYMLINK sibling: `sub` names the same fold as `Sub`.
+        std::os::unix::fs::symlink("other", root.join("sub")).unwrap();
+        // The target names the DIRECTORY `Sub`, never the symlink `sub`.
+        std::os::unix::fs::symlink("Sub/file", root.join("link")).unwrap();
+
+        let local = canonicalize_tree(&root)
+            .expect("the exact non-symlink entry must win over the fold-equal symlink");
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root)
+            .expect("the wire assembler must reach the SAME accept verdict");
+        assert_eq!(remote.entries, local.entries);
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "link")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("Sub/file")
+        );
+    }
+
+    /// G3: an EMPTY symlink target is refused by BOTH views. Before the fix
+    /// the local walk ACCEPTED `""` (its component walk over an empty path
+    /// reaches nothing) while the wire assembler refused it, so a macOS source
+    /// (where APFS stores an empty-target link) was accepted by one view and
+    /// refused by the other. The predicate-level arm runs on every platform;
+    /// the local end-to-end arm runs where the filesystem can store such a
+    /// link.
+    #[test]
+    fn empty_symlink_target_is_refused_by_both_views() {
+        // The shared validator — used by BOTH canonicalizers — refuses "".
+        assert!(
+            validate_symlink_target("l", "").is_err(),
+            "the shared symlink-target validator must refuse an empty target"
+        );
+        // The wire assembler refuses the empty target line.
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("wire");
+        std::fs::create_dir_all(&root).unwrap();
+        let empty_hash = sha256_bytes(b"");
+        let line = format!("l\tl\t1ff\t1\t{empty_hash}\t\n");
+        let wire_err = canonicalize_remote_entries(&line, &root).unwrap_err();
+        assert!(
+            wire_err.to_string().contains("symlink target"),
+            "the wire assembler must refuse an empty target, got: {wire_err}"
+        );
+        // The LOCAL walk refuses it end to end where the link is storable.
+        if !filesystem_stores_an_empty_symlink_target() {
+            announce_skip(
+                "this filesystem refuses symlink(\"\") (Linux ENOENT), so the empty-target \
+                 local reproduction is untestable here",
+            );
+            return;
+        }
+        let local_root = dir.path().join("local");
+        std::fs::create_dir_all(&local_root).unwrap();
+        std::os::unix::fs::symlink("", local_root.join("empty")).unwrap();
+        let local_err = canonicalize_tree(&local_root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("empty"),
+            "the local walk must refuse an empty target, got: {local_err}"
         );
     }
 

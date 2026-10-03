@@ -2072,6 +2072,142 @@ fn an_escaping_symlink_target_is_refused_by_push_and_pull() {
     );
 }
 
+/// G2: the containment answer must be a property of the RESULT, not of the
+/// SOURCE alone. The source here holds `dir/link -> sub/../../outside` with NO
+/// `dir/sub` (so the SOURCE rule lawfully accepts it: the walk reaches no
+/// symlink and never pops above the root), while the DESTINATION already holds
+/// `dir/sub -> ../other` (an in-root symlink the tolerant destination model
+/// enumerates). Under the default `Extraneous::Keep` that destination entry
+/// survives the run, the installed `dir/link` walks THROUGH it, and
+/// `read(dst/dir/link/secret)` returned the outside canary.
+///
+/// Pre-fix the run reported `Ok` and the link escaped. Post-fix the run is
+/// REFUSED before any transfer, naming the destination component; nothing is
+/// materialized.
+#[cfg(unix)]
+#[test]
+fn a_destination_resident_symlink_component_makes_the_run_refuse() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(src.join("dir")).unwrap();
+    write(&src.join("dir/keep"), b"payload");
+    // No `src/dir/sub`, so the SOURCE rule accepts this link.
+    std::os::unix::fs::symlink("sub/../../outside", src.join("dir/link")).unwrap();
+    fs::create_dir_all(dst.join("dir/other")).unwrap();
+    std::os::unix::fs::symlink("../other", dst.join("dir/sub")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains("dir/sub"),
+        "the run must refuse, naming the destination component, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("dir/link")).is_err(),
+        "the escaping link must never be materialized: {err}"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+
+    // CONTROL A: the SAME source, with `dir/sub` a REAL destination directory,
+    // is lawful and must still succeed.
+    let dst_real = dir.path().join("dst-real");
+    fs::create_dir_all(dst_real.join("dir/sub")).unwrap();
+    fs::create_dir_all(dst_real.join("dir/other")).unwrap();
+    let report = sync(
+        Direction::Push,
+        &src,
+        &transport(&dst_real),
+        &ReplaceAll,
+        Keep,
+    )
+    .expect("a real destination directory at the traversed component is lawful");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(read(&dst_real.join("dir/keep")), b"payload");
+    assert!(
+        fs::symlink_metadata(dst_real.join("dir/link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the in-root link is installed"
+    );
+}
+
+/// G2, control B: `Extraneous::Delete` removes the destination-only symlink at
+/// the traversed component, so the same source link no longer escapes and the
+/// sanctioned removal still runs.
+#[cfg(unix)]
+#[test]
+fn extraneous_delete_neutralizes_the_destination_resident_symlink_component() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(src.join("dir")).unwrap();
+    write(&src.join("dir/keep"), b"payload");
+    std::os::unix::fs::symlink("sub/../../outside", src.join("dir/link")).unwrap();
+    fs::create_dir_all(dst.join("dir/other")).unwrap();
+    std::os::unix::fs::symlink("../other", dst.join("dir/sub")).unwrap();
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("the sanctioned deletion removes the traversed destination symlink");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert!(
+        fs::symlink_metadata(dst.join("dir/sub")).is_err(),
+        "the destination-only symlink at the traversed component is removed: {report:?}"
+    );
+    assert_eq!(read(&dst.join("dir/keep")), b"payload");
+    assert!(
+        fs::symlink_metadata(dst.join("dir/link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is installed and now dangles instead of escaping"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("dir/link/secret")).is_err(),
+        "the link must not resolve to the outside canary"
+    );
+}
+
+/// G2, the UNSUPPORTED variant: the destination holds `dir/sub ->
+/// ../../outside` (an escaping symlink, so it is listed in
+/// `unsupported_destination`) and the source does not hold `dir/sub`. Pre-fix
+/// the report named the entry as unsupported yet the sync SUCCEEDED and the
+/// installed link still escaped. The result-containment preflight now refuses
+/// it, so an unsupported destination entry can never be the component a source
+/// link escapes through.
+#[cfg(unix)]
+#[test]
+fn an_unsupported_destination_symlink_component_cannot_be_escaped_through() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(src.join("dir")).unwrap();
+    write(&src.join("dir/keep"), b"payload");
+    std::os::unix::fs::symlink("sub/../../outside", src.join("dir/link")).unwrap();
+    // The destination component escapes the destination root.
+    fs::create_dir_all(dst.join("dir")).unwrap();
+    std::os::unix::fs::symlink("../../outside", dst.join("dir/sub")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains("dir/sub"),
+        "the run must refuse, naming the unsupported destination component, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("dir/link")).is_err(),
+        "the escaping link must never be materialized"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
 #[test]
 fn equal_trees_perform_zero_transfers() {
     let dir = fixture_tmpdir(&env()).unwrap();

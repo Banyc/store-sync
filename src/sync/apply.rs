@@ -892,8 +892,9 @@ use crate::atomic::ReplaceOutcome;
 use crate::error::{Error, Result};
 use crate::lock::FileLock;
 use crate::manifest::{
-    DestinationTree, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata, canonicalize_tree,
-    canonicalize_tree_destination, compute_tree_digest,
+    DestinationTree, SymlinkContainmentIndex, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
+    canonicalize_tree, canonicalize_tree_destination, check_relative_symlink_target_indexed,
+    compute_tree_digest, symlink_target_refusal_message,
 };
 use crate::sync::diff::{
     EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_trees, remote_destination_manifest,
@@ -966,6 +967,20 @@ pub enum Direction {
 /// sanction is DERIVED from the diff (one classification per path), and a
 /// partly-deleted destination would make the report's
 /// [`SyncReport::extraneous`] list ambiguous about which paths survived.
+///
+/// CONTAINMENT AND `Keep`: a destination-only entry can be a SYMLINK at a
+/// component a SOURCE symlink's target walks through. Under `Keep` that entry
+/// survives, so the installed link would resolve through it and could leave the
+/// destination root; the run is therefore REFUSED before any transfer, naming
+/// the destination component, rather than either installing an escaping link or
+/// silently removing the destination entry (removal is the caller's decision).
+/// The caller's routes are: delete that destination entry first — under
+/// `Extraneous::Delete` it is a destination-only entry, so `Delete` removes it
+/// and the source link is then installed as a dangling, non-escaping link — or
+/// remove the source link and re-run. This is the one case where `Keep` cannot
+/// simply leave the destination alone: leaving it alone would make the SOURCE
+/// link escape, and containment is decided against the RESULT, not the source
+/// alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Extraneous {
     /// Leave every destination-only entry in place and report it in
@@ -2938,6 +2953,83 @@ fn run(
                  source holds the path, remove it by hand) and re-run.",
                 entry.path, entry.reason
             ))));
+        }
+    }
+    // CONTAINMENT IS A PROPERTY OF THE RESULT, NOT OF THE SOURCE ALONE. A source
+    // symlink's target was checked against the SOURCE tree (which is why the
+    // run may only ever install a link whose walk reaches a non-symlink there),
+    // but the destination may already hold a SYMLINK at a component that is
+    // ABSENT in the source, and under the default `Extraneous::Keep` that
+    // destination entry survives the run. The installed link then walks through
+    // it and escapes a root the crate validated. The verdict must account for
+    // what will exist at the destination AFTER the run: the source's own entry
+    // where the source will install one, otherwise the destination entry the
+    // run leaves in place. The result view is checked with the SAME rule and the
+    // SAME fold the two canonicalizers use, and the run is REFUSED rather than
+    // silently removing the destination entry (removal is the caller's
+    // `Extraneous` decision). A `Keep` run therefore refuses with a message
+    // naming the destination component; the caller can delete that entry first,
+    // use `Extraneous::Delete` when the source does not hold the path, or remove
+    // the source link, and re-run.
+    let needs_result_containment = source_meta.entries.iter().any(|e| {
+        e.entry_type == "symlink"
+            && e.symlink_target
+                .as_deref()
+                .is_some_and(|t| !Path::new(t).is_absolute())
+    });
+    if needs_result_containment {
+        let source_paths: BTreeSet<&str> = source_meta
+            .entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        let mut result: Vec<(&str, bool)> =
+            Vec::with_capacity(dest_meta.entries.len() + source_meta.entries.len());
+        for entry in &dest_meta.entries {
+            // The source's own entry SHADOWS the destination entry at the same
+            // path (it is installed over it, or already matches it).
+            if source_paths.contains(entry.path.as_str()) {
+                continue;
+            }
+            // A destination-only entry survives only under `Keep`; under
+            // `Delete` the run removes it, so it must NOT constrain the link.
+            if extraneous == Extraneous::Delete {
+                continue;
+            }
+            result.push((entry.path.as_str(), entry.entry_type == "symlink"));
+        }
+        for entry in &source_meta.entries {
+            result.push((entry.path.as_str(), entry.entry_type == "symlink"));
+        }
+        let index = SymlinkContainmentIndex::from_pairs(result);
+        for entry in &source_meta.entries {
+            if entry.entry_type != "symlink" {
+                continue;
+            }
+            let Some(target) = entry.symlink_target.as_deref() else {
+                continue;
+            };
+            let target_path = Path::new(target);
+            if target_path.is_absolute() {
+                // The strict source manifest already refused an absolute
+                // target; a destination view adds nothing here.
+                continue;
+            }
+            if let Err(refusal) =
+                check_relative_symlink_target_indexed(Path::new(&entry.path), target_path, &index)
+            {
+                let reason = symlink_target_refusal_message(refusal, &entry.path, target);
+                return Err(SyncError::from(Error::materialization(format!(
+                    "the source symlink {} cannot be shown to stay inside the destination root \
+                     once the run finishes: {reason}. The destination holds a symlink at a \
+                     component the target walks through and the source does not replace it, so \
+                     the installed link would resolve outside the root. Remedy: remove that \
+                     destination entry first (a destination-only entry is cleared by \
+                     Extraneous::Delete; when the source holds the path, remove it by hand), or \
+                     remove the source link, and re-run.",
+                    entry.path
+                ))));
+            }
         }
     }
     let mut applier = Applier {

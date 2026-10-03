@@ -23,8 +23,12 @@ caller.
    when it is ABSOLUTE, when a `..` walks above the root, or when the walk
    reaches a symlink component — final or intermediate — because the kernel
    FOLLOWS that component and a lexical collapse past it is not the kernel's
-   answer; the crate refuses rather than guess where the follow ends. Nothing
-   is normalized or substituted.
+   answer; the crate refuses rather than guess where the follow ends. A
+   component counts as a symlink component when its EXACT entry is one, or —
+   when no exact entry exists — when it folds onto a symlink entry under the
+   crate's platform-independent name fold (NFC, Unicode lowercase, trailing
+   `.`/space), so a case- or normalization-folding spelling cannot be missed by
+   one view and accepted by another. Nothing is normalized or substituted.
 4. **A view is faithful, or the check does not run.** No lossy decode, no
    trimming, no defaulted field, on any path that decides something. A listing
    carries the live kind of each entry beside its name.
@@ -115,7 +119,11 @@ backup or checkpoint format**, and it cannot stand in for one:
   walking through a symlink component (`dir/link -> ../other`) is lawful and is
   NOT one of these refusals; a target whose walk reaches a symlink component is
   refused even when it happens to land inside, because the kernel may follow
-  that component out.
+  that component out. Containment is decided against the RESULT: a source link
+  whose target walks through a component that only the DESTINATION supplies as a
+  symlink (and that the source does not replace, kept under the default
+  `Extraneous::Keep`) also fails the run rather than installing an escaping link
+  or silently removing the destination entry.
 - A **restore drops metadata with the differ blind**: `diff(snapshot, live)` is
   EMPTY while `mtime`, xattrs and sparseness differ. Ownership,
   `security.capability`, ACLs, timestamps, file flags and sparseness are not
