@@ -17,13 +17,13 @@
 
 #![cfg(unix)]
 
-use store_sync::env::SysEnv;
-use store_sync::sync::{ReplaceAll, push};
-use store_sync::transport::{Layout, LocalTransport};
+use storekit::env::SysEnv;
+use storekit::sync::{ReplaceAll, push};
+use storekit::transport::{Layout, LocalTransport};
 
 /// The marker variable the child process sets; the parent test returns early
 /// when it is set, and the child body returns early when it is not.
-const CHILD_ENV: &str = "STORE_SYNC_PUSH_ATOMICITY_CHILD";
+const CHILD_ENV: &str = "STOREKIT_PUSH_ATOMICITY_CHILD";
 /// The exact libtest name of the child body.
 const CHILD_TEST: &str = "push_mid_write_failure_leaves_previous_content_intact_child";
 

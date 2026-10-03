@@ -74,9 +74,9 @@ the unwanted paths out of band through the destination's own removal
 primitives (or make every path you want kept part of the source).
 
 A consumer can ask whether a name may be used BEFORE it fails. The authority
-is `store_sync::is_unaddressable_name` (one path segment) and its path form
-`store_sync::is_unaddressable_path` (a canonical manifest path): these are the
-predicate the identifier rule `store_sync::id::valid_name` itself consults, so
+is `storekit::is_unaddressable_name` (one path segment) and its path form
+`storekit::is_unaddressable_path` (a canonical manifest path): these are the
+predicate the identifier rule `storekit::id::valid_name` itself consults, so
 `valid_name(s)` is false exactly when `s` is not a single safe segment OR is
 unaddressable. They report every spelling the crate refuses to name — the
 `.sync-aside.` claim-aside prefix, the `.<name>.operation.lock` record, the
@@ -108,7 +108,7 @@ that differ only in mtime compare `Same`.
 
 ## This is not a backup or checkpoint format
 
-`store-sync` moves a tree faithfully WITHIN THE MANIFEST MODEL; it is **not a
+`storekit` moves a tree faithfully WITHIN THE MANIFEST MODEL; it is **not a
 backup or checkpoint format**, and it cannot stand in for one:
 
 - A source containing a **hard link**, an **absolute symlink**, or an

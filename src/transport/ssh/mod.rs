@@ -186,8 +186,8 @@ const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
 /// on `PATH` matches to fault-inject or record the file fsync and the
 /// directory fsync independently; being comments they change nothing about the
 /// executed script.
-const PERL_FSYNC_FILE: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_FILE";
-const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STORE_SYNC_TEST_FSYNC_DIR";
+const PERL_FSYNC_FILE: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STOREKIT_TEST_FSYNC_FILE";
+const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle; my $p = $ARGV[0]; sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK) or die \"fsync-open $p: $!\"; my @s = stat($fh) or die \"fsync-stat $p: $!\"; my $t = $s[2] & 0170000; die \"fsync-refuse $p: not a regular file or directory\" unless $t == 0100000 || $t == 0040000; $fh->sync or die \"fsync $p: $!\"; close $fh; # STOREKIT_TEST_FSYNC_DIR";
 
 /// THE TRUNCATION GUARD: refuse to PUBLISH a payload whose received byte count
 /// does not match the client's.
@@ -202,12 +202,12 @@ const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle;
 /// argv token, and this check runs BETWEEN the write and the publish:
 ///
 /// `perl -e '<this>' -- <tmp> <expected_bytes>` exits 0 only when the temp holds
-/// exactly that many bytes; otherwise it prints a `store-sync:` error to stderr
+/// exactly that many bytes; otherwise it prints a `storekit:` error to stderr
 /// (which the caller surfaces) and exits nonzero, so the surrounding script
 /// removes the temp and never publishes it. `-s` is the byte size of a regular
 /// file and is portable across GNU and BSD userlands; perl is already required
 /// on the far side for the fsync helpers.
-const PERL_VERIFY_LEN: &str = "my $n = -s $ARGV[0]; if (!defined $n || $n != $ARGV[1]) { print STDERR \"store-sync: remote payload truncated: \", $ARGV[0], \" holds \", (defined $n ? $n : \"?\"), \" bytes, expected $ARGV[1]; refusing to publish\\n\"; exit 1; } exit 0; # STORE_SYNC_TEST_VERIFY_LEN";
+const PERL_VERIFY_LEN: &str = "my $n = -s $ARGV[0]; if (!defined $n || $n != $ARGV[1]) { print STDERR \"storekit: remote payload truncated: \", $ARGV[0], \" holds \", (defined $n ? $n : \"?\"), \" bytes, expected $ARGV[1]; refusing to publish\\n\"; exit 1; } exit 0; # STOREKIT_TEST_VERIFY_LEN";
 
 /// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
 /// `crate::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
@@ -1645,7 +1645,7 @@ impl SshTransport {
         let prelude =
             sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
         format!(
-            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; {prelude} binmode STDIN; my $data = do {{ local $/; <STDIN> }}; if (length($data) != $ARGV[3]) {{ print STDERR \"store-sync: sidecar payload truncated: received \", length($data), \" bytes, expected $ARGV[3]; refusing to publish\\n\"; exit {preinst}; }} my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode} {len}",
+            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; {prelude} binmode STDIN; my $data = do {{ local $/; <STDIN> }}; if (length($data) != $ARGV[3]) {{ print STDERR \"storekit: sidecar payload truncated: received \", length($data), \" bytes, expected $ARGV[3]; refusing to publish\\n\"; exit {preinst}; }} my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode} {len}",
             parent = parent_q,
             sidecar = sidecar_q,
             lock = lock_q,
@@ -5166,8 +5166,8 @@ mod tests_ssh {
     /// [`PERL_FSYNC_DIR`]. A fake `perl` matches these to fault-inject or
     /// record exactly one fsync kind without disturbing the script's other perl
     /// calls (notably the perl `link(2)` publish).
-    const FSYNC_FILE_HOOK: &str = "STORE_SYNC_TEST_FSYNC_FILE";
-    const FSYNC_DIR_HOOK: &str = "STORE_SYNC_TEST_FSYNC_DIR";
+    const FSYNC_FILE_HOOK: &str = "STOREKIT_TEST_FSYNC_FILE";
+    const FSYNC_DIR_HOOK: &str = "STOREKIT_TEST_FSYNC_DIR";
 
     /// The body of a fake `perl` that exits `code` when its `-e` program
     /// contains `needle` and otherwise delegates VERBATIM to the real perl.
@@ -5204,7 +5204,7 @@ mod tests_ssh {
         // SLOW-test gate: spawns many concurrent shells and exceeds the fast
         // suite's budget; run it under the full suites.
         if !crate::test_support::slow_tests_enabled() {
-            eprintln!("skipped: slow test — set STORE_SYNC_FULL_TESTS=1 to run");
+            eprintln!("skipped: slow test — set STOREKIT_FULL_TESTS=1 to run");
             return;
         }
 

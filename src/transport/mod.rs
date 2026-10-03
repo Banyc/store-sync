@@ -3071,7 +3071,7 @@ mod tests {
     /// produced.
     ///
     /// PLATFORM: a non-UTF-8 name cannot be created on APFS, so this SKIPS on
-    /// macOS (announcing `STORE_SYNC_SKIP`); the reproduction requires a
+    /// macOS (announcing `STOREKIT_SKIP`); the reproduction requires a
     /// Linux/BSD filesystem.
     #[test]
     fn local_list_refuses_a_non_utf8_entry_name() {
@@ -5040,7 +5040,7 @@ mod tests {
     ///   current behaviour of an intentional omission and so cannot fail
     ///   pre-fix either; a later change that starts carrying (or refuses to
     ///   carry) one of these must be an explicit, test-visible act. Each
-    ///   announces a `STORE_SYNC_SKIP` with its reason when the
+    ///   announces a `STOREKIT_SKIP` with its reason when the
     ///   filesystem/tool cannot set up the fixture (xattrs, a foreign gid),
     ///   rather than failing the suite on an environment that cannot support
     ///   it.
@@ -5056,16 +5056,16 @@ mod tests {
         /// The environment variable the shim reads to find its "remote"
         /// working directory (the directory a remote login shell would start
         /// in).
-        const SHIM_WORK_VAR: &str = "STORE_SYNC_SSH_SHIM_WORK";
+        const SHIM_WORK_VAR: &str = "STOREKIT_SSH_SHIM_WORK";
 
         /// Test-only `ssh` shim: it never opens a network connection. It
         /// reproduces the far side by running the transport's final argument
         /// (the remote command string `bash -c '<script>'`) in
-        /// `$STORE_SYNC_SSH_SHIM_WORK` with stdin/stdout/stderr connected
+        /// `$STOREKIT_SSH_SHIM_WORK` with stdin/stdout/stderr connected
         /// exactly as the real operation connects them.
         const SHIM_SCRIPT: &str = r#"#!/bin/sh
 set -u
-work=${STORE_SYNC_SSH_SHIM_WORK:?the shim work directory is not configured}
+work=${STOREKIT_SSH_SHIM_WORK:?the shim work directory is not configured}
 last=''
 for arg in "$@"; do last="$arg"; done
 cd "$work" || exit 125
@@ -5148,9 +5148,9 @@ exec /bin/sh -c "$last"
         /// so the xattr half of a test is skipped rather than failing on a
         /// filesystem/tool that cannot support it.
         fn xattrs_available(dir: &Path) -> bool {
-            let probe = dir.join(".store-sync-xattr-probe");
+            let probe = dir.join(".storekit-xattr-probe");
             std::fs::write(&probe, b"x").expect("write the xattr probe file");
-            match set_xattr(&probe, "user.store_sync.probe", b"1") {
+            match set_xattr(&probe, "user.storekit.probe", b"1") {
                 Ok(()) => true,
                 Err(e) => {
                     crate::test_support::announce_skip(&format!(
@@ -5370,16 +5370,16 @@ exec /bin/sh -c "$last"
             std::fs::write(&file, b"payload").unwrap();
 
             if xattrs_available(&src) {
-                set_xattr(&file, "user.store_sync.fidelity", b"present").unwrap();
+                set_xattr(&file, "user.storekit.fidelity", b"present").unwrap();
                 let t = LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty())
                     .unwrap();
                 t.copy_tree(&rooted("src"), &rooted("dest")).unwrap();
                 let dst = base.join("dest/f");
                 assert!(dst.is_file(), "premise: the file was copied");
                 assert!(
-                    !has_xattr(&dst, "user.store_sync.fidelity"),
+                    !has_xattr(&dst, "user.storekit.fidelity"),
                     "CHARACTERIZATION of a DOCUMENTED LIMITATION: the default list/read/write \
-                     walk must DROP xattrs, but it carried user.store_sync.fidelity; the \
+                     walk must DROP xattrs, but it carried user.storekit.fidelity; the \
                      documented fidelity scope is now wrong"
                 );
             }
@@ -5434,7 +5434,7 @@ exec /bin/sh -c "$last"
             chgrp(&file, gid).unwrap();
             let xattr = xattrs_available(&src);
             if xattr {
-                set_xattr(&file, "user.store_sync.fidelity", b"present").unwrap();
+                set_xattr(&file, "user.storekit.fidelity", b"present").unwrap();
             }
 
             let t = h.transport();
@@ -5443,10 +5443,10 @@ exec /bin/sh -c "$last"
 
             if xattr {
                 assert!(
-                    has_xattr(&dst, "user.store_sync.fidelity"),
+                    has_xattr(&dst, "user.storekit.fidelity"),
                     "CHARACTERIZATION of the DOCUMENTED DIVERGENCE: the SshTransport `cp -a` \
                      override preserves xattrs (unlike the default walk), but it dropped \
-                     user.store_sync.fidelity"
+                     user.storekit.fidelity"
                 );
             }
             assert_eq!(

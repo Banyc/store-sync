@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     /// The exhaustive per-stage sweep — the full suite runs it under
-    /// `STORE_SYNC_FULL_TESTS`; the two commit-point tests above always run.
+    /// `STOREKIT_FULL_TESTS`; the two commit-point tests above always run.
     /// EVERY pre-rename stage leaves the OLD content visible behind an
     /// `Err`; the post-rename stage leaves the NEW content visible behind
     /// `ReplacedDurabilityUnknown`, never an `Err`.

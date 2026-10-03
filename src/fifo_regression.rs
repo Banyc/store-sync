@@ -26,16 +26,16 @@ use crate::atomic::RootDir;
 use crate::env::SysEnv;
 
 /// The child re-exec reads its work mode from this.
-const MODE_ENV: &str = "STORE_SYNC_FIFO_MODE";
+const MODE_ENV: &str = "STOREKIT_FIFO_MODE";
 /// The child creates its FIFO under this directory (set by the parent).
-const ROOT_ENV: &str = "STORE_SYNC_FIFO_ROOT";
+const ROOT_ENV: &str = "STOREKIT_FIFO_ROOT";
 /// The exact libtest name of [`fifo_child`] (for the child's `--exact`).
 const CHILD_TEST: &str = "fifo_regression::fifo_child";
 /// The child's work mode.
 const CHILD_MODE: &str = "probe";
 /// Printed by the child only after ALL FOUR probes returned; the parent
 /// requires it so a child that ran no test can never pass this suite.
-const DONE_MARKER: &str = "STORE_SYNC_FIFO_CHILD_DONE";
+const DONE_MARKER: &str = "STOREKIT_FIFO_CHILD_DONE";
 /// The per-probe wall-clock bound the CHILD asserts. Well above any scheduling
 /// jitter, far below a hang.
 const PROBE_LIMIT: Duration = Duration::from_secs(5);

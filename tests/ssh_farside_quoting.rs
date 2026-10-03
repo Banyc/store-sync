@@ -9,7 +9,7 @@
 //!
 //! ```sh
 //! last=''; for arg in "$@"; do last=$arg; done
-//! cd "$STORE_SYNC_SSH_SHIM_WORK" && exec /bin/sh -c "$last"
+//! cd "$STOREKIT_SSH_SHIM_WORK" && exec /bin/sh -c "$last"
 //! ```
 //!
 //! WHAT THE SHIM PROVES. The exact command string `SshTransport` builds is
@@ -44,21 +44,21 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use store_sync::env::SysEnv;
-use store_sync::transport::{Layout, Remote, RootedRelativePath, SshTransport};
+use storekit::env::SysEnv;
+use storekit::transport::{Layout, Remote, RootedRelativePath, SshTransport};
 
 /// The environment variable the shim reads to find its "remote working
 /// directory" (the directory a remote login shell would start in).
-const SHIM_WORK_VAR: &str = "STORE_SYNC_SSH_SHIM_WORK";
+const SHIM_WORK_VAR: &str = "STOREKIT_SSH_SHIM_WORK";
 
 const SHIM_SCRIPT: &str = r#"#!/bin/sh
 # Test-only `ssh` shim: it never opens a network connection. It reproduces the
 # far side by running the transport's final argument (the remote command
-# string `bash -c '<script>'`) in $STORE_SYNC_SSH_SHIM_WORK with stdin/stdout/
+# string `bash -c '<script>'`) in $STOREKIT_SSH_SHIM_WORK with stdin/stdout/
 # stderr connected exactly as the real operation connects them. See the test
 # module doc for what this does and does not prove about real `ssh`.
 set -u
-work=${STORE_SYNC_SSH_SHIM_WORK:?the shim work directory is not configured}
+work=${STOREKIT_SSH_SHIM_WORK:?the shim work directory is not configured}
 last=''
 for arg in "$@"; do last=$arg; done
 cd "$work" || exit 125

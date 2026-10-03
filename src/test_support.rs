@@ -90,7 +90,7 @@ pub(crate) fn announce_skip(reason: &str) {
         .name()
         .unwrap_or("<unknown test>")
         .to_string();
-    let line = format!("STORE_SYNC_SKIP test={test} reason={reason}\n");
+    let line = format!("STOREKIT_SKIP test={test} reason={reason}\n");
     unsafe {
         libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
     }
@@ -104,7 +104,7 @@ pub(crate) fn announce_skip(reason: &str) {
         .name()
         .unwrap_or("<unknown test>")
         .to_string();
-    println!("STORE_SYNC_SKIP test={test} reason={reason}");
+    println!("STOREKIT_SKIP test={test} reason={reason}");
 }
 
 /// A property-test case count, reduced unless the full suites are requested.
@@ -123,7 +123,7 @@ pub(crate) fn slow_tests_enabled() -> bool {
 
 fn full_suites() -> bool {
     matches!(
-        std::env::var("STORE_SYNC_FULL_TESTS").as_deref(),
+        std::env::var("STOREKIT_FULL_TESTS").as_deref(),
         Ok("1") | Ok("true")
     )
 }

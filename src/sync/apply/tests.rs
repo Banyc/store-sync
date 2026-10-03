@@ -170,14 +170,14 @@ fn remove_deep_chain(root: &Path) {
 /// machine-greppable line DIRECTLY to file descriptor 1 (bypassing libtest's
 /// capture) and names the test with the harness thread's name (libtest names
 /// each test thread after the test). Grep a plain `cargo test` for
-/// `STORE_SYNC_SKIP` to enumerate every skipped test.
+/// `STOREKIT_SKIP` to enumerate every skipped test.
 #[cfg(unix)]
 fn announce_skip(reason: &str) {
     let test = std::thread::current()
         .name()
         .unwrap_or("<unknown test>")
         .to_string();
-    let line = format!("STORE_SYNC_SKIP test={test} reason={reason}\n");
+    let line = format!("STOREKIT_SKIP test={test} reason={reason}\n");
     unsafe {
         libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
     }
@@ -191,7 +191,7 @@ fn announce_skip(reason: &str) {
         .name()
         .unwrap_or("<unknown test>")
         .to_string();
-    println!("STORE_SYNC_SKIP test={test} reason={reason}");
+    println!("STOREKIT_SKIP test={test} reason={reason}");
 }
 
 /// Whether a mode-`0o555` directory ACTUALLY refuses a write for THIS process.
@@ -11792,12 +11792,12 @@ const DEEP_TREE_STACK_BYTES: usize = 64 * 1024;
 /// The env var that turns the test binary into the CHILD that performs the
 /// deep-tree removal.
 #[cfg(unix)]
-const DEEP_TREE_CHILD: &str = "STORE_SYNC_DEEP_TREE_CHILD";
+const DEEP_TREE_CHILD: &str = "STOREKIT_DEEP_TREE_CHILD";
 /// The env vars carrying the child's source and destination roots.
 #[cfg(unix)]
-const DEEP_TREE_SRC: &str = "STORE_SYNC_DEEP_TREE_SRC";
+const DEEP_TREE_SRC: &str = "STOREKIT_DEEP_TREE_SRC";
 #[cfg(unix)]
-const DEEP_TREE_DST: &str = "STORE_SYNC_DEEP_TREE_DST";
+const DEEP_TREE_DST: &str = "STOREKIT_DEEP_TREE_DST";
 
 /// A deep DESTINATION tree that a `sync` must remove must produce SUCCESS or a
 /// clean `Err`, never a process ABORT.
@@ -11842,7 +11842,7 @@ fn a_deep_destination_tree_is_removed_without_aborting_the_process() {
 
     let exe = std::env::current_exe().expect("the test binary's path");
     // The libtest name of THIS test: `module_path!()` carries the crate prefix
-    // (`store_sync::...`) while libtest registers the in-crate path, so the
+    // (`storekit::...`) while libtest registers the in-crate path, so the
     // name is spelled out.
     let name =
         "sync::apply::tests::a_deep_destination_tree_is_removed_without_aborting_the_process";
@@ -11899,15 +11899,15 @@ const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// Env var that turns the test binary into the CHILD holding the destination
 /// lock.
 #[cfg(unix)]
-const LOCK_CHILD: &str = "STORE_SYNC_LOCK_CHILD";
+const LOCK_CHILD: &str = "STOREKIT_LOCK_CHILD";
 #[cfg(unix)]
-const LOCK_CHILD_SRC: &str = "STORE_SYNC_LOCK_CHILD_SRC";
+const LOCK_CHILD_SRC: &str = "STOREKIT_LOCK_CHILD_SRC";
 #[cfg(unix)]
-const LOCK_CHILD_DST: &str = "STORE_SYNC_LOCK_CHILD_DST";
+const LOCK_CHILD_DST: &str = "STOREKIT_LOCK_CHILD_DST";
 #[cfg(unix)]
-const LOCK_CHILD_HELD: &str = "STORE_SYNC_LOCK_CHILD_HELD";
+const LOCK_CHILD_HELD: &str = "STOREKIT_LOCK_CHILD_HELD";
 #[cfg(unix)]
-const LOCK_CHILD_RELEASE: &str = "STORE_SYNC_LOCK_CHILD_RELEASE";
+const LOCK_CHILD_RELEASE: &str = "STOREKIT_LOCK_CHILD_RELEASE";
 
 /// Wait (BOUNDED) for `path` to appear. Returns whether it did.
 #[cfg(unix)]
@@ -12618,13 +12618,13 @@ fn a_source_that_changes_after_the_plan_fails_closed_and_names_the_path() {
 /// Env var that turns the test binary into the CHILD that runs the owned entry
 /// point with a RELATIVE destination root from a chosen working directory.
 #[cfg(unix)]
-const RELATIVE_ROOT_CHILD: &str = "STORE_SYNC_RELATIVE_ROOT_CHILD";
+const RELATIVE_ROOT_CHILD: &str = "STOREKIT_RELATIVE_ROOT_CHILD";
 #[cfg(unix)]
-const RELATIVE_ROOT_WORK: &str = "STORE_SYNC_RELATIVE_ROOT_WORK";
+const RELATIVE_ROOT_WORK: &str = "STOREKIT_RELATIVE_ROOT_WORK";
 #[cfg(unix)]
-const RELATIVE_ROOT_SRC: &str = "STORE_SYNC_RELATIVE_ROOT_SRC";
+const RELATIVE_ROOT_SRC: &str = "STOREKIT_RELATIVE_ROOT_SRC";
 #[cfg(unix)]
-const RELATIVE_ROOT_RESULT: &str = "STORE_SYNC_RELATIVE_ROOT_RESULT";
+const RELATIVE_ROOT_RESULT: &str = "STOREKIT_RELATIVE_ROOT_RESULT";
 
 /// The CHILD side of the F-3 test: `chdir` into the work directory (the child
 /// owns its process, so the process-global cwd change cannot race other tests)

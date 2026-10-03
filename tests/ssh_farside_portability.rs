@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! last=''; for arg in "$@"; do last=$arg; done
-//! cd "$STORE_SYNC_SSH_SHIM_WORK" && exec /bin/sh -c "$last"
+//! cd "$STOREKIT_SSH_SHIM_WORK" && exec /bin/sh -c "$last"
 //! ```
 //!
 //! WHAT THE SHIM PROVES. The exact command string `SshTransport` builds is
@@ -38,22 +38,22 @@ use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use store_sync::env::SysEnv;
-use store_sync::transport::{
+use storekit::env::SysEnv;
+use storekit::transport::{
     CreateNewVerdict, Layout, LocalTransport, Remote, RemoteEntry, RootedRelativePath, SshTransport,
 };
 
 /// The environment variable the shim reads to find its "remote working
 /// directory" (the directory a remote login shell would start in).
-const SHIM_WORK_VAR: &str = "STORE_SYNC_SSH_SHIM_WORK";
+const SHIM_WORK_VAR: &str = "STOREKIT_SSH_SHIM_WORK";
 
 const SHIM_SCRIPT: &str = r#"#!/bin/sh
 # Test-only `ssh` shim: it never opens a network connection. It reproduces the
 # far side by running the transport's final argument (the remote command
-# string `bash -c '<script>'`) in $STORE_SYNC_SSH_SHIM_WORK with stdin/stdout/
+# string `bash -c '<script>'`) in $STOREKIT_SSH_SHIM_WORK with stdin/stdout/
 # stderr connected exactly as the real operation connects them.
 set -u
-work=${STORE_SYNC_SSH_SHIM_WORK:?the shim work directory is not configured}
+work=${STOREKIT_SSH_SHIM_WORK:?the shim work directory is not configured}
 last=''
 for arg in "$@"; do last=$arg; done
 cd "$work" || exit 125
@@ -63,9 +63,9 @@ exec /bin/sh -c "$last"
 /// The token a far-side `perl` file-fsync helper carries, so a test's fake
 /// `perl` on `PATH` can recognise (and fault-inject into, or log) exactly the
 /// file-fsync call without disturbing the other perl calls in the same script.
-pub const FSYNC_FILE_TOKEN: &str = "STORE_SYNC_TEST_FSYNC_FILE";
+pub const FSYNC_FILE_TOKEN: &str = "STOREKIT_TEST_FSYNC_FILE";
 /// The directory-fsync counterpart of [`FSYNC_FILE_TOKEN`].
-pub const FSYNC_DIR_TOKEN: &str = "STORE_SYNC_TEST_FSYNC_DIR";
+pub const FSYNC_DIR_TOKEN: &str = "STOREKIT_TEST_FSYNC_DIR";
 
 /// Install `body` as an executable at `path` by writing it from a SHORT-LIVED
 /// HELPER PROCESS, never from the test process itself.

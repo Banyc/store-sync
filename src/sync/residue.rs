@@ -154,7 +154,7 @@ impl Residue {
         let _operation_lock = crate::lock::FileLock::acquire(
             &lock_path,
             &format!(
-                "store-sync residue recover at {} (pid {})",
+                "storekit residue recover at {} (pid {})",
                 self.root.display(),
                 std::process::id()
             ),

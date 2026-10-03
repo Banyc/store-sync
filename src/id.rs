@@ -34,7 +34,7 @@
 /// CONSUMER CONTRACT: the expansion names every external item through
 /// `$crate::…`, including the serde traits through the crate's
 /// `#[doc(hidden)] pub use ::serde as __serde` re-export. A downstream crate
-/// therefore invokes this macro with ONLY `store-sync` in its `[dependencies]`
+/// therefore invokes this macro with ONLY `storekit` in its `[dependencies]`
 /// — it does NOT need `serde` (or any `derive` feature) of its own, and the
 /// `Serialize`/`Deserialize` impls are written by hand rather than derived so
 /// no `#[serde(...)]` helper attribute has to be in scope at the call site.

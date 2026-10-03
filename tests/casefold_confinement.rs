@@ -29,12 +29,12 @@
 
 #![cfg(unix)]
 
-use store_sync::env::SysEnv;
-use store_sync::manifest::{
+use storekit::env::SysEnv;
+use storekit::manifest::{
     canonicalize_remote_entries, canonicalize_tree, remote_tree_verify_script,
 };
-use store_sync::sync::{ReplaceAll, push};
-use store_sync::transport::{Layout, LocalTransport};
+use storekit::sync::{ReplaceAll, push};
+use storekit::transport::{Layout, LocalTransport};
 
 /// Run the production remote manifest script and return its raw listing.
 fn remote_listing(root: &std::path::Path) -> String {

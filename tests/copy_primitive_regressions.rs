@@ -1,5 +1,5 @@
 //! Regressions for the PUBLIC tree-copy primitive
-//! [`store_sync::atomic::copy_dir_recursive_fd`], written from a CONSUMER's
+//! [`storekit::atomic::copy_dir_recursive_fd`], written from a CONSUMER's
 //! point of view (the public API only), so they can be run unchanged against
 //! the pre-fix tree in a scratch workspace at the parent revision.
 //!
@@ -26,8 +26,8 @@
 
 use std::path::{Path, PathBuf};
 
-use store_sync::atomic::{RootDir, copy_dir_recursive_fd, remove_dir_all_fd};
-use store_sync::manifest::canonicalize_tree;
+use storekit::atomic::{RootDir, copy_dir_recursive_fd, remove_dir_all_fd};
+use storekit::manifest::canonicalize_tree;
 
 /// Announce a SKIPPED assertion on the real console (libtest discards the
 /// captured output of a PASSING test, which would make a skip look like a
@@ -38,7 +38,7 @@ fn announce_skip(reason: &str) {
         .name()
         .unwrap_or("<unknown test>")
         .to_string();
-    let line = format!("STORE_SYNC_SKIP test={test} reason={reason}\n");
+    let line = format!("STOREKIT_SKIP test={test} reason={reason}\n");
     unsafe {
         libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
     }
@@ -512,8 +512,8 @@ fn a_bind_mount_alias_of_the_root_is_refused_by_identity() {
     // namespace is torn down when the last process exits, so the mount can
     // never outlive the test.
     let script = format!(
-        "mount --bind '{root}' '{alias}'; env 'STORE_SYNC_BIND_ROOT={root}' \
-         'STORE_SYNC_BIND_ALIAS={alias}' '{exe}' --exact bind_mount_child --ignored --nocapture; \
+        "mount --bind '{root}' '{alias}'; env 'STOREKIT_BIND_ROOT={root}' \
+         'STOREKIT_BIND_ALIAS={alias}' '{exe}' --exact bind_mount_child --ignored --nocapture; \
          rc=$?; umount '{alias}'; exit $rc",
         root = root_path.display(),
         alias = alias_path.display(),
@@ -532,7 +532,7 @@ fn a_bind_mount_alias_of_the_root_is_refused_by_identity() {
         out.status
     );
     assert!(
-        stdout.contains("STORE_SYNC_BIND_CHILD_DONE"),
+        stdout.contains("STOREKIT_BIND_CHILD_DONE"),
         "the child exited 0 but never reached the assertion, so this would pass vacuously:\n{stdout}"
     );
 }
@@ -541,11 +541,11 @@ fn a_bind_mount_alias_of_the_root_is_refused_by_identity() {
 #[test]
 #[ignore = "spawned by a_bind_mount_alias_of_the_root_is_refused_by_identity inside `sudo unshare -m`"]
 fn bind_mount_child() {
-    let Some(root_os) = std::env::var_os("STORE_SYNC_BIND_ROOT") else {
+    let Some(root_os) = std::env::var_os("STOREKIT_BIND_ROOT") else {
         return;
     };
     let root_path = PathBuf::from(root_os);
-    let alias = PathBuf::from(std::env::var_os("STORE_SYNC_BIND_ALIAS").unwrap());
+    let alias = PathBuf::from(std::env::var_os("STOREKIT_BIND_ALIAS").unwrap());
     // The owned root is opened at the BIND-MOUNT ALIAS; the source is the
     // ORIGINAL spelling. Pre-fix the path comparison saw two spellings and the
     // walk created `sub` inside its own source and recursed: bound the damage
@@ -564,17 +564,17 @@ fn bind_mount_child() {
         !root_path.join("sub").exists(),
         "nothing may be created before the refusal"
     );
-    println!("STORE_SYNC_BIND_CHILD_DONE");
+    println!("STOREKIT_BIND_CHILD_DONE");
 }
 
 // ----------------------------------------------------------------------
 // I6(a) — the copy surfaces a clean descriptor exhaustion, never an abort.
 // ----------------------------------------------------------------------
 
-const MODE_ENV: &str = "STORE_SYNC_COPY_EMFILE_MODE";
-const ROOT_ENV: &str = "STORE_SYNC_COPY_EMFILE_ROOT";
+const MODE_ENV: &str = "STOREKIT_COPY_EMFILE_MODE";
+const ROOT_ENV: &str = "STOREKIT_COPY_EMFILE_ROOT";
 const CHILD_TEST: &str = "copy_emfile_child";
-const DONE_MARKER: &str = "STORE_SYNC_COPY_EMFILE_CHILD_DONE";
+const DONE_MARKER: &str = "STOREKIT_COPY_EMFILE_CHILD_DONE";
 const DEPTH: usize = 256;
 const NOFILE: u64 = 64;
 

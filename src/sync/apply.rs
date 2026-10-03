@@ -1857,7 +1857,7 @@ fn create_lock_parent(parent: &Path) -> Result<()> {
 /// contender's "held by ..." diagnostic names the run that holds it.
 fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
     format!(
-        "store-sync {direction:?} of {} (pid {})",
+        "storekit {direction:?} of {} (pid {})",
         dest_root.display(),
         std::process::id()
     )

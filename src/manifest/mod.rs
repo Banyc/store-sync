@@ -1775,14 +1775,14 @@ mod tests {
     /// machine-greppable line DIRECTLY to file descriptor 1 (bypassing libtest's
     /// capture) and names the test with the harness thread's name (libtest
     /// names each test thread after the test). Grep a plain `cargo test` for
-    /// `STORE_SYNC_SKIP` to enumerate every skipped test.
+    /// `STOREKIT_SKIP` to enumerate every skipped test.
     #[cfg(unix)]
     fn announce_skip(reason: &str) {
         let test = std::thread::current()
             .name()
             .unwrap_or("<unknown test>")
             .to_string();
-        let line = format!("STORE_SYNC_SKIP test={test} reason={reason}\n");
+        let line = format!("STOREKIT_SKIP test={test} reason={reason}\n");
         unsafe {
             libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
         }
@@ -1796,7 +1796,7 @@ mod tests {
             .name()
             .unwrap_or("<unknown test>")
             .to_string();
-        println!("STORE_SYNC_SKIP test={test} reason={reason}");
+        println!("STOREKIT_SKIP test={test} reason={reason}");
     }
 
     /// Skip the current test, with a clear reason, when `perl` is not on

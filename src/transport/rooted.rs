@@ -330,7 +330,7 @@ mod tests {
     /// runtime Windows claim is made.
     #[test]
     fn accepted_paths_join_cannot_escape_the_root() {
-        let root = std::env::temp_dir().join("store-sync-rooted-join-property");
+        let root = std::env::temp_dir().join("storekit-rooted-join-property");
         // The accepted set is platform-specific: on Unix a `\` is an ordinary
         // name byte, so a `\`-bearing spelling is ONE legal component and
         // must be accepted (and must still not escape); on Windows those

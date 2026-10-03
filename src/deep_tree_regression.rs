@@ -30,16 +30,16 @@ use crate::env::SysEnv;
 use crate::transport::{Layout, LocalTransport, Remote, RootedRelativePath};
 
 /// The child re-exec reads its work mode (`remove` / `copy`) from this.
-const MODE_ENV: &str = "STORE_SYNC_DEEP_TREE_MODE";
+const MODE_ENV: &str = "STOREKIT_DEEP_TREE_MODE";
 /// The child builds its tree under this directory.
-const ROOT_ENV: &str = "STORE_SYNC_DEEP_TREE_ROOT";
+const ROOT_ENV: &str = "STOREKIT_DEEP_TREE_ROOT";
 /// The child nests this many directory levels.
-const DEPTH_ENV: &str = "STORE_SYNC_DEEP_TREE_DEPTH";
+const DEPTH_ENV: &str = "STOREKIT_DEEP_TREE_DEPTH";
 /// The exact libtest name of [`deep_tree_child`] (for the child's `--exact`).
 const CHILD_TEST: &str = "deep_tree_regression::deep_tree_child";
 /// Printed by the child only once its small-stack walk COMPLETES; the parent
 /// requires it so a child that ran no test can never pass this suite.
-const DONE_MARKER: &str = "STORE_SYNC_DEEP_TREE_CHILD_DONE";
+const DONE_MARKER: &str = "STOREKIT_DEEP_TREE_CHILD_DONE";
 /// The child's descriptor-exhaustion mode: lower `RLIMIT_NOFILE` before the
 /// removal walk so its one-descriptor-per-level frontier hits `EMFILE`.
 const EMFILE_MODE: &str = "remove_emfile";
@@ -48,7 +48,7 @@ const EMFILE_MODE: &str = "remove_emfile";
 const EMFILE_NOFILE: u64 = 64;
 /// Printed by the child once the descriptor-exhaustion case has run and its
 /// in-child assertions held; the parent requires it (non-vacuity).
-const EMFILE_MARKER: &str = "STORE_SYNC_DEEP_TREE_EMFILE";
+const EMFILE_MARKER: &str = "STOREKIT_DEEP_TREE_EMFILE";
 
 /// Directory levels the child nests. Calibrated against the PRE-fix
 /// one-frame-per-level walk: at [`CHILD_STACK`] it overflows between depth 96
@@ -62,7 +62,7 @@ const CHILD_STACK: usize = 16 * 1024;
 /// Optional override of the child's stack size, so a caller can measure a
 /// walk's CONSTANT stack cost (the fd-confined copy needs more than the raw
 /// syscall removal walk on glibc, for reasons unrelated to recursion).
-const STACK_ENV: &str = "STORE_SYNC_DEEP_TREE_STACK";
+const STACK_ENV: &str = "STOREKIT_DEEP_TREE_STACK";
 /// The stack the fd-confined copy/fsync children run on.
 ///
 /// PROFILE-DEPENDENT and MEASURED per platform (all at depth 256; a stack the

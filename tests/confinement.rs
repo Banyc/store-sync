@@ -18,13 +18,13 @@
 
 use std::path::{Path, PathBuf};
 
-use store_sync::Error;
-use store_sync::atomic::{
+use storekit::Error;
+use storekit::atomic::{
     RootDir, path_state_fd, read_fd, renameat_paths, write_atomic_cas_fd, write_atomic_replace,
     write_atomic_replace_fd, write_file_fd,
 };
-use store_sync::lock::FileLock;
-use store_sync::root::{EndpointKey, OwnedRoot};
+use storekit::lock::FileLock;
+use storekit::root::{EndpointKey, OwnedRoot};
 
 /// Known content of the outside file an injected symlink points at; a leak of
 /// these bytes through a refused read, or a mutation of them through a

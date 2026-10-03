@@ -268,7 +268,7 @@ mod tests {
     // candidate must be refused at construction, and the refusal must
     // happen BEFORE creating or deleting anything (the directory tree is
     // byte-for-byte unchanged after each failed construction). Bounded
-    // `proptest_cases(16)` (full 16 with `STORE_SYNC_FULL_TESTS=1`, fast
+    // `proptest_cases(16)` (full 16 with `STOREKIT_FULL_TESTS=1`, fast
     // default), fixed seed 0x5EED_5EED (house style), no persistence.
     // -------------------------------------------------------------------
     proptest! {

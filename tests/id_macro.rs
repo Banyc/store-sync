@@ -1,5 +1,5 @@
 //! This file exercises the exported `id_newtype!` macro at a call site that
-//! imports nothing (`store_sync::id_newtype!`, no `use`).
+//! imports nothing (`storekit::id_newtype!`, no `use`).
 //!
 //! LIMIT OF THIS TEST: an integration-test crate links the package's NORMAL
 //! `[dependencies]` too (Cargo makes them available to `tests/`), so `serde`
@@ -9,7 +9,7 @@
 //! hand-written serde impls (see `id_newtype!`'s consumer contract) precisely
 //! because a bare path compiles here yet fails in a real consumer. The
 //! regression guard for THAT property is a consumer crate whose only
-//! dependency is `store-sync` (see the crate's `EXTRACTION.md` note); this
+//! dependency is `storekit` (see the crate's `EXTRACTION.md` note); this
 //! file remains the in-repo round-trip check for the generated impls.
 
 /// The validator the macro's `$validator` slot takes: the contract is a
@@ -18,7 +18,7 @@ fn valid_probe_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-store_sync::id_newtype!(
+storekit::id_newtype!(
     ProbeId,
     valid_probe_id,
     "A downstream-crate identity newtype: a non-empty ASCII token."

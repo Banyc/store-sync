@@ -1,4 +1,4 @@
-# store-sync extraction
+# storekit extraction
 
 `~/code/deploy` is the read-only source of truth. Each slice ports the named
 production code **and its tests** here, applies the adaptations below, and
@@ -66,7 +66,7 @@ cargo test
   `id_newtype!` writes its serde impls by hand rather than deriving them, so
   no `#[serde(...)]` helper attribute has to resolve at the call site. The
   regression guard for this property is an OUT-OF-REPO consumer crate whose
-  only dependency is `store-sync`.
+  only dependency is `storekit`.
 * `test_support.rs` carries a module-level `#![allow(dead_code)]`: it is a
   test-only module shared by suites that land in separate waves, so a helper
   no current suite calls is not a defect.
