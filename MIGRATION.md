@@ -21,8 +21,8 @@ domain. This file is the ordered checklist and the record of what does NOT map.
 
 1. **Freeze the crate.** The API is the target of the migration; land
    `docs/API-CONSTRAINTS.md`'s work first.
-2. **Data migration before any push** (see below) — it is the only step that
-   touches existing on-disk state, and it fails closed if skipped.
+2. **Data migration before any push** (see below) — the only step that touches
+   existing on-disk state, and the one that fails closed if skipped. **DONE.**
 3. **Swap the substrate in dependency order**: `digest`/`platform`/`trace` →
    `atomic` → `lock` → `root`/`owned_root` → `relpath` → `transport` (+ runner,
    ssh) → `manifest`/`canonical`.
@@ -78,13 +78,29 @@ requires **40 lowercase hex** and fails closed on anything else, with no adoptio
 path — so without this step every existing deployment directory reads as
 malformed, and the failure is silent to a test suite that builds fresh fixtures.
 
-Choose one, and prefer the first:
+### Done (`deploy` `dev`, change `47e0e092`)
 
-1. **Adopt-on-read in `deploy`**: read the legacy marker, derive the crate's
-   receiver id, write it beside the legacy file, and keep the legacy file. One
-   shot, idempotent, no operator action, reversible.
-2. **Re-provision each deployment directory** — only if no stored identity must
-   survive.
+Adopt-on-read is implemented in `deploy` (`remote::transport::receiver_marker`):
+
+- **Derivation.** `sha256("deploy/receiver-id/v1\0" || legacy)[..20]`, hex, where
+  `legacy` is the canonical trimmed `recv-<uuid-v7>` string. Deterministic from
+  the canonical string (file whitespace cannot change it), and domain-separated
+  so it cannot collide with another hash of the same string. 160 bits, the same
+  budget the crate's own receiver ids use.
+- **Where.** The adopting read is `read_receiver_uuid_opt`; a read-only
+  `peek_receiver_uuid_opt` is used when a preflight is a `--dry-run`, because
+  adopt-on-read would otherwise MUTATE on a dry run. Fresh directories adopt on
+  provision.
+- **Wire form.** `<40 lowercase hex>\n` at `<deploy_dir>/receiver-id`, beside the
+  legacy file. `receiver-uuid` is never opened for write and its bytes are
+  unchanged; the module doc states the two conditions that would make it
+  removable.
+- **Fail closed.** An empty marker, `recv-`, a truncated uuid, or a 39/41-hex
+  string is refused by `deploy`'s read AND by the crate, with no adoption.
+- **Idempotent.** A second read leaves the inode, mtime and bytes identical.
+
+The alternative (re-provisioning every directory) was not taken: it would discard
+a stored identity for no benefit.
 
 The crate will not adopt a foreign format silently, and should not: silently
 adopting would misidentify a deployment directory.
@@ -99,8 +115,9 @@ adopting would misidentify a deployment directory.
 
 ## Riskiest step
 
-The receiver-marker migration. It is the only step that fails closed against
-existing production state, and neither side's tests cover it as it stands.
+The receiver-marker migration — DONE (above). It was the only step that fails
+closed against existing production state, and neither side's tests covered it
+beforehand; the adoption test now fails on the pre-change tree and passes after.
 
 ## Out of scope
 
