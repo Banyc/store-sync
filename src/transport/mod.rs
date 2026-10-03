@@ -2011,59 +2011,24 @@ impl LocalTransport {
 
     #[cfg(unix)]
     fn symlink_confined(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
-        use std::ffi::CString;
-        use std::os::fd::AsRawFd;
-        use std::os::unix::ffi::OsStrExt;
+        // R1: the whole symlink (ensure parent, unlink any existing entry,
+        // symlinkat, fsync parent) is issued by the ONE guarded atomic
+        // authority, so a link spelled as the lock record cannot unlink the
+        // record and install a link. There is NO raw `libc::unlinkat` /
+        // `libc::symlinkat` left here.
         let root = self.root_dir(true)?.ok_or_else(|| {
             Error::transport(format!(
                 "symlink {}: the destination root is unavailable",
                 link.display()
             ))
         })?;
-        self.ensure_dir_confined(&root, link)?;
-        let parent_rel = link
-            .as_path()
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty());
-        let parent_fd = match parent_rel {
-            Some(parent) => crate::atomic::openat_no_follow(
-                root.as_fd(),
-                parent,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-            )?,
-            None => root
-                .as_fd()
-                .try_clone()
-                .map_err(|e| Error::transport(format!("dup root dir: {e}")))?,
-        };
-        let name = link
-            .file_name()
-            .ok_or_else(|| Error::transport(format!("symlink {}: no file name", link.display())))?;
-        let name_c =
-            CString::new(name.as_bytes()).map_err(|_| Error::transport("symlink name with NUL"))?;
-        let target_c = CString::new(target.as_os_str().as_bytes())
-            .map_err(|_| Error::transport("symlink target with NUL"))?;
-        // Remove any existing entry at the link path (never following it),
-        // then create the link — all relative to the SAME parent descriptor.
-        let r = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), 0) };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(Error::transport(format!("unlink {}: {e}", link.display())));
-            }
-        }
-        let r =
-            unsafe { libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), name_c.as_ptr()) };
-        if r < 0 {
-            return Err(Error::transport(format!(
-                "symlink {} -> {}: {}",
+        crate::atomic::symlink_fd(&root, target, link.as_path()).map_err(|e| {
+            Error::transport(format!(
+                "symlink {} -> {}: {e}",
                 link.display(),
-                target.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
+                target.display()
+            ))
+        })
     }
 
     #[cfg(unix)]
@@ -2119,46 +2084,12 @@ impl LocalTransport {
     /// directory is never destroyed unnamed. A confirmed absence is success.
     #[cfg(unix)]
     fn remove_dir_confined(&self, rel: &RootedRelativePath) -> Result<()> {
-        use std::os::fd::AsRawFd;
         let Some(root) = self.root_dir(false)? else {
             return Ok(());
         };
-        let parent_rel = rel.as_path().parent().unwrap_or(Path::new(""));
-        let parent_fd = if parent_rel.as_os_str().is_empty() {
-            root.as_fd()
-                .try_clone()
-                .map_err(|e| Error::transport(format!("dup root dir: {e}")))?
-        } else {
-            match crate::atomic::openat_no_follow_io(
-                root.as_fd(),
-                parent_rel,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-            ) {
-                Ok(fd) => fd,
-                // A missing parent component is a confirmed absence.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => {
-                    return Err(Error::transport(format!("rmdir {}: {e}", rel.display())));
-                }
-            }
-        };
-        let name = rel
-            .as_path()
-            .file_name()
-            .ok_or_else(|| Error::transport(format!("rmdir {}: no file name", rel.display())))?;
-        let name_c = std::ffi::CString::new(name.as_encoded_bytes())
-            .map_err(|_| Error::transport("rmdir name with NUL"))?;
-        let r =
-            unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return Ok(());
-            }
-            return Err(Error::transport(format!("rmdir {}: {e}", rel.display())));
-        }
-        Ok(())
+        // The ONE guarded rmdir authority; a confirmed absence is success.
+        crate::atomic::remove_dir_fd(&root, rel.as_path())
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))
     }
 
     #[cfg(unix)]
@@ -2477,28 +2408,42 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
-        let p = join(&self.base, rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
+        // R4: no direct `std::fs` mutation here any more. The path-based
+        // Windows seam routes through the SAME guarded atomic funnel the Unix
+        // port uses, so the Windows atomic guards are actually reached. The
+        // mode chmod is inode-preserving and stays a best-effort path call.
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
+        if let Some(parent) = rel.parent()
+            && !parent.as_path().as_os_str().is_empty()
+        {
+            crate::atomic::ensure_private_dir_fd(&root, parent.as_path())
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
         }
-        std::fs::write(&p, data)
-            .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
+        crate::atomic::write_file_fd(&root, rel.as_path(), data)
+            .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
         if mode != 0 {
-            crate::platform::chmod(&p, mode)
-                .map_err(|e| Error::transport(format!("chmod {}: {e}", p.display())))?;
+            crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
+                .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))?;
         }
         Ok(())
     }
 
     fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        std::fs::create_dir(join(&self.base, rel))
+        // Now a guarded atomic operation on BOTH platforms (the Unix body used
+        // to be a path-based `std::fs::create_dir` that bypassed both the
+        // confinement and the lock-record guard).
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))?;
+        crate::atomic::create_dir_fd(&root, rel.as_path())
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
     #[cfg(not(unix))]
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        std::fs::create_dir_all(join(&self.base, rel))
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))?;
+        crate::atomic::ensure_private_dir_fd(&root, rel.as_path())
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
@@ -2515,28 +2460,25 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
-        let f = join(&self.base, from);
-        let t = join(&self.base, to);
-        if let Some(parent) = t.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::rename(&f, &t).map_err(|e| {
-            Error::transport(format!("rename {} -> {}: {e}", f.display(), t.display()))
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("rename {}: {e}", from.display())))?;
+        crate::atomic::renameat_paths(&root, from.as_path(), to.as_path()).map_err(|e| {
+            Error::transport(format!(
+                "rename {} -> {}: {e}",
+                from.display(),
+                to.display()
+            ))
         })
     }
 
     #[cfg(not(unix))]
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
-        let l = join(&self.base, link);
-        if let Some(parent) = l.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let _ = std::fs::remove_file(&l);
-        let res = crate::platform::symlink(target, &l);
-        res.map_err(|e| {
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("symlink {}: {e}", link.display())))?;
+        crate::atomic::symlink_fd(&root, target, link.as_path()).map_err(|e| {
             Error::transport(format!(
                 "symlink {} -> {}: {e}",
-                l.display(),
+                link.display(),
                 target.display()
             ))
         })
@@ -2567,16 +2509,21 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
-        let p = join(&self.base, rel);
-        std::fs::remove_file(&p)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
+        // R4: route through the guarded atomic funnel (a missing entry is the
+        // tolerated no-op).
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("remove {}: {e}", rel.display())))?;
+        match crate::atomic::remove_file_fd(&root, rel.as_path()) {
+            Ok(()) => Ok(()),
+            // A confirmed absence is the tolerated no-op.
+            Err(error) => match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+                Ok(None) => Ok(()),
+                _ => Err(Error::transport(format!(
+                    "remove {}: {error}",
+                    rel.display()
+                ))),
+            },
+        }
     }
 
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
@@ -2616,35 +2563,32 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        let p = join(&self.base, rel);
-        // The non-Unix port uses `std::fs::remove_dir_all`, whose walk is
-        // iterative, so a deep tree cannot exhaust the thread stack. There is
-        // NO descriptor-relative primitive on this platform, which is the
-        // documented weaker guarantee of the Windows port (see the module
-        // docs). A missing `p` is the idempotent no-op it always was.
-        std::fs::remove_dir_all(&p)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+        // R4: the Windows atomic guard (`refuse_lock_record_in_tree`) is now
+        // reached through the funnel instead of being bypassed by a direct
+        // `std::fs::remove_dir_all`. The funnel's own walk is iterative on
+        // Windows (std), so the deep-tree guarantee is unchanged. A missing
+        // entry is the idempotent no-op it always was.
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))?;
+        match crate::atomic::remove_dir_all_fd(&root, rel.as_path()) {
+            Ok(()) => Ok(()),
+            // A confirmed absence is the tolerated no-op.
+            Err(error) => match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+                Ok(None) => Ok(()),
+                _ => Err(Error::transport(format!(
+                    "rmdir {}: {error}",
+                    rel.display()
+                ))),
+            },
+        }
     }
 
     #[cfg(not(unix))]
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        let p = join(&self.base, rel);
-        std::fs::remove_dir(&p)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))?;
+        crate::atomic::remove_dir_fd(&root, rel.as_path())
+            .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))
     }
 
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
@@ -3054,6 +2998,49 @@ mod tests {
                 "the local read_link must return {target:?} verbatim"
             );
         }
+    }
+
+    /// R1 — the transport's symlink CANNOT destroy the lock record. Pre-fix
+    /// `symlink_confined` removed any existing entry at the link path with a
+    /// raw `unlinkat` and installed a symlink, so a caller could acquire the
+    /// lock, symlink OVER the record, and acquire a SECOND lock with a
+    /// different inode. Now the transport routes through the guarded
+    /// `atomic::symlink_fd`, so the operation is refused and the record (and
+    /// its inode) is untouched. PRE-FIX MESSAGE: the call returned `Ok(())`,
+    /// the record was gone, and a second `FileLock::acquire` SUCCEEDED.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_over_the_lock_record_is_refused_and_leaves_the_record_intact() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        std::fs::create_dir_all(&base).unwrap();
+        let record = base.join(crate::reserved::APPLICATION_LOCK_NAME);
+        std::fs::write(&record, b"HELD").unwrap();
+        let inode_before = std::fs::symlink_metadata(&record).unwrap().ino();
+        let t = LocalTransport::new(&SysEnv::from_process(), base, Layout::empty()).unwrap();
+        let rel =
+            RootedRelativePath::parse(Path::new(crate::reserved::APPLICATION_LOCK_NAME)).unwrap();
+        let err = t
+            .symlink(Path::new("somewhere"), &rel)
+            .expect_err("a symlink over the lock record must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock record"),
+            "the refusal must name the lock record, got: {msg}"
+        );
+        let meta = std::fs::symlink_metadata(&record)
+            .expect("the record must still exist after the refused symlink");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "the record must not be a symlink"
+        );
+        assert_eq!(
+            meta.ino(),
+            inode_before,
+            "the record's inode must not change"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), b"HELD".to_vec());
     }
 
     /// The deploy_dir's IMMUTABLE receiver-id marker: `provision_layout`

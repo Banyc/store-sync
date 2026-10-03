@@ -134,7 +134,8 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// `.<name>.operation.lock`, the application-store lock record `operation.lock`,
 /// any CASE ALIAS of those (on a case-insensitive filesystem
 /// `.SYNC-ASIDE.1` IS `.sync-aside.1`), and any of the crate's own TEMP shapes
-/// ([`crate::atomic::is_crate_temp_name`]). The temp shapes are refused because
+/// ([`crate::atomic::is_crate_temp_name`]) or a CASE ALIAS of a temp shape
+/// (`.FOO.TMP.1.0`, F6). The temp shapes are refused because
 /// the crate owns that namespace: a consumer's documented recovery sweep
 /// REMOVES every [`crate::atomic::is_crate_temp_name`] match, so an id that
 /// looked like a temp would be addressable content the sweep silently deletes
@@ -490,6 +491,84 @@ mod tests {
                 expected,
                 "Identifier must accept exactly safe single segments: {s:?}"
             );
+        }
+    }
+
+    /// F6: a CASE ALIAS of a crate TEMP shape is refused. On a
+    /// case-insensitive filesystem (macOS APFS, Windows) `.FOO.TMP.1.0` and
+    /// `.foo.tmp.1.0` are the SAME directory entry, so accepting the alias
+    /// would make the id rule's stated purpose ("an accepted id can never
+    /// alias the crate's own bookkeeping on a supported filesystem") false.
+    /// Pre-fix: `valid_name(".FOO.TMP.1.0")` was `true` while
+    /// `is_crate_temp_name(".foo.tmp.1.0")` was `true`.
+    #[test]
+    fn case_aliases_of_crate_temp_shapes_are_refused() {
+        for alias in [
+            ".FOO.TMP.1.0",
+            ".Foo.Claim.1.0",
+            ".OP.JSON.TMP.1234.1700000000.42",
+            ".FOO.TMP.aB3xY9",
+        ] {
+            assert!(
+                !valid_name(alias),
+                "{alias:?} case-aliases a crate temp on a case-insensitive filesystem and must be refused"
+            );
+            assert!(
+                crate::reserved::is_unaddressable_name(alias),
+                "{alias:?} must be unaddressable"
+            );
+        }
+        // The lowercase spellings the aliases fold onto ARE crate temps.
+        for temp in [
+            ".foo.tmp.1.0",
+            ".foo.claim.1.0",
+            ".op.json.tmp.1234.1700000000.42",
+        ] {
+            assert!(
+                crate::atomic::is_crate_temp_name(temp),
+                "premise: {temp:?} is a crate temp"
+            );
+        }
+        // A genuinely ordinary dotted name is unaffected (it case-folds onto
+        // no temp shape).
+        assert!(valid_name(".ordinary.name"), "must stay addressable");
+        assert!(
+            !valid_name(".notes.tmp.1.0"),
+            "a byte-exact temp shape stays refused"
+        );
+    }
+
+    /// The on-disk half of F6: on a CASE-INSENSITIVE filesystem the two
+    /// spellings are one inode. Linux cannot exhibit the alias (its native
+    /// filesystems are case-sensitive), so the test SKIPS there with an
+    /// announced reason rather than asserting a property the platform cannot
+    /// have.
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_case_alias_is_one_inode_only_on_a_case_insensitive_filesystem() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env())
+            .expect("tempdir");
+        let upper = dir.path().join(".FOO.TMP.1.0");
+        let lower = dir.path().join(".foo.tmp.1.0");
+        std::fs::write(&upper, b"x").expect("write the upper spelling");
+        let upper_meta = std::fs::symlink_metadata(&upper).expect("stat the upper spelling");
+        match std::fs::symlink_metadata(&lower) {
+            Ok(lower_meta) => {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    upper_meta.ino(),
+                    lower_meta.ino(),
+                    "on a case-insensitive filesystem the two spellings name one inode"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP temp_case_alias_inode: this filesystem is case-SENSITIVE, so the two \
+                     spellings are distinct entries and the alias cannot be exhibited (expected on \
+                     Linux; the NAME RULE still refuses the alias on every platform)"
+                );
+            }
+            Err(e) => panic!("unexpected stat error: {e}"),
         }
     }
 

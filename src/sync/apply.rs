@@ -7907,46 +7907,15 @@ impl LocalSide {
     /// unnamed. A confirmed absence is success (a race may have removed it).
     #[cfg(unix)]
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        use std::os::fd::AsRawFd;
-        let root = self.root_dir()?;
-        let parent_rel = rel.as_path().parent().unwrap_or(Path::new(""));
-        let parent_fd = if parent_rel.as_os_str().is_empty() {
-            root.as_fd()
-                .try_clone()
-                .map_err(|e| Error::store(format!("dup root dir: {e}")))?
-        } else {
-            crate::atomic::openat_no_follow(
-                root.as_fd(),
-                parent_rel,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-            )?
-        };
-        let name = rel
-            .as_path()
-            .file_name()
-            .ok_or_else(|| Error::store(format!("{} has no file name", rel.display())))?;
-        let name_c = std::ffi::CString::new(name.as_encoded_bytes())
-            .map_err(|_| Error::store("rmdir name with NUL"))?;
-        let r =
-            unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) };
-        if r < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound
-                && crate::atomic::path_kind_fd(self.root_dir()?, rel.as_path())?.is_none()
-            {
-                return Ok(());
-            }
-            return Err(Error::store(format!("rmdir {}: {error}", rel.display())));
-        }
-        Ok(())
+        // The ONE guarded rmdir authority; a confirmed absence is success.
+        crate::atomic::remove_dir_fd(self.root_dir()?, rel.as_path())
     }
 
     #[cfg(not(unix))]
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        let path = self.root_path.join(rel.as_path());
-        std::fs::remove_dir(&path)
-            .map_err(|e| Error::store(format!("rmdir {}: {e}", path.display())))
+        // R4: the non-Unix seam routes through the SAME guarded atomic funnel
+        // instead of a bare `std::fs::remove_dir`.
+        crate::atomic::remove_dir_fd(self.root_dir()?, rel.as_path())
     }
 
     /// Whether any entry exists at `rel` (kind-agnostic, so a symlink counts
@@ -8117,6 +8086,11 @@ fn set_local_mode(
 /// `O_NOFOLLOW`, and an existing entry at the link path is unlinked first
 /// (never followed). The parent directory is synced so the new entry is
 /// durable.
+/// The applier's local symlink goes through the ONE guarded atomic symlink
+/// authority (R1's SECOND implementation): the raw `unlinkat`/`symlinkat` that
+/// used to live here was a consumer-reachable route to destroying the lock
+/// record and installing a link. `symlink_fd` ensures the parent, unlinks any
+/// existing entry, creates the link, and fsyncs the parent — all guarded.
 #[cfg(unix)]
 fn symlink_local(
     root: &crate::atomic::RootDir,
@@ -8124,72 +8098,20 @@ fn symlink_local(
     target: &Path,
     rel: &RootedRelativePath,
 ) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let parent_rel = rel.as_path().parent().filter(|p| !p.as_os_str().is_empty());
-    if let Some(parent) = parent_rel {
-        crate::atomic::ensure_private_dir_durable_fd(root, parent)?;
-    }
-    let parent_fd = match parent_rel {
-        Some(parent) => crate::atomic::openat_no_follow(
-            root.as_fd(),
-            parent,
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            0,
-        )?,
-        None => root
-            .as_fd()
-            .try_clone()
-            .map_err(|e| Error::store(format!("dup root dir: {e}")))?,
-    };
-    let name = rel
-        .file_name()
-        .ok_or_else(|| Error::store(format!("symlink {}: no file name", rel.display())))?;
-    let name_c =
-        CString::new(name.as_bytes()).map_err(|_| Error::store("symlink name with NUL"))?;
-    let target_c = CString::new(target.as_os_str().as_bytes())
-        .map_err(|_| Error::store("symlink target with NUL"))?;
-    let r = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), 0) };
-    if r < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(Error::store(format!("unlink {}: {e}", rel.display())));
-        }
-    }
-    let r = unsafe { libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), name_c.as_ptr()) };
-    if r < 0 {
-        return Err(Error::store(format!(
-            "symlinkat {}: {}",
-            rel.display(),
-            std::io::Error::last_os_error()
-        )));
-    }
-    crate::atomic::sync_parent_dir_fd(root, rel.as_path())
+    crate::atomic::symlink_fd(root, target, rel.as_path())
 }
 
-/// The Windows port's best-effort symlink creation (the platform helper
-/// requires admin/developer mode; a failure propagates).
+/// The Windows port's best-effort symlink creation, routed through the SAME
+/// guarded atomic funnel (the platform helper requires admin/developer mode;
+/// a failure propagates).
 #[cfg(not(unix))]
 fn symlink_local(
-    _root: &crate::atomic::RootDir,
-    root_path: &Path,
+    root: &crate::atomic::RootDir,
+    _root_path: &Path,
     target: &Path,
     rel: &RootedRelativePath,
 ) -> Result<()> {
-    let link = root_path.join(rel.as_path());
-    if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    match std::fs::remove_file(&link) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::store(format!("remove {}: {e}", rel.display()))),
-    }
-    crate::platform::symlink(target, &link)
-        .map_err(|e| Error::store(format!("symlink {}: {e}", rel.display())))
+    crate::atomic::symlink_fd(root, target, rel.as_path())
 }
 
 #[cfg(test)]

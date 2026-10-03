@@ -167,11 +167,16 @@ simplification; removing one means adding back the logic it removes.
   `WalkDir` plus `symlink_metadata`/`read` on accumulated PATHS, so a tree
   deeper than the platform's path limit is refused with `ENAMETOOLONG` at the
   first path that overflows. With 1-byte components the path grows 2 bytes per
-  level, so the bound is `floor((PATH_MAX - 1 - base_len)/2)`: about depth 512
-  with macOS `PATH_MAX` 1024 and about depth 2041 with Linux `PATH_MAX` 4096
-  (the 4096 bound is 2047 at a 1-byte base; measured 478 on a 59-byte macOS
-  base and 2040 on a 15-byte Linux base, each one level above the point where
-  `ENAMETOOLONG` first lands). A
+  level, so the bound is `floor((PATH_MAX - 1 - base_len)/2)`, where
+  `base_len` is the length in BYTES of the base path AS IT RESOLVES on the
+  filesystem (work in resolved form: on macOS `/tmp` is `/private/tmp`, 4-8
+  bytes longer). The bound has no single number — it is a function of the
+  base. Worked examples, one per platform, each measured one level above where
+  `ENAMETOOLONG` first lands: Linux (`PATH_MAX` 4096) admits depth 2047 at a
+  1-byte base, 2041 at a 13-byte base, and 2040 at a 15-byte base; macOS
+  (`PATH_MAX` 1024) admits depth 511 at a 1-byte base and 482 at a 59-byte
+  resolved base (an unresolved `/tmp/B*59` base measures 478 once `/tmp`
+  resolves to `/private/tmp`). A
   descriptor-relative manifest walk would lift this; it is not implemented, and
   this bullet is the statement of the real limit. The descriptor-relative
   REMOVAL walk (`crate::atomic::remove_dir_contents_fd`) holds one descriptor

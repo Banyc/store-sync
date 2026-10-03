@@ -29,7 +29,10 @@ use std::io::Write;
 /// Windows has no Unix mode bits: the private-permission contract is a
 /// no-op (file ACLs are the privacy mechanism). Documented weaker
 /// guarantee of the Windows port.
-pub fn set_private(_path: &Path) -> Result<()> {
+pub fn set_private(path: &Path) -> Result<()> {
+    // The mode change is inode-preserving, but the guard keeps the spelling
+    // contract uniform with the Unix port.
+    refuse_lock_record_mutation(path)?;
     Ok(())
 }
 
@@ -147,6 +150,7 @@ pub fn sync_parent_dir(_path: &Path) -> Result<()> {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    refuse_lock_record_mutation(path)?;
     std::fs::create_dir_all(path)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
     // Windows has no Unix mode bits: the private chmod is a no-op.
@@ -158,6 +162,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// commit is a no-op) — the documented weaker guarantee of the Windows
 /// port. Returns `true` when this call created at least one directory.
 pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
+    refuse_lock_record_mutation(path)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
     let mut missing: Vec<PathBuf> = Vec::new();
@@ -416,29 +421,42 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
 }
 
-/// Refuse a destructive mutation whose TARGET names one of the crate's
-/// lock-record spellings (see the Unix port for the full rationale and for the
-/// list of mutating primitives that consult it).
-fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
-    // EVERY component, not only the final one (F-A2; see the Unix port).
-    for component in rel.components() {
-        let std::path::Component::Normal(name) = component else {
-            continue;
-        };
-        if !name
-            .to_str()
-            .is_some_and(crate::reserved::is_lock_record_name)
-        {
-            continue;
-        }
-        return Err(Error::conflict(format!(
-            "refusing to mutate the crate's lock record in {}: the record's stable inode is what \
-             makes two simultaneous holders impossible, so removing, replacing, or renaming it \
-             would admit a second holder",
-            rel.display()
-        )));
+/// Path-based single-directory creation (`create_dir` semantics), guarded like
+/// the Unix port's `create_dir_fd`.
+pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    std::fs::create_dir(rel_join(root, rel)?)
+        .map_err(|e| Error::store(format!("mkdir {}: {e}", rel.display())))
+}
+
+/// Path-based NON-RECURSIVE directory removal (`rmdir` semantics), guarded
+/// like the Unix port's `remove_dir_fd`. A confirmed absence is success.
+pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    match std::fs::remove_dir(rel_join(root, rel)?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::store(format!("rmdir {}: {e}", rel.display()))),
     }
-    Ok(())
+}
+
+/// Path-based symlink creation (unlink any existing entry first, then link),
+/// guarded like the Unix port's `symlink_fd` (R1). The platform helper
+/// requires admin/developer mode; a failure propagates.
+pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    let link = rel_join(root, rel)?;
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    match std::fs::remove_file(&link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::store(format!("remove {}: {e}", rel.display()))),
+    }
+    crate::platform::symlink(target, &link)
+        .map_err(|e| Error::store(format!("symlink {}: {e}", rel.display())))
 }
 
 /// Refuse a recursive removal whose tree CONTAINS a lock-record spelling at any
@@ -487,10 +505,16 @@ fn refuse_lock_record_in_tree(root: &Path) -> Result<()> {
 /// root. Windows `rename` does not overwrite an existing target: remove it
 /// first (documented weaker guarantee — not atomic).
 pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
-    refuse_lock_record_mutation(from)?;
-    refuse_lock_record_mutation(to)?;
-    let from = rel_join(root, from)?;
-    let to = rel_join(root, to)?;
+    let from = GuardedRel::new(from)?;
+    let to = GuardedRel::new(to)?;
+    renameat_paths_guarded(root, from, to)
+}
+
+/// [`renameat_paths`]'s worker: it accepts only capability tokens, so the
+/// rel-path rename cannot be named without the guard on this port either.
+fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'_>) -> Result<()> {
+    let from = rel_join(root, from.as_path())?;
+    let to = rel_join(root, to.as_path())?;
     // F-A2: renaming a directory that CONTAINS the record moves the record's
     // inode and frees the old path. Windows delegates the walk to the same
     // tree guard the recursive removal uses (type-checked only here).

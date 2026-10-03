@@ -48,11 +48,13 @@
 //! manifest-path model consults its path form ([`is_unaddressable_path`]), so
 //! a spelling the crate refuses as an id is EXACTLY a spelling a whole-store
 //! sync refuses to transfer or destroy. It refuses the crate's own TEMP shapes
-//! as well as the reserved/lock spellings, so the documented recovery sweep
-//! ([`crate::atomic::is_crate_temp_name`]) can never delete addressable
-//! content. The crate's mutating primitives consult
-//! the lock-record subset ([`is_lock_record_name`]) directly, so the record's
-//! stable inode cannot be unlinked, replaced, or renamed through the substrate.
+//! (and their case aliases, F6) as well as the reserved/lock spellings, so the
+//! documented recovery sweep ([`crate::atomic::is_crate_temp_name`]) can never
+//! delete addressable content. The crate's mutating primitives consult
+//! the lock-record subset ([`is_lock_record_name`]) through the ONE guard
+//! authority (`crate::atomic::guard`), so the record's stable inode cannot be
+//! unlinked, replaced, truncated, or renamed through the substrate's
+//! name-mutating funnel.
 
 use std::path::{Component, Path};
 
@@ -132,8 +134,10 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 
 /// Whether the id/name rule must REFUSE `name` because it NAMES or can ALIAS
 /// the crate's own bookkeeping on a supported filesystem: a byte-exact
-/// reserved spelling, the application lock record, a case alias of either, or
-/// one of the crate's own TEMP shapes ([`crate::atomic::is_crate_temp_name`]).
+/// reserved spelling, the application lock record, a case alias of either, a
+/// crate TEMP shape ([`crate::atomic::is_crate_temp_name`]), or a CASE ALIAS
+/// of a crate temp shape.
+///
 /// This is the predicate [`crate::id::valid_name`] consults, so an identity
 /// the crate accepts can never alias a reserved entry on any filesystem the
 /// crate supports NOR look like a crate temp a consumer's recovery sweep
@@ -143,11 +147,36 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 /// the documented sweep safe by construction (F-B). (While
 /// [`is_reserved_name`] / [`is_reserved_path`] stay byte-exact for the sync's
 /// reserved stripping.)
+///
+/// F6: the temp half is checked in CASE-FOLDED form too
+/// ([`is_crate_temp_case_alias`]). The byte-exact recognizer
+/// [`crate::atomic::is_crate_temp_name`] cannot see that `.FOO.TMP.1.0`
+/// aliases `.foo.tmp.1.0` on a case-insensitive filesystem (macOS APFS,
+/// Windows), so without this arm `valid_name(".FOO.TMP.1.0")` would be true
+/// while the crate treats `.foo.tmp.1.0` as its own temp — the id rule's
+/// stated purpose ("an accepted id can never alias the crate's own
+/// bookkeeping on a supported filesystem") would then be false for that
+/// family. Refusing the alias makes the purpose true. Linux cannot exhibit
+/// the alias (its filesystem is case-sensitive), so the rule is deliberately
+/// platform-INDEPENDENT: an id rule that changed with the host filesystem
+/// would make a manifest mean different things on different hosts.
 pub fn is_unaddressable_name(name: &str) -> bool {
     is_reserved_name(name)
         || is_application_lock_name(name)
         || is_reserved_case_alias(name)
         || crate::atomic::is_crate_temp_shape(name)
+        || is_crate_temp_case_alias(name)
+}
+
+/// Whether `name` case-folds onto one of the crate's own TEMP shapes
+/// ([`crate::atomic::is_crate_temp_shape`]) while being byte-different. See
+/// [`is_unaddressable_name`] (F6).
+fn is_crate_temp_case_alias(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let folded = name.to_lowercase();
+    folded != name && crate::atomic::is_crate_temp_shape(&folded)
 }
 
 /// Whether ANY component of a canonical manifest path is UNADDRESSABLE
@@ -213,31 +242,57 @@ pub fn is_residue_path(path: &str) -> bool {
 /// Whether `name` is a LOCK-RECORD spelling: the application lock record
 /// ([`APPLICATION_LOCK_NAME`]) or the sibling record spelling
 /// [`is_reserved_name`] recognises (`.<name>.operation.lock`), in byte-exact or
-/// case-ALIAS form. Every MUTATING primitive of the [`crate::atomic`]
-/// SUBSTRATE refuses this spelling — [`crate::atomic::remove_file_fd`],
-/// [`crate::atomic::remove_dir_all_fd`] (including each entry its walk unlinks),
-/// [`crate::atomic::remove_dir_all_path`], the PATH-BASED
-/// [`crate::atomic::write_atomic_replace`],
+/// case-ALIAS form.
+///
+/// Every name-mutating primitive of the [`crate::atomic`] SUBSTRATE consults
+/// this spelling through the ONE guard authority (`atomic::guard`), which
+/// now runs at the SYSCALL CHOKEPOINTS (`unlinkat`, `renameat`, `linkat`,
+/// `symlinkat`, `mkdirat`, and a mutating `openat`) rather than by
+/// enumerating call sites. The rel-path mutators
+/// ([`crate::atomic::remove_file_fd`], [`crate::atomic::remove_dir_all_fd`]
+/// and each entry its walk unlinks, [`crate::atomic::remove_dir_all_path`],
+/// the PATH-BASED [`crate::atomic::write_atomic_replace`],
 /// [`crate::atomic::write_atomic_replace_fd`],
 /// [`crate::atomic::write_atomic_if_match_fd`],
-/// [`crate::atomic::write_atomic_cas_fd`], [`crate::atomic::write_file_fd`], and
-/// [`crate::atomic::renameat_paths`] (which additionally refuses a source
-/// SUBTREE containing a record) — because the lock's STABLE INODE is what
-/// makes two simultaneous holders impossible, so removing, replacing, or
-/// renaming the record through the substrate would admit a second holder.
-/// The check consults every component of a path, not only the final one.
+/// [`crate::atomic::write_atomic_cas_fd`], [`crate::atomic::write_file_fd`],
+/// [`crate::atomic::create_dir_fd`], [`crate::atomic::remove_dir_fd`],
+/// [`crate::atomic::symlink_fd`], and [`crate::atomic::renameat_paths`] —
+/// which additionally refuses a source SUBTREE containing a record) must
+/// first mint the unforgeable [`crate::atomic::GuardedRel`] capability, whose
+/// only constructor runs the guard; the low-level single-name syscall
+/// wrappers guard the final name at the primitive. The record's STABLE INODE
+/// is what makes two simultaneous holders impossible, so removing, replacing,
+/// renaming, or truncating the record through the substrate would admit a
+/// second holder.
 ///
 /// The claim is deliberately NARROWED to the substrate's primitives. "Every
-/// mutating primitive the crate exposes" would be FALSE: the crate's OWN lock
-/// protocol mutates a lock record on purpose. [`crate::lock::FileLock::acquire`]
-/// creates/truncates the application record, and the transport's
-/// ownership-token protocol ([`crate::transport::Remote::remove_file_if`])
-/// compare-and-deletes the in-root layout lock, serialized through the sidecar
-/// flock. Those are the operations that MAKE and BREAK locks, not routes
-/// around the stable-inode guard; the guard stops a caller destroying the
-/// record through a generic file operation. The residual outside the substrate
-/// is unchanged: `std::fs` and foreign tools are not
-/// stopped (see [`crate::lock::FileLock`]'s assumption section).
+/// mutating primitive the crate exposes" would be FALSE, and the residual is:
+///
+/// * the crate's OWN lock protocol mutates a lock record on purpose.
+///   [`crate::lock::FileLock::acquire`] creates/truncates the application
+///   record, and the transport's ownership-token protocol
+///   ([`crate::transport::Remote::remove_file_if`], and `durable_create_new`)
+///   compare-and-deletes / re-creates the in-root lock, serialized through the
+///   sidecar flock. Those operations MAKE and BREAK locks by design; guarding
+///   them would break the protocol, not protect it.
+/// * the PATH-BASED helpers the manifest/retention machinery uses take an
+///   ordinary path. `set_private`, `ensure_private_dir`,
+///   `ensure_private_dir_durable`, and the PATH-BASED `write_atomic_replace`
+///   now consult the guard too; the remaining unguarded `std::fs` mutations
+///   are the local transport's crate-INTERNAL staged-publish
+///   rename/remove/create on its own temp/swap names, the destination-root
+///   `create_dir_all`, and the ssh hostkey cache — none of which a caller can
+///   steer to the record's spelling. `copy_dir_recursive` (test-only) is a
+///   path-based copy. The lock's assumption section already states that a
+///   caller acting outside the substrate (a foreign process, a raw `std::fs`
+///   call the caller writes itself) is not stopped.
+/// * a foreign process, or a developer writing a brand-new direct `libc::`
+///   mutation OUTSIDE the funnel module, is not stopped by the type system.
+///   The crate carries a source audit
+///   (`atomic::tests::no_raw_name_mutating_syscall_outside_the_funnel`) that
+///   fails when such a raw mutation appears outside `src/atomic/unix.rs`, and
+///   the funnel wrappers themselves are private, so the "obvious way" to add
+///   a mutation cannot bypass the guard.
 pub fn is_lock_record_name(name: &str) -> bool {
     fn sibling(name: &str) -> bool {
         let Some(base) = name.strip_prefix('.') else {
