@@ -62,20 +62,23 @@
 //!   well-defined, and the crate ENFORCES as much of them as it can rather than
 //!   asking.
 //!
-//!   (a) **The destination is exclusively owned for the run.** [`apply::sync`]
-//!   TAKES the destination's operation lock (a [`crate::lock::FileLock`] on the
-//!   record named by [`apply::destination_lock_path`]) before reading the
-//!   destination manifest and holds it for the WHOLE run, so a cooperating
-//!   writer that tries to acquire the same record is refused at acquisition.
-//!   That record is a SIBLING of the destination root and is a DIFFERENT file
-//!   from the in-root [`crate::transport::Layout::lock`], so the two locks do
-//!   NOT exclude each other (see [`apply::destination_lock_path`]). A
-//!   destination whose lock the crate CANNOT take — a REMOTE (far-side) one, or
-//!   a root with no sibling record location — is REFUSED by [`apply::sync`],
-//!   [`apply::push`], and [`apply::pull`] rather than run unowned; the
-//!   explicitly weaker [`apply::sync_unowned`] (and
-//!   `push_unowned`/`pull_unowned`) is the only way to reach it, so the weaker
-//!   choice cannot be made by omission.
+//!   (a) **The destination is exclusively owned for the run.** The ONE entry
+//!   point [`apply::sync`] HOLDS the destination's operation lock (a
+//!   [`crate::lock::FileLock`] on the record named by
+//!   [`apply::destination_lock_path`]) for the WHOLE run via the unforgeable
+//!   [`apply::DestinationOwnership::Locked`] token produced by
+//!   [`apply::DestinationOwnership::lock`]. That acquisition runs before the
+//!   destination manifest is read and the token is held for the WHOLE run, so a
+//!   cooperating writer that tries to acquire the same record is refused at
+//!   acquisition. That record is a SIBLING of the destination root and is a
+//!   DIFFERENT file from the in-root [`crate::transport::Layout::lock`], so the
+//!   two locks do NOT exclude each other (see
+//!   [`apply::destination_lock_path`]). A destination whose lock the crate
+//!   CANNOT take — a REMOTE (far-side) one, or a root with no sibling record
+//!   location — is REFUSED by the acquiring constructor rather than run
+//!   unowned. The weaker path is the [`apply::DestinationOwnership::Unowned`]
+//!   value written at the call site, so the weaker choice is stated in the TYPE
+//!   and cannot be made by omission.
 //!
 //!   (b) **The SOURCE is quiescent.** The crate cannot lock the source (a
 //!   remote tree for a PULL, the caller's tree for a PUSH), so it VERIFIES
@@ -95,8 +98,8 @@
 //!   `Ok`. Its coverage is the paths the run reads, so it is not total. See
 //!   [`apply`]'s "The lock discipline" section, including the far-side
 //!   limitation: for a remote destination NEITHER the lock NOR any far-side
-//!   exclusion is available, and only the explicitly-named unowned entry point
-//!   reaches it.
+//!   exclusion is available, and only the explicitly-named
+//!   [`apply::DestinationOwnership::Unowned`] value reaches it.
 //! * **The two roots must be disjoint.** Neither the local root nor the remote
 //!   root may be an ancestor of the other; [`apply::sync`] refuses a strict
 //!   nesting before any mutation because a nested destination makes the run
@@ -118,10 +121,9 @@ pub mod residue;
 pub use residue::Residue;
 
 pub use apply::{
-    Conflict, ConflictReason, Direction, EntryPolicy, Extraneous, Policy, ReplaceAll,
-    RetireOutcome, SyncError, SyncReport, SyncResult, UnsupportedDestination,
-    destination_lock_path, pull, pull_unowned, push, push_unowned, retire_destination_lock, sync,
-    sync_unowned,
+    Conflict, ConflictReason, DestinationOwnership, Direction, EntryPolicy, Extraneous,
+    LockedDestination, Policy, ReplaceAll, RetireOutcome, SyncError, SyncReport, SyncResult,
+    UnsupportedDestination, destination_lock_path, retire_destination_lock, sync,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests, diff_trees,

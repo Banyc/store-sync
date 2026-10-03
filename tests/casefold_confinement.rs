@@ -33,8 +33,33 @@ use storekit::env::SysEnv;
 use storekit::manifest::{
     canonicalize_remote_entries, canonicalize_tree, remote_tree_verify_script,
 };
-use storekit::sync::{ReplaceAll, push};
-use storekit::transport::{Layout, LocalTransport};
+use storekit::sync::{
+    DestinationOwnership, Direction, Extraneous, Policy, ReplaceAll, SyncError, SyncResult, sync,
+};
+use storekit::transport::{Layout, LocalTransport, Remote};
+
+/// The owned push through the ONE entry point: acquire the destination's
+/// operation lock with `DestinationOwnership::lock` (the only way to obtain
+/// `DestinationOwnership::Locked`) and then run. A refusal during acquisition
+/// (for example a source the strict manifest refuses) is surfaced as the same
+/// `SyncError` the run itself would return.
+fn owned_push(
+    local_root: &std::path::Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+) -> SyncResult {
+    match DestinationOwnership::lock(Direction::Push, local_root, remote) {
+        Ok(ownership) => sync(
+            Direction::Push,
+            local_root,
+            remote,
+            policy,
+            Extraneous::Keep,
+            ownership,
+        ),
+        Err(error) => Err(SyncError::from(error)),
+    }
+}
 
 /// Run the production remote manifest script and return its raw listing.
 fn remote_listing(root: &std::path::Path) -> String {
@@ -92,7 +117,7 @@ fn push_refuses_a_destination_only_fold_escape(on_disk: &str, spelled: &str) {
 
     let transport =
         LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).expect("build");
-    let outcome = push(&src, &transport, &ReplaceAll);
+    let outcome = owned_push(&src, &transport, &ReplaceAll);
     if outcome.is_ok() {
         let leaked = std::fs::read(dst.join("dir/link/secret"));
         panic!(
@@ -150,7 +175,7 @@ fn source_escape_refused_by_all_views(on_disk: &str, spelled: &str) {
     let dst = base.path().join("dst");
     let transport =
         LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).expect("build");
-    let pushed = push(&root, &transport, &ReplaceAll);
+    let pushed = owned_push(&root, &transport, &ReplaceAll);
 
     if local.is_ok() || remote.is_ok() || pushed.is_ok() {
         panic!(
@@ -223,7 +248,7 @@ fn push_refuses_a_source_contained_fold_escape() {
 
     let transport =
         LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).expect("build");
-    let err = push(&src, &transport, &ReplaceAll)
+    let err = owned_push(&src, &transport, &ReplaceAll)
         .expect_err("a source that holds the fold-equal symlink component must be refused");
     assert!(
         err.to_string().contains("escaping symlink"),

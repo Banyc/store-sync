@@ -304,37 +304,48 @@ beyond (c).
 
 ### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — OWNER DECISION
 
-`sync`/`push`/`pull` take `<parent>/.<name>.operation.lock`
-(`sync::destination_lock_path`; the rationale is in the `sync` module docs),
-while `Layout::lock` names the IN-ROOT `state/operation.lock`
-(`transport::Layout::lock`). They are DIFFERENT FILES, so the two locks do NOT
-exclude each other: a consumer that already holds its own in-root
-`operation.lock` and then calls `sync` ends up with two files that both claim
-to be "the operation lock" (also in the `sync` module docs). The sibling
+The ONE entry point `sync` takes `<parent>/.<name>.operation.lock`
+(`sync::destination_lock_path`; the rationale is in the `sync` module docs)
+when its `ownership` argument is the unforgeable
+`DestinationOwnership::Locked` token (acquired by
+`DestinationOwnership::lock`), while `Layout::lock` names the IN-ROOT
+`state/operation.lock` (`transport::Layout::lock`). They are DIFFERENT FILES, so
+the two locks do NOT exclude each other: a consumer that already holds its own
+in-root `operation.lock` and then calls `sync` ends up with two files that both
+claim to be "the operation lock" (also in the `sync` module docs). The sibling
 location is deliberate — an in-root record would create the destination ROOT
 and enter the destination manifest the run is judging — and it cannot be
 composed from the applier's side, because `Remote` exposes no accessor for its
 `Layout`.
 
-RECOMMENDATION (owner decision, not a defect): either give the applier the
-caller's `Layout::lock` path so a run can take BOTH records, or state in the
-entry-point contract that a consumer with its own in-root record must
+RECOMMENDATION (owner decision, not a defect): either give the acquiring
+constructor the caller's `Layout::lock` path so a run can take BOTH records, or
+state in the `sync` contract that a consumer with its own in-root record must
 serialize at a higher level. Do NOT simply move the record in-root: that
 breaks the "a fully-refused pull creates NOTHING" contract.
 
 ### (b) Ownership enforcement is unavailable for exactly the remote case — DOCUMENTED LIMITATION, OWNER DECISION
 
-`sync`/`push`/`pull` REFUSE a destination whose lock they cannot take (each
-entry point's own docs), and a remote (SSH) destination can never be locked:
-the far-side sidecar `flock` lives inside a single remote command and dies with
-it (the `sync` module docs). Only the explicitly weaker `sync_unowned` reaches
-a remote destination, so the
-crate's strongest guarantee applies to the case a cross-host tool uses LEAST.
+The ONE entry point `sync` takes the destination's operation lock only through
+the unforgeable `DestinationOwnership::Locked` token, which
+`DestinationOwnership::lock` produces by ACTUALLY taking the lock; a remote
+(SSH) destination can never be locked, because the far-side sidecar `flock`
+lives inside a single remote command and dies with it (the `sync` module docs).
+The acquiring constructor therefore REFUSES such a destination, and the only
+way to reach it is to pass `DestinationOwnership::Unowned` at the call site.
+The consolidation did NOT remove the limitation — a far-side destination still
+cannot be held for a run, and for an unowned run the crate enforces NEITHER the
+destination lock NOR any far-side exclusion — but it removed the SECOND entry
+point that used to express it: there is no `sync_unowned` whose existence
+implies the weak path is a normal choice, only a value the caller must name. So
+the crate's strongest guarantee still applies to the case a cross-host tool
+uses LEAST.
 
 RECOMMENDATION (owner decision): keep the refusal (fail-closed beats silently
 unowned) and, if the remote case must be owned, build a persistent far-side
 lock session (a long-lived SSH mux command holding the record) rather than
-widening `sync`. Until then this is a documented limitation, not a defect.
+widening the one entry point. Until then this is a documented limitation, not a
+defect.
 
 ### (c) The fd-confined tree helpers the source tool calls had no public equivalent — CRATE DEFECT, FIXED HERE
 

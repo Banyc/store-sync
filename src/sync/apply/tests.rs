@@ -20,6 +20,45 @@ fn transport(root: &Path) -> LocalTransport {
     LocalTransport::new(&env(), root.to_path_buf(), Layout::empty()).unwrap()
 }
 
+/// Run the OWNED path through the ONE entry point: acquire the destination's
+/// operation lock with [`DestinationOwnership::lock`] — the ONLY way to obtain
+/// `DestinationOwnership::Locked` — and then call [`sync`]. A refusal during
+/// acquisition is surfaced as a `SyncResult` error exactly as `sync` surfaces
+/// it, so an owned run's refusal and report are unchanged. Every non-weak call
+/// site in this module uses this helper, so the tests exercise the ownership
+/// axis rather than a per-variant entry point.
+fn owned(
+    direction: Direction,
+    local_root: &Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+    extraneous: Extraneous,
+) -> SyncResult {
+    match DestinationOwnership::lock(direction, local_root, remote) {
+        Ok(ownership) => sync(direction, local_root, remote, policy, extraneous, ownership),
+        Err(error) => Err(SyncError::from(error)),
+    }
+}
+
+/// Run the WEAK path through the ONE entry point by NAMING the weaker
+/// ownership at the call site ([`DestinationOwnership::Unowned`]).
+fn unowned(
+    direction: Direction,
+    local_root: &Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+    extraneous: Extraneous,
+) -> SyncResult {
+    sync(
+        direction,
+        local_root,
+        remote,
+        policy,
+        extraneous,
+        DestinationOwnership::Unowned,
+    )
+}
+
 fn write(path: &Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -1919,7 +1958,7 @@ fn push_makes_destination_equal_to_source() {
     build_rich_tree(&src);
     let dst = dir.path().join("dst");
     fs::create_dir_all(&dst).unwrap();
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(
         canonicalize_tree(&src).unwrap(),
@@ -1933,7 +1972,7 @@ fn pull_makes_local_equal_to_remote() {
     let remote_root = dir.path().join("remote");
     build_rich_tree(&remote_root);
     let local = dir.path().join("local");
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -1966,7 +2005,7 @@ fn an_in_root_relative_symlink_round_trips_through_push_and_pull() {
 
     // PUSH into a fresh local root.
     let dst = dir.path().join("dst");
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{report:?}");
     let link = dst.join("dir/link");
     assert!(
@@ -1989,7 +2028,7 @@ fn an_in_root_relative_symlink_round_trips_through_push_and_pull() {
 
     // PULL the same source into another fresh local root.
     let pulled = dir.path().join("pulled");
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &pulled,
         &transport(&src),
@@ -2041,7 +2080,7 @@ fn an_escaping_symlink_target_is_refused_by_push_and_pull() {
 
     // PUSH: refused at the source manifest; nothing is materialized.
     let dst = dir.path().join("dst");
-    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
     assert!(
         err.to_string().contains("escaping symlink"),
         "push must refuse the escaping link, got: {err}"
@@ -2054,7 +2093,7 @@ fn an_escaping_symlink_target_is_refused_by_push_and_pull() {
 
     // PULL: the same source as the far side, the same refusal.
     let pulled = dir.path().join("pulled");
-    let err = sync(
+    let err = owned(
         Direction::Pull,
         &pulled,
         &transport(&src),
@@ -2100,7 +2139,7 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     fs::create_dir_all(&outside).unwrap();
     write(&outside.join("secret"), b"SECRET");
 
-    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("escaping symlink") && msg.contains("dir/sub"),
@@ -2117,7 +2156,7 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     let dst_real = dir.path().join("dst-real");
     fs::create_dir_all(dst_real.join("dir/sub")).unwrap();
     fs::create_dir_all(dst_real.join("dir/other")).unwrap();
-    let report = sync(
+    let report = owned(
         Direction::Push,
         &src,
         &transport(&dst_real),
@@ -2151,7 +2190,7 @@ fn extraneous_delete_neutralizes_the_destination_resident_symlink_component() {
     fs::create_dir_all(dst.join("dir/other")).unwrap();
     std::os::unix::fs::symlink("../other", dst.join("dir/sub")).unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect("the sanctioned deletion removes the traversed destination symlink");
     assert!(report.conflicts.is_empty(), "{report:?}");
     assert!(
@@ -2195,7 +2234,7 @@ fn an_unsupported_destination_symlink_component_cannot_be_escaped_through() {
     fs::create_dir_all(&outside).unwrap();
     write(&outside.join("secret"), b"SECRET");
 
-    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("escaping symlink") && msg.contains("dir/sub"),
@@ -2218,7 +2257,7 @@ fn equal_trees_perform_zero_transfers() {
     let before = canonicalize_tree(&dst).unwrap();
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert_eq!(report.transfers, 0, "no destination mutation may run");
     assert_eq!(remote.ops(), 0, "the transport saw no mutating call");
     assert!(report.applied.is_empty());
@@ -2231,7 +2270,7 @@ fn equal_trees_perform_zero_transfers() {
     build_rich_tree(&local);
     let before_local = canonicalize_tree(&local).unwrap();
     let remote_src = RecordingRemote::over(transport(&src), true);
-    let report = sync(Direction::Pull, &local, &remote_src, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Pull, &local, &remote_src, &ReplaceAll, Keep).unwrap();
     assert_eq!(report.transfers, 0);
     assert_eq!(remote_src.ops(), 0);
     assert_eq!(canonicalize_tree(&local).unwrap(), before_local);
@@ -2248,7 +2287,7 @@ fn refuse_leaves_destination_byte_identical_and_reports_a_conflict() {
 
     let remote = RecordingRemote::over(transport(&dst), true);
     let refuse = |_: &str, _: EntryKind| EntryPolicy::Refuse;
-    let report = sync(Direction::Push, &src, &remote, &refuse, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &refuse, Keep).unwrap();
 
     assert!(report.applied.is_empty());
     assert_eq!(report.transfers, 0);
@@ -2294,7 +2333,7 @@ fn refuse_on_an_existing_directory_leaves_its_mode_untouched_while_children_proc
         }
     };
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &refuse_d, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &refuse_d, Keep).unwrap();
 
     assert_eq!(report.conflicts.len(), 1);
     assert_eq!(report.conflicts[0].path, "d");
@@ -2337,7 +2376,7 @@ fn refusing_a_missing_directory_blocks_its_children_in_both_directions() {
     let dst = dir.path().join("dst");
     fs::create_dir_all(&dst).unwrap();
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &refuse_dir, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &refuse_dir, Keep).unwrap();
     assert!(report.applied.is_empty());
     assert_eq!(report.transfers, 0, "nothing is mutated");
     assert_eq!(remote.ops(), 0);
@@ -2352,7 +2391,7 @@ fn refusing_a_missing_directory_blocks_its_children_in_both_directions() {
     let remote_root = dir.path().join("remote");
     write(&remote_root.join("d/f"), b"x");
     let local = dir.path().join("local");
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -2394,7 +2433,7 @@ fn refuse_on_a_read_only_existing_directory_blocks_its_children_without_mutating
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap();
     assert_eq!(report.conflicts.len(), 2, "{:?}", report.conflicts);
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert_eq!(
@@ -2440,7 +2479,7 @@ fn a_directory_mode_change_under_a_refused_read_only_directory_is_not_refused() 
     set_mode(&src.join("d/sub"), 0o700);
     set_mode(&dst.join("d"), 0o555);
     set_mode(&dst.join("d/sub"), 0o755);
-    let report = sync(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap();
     assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert!(
@@ -2468,7 +2507,7 @@ fn a_directory_mode_change_under_a_refused_read_only_directory_is_not_refused() 
     set_mode(&remote_root.join("d/sub"), 0o700);
     set_mode(&local.join("d"), 0o555);
     set_mode(&local.join("d/sub"), 0o755);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -2514,7 +2553,7 @@ fn a_child_under_a_refused_non_directory_ancestor_is_not_written_through_it() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap();
     assert_eq!(report.conflicts.len(), 2, "{:?}", report.conflicts);
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert_eq!(
@@ -2542,7 +2581,7 @@ fn append_tail_appends_the_missing_tail_and_writes_a_missing_file() {
     write(&dst.join("grow"), b"abc");
     let before_dest = read(&dst.join("grow"));
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
 
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     let after = read(&dst.join("grow"));
@@ -2568,7 +2607,7 @@ fn append_tail_writes_nothing_when_the_source_is_a_prefix() {
     write(&src.join("f"), b"abc");
     write(&dst.join("f"), b"abcdef");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
 
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(report.applied.is_empty());
@@ -2589,7 +2628,7 @@ fn append_tail_diverged_reports_a_conflict_and_changes_nothing() {
         write(&src.join("f"), source);
         write(&dst.join("f"), dest);
 
-        let report = sync(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
+        let report = owned(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
 
         assert!(report.applied.is_empty());
         assert_eq!(report.transfers, 0);
@@ -2614,7 +2653,7 @@ fn append_tail_no_op_applies_a_changed_mode_without_writing_bytes() {
     set_mode(&dst.join("f"), 0o600);
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &append_files, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &append_files, Keep).unwrap();
 
     assert_eq!(remote.writes(), 0, "no bytes are written");
     assert!(report.transfers >= 1, "at least the mode application");
@@ -2631,14 +2670,14 @@ fn extraneous_is_reported_and_survives_then_is_removed_with_the_flag() {
     write(&dst.join("f"), b"x");
     write(&dst.join("extra"), b"y");
 
-    let kept = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let kept = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert_eq!(kept.extraneous, vec!["extra".to_string()]);
     assert!(
         dst.join("extra").exists(),
         "default sync never deletes extraneous"
     );
 
-    let removed = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let removed = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert_eq!(removed.extraneous, vec!["extra".to_string()]);
     assert!(removed.transfers >= 1, "at least one removal");
     assert!(!dst.join("extra").exists());
@@ -2663,7 +2702,7 @@ fn extraneous_directory_tree_is_removed_children_before_dirs() {
     write(&dst.join("extra/sub/b"), b"2");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(
         report.extraneous,
@@ -2720,14 +2759,14 @@ fn extraneous_below_blocks_a_directory_replacement_until_sanctioned() {
     write(&src.join("p"), b"file");
     write(&dst.join("p/keep"), b"keep");
 
-    let blocked = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let blocked = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(blocked.applied.is_empty());
     assert_eq!(blocked.conflicts.len(), 1);
     assert_eq!(blocked.conflicts[0].reason, ConflictReason::ExtraneousBelow);
     assert!(dst.join("p").is_dir());
     assert_eq!(read(&dst.join("p/keep")), b"keep");
 
-    let sanctioned = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let sanctioned = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(
         sanctioned.conflicts.is_empty(),
         "{:?}",
@@ -2750,7 +2789,7 @@ fn symlink_and_non_default_modes_round_trip() {
     let dst = dir.path().join("dst");
     fs::create_dir_all(&dst).unwrap();
 
-    sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
 
     assert_eq!(
         canonicalize_tree(&src).unwrap(),
@@ -2781,7 +2820,7 @@ fn push_replaces_a_read_only_destination_file() {
     set_mode(&dst.join("f"), 0o444);
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(read(&dst.join("f")), b"new");
     assert_eq!(
@@ -2819,7 +2858,7 @@ fn extraneous_removal_under_a_read_only_same_parent_is_named_not_skipped() {
         set_mode(&root.join("d"), 0o555);
     }
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(!dst.join("d/extra").exists());
     assert_eq!(
@@ -2850,7 +2889,7 @@ fn a_failed_write_is_reported_never_a_success() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(
         dst.join("d").is_dir(),
@@ -2892,7 +2931,7 @@ fn the_report_covers_a_failure_after_a_file_was_written() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     // The first write (`d/a`) succeeds; the second (`d/b`) fails.
     remote.fail_nth_write = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert_eq!(err.report().applied, vec!["d/a".to_string()]);
     assert_report_names(err.report(), "d/a");
@@ -2917,7 +2956,7 @@ fn only_changed_entries_transfer() {
     write(&dst.join("changed"), b"old");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
 
     assert_eq!(report.applied, vec!["changed".to_string()]);
     assert_eq!(report.skipped, vec!["same".to_string()]);
@@ -2940,7 +2979,7 @@ fn mode_only_change_does_not_rewrite_content() {
     set_mode(&dst.join("f"), 0o600);
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
 
     assert_eq!(report.applied, vec!["f".to_string()]);
     assert!(report.transfers >= 1, "only the mode is applied");
@@ -2972,7 +3011,7 @@ fn a_dropped_mode_only_change_fails_verification() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.drop_modes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
         matches!(err.error(), Error::Integrity(_)),
         "a dropped mode must fail verification, got {err:?}"
@@ -3009,7 +3048,7 @@ fn a_missing_child_under_a_read_only_parent_is_installed_and_the_parent_restored
         set_mode(&root.join("d"), 0o555);
     }
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(
         read(&dst.join("d/new")),
@@ -3047,7 +3086,7 @@ fn a_missing_child_under_a_read_only_parent_is_installed_and_the_parent_restored
     for root in [&remote_root, &local] {
         set_mode(&root.join("d"), 0o555);
     }
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -3080,7 +3119,7 @@ fn extraneous_removal_under_a_read_only_parent_widens_and_removes() {
     write(&dst.join("extra/old"), b"y");
     set_mode(&dst.join("extra"), 0o555);
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(
         report.extraneous,
@@ -3112,7 +3151,7 @@ fn a_read_only_same_directory_is_transiently_widened_counted_and_restored() {
     }
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(read(&dst.join("d/f")), b"new");
     assert!(report.transfers >= 3, "widen + write + restore");
@@ -3154,7 +3193,7 @@ fn a_changed_directory_is_widened_from_its_current_mode_and_its_final_mode_wins(
     set_mode(&dst.join("d"), 0o500);
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(read(&dst.join("d/f")), b"new", "the child IS written");
     assert_eq!(
@@ -3209,7 +3248,7 @@ fn a_failed_write_restores_the_parent_and_reports_transient_dirs_honestly() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert_eq!(
@@ -3261,7 +3300,7 @@ fn applied_waits_for_the_final_mode() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.drop_modes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
         matches!(err.error(), Error::Integrity(_)),
         "an unapplied directory mode must fail verification, got {err:?}"
@@ -3289,7 +3328,7 @@ fn fully_refused_pull_leaves_the_destination_root_absent() {
     assert!(!local.exists());
 
     let refuse = |_: &str, _: EntryKind| EntryPolicy::Refuse;
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -3322,7 +3361,7 @@ fn refused_pull_beside_a_written_sibling_creates_only_the_parent() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -3354,7 +3393,7 @@ fn directory_mode_verification_catches_an_unapplied_mode() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.drop_modes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Integrity(_)), "got {err:?}");
     // The directory is NAMED in `verify_failures`, not only described by the
     // error string: the report is the machine-readable contract.
@@ -3386,7 +3425,7 @@ fn a_failed_sync_leaves_extraneous_entries_present() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(
         dst.join("extra").exists(),
@@ -3431,7 +3470,7 @@ fn push_over_a_missing_source_root_is_an_error() {
     fs::create_dir_all(&dst).unwrap();
     let before = canonicalize_tree(&dst).unwrap();
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = sync(Direction::Push, &missing, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &missing, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
         matches!(err.error(), Error::Materialization(_)),
         "a missing source root is a materialization error, got {err:?}"
@@ -3450,7 +3489,7 @@ fn push_to_an_absent_destination_root_is_an_error_not_a_delete() {
     assert!(!dst.exists());
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     // The absent ROOT is the TYPED absence condition (gap 5), consistent with
     // how the crate reports absence elsewhere; it is still an ERROR (no
     // delete), which is what this test exists to pin.
@@ -3467,7 +3506,7 @@ fn syncing_two_empty_directories_is_a_no_op() {
     fs::create_dir_all(&src).unwrap();
     fs::create_dir_all(&dst).unwrap();
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(report.applied.is_empty());
     assert!(report.conflicts.is_empty());
     assert_eq!(report.transfers, 0);
@@ -3514,7 +3553,7 @@ fn a_destination_inside_the_source_is_refused_and_the_source_is_not_destroyed() 
     write(&src.join("sub/x"), b"SOURCE-X");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     assert_overlapping_roots_refused(&err, &src, &dst);
     assert_eq!(remote.ops(), 0, "the refusal is before every mutation");
@@ -3542,7 +3581,7 @@ fn a_source_inside_the_destination_is_refused_and_the_source_is_not_destroyed() 
     write(&dst.join("sub/x"), b"SOURCE-X");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     assert_overlapping_roots_refused(&err, &src, &dst);
     assert_eq!(remote.ops(), 0, "the refusal is before every mutation");
@@ -3566,7 +3605,7 @@ fn a_destination_inside_the_source_is_refused_without_delete_extraneous() {
     write(&src.join("top"), b"TOP");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
     assert_overlapping_roots_refused(&err, &src, &dst);
     assert_eq!(remote.ops(), 0, "the refusal is before every mutation");
@@ -3589,7 +3628,7 @@ fn a_pull_into_a_destination_inside_the_remote_source_is_refused() {
     write(&remote_root.join("top"), b"TOP");
 
     let remote = RecordingRemote::over(transport(&remote_root), true);
-    let err = sync(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
 
     assert_overlapping_roots_refused(&err, &local, &remote_root);
     assert_eq!(remote.ops(), 0, "the refusal is before every mutation");
@@ -3616,7 +3655,7 @@ fn equal_roots_are_not_refused_and_are_an_idempotent_no_op() {
         PathBuf::from(format!("{}/", tree.display())),
         tree.join("..").join("tree"),
     ] {
-        let report = sync(Direction::Push, &spelling, &remote, &ReplaceAll, Keep)
+        let report = owned(Direction::Push, &spelling, &remote, &ReplaceAll, Keep)
             .unwrap_or_else(|err| panic!("{spelling:?} must be a no-op, got {err:?}"));
         assert_eq!(report.transfers, 0, "{spelling:?} must not mutate");
         assert!(report.applied.is_empty());
@@ -3646,7 +3685,7 @@ fn a_disjoint_pair_reached_through_a_symlinked_ancestor_is_not_refused() {
     // to `real-src` and is disjoint from `dst`.
     let through_link = mid.join("sub");
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &through_link, &remote, &ReplaceAll, Keep)
+    let report = owned(Direction::Push, &through_link, &remote, &ReplaceAll, Keep)
         .expect("a disjoint pair must not be refused");
     assert_eq!(read(&dst.join("f")), b"FROM-SOURCE");
     assert!(
@@ -3698,7 +3737,7 @@ fn measure_wide_sync(n: usize) -> (usize, usize, usize) {
 
     let remote = RecordingRemote::over(transport(&dst), true);
     super::listing_elements::reset();
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     let materialized = super::listing_elements::get();
     assert_eq!(
         read(&dst.join("f0000")),
@@ -3776,7 +3815,7 @@ fn measure_deep_chain_sync(depth: usize) -> (usize, usize) {
     write(&dst_leaf.join("leaf"), b"old");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert_eq!(
         read(&dst_leaf.join("leaf")),
         b"NEW",
@@ -3863,7 +3902,7 @@ fn measure_wide_delete(n: usize, policy: Extraneous) -> (usize, usize) {
     }
     let remote = RecordingRemote::over(transport(&dst), true);
     super::listing_reads::reset();
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, policy).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, policy).unwrap();
     let consumed = super::listing_reads::get();
     assert_eq!(
         report.extraneous.len(),
@@ -4038,7 +4077,7 @@ fn the_report_lists_are_mutually_exclusive_and_cover_the_diff() {
     assert_eq!(diff.count(EntryDiff::Extraneous), 1, "{diff:?}");
     assert!(diff.count(EntryDiff::Same) >= 1, "{diff:?}");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
 
     // The TRUE rule: `applied`/`skipped`/`conflicts`/`extraneous` are pairwise
     // disjoint.
@@ -4132,7 +4171,7 @@ fn a_mode_ignoring_write_is_not_reported_applied() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.drop_write_mode = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
         matches!(err.error(), Error::Integrity(_)),
         "the dropped mode must fail verification, got {err:?}"
@@ -4178,7 +4217,7 @@ fn extraneous_removal_after_finalize_rewidens_a_read_only_changed_parent() {
     write(&dst.join("d/extra"), b"e");
     set_mode(&src.join("d"), 0o555);
     set_mode(&dst.join("d"), 0o500);
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(
         !dst.join("d/extra").exists(),
@@ -4200,7 +4239,7 @@ fn extraneous_removal_after_finalize_rewidens_a_read_only_changed_parent() {
     write(&local.join("d/extra"), b"e");
     set_mode(&remote_root.join("d"), 0o555);
     set_mode(&local.join("d"), 0o500);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4227,7 +4266,7 @@ fn a_file_replacing_a_read_only_populated_directory_is_sanctioned() {
     write(&src.join("p"), b"file");
     write(&dst.join("p/keep"), b"keep");
     set_mode(&dst.join("p"), 0o555);
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(
         dst.join("p").is_file(),
@@ -4246,7 +4285,7 @@ fn a_file_replacing_a_read_only_populated_directory_is_sanctioned() {
     write(&remote_root.join("p"), b"file");
     write(&local.join("p/keep"), b"keep");
     set_mode(&local.join("p"), 0o555);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4279,7 +4318,7 @@ fn a_failed_file_replacement_of_a_directory_leaves_the_subtree_byte_identical() 
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(dst.join("p").is_dir(), "the directory survives the failure");
     assert_eq!(read(&dst.join("p/keep")), b"keep");
@@ -4320,7 +4359,7 @@ fn a_failed_file_replacement_of_a_directory_leaves_the_subtree_byte_identical_on
 
     let mut remote = RecordingRemote::over(transport(&remote_root), true);
     remote.fail_reads = true;
-    let err = sync(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(
         local.join("p").is_dir(),
@@ -4347,7 +4386,7 @@ fn a_successful_file_replacement_of_a_directory_leaves_no_aside() {
     write(&src.join("p"), b"file");
     write(&dst.join("p/keep"), b"keep");
     set_mode(&dst.join("p"), 0o555);
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(dst.join("p").is_file());
     assert_eq!(read(&dst.join("p")), b"file");
@@ -4361,7 +4400,7 @@ fn a_successful_file_replacement_of_a_directory_leaves_no_aside() {
     write(&remote_root.join("p"), b"file");
     write(&local.join("p/keep"), b"keep");
     set_mode(&local.join("p"), 0o555);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4392,7 +4431,7 @@ fn a_failed_symlink_replacement_of_a_directory_leaves_the_subtree_byte_identical
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_symlink = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(dst.join("p").is_dir());
     assert_eq!(
@@ -4416,7 +4455,7 @@ fn a_failed_directory_replacement_of_a_file_leaves_the_entry_byte_identical() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_create_dir_all = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(dst.join("p").is_file(), "the file survives the failure");
     assert_eq!(read(&dst.join("p")), b"old");
@@ -4439,7 +4478,7 @@ fn a_failed_claim_rollback_is_reported_in_restore_failures() {
     remote.fail_writes = true;
     // rename #1 is the claim, #2 is the rollback.
     remote.fail_nth_rename = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(
         err.restore_failures()
             .iter()
@@ -4509,7 +4548,7 @@ fn a_claim_rename_that_lands_and_reports_failure_names_the_aside() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     // rename #1 is the claim; it MOVES `p` aside and then reports failure.
     remote.fail_nth_rename_after_rename = Some(1);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     // The rename LANDED: the real path is gone and the aside holds the tree.
     assert!(
@@ -4562,7 +4601,7 @@ fn a_rollback_rename_that_lands_and_reports_failure_claims_no_stranded_aside() {
     // reports failure.
     remote.fail_writes = true;
     remote.fail_nth_rename_after_rename = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     // The rollback LANDED: the original is back at `p`, byte-identical, and no
     // aside exists anywhere.
@@ -4604,7 +4643,7 @@ fn a_symlink_replacing_a_populated_directory_is_reported_applied() {
     // journal entry the symlink must not inherit.
     set_mode(&dst.join("p"), 0o555);
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(fs::symlink_metadata(dst.join("p")).unwrap().is_symlink());
     assert!(
         report.applied.contains(&"p".to_string()),
@@ -4627,7 +4666,7 @@ fn a_symlink_replacing_an_empty_read_only_directory_is_reported_applied() {
     fs::create_dir_all(dst.join("p")).unwrap();
     set_mode(&dst.join("p"), 0o555);
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(fs::symlink_metadata(dst.join("p")).unwrap().is_symlink());
     assert!(
         report.applied.contains(&"p".to_string()),
@@ -4678,7 +4717,7 @@ fn the_refuse_rule_is_uniform_for_a_confined_pull() {
     let local = dir.path().join("blocked");
     write(&local.join("d/f"), b"old");
     set_mode(&local.join("d"), 0o755);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4704,7 +4743,7 @@ fn the_refuse_rule_is_uniform_for_a_confined_pull() {
     let local = dir.path().join("admitted");
     write(&local.join("d/f"), b"old");
     set_mode(&local.join("d"), 0o700);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4738,7 +4777,7 @@ fn a_changed_directory_child_under_a_read_only_parent_is_created() {
     write(&dst.join("d/sub"), b"old");
     set_mode(&src.join("d"), 0o555);
     set_mode(&dst.join("d"), 0o555);
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(dst.join("d/sub").is_dir());
     assert_eq!(read(&dst.join("d/sub/f")), b"new");
@@ -4756,7 +4795,7 @@ fn a_changed_directory_child_under_a_read_only_parent_is_created() {
     write(&local.join("d/sub"), b"old");
     set_mode(&remote_root.join("d"), 0o555);
     set_mode(&local.join("d"), 0o555);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4788,7 +4827,7 @@ fn append_tail_on_a_non_file_is_a_conflict() {
     set_mode(&src.join("d"), 0o755);
     set_mode(&dst.join("d"), 0o700);
     let append_all = |_: &str, _: EntryKind| EntryPolicy::AppendTail;
-    let report = sync(Direction::Push, &src, &transport(&dst), &append_all, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &append_all, Keep).unwrap();
     assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
     assert_eq!(report.conflicts[0].reason, ConflictReason::AppendNotAFile);
     assert_eq!(mode_of(&dst.join("d")), 0o700, "the directory is untouched");
@@ -4799,7 +4838,7 @@ fn append_tail_on_a_non_file_is_a_conflict() {
     write(&src.join("f"), b"payload");
     fs::create_dir_all(&dst).unwrap();
     std::os::unix::fs::symlink("target", dst.join("f")).unwrap();
-    let report = sync(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &append_files, Keep).unwrap();
     assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
     assert_eq!(report.conflicts[0].reason, ConflictReason::AppendNotAFile);
     assert!(
@@ -4820,7 +4859,7 @@ fn a_source_symlink_replacing_a_populated_directory_conflicts() {
     std::os::unix::fs::symlink("target", src.join("p")).unwrap();
     write(&dst.join("p/keep"), b"keep");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
     assert_eq!(report.conflicts[0].path, "p");
     assert_eq!(report.conflicts[0].reason, ConflictReason::ExtraneousBelow);
@@ -4843,7 +4882,7 @@ fn a_pull_publishes_by_atomic_rename_not_an_in_place_write() {
     write(&local.join("f"), b"old");
     let before = fs::symlink_metadata(local.join("f")).unwrap().ino();
 
-    sync(
+    owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -4902,7 +4941,7 @@ fn a_directory_blocked_by_an_append_conflict_is_never_widened() {
     set_mode(&dst.join("d"), 0o555);
 
     let append_all = |_: &str, _: EntryKind| EntryPolicy::AppendTail;
-    let report = sync(Direction::Push, &src, &transport(&dst), &append_all, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &append_all, Keep).unwrap();
 
     assert_eq!(report.transfers, 0, "nothing is mutated");
     assert!(
@@ -4963,7 +5002,7 @@ fn a_no_write_append_under_a_refused_read_only_parent_is_not_parent_refused() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &policy, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &policy, Keep).unwrap();
     assert_eq!(report.transfers, 0, "nothing is mutated");
     assert!(
         report.conflicts.iter().all(|c| c.path == "d"),
@@ -4982,7 +5021,7 @@ fn a_no_write_append_under_a_refused_read_only_parent_is_not_parent_refused() {
     set_mode(&dst2.join("d/f"), 0o644);
     set_mode(&src2.join("d"), 0o755);
     set_mode(&dst2.join("d"), 0o555);
-    let report = sync(Direction::Push, &src2, &transport(&dst2), &policy, Keep).unwrap();
+    let report = owned(Direction::Push, &src2, &transport(&dst2), &policy, Keep).unwrap();
     assert!(
         report
             .conflicts
@@ -5029,7 +5068,7 @@ fn an_append_write_that_races_a_concurrent_appender_conflicts_and_preserves_it()
             EntryPolicy::Replace
         }
     };
-    let result = sync(Direction::Push, &src, &remote, &policy, Keep);
+    let result = owned(Direction::Push, &src, &remote, &policy, Keep);
     let report = match &result {
         Ok(report) => report,
         Err(error) => error.report(),
@@ -5090,7 +5129,7 @@ fn an_append_whose_target_is_deleted_during_the_compare_creates_it() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &remote, &policy, Keep)
+    let report = owned(Direction::Push, &src, &remote, &policy, Keep)
         .expect("a deleted append target is a mismatch, never an error");
 
     // The retry re-reads, sees the live kind is `None`, and CREATES the source
@@ -5150,7 +5189,7 @@ fn an_append_whose_target_is_deleted_before_the_byte_read_is_created() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &remote, &policy, Keep)
+    let report = owned(Direction::Push, &src, &remote, &policy, Keep)
         .expect("an append target deleted before the byte read is a mismatch, never an error");
 
     assert_eq!(
@@ -5200,7 +5239,7 @@ fn an_append_settle_whose_target_is_deleted_after_the_byte_read_is_created() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &remote, &policy, Keep)
+    let report = owned(Direction::Push, &src, &remote, &policy, Keep)
         .expect("a settled append target deleted in the window is a mismatch, never an error");
 
     assert!(
@@ -5253,7 +5292,7 @@ fn a_parent_sync_never_destroys_a_held_nested_lock_record() {
     assert!(lock_path.exists(), "the held record exists before the run");
 
     // A SANCTIONED parent sync: the whole-store push with deletion enabled.
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
 
     assert!(
         lock_path.exists(),
@@ -5306,7 +5345,7 @@ fn a_push_cannot_carry_the_lock_record_over_a_live_holder() {
     let held = FileLock::acquire(&record, "the test's holder").expect("hold the record");
     let inode_before = std::fs::metadata(&record).unwrap().ino();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
 
     assert!(
         !report.applied.contains(&"state/operation.lock".to_string()),
@@ -5359,7 +5398,7 @@ fn a_push_strips_a_case_alias_of_the_lock_record() {
     write(&src.join("STATE/OPERATION.LOCK"), b"evil");
     std::fs::create_dir_all(&dst).unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(
         !report
             .applied
@@ -5397,7 +5436,7 @@ fn extraneous_delete_spares_and_names_the_lock_record() {
     let bare = dst.join("operation.lock");
     std::fs::write(&bare, b"held").unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect("deleting extraneous content must not abort on the lock record");
     assert!(
         record.exists() && bare.exists(),
@@ -5435,7 +5474,7 @@ fn a_farside_mktemp_temp_is_extraneous_not_residue() {
     let temp = dst.join(".sync-aside.foo.tmp.aB3xY9");
     std::fs::write(&temp, b"partial payload").unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(
         report
             .extraneous
@@ -5477,7 +5516,7 @@ fn extraneous_delete_spares_a_case_alias_of_a_reserved_spelling() {
         return;
     }
     // The alias resolves to the SAME inode as the lowercase spelling.
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect("deleting extraneous content must not abort on a reserved alias");
     assert!(
         dst.join(".SYNC-ASIDE.1").exists(),
@@ -5591,7 +5630,7 @@ fn a_refused_source_creates_no_destination_root_or_lock_record() {
     let lock = destination_lock_path(&dst).expect("the record location derives");
     assert!(!lock.exists(), "the lock record starts absent");
 
-    let result = push(&src, &transport(&dst), &ReplaceAll);
+    let result = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep);
     assert!(
         result.is_err(),
         "a hard-linked source must be refused: {result:?}"
@@ -5631,7 +5670,7 @@ fn a_blocked_extraneous_removal_reports_a_conflict() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &refuse_d, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &refuse_d, Delete).unwrap();
     assert!(
         dst.join("d/extra").exists(),
         "the blocked removal leaves the entry"
@@ -5737,7 +5776,7 @@ fn a_pull_replaces_a_symlink_destination_and_leaves_no_aside() {
     fs::create_dir_all(&local).unwrap();
     std::os::unix::fs::symlink("target", local.join("f")).unwrap();
 
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -5770,7 +5809,7 @@ fn a_pull_removes_an_extraneous_symlink() {
     write(&local.join("f"), b"x");
     std::os::unix::fs::symlink("target", local.join("extra")).unwrap();
 
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -5808,7 +5847,7 @@ fn a_failed_pull_replacement_of_a_symlink_leaves_it_byte_identical() {
 
     let mut remote = RecordingRemote::over(transport(&remote_root), true);
     remote.fail_reads = true;
-    let err = sync(Direction::Pull, &local, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(
         fs::symlink_metadata(local.join("f")).unwrap().is_symlink(),
@@ -5843,7 +5882,7 @@ fn a_kind_changing_replacement_removes_a_read_only_subtree() {
     write(&src.join("p"), b"file");
     write(&dst.join("p/ro/child"), b"keep");
     set_mode(&dst.join("p/ro"), 0o555);
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(dst.join("p").is_file());
     assert_eq!(read(&dst.join("p")), b"file");
@@ -5861,7 +5900,7 @@ fn a_kind_changing_replacement_removes_a_read_only_subtree() {
     write(&remote_root.join("p"), b"file");
     write(&local.join("p/ro/child"), b"keep");
     set_mode(&local.join("p/ro"), 0o555);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -5893,7 +5932,7 @@ fn a_failed_replacement_of_a_read_only_subtree_leaves_it_byte_identical() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -5915,7 +5954,7 @@ fn a_failed_replacement_of_a_read_only_subtree_leaves_it_byte_identical() {
     let before_local = canonicalize_tree(&local).unwrap();
     let mut remote = RecordingRemote::over(transport(&remote_root), true);
     remote.fail_reads = true;
-    let err = sync(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert_eq!(
         canonicalize_tree(&local).unwrap(),
@@ -5946,7 +5985,7 @@ fn append_tail_file_over_a_writable_directory_does_not_delete_its_children() {
     write(&dst.join("p/keep"), b"keep");
     set_mode(&dst.join("p"), 0o755);
 
-    let report = sync(
+    let report = owned(
         Direction::Push,
         &src,
         &transport(&dst),
@@ -5983,7 +6022,7 @@ fn append_tail_file_over_a_writable_directory_does_not_delete_its_children() {
     write(&remote_root.join("p"), b"file");
     write(&local.join("p/keep"), b"keep");
     set_mode(&local.join("p"), 0o755);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -6019,7 +6058,7 @@ fn append_tail_file_over_a_read_only_directory_does_not_delete_its_children() {
     write(&dst.join("p/keep"), b"keep");
     set_mode(&dst.join("p"), 0o555);
 
-    let report = sync(
+    let report = owned(
         Direction::Push,
         &src,
         &transport(&dst),
@@ -6070,7 +6109,7 @@ fn append_tail_symlink_over_a_directory_does_not_delete_its_children() {
     set_mode(&dst.join("p"), 0o755);
 
     let append_all = |_: &str, _: EntryKind| EntryPolicy::AppendTail;
-    let report = sync(Direction::Push, &src, &transport(&dst), &append_all, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &append_all, Delete).unwrap();
     assert_eq!(
         conflict_at(&report, "p").reason,
         ConflictReason::AppendNotAFile
@@ -6104,7 +6143,7 @@ fn append_tail_symlink_over_a_directory_does_not_delete_its_children() {
     std::os::unix::fs::symlink("target", remote_root.join("p")).unwrap();
     write(&local.join("p/keep"), b"keep");
     set_mode(&local.join("p"), 0o755);
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -6144,13 +6183,13 @@ fn a_stranded_aside_is_residue_never_transferred_or_deleted() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
     remote.fail_nth_rename = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(!err.restore_failures().is_empty(), "{err:?}");
     let residue = find_residue(&dst);
 
     // (i) A later push with `delete_extraneous=false` keeps it and reports it
     // as residue, NOT as ordinary extraneous content.
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(report.residue.contains(&residue), "{report:?}");
     assert!(
         !report
@@ -6163,7 +6202,7 @@ fn a_stranded_aside_is_residue_never_transferred_or_deleted() {
     assert_residue_present(&report, &[&dst]);
 
     // (iii) A later push with `delete_extraneous=true` does NOT delete it.
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.residue.contains(&residue), "{report:?}");
     assert!(
         dst.join(&residue).exists(),
@@ -6174,7 +6213,7 @@ fn a_stranded_aside_is_residue_never_transferred_or_deleted() {
     // (ii) A later PULL does not transfer the residue into the other tree; a
     // SOURCE collision with the reserved namespace is a conflict.
     let other = dir.path().join("other");
-    let report = sync(Direction::Pull, &other, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Pull, &other, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(
         report
             .conflicts
@@ -6206,7 +6245,7 @@ fn a_stranded_aside_is_residue_never_transferred_or_deleted() {
     write(&src2.join("p"), b"new");
     write(&dst2.join("p/keep"), b"keep");
     write(&dst2.join("p/.sync-aside.999.0/stranded"), b"precious");
-    let report = sync(Direction::Push, &src2, &transport(&dst2), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src2, &transport(&dst2), &ReplaceAll, Keep).unwrap();
     assert!(
         report.residue.contains(&"p/.sync-aside.999.0".to_string()),
         "{report:?}"
@@ -6242,7 +6281,7 @@ fn a_stranded_aside_can_be_recovered_or_deliberately_discarded() {
         let mut remote = RecordingRemote::over(transport(&dst), true);
         remote.fail_writes = true;
         remote.fail_nth_rename = Some(2);
-        let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+        let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
         assert!(!err.restore_failures().is_empty(), "{err:?}");
         let residue = find_residue(&dst);
         (src, dst, residue)
@@ -6268,14 +6307,14 @@ fn a_stranded_aside_can_be_recovered_or_deliberately_discarded() {
         "the aside is gone after recovery"
     );
     // The destination now converges cleanly: no residue remains.
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.residue.is_empty(), "{report:?}");
 
     // (d) A later `Extraneous::Delete` sync still REFUSES a strand and reports
     // it (the original path it would have installed over is not the strand).
     let dir = fixture_tmpdir(&env()).unwrap();
     let (src, dst, residue_path) = strand(dir.path());
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(report.residue.contains(&residue_path), "{report:?}");
     assert!(
         dst.join(&residue_path).exists(),
@@ -6342,7 +6381,7 @@ fn retiring_an_obsolete_snapshot_lock_record_is_explicit_and_refuses_a_held_one(
     let roots: Vec<PathBuf> = (0..5).map(|i| snapshots.join(format!("s{i}"))).collect();
     for root in &roots {
         fs::create_dir_all(root).unwrap();
-        sync(Direction::Push, &src, &transport(root), &ReplaceAll, Keep).unwrap();
+        owned(Direction::Push, &src, &transport(root), &ReplaceAll, Keep).unwrap();
     }
     let record_count = |dir: &Path| -> usize {
         fs::read_dir(dir)
@@ -6481,7 +6520,7 @@ fn residue_nested_under_an_extraneous_directory_is_never_deleted() {
     write(&dst.join("x/keep"), b"keep");
     write(&dst.join("x/.sync-aside.999.0/stranded"), b"precious");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(
         report.residue.contains(&"x/.sync-aside.999.0".to_string()),
         "{report:?}"
@@ -6577,7 +6616,7 @@ fn a_stale_temp_in_the_aside_namespace_is_extraneous_not_residue() {
         write(&dst.join(name.as_str()), b"stale temp");
     }
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     for name in [&short, &long, &control] {
         assert!(
             report.extraneous.contains(name),
@@ -6599,7 +6638,7 @@ fn a_stale_temp_in_the_aside_namespace_is_extraneous_not_residue() {
     // And a GENUINE claim-aside is STILL residue: the reserved-spelling
     // guarantee for a held-aside is not weakened, only a temp is told apart.
     write(&dst.join(".sync-aside.999.0/stranded"), b"precious");
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(
         report.residue.contains(&".sync-aside.999.0".to_string()),
         "a genuine claim-aside stays residue: {report:?}"
@@ -6699,7 +6738,7 @@ fn a_stale_temp_inside_a_claimed_subtree_is_removed_not_left_as_residue() {
     write(&dst.join("p/f"), b"stale child");
     write(&dst.join("p/.sync-aside.x.tmp.7.0"), b"stale temp");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(
         !report
             .residue
@@ -6729,7 +6768,7 @@ fn a_directory_holding_residue_is_never_treated_as_childless() {
     write(&src.join("p"), b"file");
     write(&dst.join("p/.sync-aside.999.0/stranded"), b"precious");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert_eq!(
         conflict_at(&report, "p").reason,
         ConflictReason::ExtraneousBelow
@@ -6773,7 +6812,7 @@ fn a_sanctioned_replacement_leaves_a_nested_aside_in_place() {
     write(&src.join("p"), b"file");
     write(&dst.join("p/.sync-aside.999.0/stranded"), b"precious");
     set_mode(&dst.join("p"), 0o555);
-    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap_err();
     assert!(
         err.report().applied.contains(&"p".to_string()),
         "the replacement itself was installed: {:?}",
@@ -6805,7 +6844,7 @@ fn a_sanctioned_replacement_leaves_a_nested_aside_in_place() {
     write(&remote_root.join("p"), b"file");
     write(&local.join("p/.sync-aside.999.0/stranded"), b"precious");
     set_mode(&local.join("p"), 0o555);
-    let err = sync(
+    let err = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -6852,7 +6891,7 @@ fn a_residue_mode_restore_failure_is_residue_not_a_verify_failure() {
     // must catch it. Keyed on the reserved-aside PATH and the MODE, not a call
     // ordinal, so an added earlier `set_mode` call cannot retarget it.
     remote.drop_mode_for = Some((DropModeTarget::ReservedAside, 0o555, DropModeWhen::Always));
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     let residue = find_residue(&dst);
     assert_eq!(
         remote.dropped_modes(),
@@ -6898,7 +6937,7 @@ fn a_failed_rollback_reports_the_stranded_aside_as_residue() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
     remote.fail_nth_rename = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     let aside = find_residue(&dst);
     assert!(
         err.report().residue.contains(&aside),
@@ -6937,7 +6976,7 @@ fn a_partially_created_directory_replacement_is_rolled_back() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_create_dir_all_after_create = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(dst.join("p").is_file(), "the file is restored");
     assert_eq!(read(&dst.join("p")), b"old");
@@ -6971,7 +7010,7 @@ fn a_failed_drop_claim_reports_the_entry_applied_and_the_leftover_aside() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_remove_file = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
         err.report().applied.contains(&"p".to_string()),
         "the install succeeded, so it is applied: {:?}",
@@ -7051,7 +7090,7 @@ fn a_transport_that_publishes_an_entry_and_then_fails_names_and_counts_it() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_write_after_write = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     // The entry IS on disk: the mutation happened before the error.
     assert_eq!(read(&dst.join("p")), b"new");
@@ -7087,7 +7126,7 @@ fn a_created_directory_is_named_when_a_later_entry_fails() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_writes = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(dst.join("d").is_dir(), "the directory was created");
     assert!(
         err.report().verify_failures.contains(&"d".to_string()),
@@ -7131,7 +7170,7 @@ fn a_written_file_is_named_when_a_later_entry_fails() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     // The FIRST write (`a`) lands; the SECOND (`b`) fails.
     remote.fail_nth_write = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert_eq!(read(&dst.join("a")), b"one", "the first write landed");
     assert!(
         err.report().applied.contains(&"a".to_string()),
@@ -7170,7 +7209,7 @@ fn a_mode_read_failure_after_a_write_names_the_mutated_file() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_metadata_after_write = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert_eq!(read(&dst.join("p")), b"new", "the bytes landed");
     assert!(
         err.report().verify_failures.contains(&"p".to_string()),
@@ -7208,7 +7247,7 @@ fn a_leftover_aside_is_not_also_reported_transient() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_remove_file = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     let aside = find_residue(&dst);
     assert!(err.report().residue.contains(&aside), "{:?}", err.report());
     assert!(
@@ -7237,7 +7276,7 @@ fn the_report_lists_stay_disjoint_on_a_removal_failure() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_remove_file = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(
         err.report().extraneous.contains(&"x".to_string()),
         "the un-removed directory is still destination-only: {:?}",
@@ -7280,7 +7319,7 @@ fn a_written_but_unverified_path_is_named_in_the_report() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.drop_write_mode = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     assert!(
         err.report().verify_failures.contains(&"f".to_string()),
         "the written-but-unverified path is machine-readable: {:?}",
@@ -7308,7 +7347,7 @@ fn a_source_entry_in_the_reserved_namespace_is_a_conflict() {
     write(&dst.join(".sync-aside.foo"), b"stranded on the destination");
     fs::create_dir_all(&dst).unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert_eq!(
         conflict_at(&report, ".sync-aside.foo").reason,
         ConflictReason::ReservedName
@@ -7359,7 +7398,7 @@ fn a_destination_entry_in_the_reserved_namespace_is_residue() {
     write(&dst.join("f"), b"x");
     write(&dst.join(".sync-aside.foo"), b"user data");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(
         report.residue.contains(&".sync-aside.foo".to_string()),
         "{report:?}"
@@ -7383,7 +7422,7 @@ fn a_nested_reserved_name_is_residue() {
     write(&dst.join("d/f"), b"x");
     write(&dst.join("d/.sync-aside.foo"), b"user data");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
     assert!(
         report.residue.contains(&"d/.sync-aside.foo".to_string()),
         "{report:?}"
@@ -7406,7 +7445,7 @@ fn names_resembling_the_reserved_namespace_transfer_normally() {
     write(&src.join("foo.sync-aside.bar"), b"two");
     fs::create_dir_all(&dst).unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(report.residue.is_empty(), "{report:?}");
     assert!(
@@ -7500,7 +7539,7 @@ fn a_refused_writable_directory_admits_a_transfer_but_not_a_deletion() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &refuse_d, Delete).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &refuse_d, Delete).unwrap();
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert_eq!(
         conflict_at(&report, "d/extra").reason,
@@ -7562,7 +7601,7 @@ fn a_refused_writable_directory_on_a_pull_admits_a_transfer_but_not_a_deletion()
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Pull, &dst, &transport(&src), &refuse_d, Delete).unwrap();
+    let report = owned(Direction::Pull, &dst, &transport(&src), &refuse_d, Delete).unwrap();
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert_eq!(
         conflict_at(&report, "d/extra").reason,
@@ -7618,7 +7657,7 @@ fn a_refused_directory_a_local_write_must_re_mode_on_a_pull_blocks_the_child() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Pull, &dst, &transport(&src), &refuse_d, Delete).unwrap();
+    let report = owned(Direction::Pull, &dst, &transport(&src), &refuse_d, Delete).unwrap();
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert_eq!(
         conflict_at(&report, "d/f").reason,
@@ -7670,7 +7709,7 @@ fn a_claim_aside_under_a_refused_writable_directory_is_still_deletable() {
             EntryPolicy::Replace
         }
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &refuse_d, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &refuse_d, Delete)
         .expect("the sync's own claim aside must not be blocked by the prohibition");
     assert_eq!(conflict_at(&report, "d").reason, ConflictReason::Refused);
     assert!(
@@ -7768,7 +7807,7 @@ fn a_path_that_fails_the_post_settle_verification_is_not_reported_applied() {
         0o555,
         DropModeWhen::AfterRemoval,
     ));
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
     assert_eq!(
         remote.dropped_modes(),
         vec![("d".to_string(), 0o555)],
@@ -7826,7 +7865,7 @@ fn a_published_write_that_fails_stays_indeterminate_after_a_mode_restore() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_write_after_write = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
     // The bytes ARE visible and the mode IS restored...
     assert_eq!(
@@ -7881,7 +7920,7 @@ fn a_changed_symlink_child_under_a_read_only_parent_is_replaced_and_the_parent_r
     }
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert_eq!(
         fs::read_link(dst.join("d/link")).unwrap(),
@@ -7944,7 +7983,7 @@ fn the_failure_path_report_accounts_for_every_diff_entry() {
     assert_eq!(diff.count(EntryDiff::Changed), 1, "{diff:?}");
     assert_eq!(diff.count(EntryDiff::Extraneous), 1, "{diff:?}");
     assert!(diff.count(EntryDiff::Same) >= 1, "{diff:?}");
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     let transient: BTreeSet<&str> = err
         .report()
@@ -7985,7 +8024,7 @@ fn a_read_only_destination_root_on_a_pull_fails_loudly_and_stays_unchanged() {
     let local = dir.path().join("local");
     write(&local.join("f"), b"old");
     set_mode(&local, 0o555);
-    let err = sync(
+    let err = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -8009,7 +8048,7 @@ fn a_read_only_destination_root_on_a_pull_fails_loudly_and_stays_unchanged() {
     let local2 = dir.path().join("local2");
     fs::create_dir_all(&local2).unwrap();
     set_mode(&local2, 0o555);
-    let err = sync(
+    let err = owned(
         Direction::Pull,
         &local2,
         &transport(&remote2),
@@ -8034,7 +8073,7 @@ fn a_read_only_destination_root_on_a_pull_fails_loudly_and_stays_unchanged() {
     fs::create_dir_all(&local3).unwrap();
     std::os::unix::fs::symlink("old-target", local3.join("link")).unwrap();
     set_mode(&local3, 0o555);
-    let err = sync(
+    let err = owned(
         Direction::Pull,
         &local3,
         &transport(&remote3),
@@ -8074,7 +8113,7 @@ fn a_read_only_destination_root_on_a_push_fails_loudly_and_stays_unchanged() {
     fs::create_dir_all(&dst).unwrap();
     set_mode(&dst, 0o555);
 
-    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
     assert_eq!(mode_of(&dst), 0o555, "the root mode is untouched");
     assert!(!dst.join("f").exists(), "nothing was written");
     assert!(
@@ -8127,7 +8166,7 @@ fn a_claim_rename_whose_location_cannot_be_confirmed_names_both_possibilities() 
     // The follow-up probe of the aside ALSO fails, so the location cannot be
     // confirmed.
     remote.fail_metadata_for_reserved_after_rename = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     // The claim LANDED: the real path is gone and the aside holds the copy.
     assert!(!dst.join("p").exists(), "the landed claim moved `p` aside");
@@ -8189,7 +8228,7 @@ fn a_claim_rename_whose_entry_vanished_names_both_possibilities() {
     // rename #1 DELETES the source entry and reports failure: neither spelling
     // now exists.
     remote.vanish_nth_rename = Some(1);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     assert!(!dst.join("p").exists(), "the source spelling is gone");
     assert_no_aside(&dst);
@@ -8231,7 +8270,7 @@ fn a_claim_rename_that_fails_without_landing_records_no_stranded_aside() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     // rename #1 is the claim; it fails WITHOUT moving anything.
     remote.fail_nth_rename = Some(1);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -8287,7 +8326,7 @@ fn a_widened_file_whose_write_succeeded_is_not_reverted_by_a_later_failure() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     // `f` (the first path-ordered entry) is written; `z` fails after it.
     remote.fail_nth_write = Some(2);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
     assert_eq!(read(&dst.join("f")), b"new", "the first write landed");
     assert_eq!(
@@ -8327,7 +8366,7 @@ fn a_pull_changed_file_and_symlink_under_a_read_only_parent_transfer_and_restore
         set_mode(&root.join("d"), 0o555);
     }
 
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -8376,7 +8415,7 @@ fn an_unreadable_far_side_root_is_an_error_and_destroys_nothing() {
         stderr: format!("cannot open {}: Permission denied", remote_root.display()),
         timeout_cause: None,
     });
-    let err = sync(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Pull, &local, &remote, &ReplaceAll, Delete).unwrap_err();
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     assert!(
         err.error().to_string().contains("Permission denied"),
@@ -8407,7 +8446,7 @@ fn append_tail_file_over_a_read_only_directory_on_a_pull_destroys_nothing() {
     write(&local.join("p/keep"), b"keep");
     set_mode(&local.join("p"), 0o555);
 
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -8501,7 +8540,7 @@ fn a_rollback_rename_whose_location_cannot_be_confirmed_names_both_possibilities
     remote.fail_nth_rename = Some(2);
     // The probe of the reserved aside then fails too.
     remote.fail_metadata_for_reserved_after_rename = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     let aside = remote.rename_targets().into_iter().next().unwrap();
     // The rollback did not land, so the real path is still gone.
@@ -8547,7 +8586,7 @@ fn an_unconfirmed_move_of_a_residue_free_subtree_names_both_possibilities() {
     // The follow-up probe of the aside ALSO fails, so the location cannot be
     // confirmed.
     remote.fail_metadata_for_reserved_after_rename = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     let aside = remote.rename_targets().into_iter().next().unwrap();
     // The claim LANDED: the real path is gone and the aside holds the copy.
@@ -8612,7 +8651,7 @@ fn a_leftover_aside_removal_that_lands_and_reports_failure_names_no_absent_aside
     // The install succeeds; deleting the aside UNLINKS it and THEN reports
     // failure — the removal landed.
     remote.fail_nth_remove_after_remove = Some(1);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
     // The destination is correct and no aside survives.
     assert_eq!(read(&dst.join("p")), b"new");
@@ -8672,7 +8711,7 @@ fn a_stranded_aside_whose_probe_fails_is_named_as_a_possibility() {
     // (3) The read-back probe of the claimed aside fails too, so its presence
     //     cannot be confirmed.
     remote.fail_metadata_for_reserved_after_rename = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     // The claim landed: the original tree is at the aside and holds the copy.
     let aside = remote.rename_targets().into_iter().next().unwrap();
@@ -8724,7 +8763,7 @@ fn a_decomposed_source_name_is_refused_at_manifest_time_and_mutates_nothing() {
     write(&src.join(DECOMPOSED_NAME), b"new");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = match sync(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
+    let err = match owned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
         Ok(report) => {
             panic!("a source name that is not NFC must be REFUSED, not synced: {report:?}")
         }
@@ -8778,7 +8817,7 @@ fn a_decomposed_destination_name_is_refused_instead_of_landing_a_second_entry() 
     write(&dst.join(DECOMPOSED_NAME), b"old");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = match sync(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
+    let err = match owned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
         Ok(report) => panic!(
             "a destination name that is not NFC must be REFUSED, not synced into a \
              second entry: {report:?}"
@@ -8832,7 +8871,7 @@ fn delete_extraneous_never_silently_spares_a_decomposed_destination_entry() {
     write(&dst.join(DECOMPOSED_NAME), b"extra");
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = match sync(Direction::Push, &src, &remote, &ReplaceAll, Delete) {
+    let err = match owned(Direction::Push, &src, &remote, &ReplaceAll, Delete) {
         Ok(report) => panic!(
             "delete_extraneous must not report success while a decomposed entry it \
              addressed by its NFC spelling survives: {report:?}"
@@ -8879,7 +8918,7 @@ fn a_leftover_directory_aside_does_not_claim_to_still_hold_the_original() {
     // The FIRST descendant unlink LANDS and then reports failure, so the aside
     // directory remains with `child` already gone.
     remote.fail_nth_remove_after_remove = Some(1);
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
 
     assert!(
         err.report().applied.contains(&"p".to_string()),
@@ -8924,7 +8963,7 @@ fn a_tab_in_a_source_symlink_target_is_refused_at_manifest_time() {
     std::os::unix::fs::symlink("a\tb", src.join("l")).unwrap();
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = match sync(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
+    let err = match owned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
         Ok(report) => panic!(
             "a symlink target containing a tab cannot be represented on the \
              tab-separated wire and must be REFUSED, not synced: {report:?}"
@@ -8970,7 +9009,7 @@ fn a_tab_in_a_remote_symlink_target_is_refused_not_installed_truncated() {
     // is_local = false so the FAR-SIDE script (not the in-process walk)
     // describes the source tree: that is the path where the tab truncates.
     let remote = RecordingRemote::over(transport(&remote_root), false);
-    let err = match sync(Direction::Pull, &local, &remote, &ReplaceAll, Keep) {
+    let err = match owned(Direction::Pull, &local, &remote, &ReplaceAll, Keep) {
         Ok(report) => panic!(
             "a remote symlink target containing a tab must be REFUSED, not \
              installed with a truncated target: {report:?}"
@@ -9009,7 +9048,7 @@ fn a_tab_in_a_remote_destination_symlink_target_is_refused_not_read_as_same() {
     std::os::unix::fs::symlink("a\tb", remote_root.join("l")).unwrap();
 
     let remote = RecordingRemote::over(transport(&remote_root), false);
-    let err = match sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
+    let err = match unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
         Ok(report) => panic!(
             "the destination's real target `a\\tb` must not be silently \
              addressed as `a` (which reads as `Same`): {report:?}"
@@ -9052,7 +9091,7 @@ fn a_non_utf8_symlink_target_is_refused_at_manifest_time_and_mutates_nothing() {
     std::os::unix::fs::symlink(OsStr::from_bytes(raw), src.join("l")).unwrap();
 
     let remote = RecordingRemote::over(transport(&dst), true);
-    let err = match sync(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
+    let err = match owned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
         Ok(report) => panic!(
             "a symlink target that is not valid UTF-8 cannot be stored \
              faithfully and must be REFUSED, not synced: {report:?}"
@@ -9113,7 +9152,7 @@ fn a_non_utf8_remote_destination_name_is_refused_instead_of_silently_spared() {
 
     // The far-side script describes the REMOTE destination tree.
     let remote = RecordingRemote::over(transport(&remote_root), false);
-    let err = match sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete) {
+    let err = match unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete) {
         Ok(report) => panic!(
             "a destination name that is not valid UTF-8 must be REFUSED, not \
              reported `Ok` with a surviving entry: {report:?}"
@@ -9164,7 +9203,7 @@ fn a_case_folded_source_name_is_reported_not_silently_applied() {
     write(&src.join("Foo.txt"), b"new");
     write(&dst.join("foo.txt"), b"old");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     let src_tree = canonicalize_tree(&src).unwrap();
     let dst_tree = canonicalize_tree(&dst).unwrap();
     if report.conflicts.is_empty() {
@@ -9215,7 +9254,7 @@ fn delete_extraneous_never_destroys_a_case_aliased_transfer() {
     write(&src.join("Foo.txt"), b"new");
     write(&dst.join("foo.txt"), b"old");
 
-    let result = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete);
+    let result = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete);
     // The sanctioned removal must not destroy the destination-only spelling that
     // is the source entry's folded alias: the destination is not left empty.
     assert_eq!(
@@ -9286,7 +9325,7 @@ fn a_case_colliding_source_pair_is_reported_not_silently_lost() {
         format!("Foo.txt\tf\t1a4\t1\t{content_hash}\t\nfoo.txt\tf\t1a4\t1\t{content_hash}\t\n");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let report = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
     assert!(
         !report.conflicts.is_empty(),
         "one member of a case-colliding pair cannot exist and must be reported: {report:?}"
@@ -9336,7 +9375,7 @@ fn a_case_differing_source_pair_transfers_on_a_case_sensitive_destination() {
     write(&src.join("Foo.txt"), b"upper");
     write(&src.join("foo.txt"), b"lower");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(
         report.conflicts.is_empty(),
         "a case-sensitive destination represents both entries: {:?}",
@@ -9371,7 +9410,7 @@ fn a_plain_same_case_transfer_is_still_reported_applied() {
     write(&src.join("f"), b"new");
     write(&dst.join("f"), b"old");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
     assert!(report.applied.iter().any(|path| path == "f"), "{report:?}");
     assert!(
@@ -9408,7 +9447,7 @@ fn a_name_conflict_names_the_on_disk_spelling() {
     write(&src.join("Foo.txt"), b"new");
     write(&dst.join("foo.txt"), b"old");
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
     let conflict = conflict_at(&report, "Foo.txt");
     assert_eq!(conflict.reason, ConflictReason::NameNotFaithful);
     assert_eq!(
@@ -9441,7 +9480,7 @@ fn delete_extraneous_never_destroys_a_nested_case_aliased_transfer() {
     write(&src.join("d").join("Foo.txt"), b"new");
     write(&dst.join("d").join("foo.txt"), b"old");
 
-    let result = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete);
+    let result = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete);
     assert_eq!(
         dir_names(&dst.join("d")),
         vec![std::ffi::OsString::from("foo.txt")],
@@ -9523,7 +9562,7 @@ fn a_unicode_case_fold_never_overwrites_a_destination_entry() {
     write(&src.join("other.txt"), b"CCCC");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let report = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
 
     // The victim's CONTENT is unchanged, byte-for-byte: a `Skipped` entry
     // needed no mutation at all.
@@ -9600,7 +9639,7 @@ fn delete_extraneous_never_destroys_a_unicode_case_aliased_transfer() {
     write(&src.join("Straße.txt"), b"AAAA");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let result = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Delete);
+    let result = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Delete);
     let report = match result {
         Ok(report) => report,
         Err(err) => err.into_parts().1,
@@ -9668,7 +9707,7 @@ fn a_nested_unicode_case_fold_never_overwrites_a_destination_entry() {
     write(&src.join("d").join("other.txt"), b"CCCC");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let report = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
     assert_eq!(
         read(&dst.join("d").join("STRASSE.txt")),
         b"BBBB",
@@ -9719,7 +9758,7 @@ fn a_folded_parent_component_never_mutates_an_unreported_path() {
     let manifest = format!("ς\td\t1ed\t1\t\t\nς/child\tf\t1a4\t1\t{child}\t\n");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let result = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep);
     let report = match result {
         Ok(report) => report,
         Err(err) => err.into_parts().1,
@@ -9797,7 +9836,7 @@ fn a_case_colliding_pair_is_a_clean_conflict_not_a_verification_failure() {
     write(&src.join("Foo"), b"A");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let report = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep).unwrap();
     // A clean up-front conflict, not a post-transfer verification failure.
     assert!(
         report.verify_failures.is_empty(),
@@ -9840,7 +9879,7 @@ fn a_fully_refused_case_pair_leaves_the_destination_root_absent() {
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
     let refuse = |_: &str, _: EntryKind| EntryPolicy::Refuse;
 
-    let report = sync(Direction::Pull, &dst, &remote, &refuse, Keep).unwrap();
+    let report = owned(Direction::Pull, &dst, &remote, &refuse, Keep).unwrap();
     assert_eq!(report.transfers, 0, "{report:?}");
     assert!(report.applied.is_empty(), "{report:?}");
     assert!(
@@ -9902,7 +9941,7 @@ fn a_non_parent_closed_source_manifest_is_refused_before_any_mutation() {
     let manifest = format!("d/x\tf\t1a4\t1\t{hash}\t\n");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let result = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep);
     let err = match result {
         Ok(report) => panic!(
             "a non-parent-closed manifest must be refused, not reported as an \
@@ -9962,7 +10001,7 @@ fn a_non_parent_closed_manifest_cannot_invent_a_parent_spelling() {
     let manifest = format!("d/x\tf\t1a4\t1\t{hash}\t\n");
     let remote = RecordingRemote::over(transport(&src), false).with_manifest_output(manifest);
 
-    let result = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Keep);
     let err = match result {
         Ok(report) => panic!(
             "the crafted manifest names `d/x` while the destination holds `D/x`; \
@@ -10024,7 +10063,7 @@ fn a_folded_ancestor_after_an_install_is_not_reported_applied() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::Rename("a/b".to_string(), "a/B".to_string())));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     // The refusal may surface as a conflict on an `Ok` run or as an error; the
     // report is the same either way, and the child is never `applied`.
     let report = match result {
@@ -10070,7 +10109,7 @@ fn an_unplanned_destination_entry_is_an_error_not_a_silent_ok() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::CreateFile("d/y".to_string())));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     let err = match result {
         Ok(report) => panic!("an unplanned on-disk entry must not be an `Ok` run: {report:?}"),
         Err(err) => err,
@@ -10097,7 +10136,7 @@ fn an_unplanned_root_entry_names_the_destination_root() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::CreateFile("zzz".to_string())));
 
-    let err = match sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
+    let err = match unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep) {
         Ok(report) => panic!("an unplanned root entry must not be an `Ok` run: {report:?}"),
         Err(err) => err,
     };
@@ -10133,7 +10172,7 @@ fn a_claimed_untouched_entry_changed_by_a_writer_is_not_reported_skipped() {
         AfterWrite::Overwrite("d/skip".to_string(), b"CHANGED".to_vec()),
     ));
 
-    let report = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(
         !report.skipped.iter().any(|p| p == "d/skip"),
         "an entry whose content changed under the run is not a no-mutation \
@@ -10166,7 +10205,7 @@ fn a_failed_verification_read_is_an_infrastructure_error_not_a_content_mismatch(
     // `verify_claimed_untouched`.
     remote.fail_read_for = Some("d/skip".to_string());
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     let err = match result {
         Ok(report) => panic!(
             "a failed verification read must not return Ok with a content-mismatch claim: {report:?}"
@@ -10233,7 +10272,7 @@ fn a_mode_only_transfer_is_content_verified() {
         AfterWrite::Overwrite("f".to_string(), b"MUTATED".to_vec()),
     ));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     // A failed post-transfer check makes the RUN an error; the report is still
     // the honest account of what landed.
     let report = match result {
@@ -10285,7 +10324,7 @@ fn an_append_mode_only_transfer_is_content_verified() {
         AfterWrite::Overwrite("f".to_string(), b"MUTATED".to_vec()),
     ));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &append_files, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &append_files, Keep);
     let report = match result {
         Ok(report) => report,
         Err(err) => err.into_parts().1,
@@ -10323,7 +10362,7 @@ fn a_same_directory_replaced_by_a_file_is_not_reported_skipped() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::ReplaceDirWithFile("d".to_string())));
 
-    let report = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
     assert!(
         !report.skipped.iter().any(|p| p == "d"),
         "a directory replaced by a file is not a no-mutation claim: {report:?}"
@@ -10368,7 +10407,7 @@ fn an_unplanned_raw_non_utf8_destination_name_is_an_error_not_a_silent_ok() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::RawName(b"\xff".to_vec())));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     let err = match result {
         Ok(report) => panic!(
             "an unplanned raw non-UTF-8 destination name must not be an `Ok` run: \
@@ -10425,7 +10464,7 @@ fn a_non_utf8_destination_directory_is_never_removed_from_and_fails_closed() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::RawName(b"\xff".to_vec())));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
     match result {
         Ok(report) => panic!(
             "a destination the run cannot enumerate must fail closed even when \
@@ -10491,7 +10530,7 @@ fn delete_extraneous_never_removes_from_a_directory_it_cannot_enumerate() {
         AfterWrite::RawNameUnder("d".to_string(), b"\xff".to_vec()),
     ));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
     if let Ok(report) = result {
         panic!(
             "a directory the removal pass cannot enumerate must fail closed, not \
@@ -10523,7 +10562,7 @@ fn a_transferred_directory_replaced_by_a_file_is_not_reported_applied() {
     let mut remote = RecordingRemote::over(transport(&dst), false);
     remote.after_write = Some((1, AfterWrite::ReplaceDirWithFile("d".to_string())));
 
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     let report = match result {
         Ok(report) => report,
         Err(err) => err.into_parts().1,
@@ -10601,7 +10640,7 @@ fn an_extraneous_removal_never_follows_a_swapped_directory_symlink() {
 
     let remote = RecordingRemote::over(transport(&dst), true)
         .swapping_before_first_op(dst.join("d"), outside.clone());
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
     assert!(
         outside.join("y").exists(),
         "the run DESTROYED a file OUTSIDE the destination root through a \
@@ -10637,7 +10676,7 @@ fn an_install_never_follows_a_swapped_directory_symlink() {
 
     let remote = RecordingRemote::over(transport(&dst), true)
         .swapping_before_first_op(dst.join("d"), outside.clone());
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     assert!(
         !outside.join("x").exists(),
         "the run INSTALLED a file OUTSIDE the destination root through a \
@@ -10674,7 +10713,7 @@ fn a_preexisting_directory_symlink_is_refused_for_extraneous_removal() {
     let hash = crate::digest::sha256_bytes(b"y");
     let manifest = format!("d\td\t1ed\t1\t\t\nd/y\tf\t1a4\t1\t{hash}\t\n");
     let remote = RecordingRemote::over(transport(&dst), false).with_manifest_output(manifest);
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
     assert!(
         outside.join("y").exists(),
         "the run DESTROYED OUTSIDE/y through a pre-existing symlinked directory; \
@@ -10715,7 +10754,7 @@ fn a_preexisting_directory_symlink_is_refused_for_install() {
     let manifest = "d\td\t1ed\t1\t\t\n";
     let remote =
         RecordingRemote::over(transport(&dst), false).with_manifest_output(manifest.to_string());
-    let result = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     assert!(
         !outside.join("x").exists(),
         "the run INSTALLED OUTSIDE/x through a pre-existing symlinked directory; \
@@ -10760,7 +10799,7 @@ fn a_live_symlink_where_the_manifest_says_dir_is_not_an_intact_directory() {
     let manifest = "d\td\t1ed\t1\t\t\n";
     let remote =
         RecordingRemote::over(transport(&dst), false).with_manifest_output(manifest.to_string());
-    let report = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+    let report = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
         .expect("no destination mutation is required");
     assert!(
         !report.skipped.contains(&"d".to_string()),
@@ -10792,7 +10831,7 @@ fn local_and_remote_destinations_agree_a_swapped_symlink_is_not_followed() {
     fs::create_dir_all(&outside_remote).unwrap();
     let remote_dest = RecordingRemote::over(transport(&dst), true)
         .swapping_before_first_op(dst.join("d"), outside_remote.clone());
-    let _ = sync(Direction::Push, &src, &remote_dest, &ReplaceAll, Keep);
+    let _ = owned(Direction::Push, &src, &remote_dest, &ReplaceAll, Keep);
     let remote_created = outside_remote.join("x").exists();
 
     // (b) Local destination (Pull): the swap fires before the SOURCE's first
@@ -10806,7 +10845,7 @@ fn local_and_remote_destinations_agree_a_swapped_symlink_is_not_followed() {
     fs::create_dir_all(&outside_local).unwrap();
     let remote_src = RecordingRemote::over(transport(&src2), true)
         .swapping_before_first_op(local.join("d"), outside_local.clone());
-    let _ = sync(Direction::Pull, &local, &remote_src, &ReplaceAll, Keep);
+    let _ = owned(Direction::Pull, &local, &remote_src, &ReplaceAll, Keep);
     let local_created = outside_local.join("x").exists();
 
     assert_eq!(
@@ -10853,7 +10892,7 @@ fn a_path_based_destination_refuses_a_directory_swapped_for_a_symlink_after_a_tr
         1,
         AfterWrite::ReplaceDirWithSymlink("a".to_string(), outside.clone()),
     );
-    let error = sync_unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+    let error = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
         .expect_err("a swapped directory component must be refused, not followed");
 
     // THE DECISIVE ASSERTION: NOTHING was created or overwritten outside the
@@ -10905,7 +10944,7 @@ fn a_skipped_path_whose_verification_could_not_run_is_not_reported_skipped() {
     let mut remote = RecordingRemote::over(transport(&dst), true);
     // `d/y` (Changed) is written first; the writer then makes `d` unreadable.
     remote.after_write = Some((1, AfterWrite::Chmod("d".to_string(), 0o000)));
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     let report = match result {
         Ok(report) => panic!("an unenumerable directory must fail closed: {report:?}"),
         Err(error) => error.into_parts().1,
@@ -10945,7 +10984,7 @@ fn a_skipped_path_under_a_raw_named_directory_is_not_reported_skipped() {
         1,
         AfterWrite::RawNameUnder("d".to_string(), b"\xff".to_vec()),
     ));
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     assert!(
         result.is_err(),
         "a directory the run cannot enumerate must fail closed: {result:?}"
@@ -10984,7 +11023,7 @@ fn an_own_claim_removal_never_destroys_a_live_unaddressed_child() {
         1,
         AfterWrite::Overwrite("a/extra".to_string(), b"KEEP".to_vec()),
     ));
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
 
     let survivor = find_named(&dst, "extra");
     assert!(
@@ -11017,7 +11056,7 @@ fn an_own_claim_removal_never_destroys_a_live_nested_unaddressed_child() {
     // neither is a manifest entry (a manifest-known child would make the
     // directory non-empty and block the replacement entirely).
     remote.after_write = Some((1, AfterWrite::CreateFile("a/b/extra".to_string())));
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
 
     let survivor = find_named(&dst, "extra");
     assert!(
@@ -11161,7 +11200,7 @@ fn a_claim_window_writer_subtree_survives_every_rollback_campaign_case() {
                     remote.fail_create_dir_all_after_create = true;
                 }
 
-                let result = sync(Direction::Push, &src, &remote, &ReplaceAll, extraneous);
+                let result = owned(Direction::Push, &src, &remote, &ReplaceAll, extraneous);
 
                 let context =
                     format!("src={src_kind:?} dst={dst_kind:?} extraneous={extraneous:?}");
@@ -11207,7 +11246,7 @@ fn a_rolled_back_failure_still_names_the_path_it_touched() {
 
     let mut remote = RecordingRemote::over(transport(&dst), true);
     remote.fail_create_dir_all_after_create = true;
-    let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
 
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -11248,7 +11287,7 @@ fn a_rollback_never_displaces_a_writer_entry_at_its_target() {
         1,
         AfterWrite::Overwrite("p".to_string(), b"WRITER-AT-TARGET".to_vec()),
     ));
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
 
     assert_eq!(
         read(&dst.join("p")),
@@ -11303,7 +11342,7 @@ fn a_live_directory_is_never_chmodded_by_a_mode_only_file_transfer() {
         b"WRITER-DATA".to_vec(),
     ));
 
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
     let live = fs::symlink_metadata(dst.join("p")).unwrap();
     assert!(
         !live.is_dir(),
@@ -11354,7 +11393,7 @@ fn a_skipped_path_under_an_untouched_directory_is_reported_on_the_manifest_alone
         "a/f".to_string(),
         b"WRITER-CHANGED".to_vec(),
     ));
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap();
 
     // `a` is NOT a touched directory (nothing under it transfers), so the run
     // makes no re-confirmation claim about `a/f`; it is reported on the
@@ -11396,7 +11435,7 @@ fn a_claim_window_writer_source_addressed_child_is_preserved_under_own_partial()
         AfterWrite::WriteTree("p/f".to_string(), b"WRITER-CHILD".to_vec()),
     ));
     remote.fail_create_dir_all_after_create = true;
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep);
 
     let survivor = find_named(&dst, "f").unwrap_or_else(|| {
         panic!("the writer's source-addressed child must survive (or be named): {result:?}")
@@ -11493,7 +11532,7 @@ fn confined_pull_live_kind_swap_scenario(src_kind: EntryKind) {
         ),
     ));
 
-    let result = sync(Direction::Pull, &local, &remote, &ReplaceAll, Keep);
+    let result = owned(Direction::Pull, &local, &remote, &ReplaceAll, Keep);
     let context = format!("src={src_kind:?}");
 
     let survivor = find_named(&local, "gc").unwrap_or_else(|| {
@@ -11587,7 +11626,7 @@ fn a_confined_pull_claim_window_campaign() {
                         remote.fail_nth_read = Some(2);
                     }
 
-                    let result = sync(Direction::Pull, &local, &remote, &ReplaceAll, extraneous);
+                    let result = owned(Direction::Pull, &local, &remote, &ReplaceAll, extraneous);
                     let context = format!(
                         "src={src_kind:?} dst={dst_kind:?} extraneous={extraneous:?} fail={inject_failure}"
                     );
@@ -11676,7 +11715,7 @@ fn a_restore_never_applies_a_recorded_mode_to_a_live_kind_it_never_recorded() {
         ),
     ));
 
-    let error = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
+    let error = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep).unwrap_err();
     let live = fs::symlink_metadata(dst.join("p")).unwrap();
     assert!(
         live.is_dir(),
@@ -11736,7 +11775,7 @@ fn a_late_child_in_the_removal_window_is_refused_and_preserved() {
         1,
         AfterWrite::WriteTree("d/late".to_string(), b"LATE".to_vec()),
     ));
-    let result = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete);
+    let result = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete);
 
     let late = dst.join("d/late");
     assert!(
@@ -11824,7 +11863,7 @@ fn a_deep_destination_tree_is_removed_without_aborting_the_process() {
         let dst = std::path::PathBuf::from(std::env::var_os(DEEP_TREE_DST).unwrap());
         let handle = std::thread::Builder::new()
             .stack_size(DEEP_TREE_STACK_BYTES)
-            .spawn(move || sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete))
+            .spawn(move || owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete))
             .expect("spawn the deep-removal thread");
         let joined = handle.join().expect("the removal thread must not panic");
         let report = joined.unwrap_or_else(|error| panic!("the sync must succeed: {error:?}"));
@@ -12013,7 +12052,7 @@ fn destination_lock_child_holder() {
         }
         EntryPolicy::Replace
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &policy, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &policy, Keep).unwrap();
     assert!(report.applied.contains(&"f".to_string()), "{report:?}");
 }
 
@@ -12050,7 +12089,7 @@ fn the_destination_lock_is_held_during_the_run_and_released_after() {
         );
         EntryPolicy::Replace
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &probe, Keep).unwrap();
+    let report = owned(Direction::Push, &src, &transport(&dst), &probe, Keep).unwrap();
     assert!(report.applied.contains(&"f".to_string()), "{report:?}");
 
     // The guard has dropped: the record is free again.
@@ -12080,7 +12119,7 @@ fn an_error_exit_releases_the_destination_lock() {
     let missing = dir.path().join("missing-source");
     let dst_before = dir.path().join("dst-before");
     let lock_before = destination_lock_path(&dst_before).unwrap();
-    let err = sync(
+    let err = owned(
         Direction::Push,
         &missing,
         &transport(&dst_before),
@@ -12108,7 +12147,7 @@ fn an_error_exit_releases_the_destination_lock() {
     let dst_after = dir.path().join("dst-after");
     fs::write(&dst_after, b"not a directory").unwrap();
     let lock_after = destination_lock_path(&dst_after).unwrap();
-    let err = sync(
+    let err = owned(
         Direction::Push,
         &src,
         &transport(&dst_after),
@@ -12155,7 +12194,7 @@ fn two_concurrent_syncs_against_one_destination_do_not_interleave() {
         "the holder never reported holding the lock"
     );
 
-    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
         .expect_err("the second run must be refused while the holder holds the lock");
     assert!(
         err.error().to_string().contains("held by"),
@@ -12224,11 +12263,11 @@ fn a_killed_holder_releases_the_destination_lock() {
     );
 }
 
-/// THE API SPLIT. The owned default REFUSES a destination whose lock the crate
-/// cannot take (here: a destination that declares itself REMOTE), mutates
-/// nothing, and names the entry point that states the weaker guarantee. An
-/// agentic caller therefore cannot reach an unowned run by reaching for
-/// `sync`; it has to type `sync_unowned`.
+/// THE OWNERSHIP AXIS. The owned path REFUSES a destination whose lock the
+/// crate cannot take (here: a destination that declares itself REMOTE),
+/// mutates nothing, and names the value that states the weaker guarantee. An
+/// agentic caller therefore cannot reach an unowned run by taking ownership;
+/// it has to type `DestinationOwnership::Unowned`.
 ///
 /// This also pins the ORDERING the refusal depends on: the refusal is a PURE
 /// decision taken BEFORE [`Remote::prepare_identity`], so a refused run leaves
@@ -12248,7 +12287,7 @@ fn a_killed_holder_releases_the_destination_lock() {
 /// so this call-count assertion is no longer the only cover for the ordering
 /// gap.
 #[test]
-fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
+fn sync_refuses_a_remote_destination_and_points_at_the_unowned_value() {
     let dir = fixture_tmpdir(&env()).unwrap();
     let src = dir.path().join("src");
     let dst = dir.path().join("dst");
@@ -12256,7 +12295,7 @@ fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
     fs::create_dir_all(&dst).unwrap();
     let before = canonicalize_tree(&dst).unwrap();
     let remote = RecordingRemote::over(transport(&dst), false);
-    let error = sync(
+    let error = owned(
         Direction::Push,
         &src,
         &remote,
@@ -12280,8 +12319,8 @@ fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
     );
     let text = error.to_string();
     assert!(
-        text.contains("sync_unowned"),
-        "the refusal must name the unowned entry point: {text}"
+        text.contains("DestinationOwnership::Unowned"),
+        "the refusal must name the unowned value: {text}"
     );
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -12290,11 +12329,11 @@ fn sync_refuses_a_remote_destination_and_points_at_sync_unowned() {
     );
 }
 
-/// The weak entry point is REACHABLE and correct: an explicitly unowned run
-/// against the same remote destination transfers and verifies normally. The
-/// refusal above is a redirect, not a removal of the capability.
+/// The weak path is REACHABLE and correct: an explicitly unowned run against
+/// the same remote destination transfers and verifies normally. The refusal
+/// above is a redirect, not a removal of the capability.
 #[test]
-fn sync_unowned_runs_against_a_remote_destination_and_still_verifies() {
+fn an_unowned_run_reaches_a_remote_destination_and_still_verifies() {
     let dir = fixture_tmpdir(&env()).unwrap();
     let src = dir.path().join("src");
     let dst = dir.path().join("dst");
@@ -12302,7 +12341,7 @@ fn sync_unowned_runs_against_a_remote_destination_and_still_verifies() {
     write(&src.join("d/g"), b"nested");
     fs::create_dir_all(&dst).unwrap();
     let remote = RecordingRemote::over(transport(&dst), false);
-    let report = sync_unowned(
+    let report = unowned(
         Direction::Push,
         &src,
         &remote,
@@ -12325,6 +12364,46 @@ fn sync_unowned_runs_against_a_remote_destination_and_still_verifies() {
 // ---------------------------------------------------------------------------
 // F1: the sync entry points prepare the transport's host identity.
 // ---------------------------------------------------------------------------
+
+/// The `Locked` token is BOUND to the run it was taken for: a token acquired
+/// for one destination is REFUSED when handed to a run against another, so a
+/// caller cannot take the lock on a destination it will not mutate.
+#[test]
+fn a_destination_ownership_token_is_bound_to_its_run() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"payload");
+    let locked_dst = dir.path().join("locked-dst");
+    let other_dst = dir.path().join("other-dst");
+    fs::create_dir_all(&locked_dst).unwrap();
+    fs::create_dir_all(&other_dst).unwrap();
+    let before = canonicalize_tree(&other_dst).unwrap();
+
+    // Take ownership for `locked_dst`...
+    let ownership = DestinationOwnership::lock(Direction::Push, &src, &transport(&locked_dst))
+        .expect("acquiring the lock for the real destination");
+    // ...and hand it to a run against `other_dst`.
+    let err = sync(
+        Direction::Push,
+        &src,
+        &transport(&other_dst),
+        &ReplaceAll,
+        Keep,
+        ownership,
+    )
+    .expect_err("a token taken for another destination must be refused");
+    assert!(
+        err.error()
+            .to_string()
+            .contains("destination ownership was taken for"),
+        "the refusal must name the mismatch: {err}"
+    );
+    assert_eq!(
+        canonicalize_tree(&other_dst).unwrap(),
+        before,
+        "the mismatched run must mutate nothing"
+    );
+}
 
 /// F1: every sync entry point that reaches the transport runs
 /// [`Remote::prepare_identity`] BEFORE its first remote request.
@@ -12354,9 +12433,9 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
         timeout_cause: None,
     };
 
-    let mut owned = RecordingRemote::over(transport(&remote_root), false);
-    owned.exec_failure = Some(broken_exec());
-    let err = sync(Direction::Pull, &local, &owned, &ReplaceAll, Keep)
+    let mut owned_recorder = RecordingRemote::over(transport(&remote_root), false);
+    owned_recorder.exec_failure = Some(broken_exec());
+    let err = owned(Direction::Pull, &local, &owned_recorder, &ReplaceAll, Keep)
         .expect_err("the far-side manifest command failed");
     assert!(matches!(err.error(), Error::Transport(_)), "got {err:?}");
     // The entry point prepares the transport identity, and the source
@@ -12364,39 +12443,45 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
     // exactly two preparations. What matters is unchanged: EVERY prepare call
     // runs before the FIRST remote request (op index 0).
     assert_eq!(
-        owned.identity_calls(),
+        owned_recorder.identity_calls(),
         2,
-        "the owned entry point prepares once and the self-preparing source manifest primitive \
+        "the owned path prepares once and the self-preparing source manifest primitive \
          prepares again (idempotent)"
     );
     assert_eq!(
-        owned.identity_op_index(),
+        owned_recorder.identity_op_index(),
         vec![0, 0],
         "EVERY prepare_identity call must run before the FIRST remote request"
     );
     assert!(
-        owned.remote_requests() > 0,
+        owned_recorder.remote_requests() > 0,
         "the run must have reached the transport"
     );
 
-    // The explicitly-unowned entry point (the only way to reach a remote
+    // The explicitly-unowned path (the only way to reach a remote
     // destination) prepares too.
-    let mut unowned = RecordingRemote::over(transport(&remote_root), false);
-    unowned.exec_failure = Some(broken_exec());
-    let _ = sync_unowned(Direction::Pull, &local, &unowned, &ReplaceAll, Keep)
-        .expect_err("the far-side manifest command failed");
+    let mut unowned_recorder = RecordingRemote::over(transport(&remote_root), false);
+    unowned_recorder.exec_failure = Some(broken_exec());
+    let _ = unowned(
+        Direction::Pull,
+        &local,
+        &unowned_recorder,
+        &ReplaceAll,
+        Keep,
+    )
+    .expect_err("the far-side manifest command failed");
     assert_eq!(
-        unowned.identity_calls(),
+        unowned_recorder.identity_calls(),
         2,
-        "the unowned entry point prepares once and the self-preparing source manifest primitive \
+        "the unowned path prepares once and the self-preparing source manifest primitive \
          prepares again (idempotent)"
     );
     assert_eq!(
-        unowned.identity_op_index(),
+        unowned_recorder.identity_op_index(),
         vec![0, 0],
         "EVERY prepare_identity call must run before the FIRST remote request"
     );
-    assert!(unowned.remote_requests() > 0);
+    assert!(unowned_recorder.remote_requests() > 0);
 }
 
 /// F1: a failure from the transport's identity preparation surfaces as THAT
@@ -12427,7 +12512,7 @@ fn a_transport_preparation_failure_leaves_nothing_behind() {
 
     // A PULL puts the LOCAL tree on the destination side, so the owned entry
     // point would have taken the destination lock had preparation succeeded.
-    let err = sync(Direction::Pull, &dst, &remote, &ReplaceAll, Delete)
+    let err = owned(Direction::Pull, &dst, &remote, &ReplaceAll, Delete)
         .expect_err("the injected identity preparation failure must fail the run");
     let msg = err.error().to_string();
     assert!(
@@ -12482,7 +12567,7 @@ fn the_sibling_record_does_not_compose_with_the_in_root_layout_lock() {
     // Direction 1: holding the in-root lock does not exclude an owned `sync`.
     let in_root_guard = crate::lock::FileLock::acquire(&in_root, "in-root-holder")
         .expect("take the in-root layout lock");
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
         .expect("the in-root layout lock must not exclude a sync");
     assert!(report.applied.contains(&"f".to_string()), "{report:?}");
     drop(in_root_guard);
@@ -12501,7 +12586,7 @@ fn the_sibling_record_does_not_compose_with_the_in_root_layout_lock() {
         fired.store(true, Ordering::SeqCst);
         EntryPolicy::Replace
     };
-    let report = sync(Direction::Push, &src, &transport(&dst), &probe, Keep)
+    let report = owned(Direction::Push, &src, &transport(&dst), &probe, Keep)
         .expect("the run must succeed with the in-run probe");
     assert!(
         probe_fired.load(Ordering::SeqCst),
@@ -12585,7 +12670,7 @@ fn a_source_that_changes_after_the_plan_fails_closed_and_names_the_path() {
         src.clone(),
         AfterWrite::Overwrite("a".to_string(), b"CHANGED".to_vec()),
     ));
-    let error = sync(
+    let error = owned(
         Direction::Pull,
         &local,
         &remote,
@@ -12641,7 +12726,7 @@ fn destination_lock_relative_root_child() {
     let src = PathBuf::from(std::env::var_os(RELATIVE_ROOT_SRC).unwrap());
     let result = PathBuf::from(std::env::var_os(RELATIVE_ROOT_RESULT).unwrap());
     std::env::set_current_dir(&work).expect("chdir into the work directory");
-    let outcome = match sync(
+    let outcome = match owned(
         Direction::Pull,
         Path::new("local"),
         &transport(&src),
@@ -12725,7 +12810,7 @@ fn taking_the_destination_lock_does_not_narrow_a_missing_parent_to_store_private
     // OWNED: the lock's sibling record needs the missing parent chain.
     let owned_parent = dir.path().join("owned-parent");
     let owned_dest = owned_parent.join("local");
-    sync(
+    owned(
         Direction::Pull,
         &owned_dest,
         &transport(&remote_root),
@@ -12738,7 +12823,7 @@ fn taking_the_destination_lock_does_not_narrow_a_missing_parent_to_store_private
     // UNOWNED: the run's own `create_dir_all` creates the same missing chain.
     let unowned_parent = dir.path().join("unowned-parent");
     let unowned_dest = unowned_parent.join("local");
-    sync_unowned(
+    unowned(
         Direction::Pull,
         &unowned_dest,
         &transport(&remote_root),
@@ -12770,7 +12855,7 @@ fn taking_the_destination_lock_does_not_narrow_a_missing_parent_to_store_private
     let refused_parent = dir.path().join("refused-parent");
     let refused_dest = refused_parent.join("local");
     let refuse = |_: &str, _: EntryKind| EntryPolicy::Refuse;
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &refused_dest,
         &transport(&remote_root),
@@ -12810,7 +12895,7 @@ fn removing_an_all_extraneous_nested_chain_does_not_fail_the_removal_verify() {
     let local = dir.path().join("local");
     write(&local.join("d/d/f"), b"gone");
 
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -12982,7 +13067,7 @@ fn push_to_a_fresh_destination_root_creates_it() {
     );
 
     let remote = transport(&dst_root);
-    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+    let report = owned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
         .expect("a push to a fresh destination must create and use the root");
 
     assert!(dst_root.is_dir(), "the destination root was created");
@@ -13002,7 +13087,7 @@ fn push_unowned_to_a_fresh_destination_root_creates_it() {
     let dst_root = dir.path().join("fresh-dst-unowned");
 
     let remote = transport(&dst_root);
-    let report = push_unowned(&src, &remote, &ReplaceAll)
+    let report = unowned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
         .expect("an unowned push to a fresh destination must create the root");
 
     assert!(dst_root.is_dir(), "the destination root was created");
@@ -13021,7 +13106,7 @@ fn push_to_a_fresh_destination_works_with_an_empty_layout() {
     let dst_root = dir.path().join("empty-layout-dst");
 
     let remote = transport(&dst_root);
-    sync(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+    owned(Direction::Push, &src, &remote, &ReplaceAll, Keep)
         .expect("Layout::empty() must provision a fresh destination");
 
     // No SPURIOUS entries: only what the source holds (plus the directory the
@@ -13070,7 +13155,7 @@ fn sanctioned_delete_clears_an_absolute_symlink_destination_entry() {
         )
     );
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect("a sanctioned deletion of an absolute-symlink destination entry must run");
 
     assert!(
@@ -13104,7 +13189,7 @@ fn sanctioned_delete_clears_an_escaping_symlink_destination_entry() {
         )
     );
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect("a sanctioned deletion of an escaping-symlink destination entry must run");
 
     assert!(
@@ -13151,7 +13236,7 @@ fn sanctioned_delete_clears_a_hard_link_destination_entry_without_touching_its_t
         "{strict}"
     );
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect("a sanctioned deletion of a hard-link destination entry must run");
 
     assert!(
@@ -13199,7 +13284,7 @@ fn sanctioned_delete_clears_an_absolute_symlink_in_a_local_pull_destination() {
         )
     );
 
-    let report = sync(
+    let report = owned(
         Direction::Pull,
         &local,
         &transport(&remote_root),
@@ -13229,7 +13314,7 @@ fn keep_reports_an_unsupported_destination_entry_without_failing_the_run() {
     fs::create_dir_all(&dst).unwrap();
     symlink("/opt/app/v1", dst.join("current")).unwrap();
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
         .expect("a kept unsupported destination entry must be reported, not fatal");
 
     assert!(
@@ -13279,7 +13364,7 @@ fn the_report_explains_a_tolerated_hard_link_destination_entry() {
         "premise: the destination entries are hard links"
     );
 
-    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
         .expect("a kept unsupported destination entry must be reported, not fatal");
 
     assert!(
@@ -13319,7 +13404,7 @@ fn a_source_entry_over_an_unsupported_destination_entry_is_refused_before_any_tr
     fs::create_dir_all(&dst).unwrap();
     symlink("/opt/app/v1", dst.join("current")).unwrap();
 
-    let failure = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+    let failure = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
         .expect_err("writing over an unsupported destination entry must be refused");
 
     let message = failure.to_string();

@@ -18,8 +18,32 @@
 #![cfg(unix)]
 
 use storekit::env::SysEnv;
-use storekit::sync::{ReplaceAll, push};
-use storekit::transport::{Layout, LocalTransport};
+use storekit::sync::{
+    DestinationOwnership, Direction, Extraneous, Policy, ReplaceAll, SyncError, SyncResult, sync,
+};
+use storekit::transport::{Layout, LocalTransport, Remote};
+
+/// The owned push through the ONE entry point: acquire the destination's
+/// operation lock with `DestinationOwnership::lock` (the only way to obtain
+/// `DestinationOwnership::Locked`) and then run. A refusal during acquisition
+/// is surfaced as the same `SyncError` the run itself would return.
+fn owned_push(
+    local_root: &std::path::Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+) -> SyncResult {
+    match DestinationOwnership::lock(Direction::Push, local_root, remote) {
+        Ok(ownership) => sync(
+            Direction::Push,
+            local_root,
+            remote,
+            policy,
+            Extraneous::Keep,
+            ownership,
+        ),
+        Err(error) => Err(SyncError::from(error)),
+    }
+}
 
 /// The marker variable the child process sets; the parent test returns early
 /// when it is set, and the child body returns early when it is not.
@@ -97,7 +121,7 @@ fn push_mid_write_failure_leaves_previous_content_intact_child() {
 
     let transport =
         LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).expect("build");
-    let result = push(&src, &transport, &ReplaceAll);
+    let result = owned_push(&src, &transport, &ReplaceAll);
     assert!(
         result.is_err(),
         "the push MUST fail when the destination write cannot complete: {result:?}"
@@ -171,7 +195,7 @@ fn push_names_at_the_name_max_boundary_are_transferable() {
 
     let transport = LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty())
         .expect("build the local transport");
-    let report = push(&src, &transport, &ReplaceAll)
+    let report = owned_push(&src, &transport, &ReplaceAll)
         .expect("every name up to NAME_MAX is legal and must push");
     assert_eq!(
         report.applied.len(),
