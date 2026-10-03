@@ -45,6 +45,15 @@ sites were verified to be `Sanction::None` — no site intended only the lock ha
 which is what the design says cannot exist — so the alias was deleted and every
 site now names `refuse_reserved_mutation(…, Sanction::None)`.
 
+**D — one concept, two types. FIXED.** `sync::apply::UnsupportedDestination` was
+a field-for-field copy of `manifest::UnsupportedEntry` (`path`, `reason`), built
+by mapping one to the other, and its own doc said the values were *"preserved
+verbatim from `crate::manifest::UnsupportedEntry`"*. Two names for one thing
+meant any distinction typed on the manifest side had to be added twice or lost
+in transit — which is exactly what happened when the tolerated reason gained a
+kind. The duplicate was deleted; the report now carries the manifest type, so a
+consumer sees the kind, and one `map(…clone…)` step disappeared with it.
+
 **F — a duplicated constant across the platform twins.** `MAX_ANCESTRY` was
 defined independently in `atomic/unix.rs` and `atomic/windows.rs`, both `1 << 16`.
 The two ports enforce the same rule, so the values must agree; two literals are
