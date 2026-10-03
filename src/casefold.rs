@@ -34,24 +34,25 @@
 //! # Provenance
 //!
 //! The table below is the complete set of code points whose full case fold
-//! differs from themselves, with their fold. It was generated from the Unicode
-//! Character Database (Unicode 16.0.0, the version `unicode-normalization`
-//! and the Rust standard library's case tables are built from) with:
+//! differs from themselves, with their fold. It was generated from the `C` +
+//! `F` mappings of the Unicode Character Database `CaseFolding-17.0.0.txt`,
+//! the version declared by the pinned `unicode-normalization 0.1.25`
+//! (`UNICODE_VERSION = (17, 0, 0)`); regenerating it at 16.0.0 instead would
+//! leave the normalization step ([`crate::manifest`] folds from NFD) on 17.0.0
+//! data while the fold skipped the 28 code points 17.0.0 added. (A prior
+//! revision of this comment said the table was generated from "Unicode 16.0.0,
+//! the version `unicode-normalization` is built from" — that was wrong about
+//! the dependency and the pin; 16.0.0 does differ from 17.0.0 by 28 added
+//! `C`/`F` mappings, though it changes no existing one.) The same table is the
+//! `C` + `F` fold (`str.casefold` semantics, no `T` Turkic mappings), which is
+//! the default case fold used by filesystems.
 //!
-//! ```text
-//! python3 -c "import sys
-//! for cp in range(0x110000):
-//!     c = chr(cp)
-//!     f = c.casefold()
-//!     if f != c: print(f'0x{cp:04X} {f!r}')"
-//! ```
-//!
-//! `str.casefold` implements exactly the `C` + `F` mappings (and no `T`
-//! Turkic mappings), which is the default case fold used by filesystems. The
-//! table is sorted by code point so [`case_fold_into`] can binary-search it;
-//! `the_table_is_sorted` below pins that precondition and
+//! The table is sorted by code point so [`case_fold_into`] can binary-search
+//! it; `the_table_is_sorted` below pins that precondition,
 //! `the_fold_covers_the_measured_host_folds` pins the folds the host
-//! measurements depend on.
+//! measurements depend on, and `the_table_covers_the_unicode_17_additions`
+//! pins the 28 `C`/`F` mappings 17.0.0 added over 16.0.0 together with the
+//! total table length, so a future regeneration or hand edit cannot drop one.
 
 /// Every code point whose full case fold differs from itself, sorted by code
 /// point, paired with that fold.
@@ -1207,7 +1208,10 @@ pub(crate) static CASE_FOLD: &[(u32, &str)] = &[
     (0xA7C9, "\u{A7CA}"),
     (0xA7CB, "\u{264}"),
     (0xA7CC, "\u{A7CD}"),
+    (0xA7CE, "\u{A7CF}"),
     (0xA7D0, "\u{A7D1}"),
+    (0xA7D2, "\u{A7D3}"),
+    (0xA7D4, "\u{A7D5}"),
     (0xA7D6, "\u{A7D7}"),
     (0xA7D8, "\u{A7D9}"),
     (0xA7DA, "\u{A7DB}"),
@@ -1579,6 +1583,31 @@ pub(crate) static CASE_FOLD: &[(u32, &str)] = &[
     (0x16E5D, "\u{16E7D}"),
     (0x16E5E, "\u{16E7E}"),
     (0x16E5F, "\u{16E7F}"),
+    (0x16EA0, "\u{16EBB}"),
+    (0x16EA1, "\u{16EBC}"),
+    (0x16EA2, "\u{16EBD}"),
+    (0x16EA3, "\u{16EBE}"),
+    (0x16EA4, "\u{16EBF}"),
+    (0x16EA5, "\u{16EC0}"),
+    (0x16EA6, "\u{16EC1}"),
+    (0x16EA7, "\u{16EC2}"),
+    (0x16EA8, "\u{16EC3}"),
+    (0x16EA9, "\u{16EC4}"),
+    (0x16EAA, "\u{16EC5}"),
+    (0x16EAB, "\u{16EC6}"),
+    (0x16EAC, "\u{16EC7}"),
+    (0x16EAD, "\u{16EC8}"),
+    (0x16EAE, "\u{16EC9}"),
+    (0x16EAF, "\u{16ECA}"),
+    (0x16EB0, "\u{16ECB}"),
+    (0x16EB1, "\u{16ECC}"),
+    (0x16EB2, "\u{16ECD}"),
+    (0x16EB3, "\u{16ECE}"),
+    (0x16EB4, "\u{16ECF}"),
+    (0x16EB5, "\u{16ED0}"),
+    (0x16EB6, "\u{16ED1}"),
+    (0x16EB7, "\u{16ED2}"),
+    (0x16EB8, "\u{16ED3}"),
     (0x1E900, "\u{1E922}"),
     (0x1E901, "\u{1E923}"),
     (0x1E902, "\u{1E924}"),
@@ -1694,5 +1723,33 @@ mod tests {
             let once = case_fold(s);
             assert_eq!(case_fold(&once), once, "{s:?} must fold idempotently");
         }
+    }
+
+    /// The 28 `C`/`F` mappings Unicode 17.0.0 added over 16.0.0, plus the total
+    /// table length. Regenerating at the `unicode-normalization 0.1.25`
+    /// version (17.0.0) is what keeps the fold and the normalization step on
+    /// the same UCD version; this pins that regeneration.
+    #[test]
+    fn the_table_covers_the_unicode_17_additions() {
+        for (cp, expected) in [
+            (0xA7CEu32, "\u{a7cf}"),
+            (0xA7D2, "\u{a7d3}"),
+            (0xA7D4, "\u{a7d5}"),
+            (0x16EA0, "\u{16ebb}"),
+            (0x16EA1, "\u{16ebc}"),
+            (0x16EB8, "\u{16ed3}"),
+        ] {
+            let s = char::from_u32(cp).unwrap().to_string();
+            assert_eq!(
+                case_fold(&s),
+                expected,
+                "U+{cp:04X} must fold as 17.0.0 says"
+            );
+        }
+        assert_eq!(
+            CASE_FOLD.len(),
+            1585,
+            "the 17.0.0 C+F table has exactly 1585 entries"
+        );
     }
 }

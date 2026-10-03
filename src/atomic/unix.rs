@@ -5576,6 +5576,48 @@ mod tests {
         assert!(!base.path().join("root/dst/dir/link").exists());
     }
 
+    /// ORDER fix, the FOURTH caller (the tree copy): the pre-fix order bug was
+    /// in the ONE fold authority, so the copy had the SAME under-fold as the
+    /// manifest. Both must refuse the Greek escape. PRE-FIX this is the
+    /// tree-copy half of the observed escape: the manifest ACCEPTED (checked by
+    /// the integration `greek_*` tests) and the copy returned `Ok`.
+    #[test]
+    fn copy_dir_recursive_fd_and_manifest_agree_on_a_greek_order_fold() {
+        for (on_disk, capital) in [
+            ("\u{1fb7}", "\u{1fbc}\u{0342}"),
+            ("\u{1fb7}", "\u{0391}\u{0342}\u{0345}"),
+            ("\u{1fc7}", "\u{1fcc}\u{0342}"),
+            ("\u{1ff7}", "\u{1ffc}\u{0342}"),
+        ] {
+            let (base, root, src) = out_of_root_fixture();
+            std::fs::create_dir_all(src.join("dir")).unwrap();
+            std::fs::create_dir_all(src.join("other")).unwrap();
+            std::fs::write(src.join("other/file"), b"inside").unwrap();
+            std::os::unix::fs::symlink("../other", src.join("dir").join(on_disk)).unwrap();
+            std::os::unix::fs::symlink(format!("{capital}/../../outside"), src.join("dir/link"))
+                .unwrap();
+
+            let manifest_err = crate::manifest::canonicalize_tree(&src)
+                .expect_err("the manifest must refuse the Greek order-fold component");
+            assert!(
+                manifest_err.to_string().contains("escaping symlink"),
+                "the manifest refusal must name the escape, got: {manifest_err}"
+            );
+
+            let copy_err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+                .expect_err("the copy must reach the manifest's SAME verdict");
+            assert!(
+                copy_err.to_string().contains("escaping symlink"),
+                "the copy refusal must name the escape, got: {copy_err}"
+            );
+            assert!(!base.path().join("root/dst/dir/link").exists());
+            assert!(
+                std::fs::read(base.path().join("root/dst/dir/link/secret")).is_err(),
+                "the canary must be unreachable through the refused copy"
+            );
+        }
+    }
+
     /// H3: the copy no longer collapses a filesystem error to "no symlink
     /// here". An unreadable destination subtree makes the enumeration fail, and
     /// the copy fails CLOSED rather than guessing the escaped component is

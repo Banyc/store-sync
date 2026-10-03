@@ -577,6 +577,80 @@ mod tests {
         }
     }
 
+    /// K3: all three DENIAL folds must be the FULL case fold, not
+    /// `str::to_lowercase`. A full-fold-only character (`ſ`, U+017F, folds to
+    /// `s`; `to_lowercase` leaves it unchanged) is an ALIAS of a reserved or
+    /// crate-temp spelling on a case-folding host, so narrowing a fold would
+    /// silently reopen an alias. PRE-FIX this test is the only coverage: the
+    /// suite was green under a `to_lowercase` mutation because nothing used a
+    /// full-fold-only alias.
+    ///
+    /// The lock-record SPELLING (`operation.lock` / `.operation.lock`) is pure
+    /// ASCII with no `s`, ligature, or other full-fold-only target character, so
+    /// no byte-different name needs the full fold merely to be RECOGNISED as a
+    /// lock record. The fold PRIMITIVE the lock-record predicate consults must
+    /// still be the full fold, so it is pinned directly below on a lock-record
+    /// sibling spelling with `ſ` in its base.
+    #[test]
+    fn full_fold_only_aliases_are_refused_by_the_denial_rules() {
+        // Reserved family: `.ſync-aside.1` IS `.sync-aside.1` on macOS APFS /
+        // Linux `ext4 -O casefold`.
+        let reserved = ".\u{17f}ync-aside.1";
+        assert!(
+            is_reserved_case_alias(reserved),
+            "{reserved:?} aliases the reserved prefix only under the full fold"
+        );
+        assert!(
+            !is_reserved_name(reserved),
+            "the byte-exact reserved MATCH must deliberately leave {reserved:?} alone"
+        );
+        assert!(
+            is_unaddressable_name(reserved),
+            "{reserved:?} must be unaddressable"
+        );
+        assert!(!crate::id::valid_name(reserved));
+        assert_eq!(
+            "\u{17f}".to_lowercase(),
+            "\u{17f}",
+            "`to_lowercase` leaves long s alone, so the alias above is exactly what a narrowed fold misses"
+        );
+
+        // Crate-temp family: the far-side `mktemp` tail is six ASCII
+        // alphanumerics; `ſ` folds to `s`, so `ſ12345` is a legal tail only
+        // under the full fold (byte-exact the tail is seven bytes, so the
+        // byte-exact shape recognizer must reject it).
+        let temp = ".foo.tmp.\u{17f}12345";
+        assert!(
+            is_crate_temp_case_alias(temp),
+            "{temp:?} aliases a crate temp shape only under the full fold"
+        );
+        assert!(
+            !crate::atomic::is_crate_temp_shape(temp),
+            "byte-exact {temp:?} is not a temp shape (its tail is seven bytes, not six)"
+        );
+        assert!(
+            is_unaddressable_name(temp),
+            "{temp:?} must be unaddressable"
+        );
+        assert!(!crate::id::valid_name(temp));
+        assert_eq!("\u{17f}12345".to_lowercase(), "\u{17f}12345");
+
+        // Lock-record family: the full fold PRIMITIVE, exercised on a
+        // lock-record sibling spelling with `ſ` in its base. A narrowed
+        // `to_lowercase` fold would return the long-s spelling unchanged.
+        assert_eq!(
+            fold_lock_record_component(".\u{17f}.operation.lock"),
+            ".s.operation.lock",
+            "the lock-record fold must be the FULL case fold"
+        );
+        assert_eq!(fold_lock_record_component(".\u{17f}"), ".s");
+        assert_eq!(
+            fold_lock_record_component(".\u{17f}.operation.lock. "),
+            ".s.operation.lock",
+            "the trailing dot/space strip must sit AFTER the full fold"
+        );
+    }
+
     /// The crate's own lock-record spellings are recognised as LOCK RECORDS
     /// (so every mutating primitive can refuse them) without turning the
     /// byte-exact reserved family into a broader match: `.sync-aside.1` is

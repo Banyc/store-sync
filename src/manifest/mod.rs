@@ -110,13 +110,33 @@
 //! instead of `s`), so a target component the kernel resolved onto a symlink
 //! was answered `Absent` and ACCEPTED — an under-refusal, i.e. an escape, not
 //! an over-refusal. The fold is now the FULL Unicode case fold
-//! ([`crate::casefold`]) taken to NFC, which is at least as broad as the
-//! measured folds of macOS APFS and Linux `ext4 -O casefold`; the
-//! over-refusal residual above is now true. The added over-refusal is exactly
-//! the extra spellings those hosts fold together and a case-sensitive host
-//! would leave dangling (`straße`/`SS`, `ﬁle`/`FILE`, `ς`/`σ`, ...): refused
-//! on every host, which is the safe direction for a decision that otherwise
-//! GRANTS acceptance.
+//! ([`crate::casefold`]), applied to the NFD-DECOMPOSED component
+//! (`NFC(case_fold(NFD(name)))`; see [`fold_component`]) — the Unicode default
+//! caseless match the host filesystems implement. The macOS APFS half of that
+//! claim is DEMONSTRATED, not asserted:
+//! `the_fold_agrees_with_the_host_on_the_measured_families` probes the live
+//! filesystem with a real write and a cross-spelling lookup for the measured
+//! families, and the three Greek precomposed perispomeni+ypogegrammeni pairs
+//! are covered end to end by the `greek_*` tests in
+//! `tests/casefold_confinement.rs`. The Linux `ext4 -O casefold` half was NOT
+//! re-run in this environment (`ser` was unreachable), so the claim for that
+//! host rests only on the fold being the Unicode C+F caseless match and is
+//! left UNVERIFIED here rather than asserted. The over-refusal residual above
+//! is now true, and the added over-refusal is exactly the extra spellings those
+//! hosts fold together and a case-sensitive host would leave dangling
+//! (`straße`/`SS`, `ﬁle`/`FILE`, `ς`/`σ`, ...): refused on every host, which is
+//! the safe direction for a decision that otherwise GRANTS acceptance.
+//!
+//! CORRECTION (this revision) to the fold's ORDER: the previous revision
+//! folded `NFC(name)` first, then case-folded. Unicode caseless matching is
+//! NFD-based, so that order is not canonical-equivalence-safe: it diverges for
+//! exactly three code points — U+1FB7, U+1FC7, and U+1FF7 (the Greek
+//! precomposed perispomeni+ypogegrammeni forms). Their canonically-related
+//! capital spellings (`U+1FBC U+0342`, `U+1FCC U+0342`, `U+1FFC U+0342`, and the
+//! fully decomposed `U+0391 U+0342 U+0345` family) fold to a DIFFERENT string,
+//! so the index answered `Absent` for a component the kernel resolves to a
+//! symlink and the escape was ACCEPTED. Taking the NFD first makes both
+//! spellings fold to the same key (`NFC(case_fold(NFD(·)))`).
 //!
 //! This section is also the corrected RESIDUAL LIST for the physical-walk
 //! change. The previous revision claimed no legitimate tree was newly refused
@@ -353,26 +373,42 @@ pub(crate) enum SymlinkTargetRefusal {
 /// ligatures to themselves, and U+03C2 FINAL SIGMA to itself, while macOS APFS
 /// and Linux `ext4 -O casefold` resolve all of those onto each other. This
 /// fold feeds a decision that GRANTS acceptance ("this component is not a
-/// symlink"), so it must be at least as broad as ANY supported host's fold; a
+/// symlink"), so it must not be narrower than the fold the host applies; a
 /// narrower fold lets the kernel resolve a spelled component onto a symlink
-/// the index called absent, which is the escape class this module closes.
-/// Over-refusal (a spelling with no exact entry that fold-equals a symlink
-/// entry) is the safe direction.
+/// the index called absent, which is the escape class this module closes. The
+/// fold used is the Unicode default caseless match — the full `C`+`F` case fold
+/// applied to the NFD-DECOMPOSED component — and the macOS APFS half of "not
+/// narrower than the host" is DEMONSTRATED, not asserted, by the test
+/// `the_fold_agrees_with_the_host_on_the_measured_families` (a real write and a
+/// cross-spelling lookup for each measured family). The Linux `ext4 -O casefold`
+/// half was NOT re-run in this environment and is left UNVERIFIED here rather
+/// than claimed. Over-refusal (a spelling with no exact entry that fold-equals a
+/// symlink entry) is the safe direction.
 ///
-/// A component is taken to NFC, full-case-folded, taken to NFC again (the case
-/// fold can emit a decomposed sequence, and the host compares canonically),
-/// and stripped of any trailing `.`/space (the Win32 name fold
-/// [`crate::reserved`] already models for the lock record). The fold is
-/// deliberately PLATFORM-INDEPENDENT, exactly like the reserved-name rules: a
-/// manifest must mean the same thing on every host, so the walk cannot ask the
-/// host filesystem what it folds without making the manifest's verdict depend
-/// on which filesystem happened to describe it. The reserved-name,
-/// lock-record, and crate-temp DENIAL rules ([`crate::reserved`]) share the
-/// same [`crate::casefold`] primitive, so the containment view and the denial
-/// rules cannot disagree about what a host can fold together.
+/// The component is taken to its NFD (canonical DECOMPOSITION), full-case-folded
+/// with [`crate::casefold`], taken to NFC again, and then stripped of any
+/// trailing `.`/space (the Win32 name fold [`crate::reserved`] already models
+/// for the lock record). The NFD-first order is load-bearing: Unicode caseless
+/// matching is NFD-based, so `NFD → fold → NFC` merges every pair a caseless
+/// host merges, while `NFC → fold → NFC` does not — it under-folds exactly the
+/// three Greek precomposed perispomeni+ypogegrammeni forms U+1FB7/U+1FC7/U+1FF7,
+/// whose capital spellings are caseless-equal on a folding host but are not
+/// byte-equal after an NFC-first fold (see the module docs). The RESULT is in
+/// NFC, the same canonical form the manifest names use, so two folded strings
+/// compared as bytes are compared in the crate's canonical form. The trailing
+/// `.`/space strip sits AFTER the final NFC, so both the folded key and the
+/// folded query are stripped identically regardless of whether the fold or the
+/// normalization emitted the trailing character first. The fold is deliberately
+/// PLATFORM-INDEPENDENT, exactly like the reserved-name rules: a manifest must
+/// mean the same thing on every host, so the walk cannot ask the host filesystem
+/// what it folds without making the manifest's verdict depend on which
+/// filesystem happened to describe it. The reserved-name, lock-record, and
+/// crate-temp DENIAL rules ([`crate::reserved`]) share the same
+/// [`crate::casefold`] primitive, so the containment view and the denial rules
+/// cannot disagree about what a host can fold together.
 fn fold_component(name: &str) -> String {
-    let nfc: String = name.nfc().collect();
-    let folded: String = crate::casefold::case_fold(&nfc).nfc().collect();
+    let nfd: String = name.nfd().collect();
+    let folded: String = crate::casefold::case_fold(&nfd).nfc().collect();
     folded.trim_end_matches(['.', ' ']).to_string()
 }
 
@@ -3052,9 +3088,14 @@ mod tests {
                 "the escape must be REAL on a host that folds {on_disk:?} onto {spelled:?}"
             );
         }
+        // Rust's `Debug` for a path escapes grapheme-extending characters
+        // (U+0342, U+0345) as `\u{...}`, so a raw `contains(spelled)` cannot
+        // match the component the message names; compare the same escaped form
+        // the message uses.
+        let escaped: String = spelled.chars().flat_map(|c| c.escape_debug()).collect();
         let local_msg = canonicalize_tree(&root).unwrap_err().to_string();
         assert!(
-            local_msg.contains("escaping symlink") && local_msg.contains(spelled),
+            local_msg.contains("escaping symlink") && local_msg.contains(&escaped),
             "the local walk must refuse the full-fold escape, naming {spelled:?}, got: {local_msg}"
         );
         let out = run_remote_script(&root);
@@ -3062,7 +3103,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            remote_msg.contains("escaping symlink") && remote_msg.contains(spelled),
+            remote_msg.contains("escaping symlink") && remote_msg.contains(&escaped),
             "the wire assembler must refuse the SAME full-fold escape, naming {spelled:?}, \
              got: {remote_msg}"
         );
@@ -3118,6 +3159,179 @@ mod tests {
             "\u{3a3}",
             filesystem_folds_pair("\u{3c2}", "\u{3a3}"),
         );
+    }
+
+    /// ORDER-FIX: the three Greek precomposed perispomeni+ypogegrammeni forms
+    /// and their canonically-related capital spellings. Unicode caseless
+    /// matching is NFD-based, so the pre-fix order `NFC -> fold -> NFC` folded
+    /// the small and capital spellings to DIFFERENT strings and the walk
+    /// answered `Absent` for a component the host resolves onto a symlink — the
+    /// escape was ACCEPTED. `NFD -> fold -> NFC` merges them. Each pair is
+    /// covered in both capital witness spellings (`U+1FBC U+0342` and the fully
+    /// decomposed `U+0391 U+0342 U+0345` family), and on a host that folds the
+    /// pair the LIVE escape is asserted first so the refusal closes a real
+    /// hole. PRE-FIX this FAILED on macOS APFS.
+    #[test]
+    #[cfg(unix)]
+    fn greek_perispomeni_ypogegrammeni_pairs_are_refused_by_both_canonicalizers() {
+        skip_without_perl!(
+            "greek_perispomeni_ypogegrammeni_pairs_are_refused_by_both_canonicalizers"
+        );
+        for (on_disk, capital) in [
+            ("\u{1fb7}", "\u{1fbc}\u{0342}"),
+            ("\u{1fb7}", "\u{0391}\u{0342}\u{0345}"),
+            ("\u{1fc7}", "\u{1fcc}\u{0342}"),
+            ("\u{1fc7}", "\u{0397}\u{0342}\u{0345}"),
+            ("\u{1ff7}", "\u{1ffc}\u{0342}"),
+            ("\u{1ff7}", "\u{03a9}\u{0342}\u{0345}"),
+        ] {
+            assert_full_fold_escape_is_refused_by_both(
+                on_disk,
+                capital,
+                filesystem_folds_pair(on_disk, capital),
+            );
+        }
+    }
+
+    /// The pre-fix fold order, inlined ONLY so the change below can be shown to
+    /// be a strict COARSENING of the equivalence relation it produces.
+    fn pre_fix_fold_component(name: &str) -> String {
+        let nfc: String = name.nfc().collect();
+        let folded: String = crate::casefold::case_fold(&nfc).nfc().collect();
+        folded.trim_end_matches(['.', ' ']).to_string()
+    }
+
+    /// FIX evidence 2, order half: the NFD-first change only MERGES
+    /// equivalence classes. It never splits a pair the pre-fix fold already
+    /// agreed on, so no pair the old fold caught is now missed; on top of that
+    /// the three Greek pairs move from SPLIT (pre-fix) to MERGED (post-fix).
+    #[test]
+    fn the_fold_change_only_merges_equivalence_classes() {
+        let corpus = [
+            "stra\u{df}e",
+            "STRASSE",
+            "StRaSsE",
+            "\u{1e9e}",
+            "\u{df}",
+            "\u{fb01}le",
+            "FILE",
+            "\u{fb01}",
+            "fl",
+            "\u{fb03}",
+            "\u{3c2}",
+            "\u{3c3}",
+            "\u{3a3}",
+            "\u{17f}",
+            "s",
+            "S",
+            "\u{b5}",
+            "\u{3bc}",
+            "\u{212a}",
+            "\u{212b}",
+            "k",
+            "\u{e5}",
+            "caf\u{e9}",
+            "cafe\u{301}",
+            "\u{1fb7}",
+            "\u{1fb6}\u{3b9}",
+            "\u{1fbc}\u{342}",
+            "\u{391}\u{342}\u{345}",
+            "a.",
+            "a ",
+            "A.",
+        ];
+        for a in corpus {
+            for b in corpus {
+                if pre_fix_fold_component(a) == pre_fix_fold_component(b) {
+                    assert_eq!(
+                        fold_component(a),
+                        fold_component(b),
+                        "the order fix must not SPLIT the pre-fix pair {a:?}/{b:?}"
+                    );
+                }
+            }
+        }
+        for (small, capital) in [
+            ("\u{1fb7}", "\u{1fbc}\u{0342}"),
+            ("\u{1fc7}", "\u{1fcc}\u{0342}"),
+            ("\u{1ff7}", "\u{1ffc}\u{0342}"),
+        ] {
+            assert_ne!(
+                pre_fix_fold_component(small),
+                pre_fix_fold_component(capital),
+                "pre-fix the Greek pair must SPLIT"
+            );
+            assert_eq!(
+                fold_component(small),
+                fold_component(capital),
+                "post-fix the Greek pair must MERGE"
+            );
+        }
+    }
+
+    /// Over-refusal residual re-check (F4): the order fix adds NO over-refusal.
+    /// The two pre-existing fail-closed refusals are unchanged: the trailing
+    /// `.`/space strip (a Win32 fold model applied on every host) and the
+    /// widened-case refusal of a case-variant spelling on a case-SENSITIVE host
+    /// (`SUB/file` refused where the kernel would `ENOENT` and dangle). Each is
+    /// compared against the pre-fix fold to show the order change moved neither.
+    #[test]
+    fn the_over_refusal_residual_is_unchanged_by_the_order_fix() {
+        for (a, b) in [("a.", "a"), ("a ", "a"), ("A.", "a"), ("Sub.", "sub")] {
+            assert_eq!(fold_component(a), fold_component(b));
+            assert_eq!(pre_fix_fold_component(a), fold_component(a));
+        }
+        // The widened-case refusal of a case-variant spelling is unchanged.
+        assert_eq!(fold_path("SUB/file"), fold_path("Sub/file"));
+        assert_eq!(fold_path("SUB/file"), "sub/file");
+        assert_eq!(
+            pre_fix_fold_component("SUB"),
+            fold_component("Sub"),
+            "the case-variant refusal must not move with the order fix"
+        );
+    }
+
+    /// FIX evidence 2, host half: on the live filesystem, wherever the host
+    /// really resolves the two spellings onto ONE entry, the crate's fold MUST
+    /// merge them — an under-fold there is the escape class. The families are
+    /// the ones the macOS APFS measurement pins; a family the host does not
+    /// fold is announced as a skip for that row. The non-folds (`ı` vs `i`,
+    /// `\u{130}` vs `i`) must stay distinct even though they are close.
+    #[test]
+    #[cfg(unix)]
+    fn the_fold_agrees_with_the_host_on_the_measured_families() {
+        for (on_disk, spelled) in [
+            ("stra\u{df}e", "STRASSE"),
+            ("\u{fb01}le", "FILE"),
+            ("\u{3c2}", "\u{3a3}"),
+            ("\u{17f}", "S"),
+            ("\u{b5}", "\u{3bc}"),
+            ("\u{212a}", "k"),
+            ("\u{212b}", "\u{e5}"),
+            ("caf\u{e9}", "cafe\u{301}"),
+            ("\u{1fb7}", "\u{1fbc}\u{0342}"),
+            ("\u{1fb7}", "\u{0391}\u{0342}\u{0345}"),
+            ("\u{1fc7}", "\u{1fcc}\u{0342}"),
+            ("\u{1ff7}", "\u{1ffc}\u{0342}"),
+        ] {
+            if filesystem_folds_pair(on_disk, spelled) {
+                assert_eq!(
+                    fold_component(on_disk),
+                    fold_component(spelled),
+                    "the host resolves {on_disk:?} and {spelled:?} onto one entry, so the \
+                     containment fold must merge them"
+                );
+            } else {
+                let msg = format!(
+                    "this host does not fold {on_disk:?}/{spelled:?}, so the crate's agreement \
+                     with the host on that family is untestable here"
+                );
+                announce_skip(&msg);
+            }
+        }
+        // Non-folds: the crate must NOT equate these.
+        assert_ne!(fold_component("\u{131}"), fold_component("i"));
+        assert_ne!(fold_component("\u{130}"), fold_component("i"));
     }
 
     /// H1, the ACCEPT direction that must survive the widened fold: an
