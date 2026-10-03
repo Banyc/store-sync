@@ -2013,6 +2013,65 @@ fn an_in_root_relative_symlink_round_trips_through_push_and_pull() {
     );
 }
 
+/// The reviewer's escape tree must be refused by a REAL push and a REAL pull,
+/// not only by `canonicalize_tree`: the strict SOURCE manifest is the gate and
+/// it fires before any mutation. `src/dir/sub -> ../other` is an accepted
+/// in-root link, and `src/dir/link -> sub/../../outside` walks THROUGH it, so
+/// the kernel reaches `../outside/secret` even though the lexical collapse
+/// says `<root>/outside`. The link really does escape on the live tree, and the
+/// sync must refuse rather than reproduce it.
+#[cfg(unix)]
+#[test]
+fn an_escaping_symlink_target_is_refused_by_push_and_pull() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(src.join("dir")).unwrap();
+    fs::create_dir_all(src.join("other")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&src.join("other/file"), b"payload");
+    write(&outside.join("secret"), b"SECRET");
+    std::os::unix::fs::symlink("../other", src.join("dir/sub")).unwrap();
+    std::os::unix::fs::symlink("sub/../../outside", src.join("dir/link")).unwrap();
+    assert_eq!(
+        read(&src.join("dir/link/secret")),
+        b"SECRET",
+        "the escape is real on the live source before the sync runs"
+    );
+
+    // PUSH: refused at the source manifest; nothing is materialized.
+    let dst = dir.path().join("dst");
+    let err = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    assert!(
+        err.to_string().contains("escaping symlink"),
+        "push must refuse the escaping link, got: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("dir/link")).is_err(),
+        "the escaping link must never be materialized"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+
+    // PULL: the same source as the far side, the same refusal.
+    let pulled = dir.path().join("pulled");
+    let err = sync(
+        Direction::Pull,
+        &pulled,
+        &transport(&src),
+        &ReplaceAll,
+        Keep,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("escaping symlink"),
+        "pull must refuse the escaping link, got: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(pulled.join("dir/link")).is_err(),
+        "the escaping link must never be materialized"
+    );
+}
+
 #[test]
 fn equal_trees_perform_zero_transfers() {
     let dir = fixture_tmpdir(&env()).unwrap();

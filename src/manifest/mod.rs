@@ -48,9 +48,48 @@
 //! root — and the resolution base is the directory CONTAINING the link (its own
 //! parent), as POSIX specifies, not the tree root. So `dir/link -> ../other`
 //! resolves to `<root>/other` and is ACCEPTED, while `dir/link ->
-//! ../../outside` resolves outside the root and is REFUSED. A root that is
-//! itself reached through a symlink is canonicalized first, so the base is the
-//! real directory the kernel would resolve against.
+//! ../../outside` resolves outside the root and is REFUSED.
+//!
+//! # Containment is decided PHYSICALLY, on the TARGET's components
+//!
+//! The kernel resolves a relative target PHYSICALLY: it walks the SPELLED
+//! components in order and `..` moves to the physical parent of whatever it
+//! has reached, so a lexical `..`-collapse is faithful ONLY while no component
+//! it walks is a symlink. A `..` that follows a symlink component is exactly
+//! where the collapse and the kernel disagree: with `dir/sub -> ../other`,
+//! `dir/link -> sub/../../outside` collapses to `<root>/outside` (inside,
+//! because the first `..` undoes `sub`), while the kernel WALKS THROUGH
+//! `dir/sub` to `<root>/../other`, so the next `..` reaches the root's parent
+//! and the target leaves the root. The kernel also FOLLOWS the FINAL component,
+//! so a target that ends at a symlink can leave the root even when its spelling
+//! never pops above it. The rule therefore refuses a relative target as soon as
+//! the walk reaches a component (final or intermediate) that is a symlink, and
+//! refuses a `..` that pops above the root: the collapse is never trusted past
+//! a symlink. This is the crate's fail-closed doctrine — refuse rather than
+//! guess where a follow ends.
+//!
+//! The walk is over root-RELATIVE paths and never builds an absolute base, so
+//! it does not depend on the root's spelling, and the LOCAL walk and the
+//! far-side wire assembler apply exactly the same rule: the local walk answers
+//! "is this component a symlink?" with `symlink_metadata` of the live tree, and
+//! the assembler answers it with the `symlink` entries it assembled from the
+//! far side. Neither canonicalizes the root, so a root reached through a
+//! symlink can no longer make the two verdicts differ.
+//!
+//! The root-relative walk is also the only rule that keeps containment
+//! PORTABLE, which is the property a manifest must have: a target that stays in
+//! the root only because the root happens to be NAMED a particular name (e.g.
+//! `dir/link -> ../../real/other` when the root is `.../real`) leaves the root
+//! as soon as the tree is materialized under any other name. Checking it
+//! against the resolved real root would accept a tree whose containment is a
+//! coincidence of the root's spelling, so such a target is refused.
+//!
+//! The earlier version of this section got the argument wrong in a way worth
+//! recording: it argued only about the LINK'S PARENT components (which the walk
+//! had already verified as real directories) and never about the TARGET's
+//! components — the half whose treatment the resolution base had just changed.
+//! A safety argument must cover the part of the input whose treatment can
+//! change, not the part that was already correct.
 //!
 //! NFC is deliberately NOT required of a target. A name is an index into the
 //! tree, but a target is DATA: the kernel resolves it verbatim, it may contain
@@ -223,42 +262,117 @@ fn fmt_mode(m: u32) -> String {
     format!("{:04o}", m & 0o7777)
 }
 
-/// The directory a RELATIVE symlink target must be resolved against: the
-/// directory CONTAINING the link, per POSIX, not the tree root.
+/// Why a RELATIVE symlink target is refused.
 ///
-/// `root` is the tree root `link_rel` is relative to, and `link_rel` is the
-/// link's artifact-relative path, so the result is `root` joined with the
-/// link's parent. For the LOCAL walk `root` is the CANONICALIZED root, so a
-/// root that is itself reached through a symlink is resolved before the check
-/// and the target's `..` collapses against the real directory containing the
-/// link; the link's parent components are the on-disk names the walk already
-/// verified as [`Component::Normal`], and the walk does not follow a symlinked
-/// directory, so none of them can be a symlink that would change the answer.
-fn symlink_target_base(root: &Path, link_rel: &Path) -> PathBuf {
-    match link_rel.parent() {
-        Some(parent) => root.join(parent),
-        None => root.to_path_buf(),
+/// The kernel resolves a relative target PHYSICALLY: it walks the SPELLED
+/// components in order from the directory containing the link, and `..` moves
+/// to the physical parent of whatever it has reached. A lexical `..`-collapse
+/// equals that walk ONLY while no component it walks is a symlink, so the
+/// decision is made on the spelled components, in order, not on the collapsed
+/// path. The kernel also follows the FINAL component, so a target that ends at
+/// a symlink can leave the root even when its spelling does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SymlinkTargetRefusal {
+    /// The spelled target pops above the tree root.
+    EscapesRoot,
+    /// A component the walk reaches (final or intermediate) is a symlink the
+    /// kernel would follow, so the spelled location is not the physical one.
+    ThroughSymlink(PathBuf),
+}
+
+/// Decide whether a RELATIVE symlink target may be accepted, using the SAME
+/// rule at BOTH call sites: the local walk and the far-side wire assembler.
+///
+/// `link_rel` is the link's path relative to the tree root (e.g. `dir/link`),
+/// and `target` is its raw relative link target. The walk starts at the link's
+/// CONTAINING directory, per POSIX. Every component it reaches is checked:
+/// a `..` pops one component and refuses if it would pop above the root, and a
+/// `Component::Normal` that names a symlink is refused, because the kernel
+/// follows it and the physical location is then not the spelled one.
+///
+/// `is_symlink` answers, for a ROOT-RELATIVE spelling, whether that path names
+/// a symlink in the tree. Both call sites work in root-RELATIVE paths, so
+/// neither depends on the root's spelling and the two cannot disagree: the
+/// local walk answers with `symlink_metadata` of the live tree, and the wire
+/// assembler answers with the set of `symlink` entries it assembled. (The
+/// previous rule built an ABSOLUTE base from the root and collapsed the target
+/// lexically; that made the local walk canonicalize the root while the
+/// assembler could not, so a symlinked root made the two disagree, and the
+/// collapse itself never followed a symlink component.)
+fn check_relative_symlink_target(
+    link_rel: &Path,
+    target: &Path,
+    is_symlink: &mut dyn FnMut(&Path) -> bool,
+) -> std::result::Result<(), SymlinkTargetRefusal> {
+    let mut current = PathBuf::new();
+    if let Some(parent) = link_rel.parent() {
+        for comp in parent.components() {
+            match comp {
+                Component::Normal(name) => current.push(name),
+                Component::CurDir => {}
+                // A validated entry path has only `Normal` components; fail
+                // closed rather than reason about a spelling that cannot occur.
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(SymlinkTargetRefusal::EscapesRoot);
+                }
+            }
+        }
+    }
+    for comp in target.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(SymlinkTargetRefusal::EscapesRoot);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !current.pop() {
+                    return Err(SymlinkTargetRefusal::EscapesRoot);
+                }
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                if is_symlink(&current) {
+                    return Err(SymlinkTargetRefusal::ThroughSymlink(current.clone()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The refusal message for [`SymlinkTargetRefusal`], naming the offending
+/// entry and the symlink component the walk reached (when there is one). The
+/// `escaping symlink` prefix is the crate's single classification for a
+/// relative target that cannot be shown to stay inside the root.
+fn symlink_target_refusal_message(
+    refusal: SymlinkTargetRefusal,
+    link_display: &str,
+    target: &str,
+) -> String {
+    match refusal {
+        SymlinkTargetRefusal::EscapesRoot => {
+            format!("escaping symlink not allowed: {link_display}")
+        }
+        SymlinkTargetRefusal::ThroughSymlink(component) => format!(
+            "escaping symlink not allowed: {link_display} (target {target:?} resolves through the symlink component {component:?}, which the kernel follows, so a lexical `..` after it is not the kernel's resolution)"
+        ),
     }
 }
 
-/// Lexically normalize a path, collapsing `.` and `..`, returning `None` if it
-/// escapes the base directory.
-fn normalize_lexical(base: &Path, rel: &Path) -> Option<PathBuf> {
-    let mut out = base.to_path_buf();
+/// Join a root-relative path of `Component::Normal` names with `/`, the
+/// manifest's canonical spelling. Used to look a candidate component up in the
+/// wire assembler's set of `symlink` entries.
+fn rel_path_string(rel: &Path) -> String {
+    let mut out = String::new();
     for comp in rel.components() {
-        use std::path::Component::*;
-        match comp {
-            Prefix(_) | RootDir => return None,
-            CurDir => {}
-            ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
+        if let Component::Normal(name) = comp {
+            if !out.is_empty() {
+                out.push('/');
             }
-            Normal(c) => out.push(c),
+            out.push_str(&name.to_string_lossy());
         }
     }
-    Some(out)
+    out
 }
 
 /// The manifest's canonical spelling for an artifact-relative path: every
@@ -607,13 +721,28 @@ fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<Dest
                 // A RELATIVE target is resolved against the directory
                 // CONTAINING the link (the link's own parent), per POSIX, not
                 // against the tree root: `dir/link -> ../other` lands in
-                // `<root>/other`, which is inside the root, and must be
-                // accepted. Containment is then tested in the root.
-                let base = symlink_target_base(&root_c, rel_os);
-                let resolved = normalize_lexical(&base, &target);
-                let inside = matches!(resolved.as_ref(), Some(r) if r.starts_with(&root_c));
-                if !inside {
-                    let reason = format!("escaping symlink not allowed: {}", path.display());
+                // `<root>/other`, which is inside the root, and is ACCEPTED.
+                // Containment is decided PHYSICALLY, on the target's spelled
+                // components: the kernel follows a symlink component (final or
+                // intermediate), so a target whose walk reaches one is refused
+                // rather than collapsed lexically. `root_c` is the real
+                // directory the kernel resolves against, so the `lstat` sees
+                // the live tree; the walk itself is root-relative and does not
+                // depend on the root's spelling (see
+                // [`check_relative_symlink_target`]).
+                let mut is_symlink = |rel: &Path| -> bool {
+                    std::fs::symlink_metadata(root_c.join(rel))
+                        .map(|m| m.is_symlink())
+                        .unwrap_or(false)
+                };
+                if let Err(refusal) =
+                    check_relative_symlink_target(rel_os, &target, &mut is_symlink)
+                {
+                    let reason = symlink_target_refusal_message(
+                        refusal,
+                        &path.display().to_string(),
+                        &target.to_string_lossy(),
+                    );
                     match policy {
                         UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
                         UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
@@ -838,9 +967,15 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// or fold can never be hidden by recomputing the hash after decoding. The
 /// per-file content hashes come from the remote (sha256sum); the digest is
 /// computed from the assembled metadata, so a corrupted or divergent remote
-/// tree produces a digest mismatch without any content transfer. `root` is
-/// the remote tree root (absolute, on the remote host) used for the in-root
-/// symlink check.
+/// tree produces a digest mismatch without any content transfer. A SYMLINK's
+/// RELATIVE target is checked with the SAME root-relative walk the local
+/// canonicalizer uses, driven by the kinds the far side reported: a component
+/// the listing marks `symlink` is refused, exactly as the local walk's
+/// `symlink_metadata` refuses it. `root` is accepted for compatibility but the
+/// symlink check does NOT consult it: the far side's root cannot be
+/// canonicalized from here, and because the walk is root-relative it does not
+/// need to be, so the local and wire verdicts agree even when the root is
+/// itself reached through a symlink.
 ///
 /// `output` must come from a walk that actually enumerated the whole tree:
 /// [`remote_tree_verify_script`] exits non-zero for an absent, non-directory,
@@ -867,7 +1002,7 @@ pub fn canonicalize_remote_entries_destination(
 
 fn canonicalize_remote_entries_with(
     output: &str,
-    root: &Path,
+    _root: &Path,
     policy: UnsupportedPolicy,
 ) -> Result<DestinationTree> {
     let mut entries: Vec<TreeEntry> = Vec::new();
@@ -995,8 +1130,7 @@ fn canonicalize_remote_entries_with(
                 // and TAB (the script refuses them before they reach this
                 // string).
                 let symlink_target = validate_symlink_target(&entry_path, symlink_target)?;
-                let target = PathBuf::from(&symlink_target);
-                if target.is_absolute() {
+                if Path::new(&symlink_target).is_absolute() {
                     let reason = format!("absolute symlink not allowed: {entry_path}");
                     match policy {
                         UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
@@ -1005,26 +1139,13 @@ fn canonicalize_remote_entries_with(
                             reason,
                         }),
                     }
-                } else {
-                    // Same POSIX base as the local walk: the directory
-                    // CONTAINING the link, here spelled relative to the
-                    // far-side root, then tested for containment in that root.
-                    let base = symlink_target_base(root, Path::new(&entry_path));
-                    let resolved = normalize_lexical(&base, &target);
-                    let inside = matches!(resolved.as_ref(), Some(r) if r.starts_with(root));
-                    if !inside {
-                        let reason = format!("escaping symlink not allowed: {entry_path}");
-                        match policy {
-                            UnsupportedPolicy::Refuse => {
-                                return Err(Error::materialization(reason));
-                            }
-                            UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
-                                path: entry_path.clone(),
-                                reason,
-                            }),
-                        }
-                    }
                 }
+                // A RELATIVE target's containment is checked in a POST-PASS,
+                // because the rule needs the KIND of every entry the target's
+                // spelled walk reaches (a component that is a symlink makes the
+                // lexical collapse lie) and a target may name an entry that
+                // appears later in the listing. See
+                // [`check_relative_symlink_target`].
                 let recomputed = sha256_bytes(symlink_target.as_bytes());
                 if recomputed != content_hash {
                     return Err(Error::materialization(format!(
@@ -1052,6 +1173,45 @@ fn canonicalize_remote_entries_with(
     // satisfies this, and a hand-built or proxied line that does not is
     // refused rather than implicitly creating an unnamed parent.
     require_parent_closed(&entries)?;
+    // The SAME relative-target rule as the local walk, applied with the KINDS
+    // the far side reported. The walk is over root-RELATIVE paths, so `root`
+    // is deliberately NOT consulted: the far side cannot be canonicalized from
+    // here, and neither side needs to, because the rule never builds an
+    // absolute base. A component counts as a symlink exactly when the listing
+    // says `symlink` at that path — the same fact the local walk's `lstat`
+    // reads — so a symlinked root can no longer make the two verdicts differ.
+    let symlink_paths: BTreeSet<String> = entries
+        .iter()
+        .filter(|e| e.entry_type == "symlink")
+        .map(|e| e.path.clone())
+        .collect();
+    for entry in &entries {
+        if entry.entry_type != "symlink" {
+            continue;
+        }
+        let Some(target) = entry.symlink_target.as_deref() else {
+            continue;
+        };
+        let target = Path::new(target);
+        if target.is_absolute() {
+            // Already classified (and tolerated or refused) at the field.
+            continue;
+        }
+        let mut is_symlink = |rel: &Path| -> bool { symlink_paths.contains(&rel_path_string(rel)) };
+        if let Err(refusal) =
+            check_relative_symlink_target(Path::new(&entry.path), target, &mut is_symlink)
+        {
+            let reason =
+                symlink_target_refusal_message(refusal, &entry.path, &target.to_string_lossy());
+            match policy {
+                UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
+                    path: entry.path.clone(),
+                    reason,
+                }),
+            }
+        }
+    }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     unsupported.sort_by(|a, b| a.path.cmp(&b.path));
     let mut meta = TreeMetadata {
@@ -2038,9 +2198,12 @@ mod tests {
     }
 
     /// B1, the base's own resolution: when the ROOT is reached through a
-    /// symlink, the local walk canonicalizes it before the containment check,
-    /// so the base is the REAL directory the kernel resolves against (as POSIX
-    /// requires) rather than the unresolved spelling.
+    /// symlink, a target that stays inside the root (`../other` from `dir`) is
+    /// accepted, and a target that escapes it is refused. The local walk's
+    /// `lstat` base is the CANONICALIZED root, so it sees the live tree the
+    /// kernel resolves against, while the containment walk itself is
+    /// root-relative and does not depend on the root's spelling (which is what
+    /// lets the wire assembler reach the same verdict).
     #[test]
     fn in_root_target_accepted_when_the_root_is_a_symlink() {
         skip_without_perl!("in_root_target_accepted_when_the_root_is_a_symlink");
@@ -2073,6 +2236,195 @@ mod tests {
         assert!(
             err.to_string().contains("escaping symlink"),
             "the resolved root must still bound the target, got: {err}"
+        );
+    }
+
+    /// The reviewer's escape: a RELATIVE target whose SPELLED walk reaches a
+    /// symlink component. `R/dir/sub -> ../other` and `R/dir/link ->
+    /// sub/../../outside` collapse lexically to `R/outside` (inside the root,
+    /// because the first `..` undoes `sub`), but the kernel WALKS THROUGH the
+    /// `dir/sub` symlink to `R/other`, so the next `..` reaches the root's
+    /// PARENT and `outside` is OUTSIDE. Containment is therefore decided on the
+    /// spelled components: the walk reaches `dir/sub`, which the listing says is
+    /// a symlink, and BOTH canonicalizers refuse it. Before the fix the local
+    /// walk and the wire assembler both ACCEPTED this tree, and
+    /// `read(dst/dir/link/secret)` returned the outside file.
+    #[test]
+    fn symlink_target_through_a_symlink_component_is_refused_by_both_canonicalizers() {
+        skip_without_perl!(
+            "symlink_target_through_a_symlink_component_is_refused_by_both_canonicalizers"
+        );
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(dir.path().join("outside/secret"), b"SECRET").unwrap();
+        // `R/dir/sub` is a SYMLINK to `R/other` (an accepted, in-root link).
+        std::os::unix::fs::symlink("../other", root.join("dir/sub")).unwrap();
+        // Its sibling walks `sub`, then `..` (which the kernel runs at the
+        // SYMLINK's physical location), then out of the root.
+        std::os::unix::fs::symlink("sub/../../outside", root.join("dir/link")).unwrap();
+
+        // The escape is REAL on the live tree: through the symlink component,
+        // the kernel leaves the root and reads the canary.
+        assert_eq!(
+            std::fs::read(root.join("dir/link/secret")).unwrap(),
+            b"SECRET",
+            "the escape must be real on the live tree for this test to mean anything"
+        );
+
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        let local_msg = local_err.to_string();
+        assert!(
+            local_msg.contains("escaping symlink") && local_msg.contains("dir/sub"),
+            "the local walk must refuse the symlink component, naming it, got: {local_msg}"
+        );
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_msg = remote_err.to_string();
+        assert!(
+            remote_msg.contains("escaping symlink") && remote_msg.contains("dir/sub"),
+            "the wire assembler must refuse the symlink component, naming it, got: {remote_msg}"
+        );
+    }
+
+    /// The SAME disagreement with NO escape: `R/dir/sub -> ../other` and
+    /// `R/dir/link -> sub/../other` collapse lexically to `R/dir/other`, but the
+    /// kernel resolves `R/other`. Both land inside the root here, so the old
+    /// lexical test accepted the tree with a WRONG answer; the physical rule
+    /// refuses it (the `dir/sub` component is a symlink) rather than record a
+    /// containment answer that does not match the kernel.
+    #[test]
+    fn symlink_target_through_a_symlink_component_is_refused_even_when_it_stays_lexically_in_root()
+    {
+        skip_without_perl!(
+            "symlink_target_through_a_symlink_component_is_refused_even_when_it_stays_lexically_in_root"
+        );
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        std::os::unix::fs::symlink("../other", root.join("dir/sub")).unwrap();
+        std::os::unix::fs::symlink("sub/../other", root.join("dir/link")).unwrap();
+
+        // Lexical: `R/dir/sub/../other` = `R/dir/other` (inside). Physical:
+        // `dir/sub` is `R/other`, so `sub/..` is `R`, then `other` is `R/other`.
+        // The two answers differ, so the tree is refused, never recorded with
+        // the lexical one.
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("dir/sub"),
+            "the local walk must refuse the symlink component, got: {local_err}"
+        );
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("dir/sub"),
+            "the wire assembler must refuse the symlink component, got: {remote_err}"
+        );
+    }
+
+    /// The FINAL component counts too: the kernel FOLLOWS it, so a target that
+    /// ends at a symlink can leave the root even when its spelling never pops
+    /// above the root. `dir/link -> other-link`, where `other-link` is itself a
+    /// symlink, is refused by BOTH canonicalizers rather than accepted as
+    /// `<root>/other-link`. The rule is fail-closed even when the followed link
+    /// happens to stay inside (as here, `other-link -> other`): the walk cannot
+    /// know where the follow ends without following it, and the kernel WILL.
+    #[test]
+    fn symlink_target_ending_at_a_symlink_is_refused_by_both_canonicalizers() {
+        skip_without_perl!("symlink_target_ending_at_a_symlink_is_refused_by_both_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        // A symlink INSIDE the root (it does not itself escape, so the refusal
+        // below can only come from the FINAL-component rule).
+        std::os::unix::fs::symlink("other", root.join("other-link")).unwrap();
+        // The final component of this target is that symlink.
+        std::os::unix::fs::symlink("../other-link", root.join("dir/link")).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("dir/link/file")).unwrap(),
+            b"inside",
+            "the kernel follows the final symlink into the root"
+        );
+
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("other-link"),
+            "the local walk must refuse a target that ends at a symlink, got: {local_err}"
+        );
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("other-link"),
+            "the wire assembler must refuse a target that ends at a symlink, got: {remote_err}"
+        );
+    }
+
+    /// The two call sites must reach the SAME verdict when the ROOT is reached
+    /// through a symlink, because the local walk used to canonicalize the root
+    /// and the wire assembler could not. The relative walk is the same on both
+    /// sides now, so a genuinely in-root target is ACCEPTED with byte-equal
+    /// manifests on both, and a target that crosses the spelled root and
+    /// re-enters only by spelling the root's own name is REFUSED by both. Before
+    /// the fix `dir/link -> ../../real/other` was accepted locally and refused
+    /// on the wire.
+    #[test]
+    fn symlinked_root_verdict_agrees_between_the_canonicalizers() {
+        skip_without_perl!("symlinked_root_verdict_agrees_between_the_canonicalizers");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let real = dir.path().join("deep").join("real");
+        std::fs::create_dir_all(real.join("dir")).unwrap();
+        std::fs::create_dir_all(real.join("other")).unwrap();
+        std::fs::write(real.join("other/file"), b"ok").unwrap();
+        let link_root = dir.path().join("lr");
+        std::os::unix::fs::symlink(&real, &link_root).unwrap();
+
+        // A genuinely in-root target (`../other` from `dir`): both ACCEPT, and
+        // the manifests (and digests) are byte-equal.
+        std::os::unix::fs::symlink("../other", real.join("dir/up")).unwrap();
+        let local = canonicalize_tree(&link_root)
+            .expect("a target that stays in the root must be accepted locally");
+        let out = run_remote_script(&link_root);
+        let remote = canonicalize_remote_entries(&out, &link_root)
+            .expect("the wire assembler must reach the SAME accept verdict");
+        assert_eq!(remote.entries, local.entries);
+        assert_eq!(remote.tree_sha256, local.tree_sha256);
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "dir/up")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("../other"),
+            "the link target is stored verbatim"
+        );
+
+        // The divergence case: `dir/link -> ../../real/other` physically lands
+        // at `<parent-of-real>/real/other` only because the root is NAMED
+        // `real`; the spelled walk pops above the root and re-enters by that
+        // name, so the link leaves the root the moment the tree is materialized
+        // under any OTHER name. It is not portably contained, and the wire
+        // cannot verify the physical re-entry, so the ONE rule refuses it on
+        // both sides rather than let the two disagree.
+        std::os::unix::fs::symlink("../../real/other", real.join("dir/link")).unwrap();
+        let local_err = canonicalize_tree(&link_root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("escaping symlink"),
+            "the local walk must refuse it, got: {local_err}"
+        );
+        let out = run_remote_script(&link_root);
+        let remote_err = canonicalize_remote_entries(&out, &link_root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("escaping symlink"),
+            "the wire assembler must reach the SAME refuse verdict, got: {remote_err}"
         );
     }
 

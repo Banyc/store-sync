@@ -19,9 +19,12 @@ caller.
 3. **Addresses are faithful and injective.** A manifest value is byte-exact:
    names UTF-8 in NFC, no CR, LF or TAB. A symlink target is link DATA, stored
    UTF-8-verbatim: it may contain `/` and `..`, and a relative target is
-   resolved against the directory CONTAINING the link (POSIX), refused only
-   when it is ABSOLUTE or resolves outside the root. Anything else is refused,
-   never normalized or substituted.
+   resolved against the directory CONTAINING the link (POSIX). It is refused
+   when it is ABSOLUTE, when a `..` walks above the root, or when the walk
+   reaches a symlink component — final or intermediate — because the kernel
+   FOLLOWS that component and a lexical collapse past it is not the kernel's
+   answer; the crate refuses rather than guess where the follow ends. Nothing
+   is normalized or substituted.
 4. **A view is faithful, or the check does not run.** No lossy decode, no
    trimming, no defaulted field, on any path that decides something. A listing
    carries the live kind of each entry beside its name.
@@ -47,7 +50,9 @@ caller.
 ## Refused, by rule
 
 Names not UTF-8 or not NFC · names or targets containing CR, LF or TAB ·
-absolute or escaping symlink targets · hard links · devices, sockets, FIFOs ·
+absolute or escaping symlink targets · a relative target that walks through a
+symlink component (the kernel follows it, so a lexical collapse past it is not
+its resolution) · hard links · devices, sockets, FIFOs ·
 reserved-name collisions · overlapping roots (equal is an idempotent no-op;
 ancestor or descendant is refused) · any root or entry reached through a symlink
 component — where a destination's lock cannot be taken, a component swapped
@@ -106,8 +111,11 @@ backup or checkpoint format**, and it cannot stand in for one:
   **escaping symlink** cannot be snapshotted AT ALL: the strict source manifest
   refuses the run, so such a tree must be normalized (copy the hard-linked
   content, make the symlink relative) before it can be pushed. A relative
-  symlink target that contains `/` or `..` but still RESOLVES inside the root
-  (`dir/link -> ../other`) is lawful and is NOT one of these refusals.
+  symlink target that contains `/` or `..` but stays inside the root WITHOUT
+  walking through a symlink component (`dir/link -> ../other`) is lawful and is
+  NOT one of these refusals; a target whose walk reaches a symlink component is
+  refused even when it happens to land inside, because the kernel may follow
+  that component out.
 - A **restore drops metadata with the differ blind**: `diff(snapshot, live)` is
   EMPTY while `mtime`, xattrs and sparseness differ. Ownership,
   `security.capability`, ACLs, timestamps, file flags and sparseness are not
