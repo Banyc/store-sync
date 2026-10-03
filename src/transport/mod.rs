@@ -97,7 +97,13 @@ use walkdir::WalkDir;
 ///   before the first mutation.
 /// * [`Layout::lock`] — the operation-lock record. Every sidecar-serialized
 ///   mutation of THIS path (create-new, compare-and-delete, recover) runs
-///   under the flock on [`Layout::lock_sidecar`].
+///   under the flock on [`Layout::lock_sidecar`]. This is the IN-ROOT layout
+///   lock. It is a DIFFERENT FILE from the sync's destination operation lock
+///   ([`crate::sync::destination_lock_path`], a SIBLING of the destination
+///   root), so the two locks DO NOT exclude each other: holding this one does
+///   not exclude a [`crate::sync::sync`], and a sync holding its own record
+///   does not exclude a holder of this one. A caller that wants both must take
+///   both; neither path composes the other.
 /// * [`Layout::lock_sidecar`] — the flock mutex file serializing mutations of
 ///   [`Layout::lock`]. Created once durably and never removed, so every
 ///   participant flocks the same inode.
@@ -297,6 +303,17 @@ pub trait Remote {
     /// a silent local-verification bug.
     fn is_local(&self) -> bool;
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
+    /// Write `data` to `rel` with the final `mode`, creating or replacing the
+    /// entry.
+    ///
+    /// FIDELITY SCOPE: this primitive carries the manifest model only — the
+    /// bytes and the mode. It writes NO ownership, extended attributes
+    /// (including `security.capability` and macOS `com.apple.*`), POSIX ACLs,
+    /// timestamps, file flags, or sparseness, and the crate's differ cannot see
+    /// their absence: a dropped xattr leaves two manifests equal and the sync
+    /// reporting no difference. The authoritative list is [`crate::manifest`]'s
+    /// "Fidelity scope" section; a caller that needs any of it must apply it
+    /// out of band.
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
     /// Atomically create `rel` with `data` only if it does not already exist,
     /// and make the install DURABLE before returning: the create-new
@@ -563,10 +580,14 @@ pub trait Remote {
     /// Construction is side-effect-free; layout provisioning happens only after
     /// the push engine's non-dry-run gate. The DEFAULT is a no-op (the trait
     /// method has no access to a [`Layout`]); the transports that override it
-    /// ([`LocalTransport`], [`SshTransport`]) create the caller's bootstrap
-    /// directories AND, when [`Layout::receiver_marker`] is `Some`, the
-    /// immutable receiver-id marker (created ONCE at provisioning and never
-    /// changed).
+    /// ([`LocalTransport`], [`SshTransport`]) create the destination ROOT
+    /// ITSELF, the caller's bootstrap directories, AND, when
+    /// [`Layout::receiver_marker`] is `Some`, the immutable receiver-id marker
+    /// (created ONCE at provisioning and never changed). Creating the ROOT is
+    /// what makes a FRESH destination usable: the push entry points call this
+    /// before reading the destination manifest, and `LocalTransport` already
+    /// created its base while `SshTransport` used to omit the root (so the same
+    /// consumer call worked locally and failed only on the remote path).
     fn provision_layout(&self) -> Result<()> {
         Ok(())
     }

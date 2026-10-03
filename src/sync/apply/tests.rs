@@ -11256,3 +11256,320 @@ fn the_ancestry_memo_is_off_for_a_path_based_destination_on_this_platform() {
         );
     }
 }
+
+/// F1 REGRESSION: a PUSH to a destination root that does not exist yet must
+/// create and use it, exactly as the local `provision_layout` already did.
+///
+/// Pre-fix `run` read the destination manifest BEFORE anything created the
+/// root, and `remote_manifest` refuses to describe an absent root as a tree,
+/// so this call failed with `local remote root <root> cannot be described: No
+/// such file or directory (os error 2)` (and, over ssh, `not a directory:
+/// <root>`), even though `LocalTransport::provision_layout` creates the base.
+/// The push path now provisions the destination it is about to write into
+/// before reading its manifest, so the SAME consumer call works for a local
+/// and a remote destination.
+#[test]
+fn push_to_a_fresh_destination_root_creates_it() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    let dst_root = dir.path().join("fresh-dst");
+    assert!(
+        !dst_root.exists(),
+        "premise: the destination root does not exist"
+    );
+
+    let remote = transport(&dst_root);
+    let report = sync(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+        .expect("a push to a fresh destination must create and use the root");
+
+    assert!(dst_root.is_dir(), "the destination root was created");
+    assert_eq!(read(&dst_root.join("ok")), b"payload");
+    assert_eq!(report.transfers, 1, "{report:?}");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+}
+
+/// The same fresh-destination push through the UNOWNED entry point (the one a
+/// remote destination requires), so the provisioning is on the common path and
+/// not only the lock-taking one.
+#[test]
+fn push_unowned_to_a_fresh_destination_root_creates_it() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    let dst_root = dir.path().join("fresh-dst-unowned");
+
+    let remote = transport(&dst_root);
+    let report = push_unowned(&src, &remote, &ReplaceAll)
+        .expect("an unowned push to a fresh destination must create the root");
+
+    assert!(dst_root.is_dir(), "the destination root was created");
+    assert_eq!(read(&dst_root.join("ok")), b"payload");
+    assert_eq!(report.transfers, 1, "{report:?}");
+}
+
+/// F1 `Layout::empty()` usability, end to end: a layout with no bootstrap
+/// directories and no receiver marker is enough to provision a fresh
+/// destination. (`transport` builds exactly `Layout::empty()`.)
+#[test]
+fn push_to_a_fresh_destination_works_with_an_empty_layout() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("nested/ok"), b"payload");
+    let dst_root = dir.path().join("empty-layout-dst");
+
+    let remote = transport(&dst_root);
+    sync(Direction::Push, &src, &remote, &ReplaceAll, Keep)
+        .expect("Layout::empty() must provision a fresh destination");
+
+    // No SPURIOUS entries: only what the source holds (plus the directory the
+    // source itself has).
+    let mut names: Vec<String> = fs::read_dir(&dst_root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["nested".to_string()], "{names:?}");
+    assert_eq!(read(&dst_root.join("nested/ok")), b"payload");
+}
+
+/// F2 REGRESSION (absolute symlink): a destination-only entry the manifest
+/// model refuses must not block the WHOLE run, including its own sanctioned
+/// deletion.
+///
+/// Pre-fix `canonicalize_tree` refused `current -> /opt/app/v1` unconditionally
+/// and the destination manifest is built BEFORE the diff, so this run died at
+/// destination-manifest time with `materialization error: absolute symlink not
+/// allowed: <dst>/current` and never reached the `Extraneous::Delete` the
+/// caller asked for. An absolute `current -> /abs/release` symlink is the
+/// canonical deploy layout, so this is a realistic tree, not a corner case.
+#[cfg(unix)]
+#[test]
+fn sanctioned_delete_clears_an_absolute_symlink_destination_entry() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    symlink("/opt/app/v1", dst.join("current")).unwrap();
+    assert!(
+        fs::symlink_metadata(dst.join("current")).is_ok(),
+        "premise: the absolute symlink is present"
+    );
+    // PRE-FIX PROOF: the STRICT canonicalizer still refuses this entry with
+    // exactly the message the run used to die on at destination-manifest time
+    // (`sync` did not tolerate it, so the whole run failed here).
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap_err().to_string(),
+        format!(
+            "materialization error: absolute symlink not allowed: {}",
+            dst.join("current").display()
+        )
+    );
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("a sanctioned deletion of an absolute-symlink destination entry must run");
+
+    assert!(
+        fs::symlink_metadata(dst.join("current")).is_err(),
+        "the sanctioned deletion removed the absolute symlink: {report:?}"
+    );
+    assert_eq!(read(&dst.join("ok")), b"payload");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert!(report.verify_failures.is_empty(), "{report:?}");
+}
+
+/// F2 REGRESSION (escaping symlink): the second refusal, same capability.
+///
+/// Pre-fix: `materialization error: escaping symlink not allowed: <dst>/esc`.
+#[cfg(unix)]
+#[test]
+fn sanctioned_delete_clears_an_escaping_symlink_destination_entry() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    symlink("../../../etc/passwd", dst.join("esc")).unwrap();
+    // PRE-FIX PROOF: the strict canonicalizer's exact message.
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap_err().to_string(),
+        format!(
+            "materialization error: escaping symlink not allowed: {}",
+            dst.join("esc").display()
+        )
+    );
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("a sanctioned deletion of an escaping-symlink destination entry must run");
+
+    assert!(
+        fs::symlink_metadata(dst.join("esc")).is_err(),
+        "the sanctioned deletion removed the escaping symlink: {report:?}"
+    );
+    assert_eq!(read(&dst.join("ok")), b"payload");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+}
+
+/// F2 REGRESSION (hard link): the third refusal, same capability — and the
+/// removal unlinks ONE name without destroying the other.
+///
+/// Pre-fix: `materialization error: hard links not allowed: <dst>/hard`.
+#[cfg(unix)]
+#[test]
+fn sanctioned_delete_clears_a_hard_link_destination_entry_without_touching_its_twin() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    // The SOURCE holds the twin under the same name and content, so the diff
+    // classifies the twin `Same` (it must be left alone) while `hard` is
+    // destination-only.
+    write(&src.join("kept"), b"shared-bytes");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    write(&dst.join("hard"), b"shared-bytes");
+    fs::hard_link(dst.join("hard"), dst.join("kept")).unwrap();
+    assert_eq!(
+        {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(dst.join("hard")).unwrap().nlink()
+        },
+        2,
+        "premise: the destination entry is a hard link"
+    );
+    // PRE-FIX PROOF: the strict canonicalizer's message (the walk may name
+    // EITHER link, so the assertion pins the reason and the tree, not which of
+    // the two names readdir yielded first).
+    let strict = canonicalize_tree(&dst).unwrap_err().to_string();
+    assert!(
+        strict.starts_with("materialization error: hard links not allowed: ")
+            && strict.contains("/dst/"),
+        "{strict}"
+    );
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("a sanctioned deletion of a hard-link destination entry must run");
+
+    assert!(
+        fs::symlink_metadata(dst.join("hard")).is_err(),
+        "the sanctioned deletion removed the destination-only hard link: {report:?}"
+    );
+    assert_eq!(
+        read(&dst.join("kept")),
+        b"shared-bytes",
+        "the twin the source holds is left intact: {report:?}"
+    );
+    assert_eq!(read(&dst.join("ok")), b"payload");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+}
+
+/// F2 (LOCAL destination, PULL direction): the same tolerance on the local
+/// destination manifest, so the capability does not depend on the direction.
+#[cfg(unix)]
+#[test]
+fn sanctioned_delete_clears_an_absolute_symlink_in_a_local_pull_destination() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let remote_root = dir.path().join("remote");
+    write(&remote_root.join("ok"), b"payload");
+    let local = dir.path().join("local");
+    fs::create_dir_all(&local).unwrap();
+    symlink("/opt/app/v1", local.join("current")).unwrap();
+    // PRE-FIX PROOF: the strict canonicalizer's exact message.
+    assert_eq!(
+        canonicalize_tree(&local).unwrap_err().to_string(),
+        format!(
+            "materialization error: absolute symlink not allowed: {}",
+            local.join("current").display()
+        )
+    );
+
+    let report = sync(
+        Direction::Pull,
+        &local,
+        &transport(&remote_root),
+        &ReplaceAll,
+        Delete,
+    )
+    .expect("a sanctioned deletion of a local destination's absolute symlink must run");
+
+    assert!(
+        fs::symlink_metadata(local.join("current")).is_err(),
+        "the sanctioned deletion removed the local absolute symlink: {report:?}"
+    );
+    assert_eq!(read(&local.join("ok")), b"payload");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+}
+
+/// F2, `Extraneous::Keep`: `keep` must report the unsupported destination entry
+/// instead of dying, so a consumer can at least list what differs.
+#[cfg(unix)]
+#[test]
+fn keep_reports_an_unsupported_destination_entry_without_failing_the_run() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    symlink("/opt/app/v1", dst.join("current")).unwrap();
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+        .expect("a kept unsupported destination entry must be reported, not fatal");
+
+    assert!(
+        fs::symlink_metadata(dst.join("current")).is_ok(),
+        "Keep must leave the unsupported entry in place: {report:?}"
+    );
+    assert!(
+        report.extraneous.contains(&"current".to_string()),
+        "the unsupported entry is reported extraneous: {report:?}"
+    );
+}
+
+/// F2 SOUNDNESS GATE: an unsupported destination entry may be DELETED under a
+/// sanction, but the run must NEVER write a source entry over it. The refusal
+/// names the path, the reason, and the remedy, and it fires BEFORE any
+/// transfer.
+#[cfg(unix)]
+#[test]
+fn a_source_entry_over_an_unsupported_destination_entry_is_refused_before_any_transfer() {
+    use std::os::unix::fs::symlink;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(
+        &src.join("current"),
+        b"a regular file the source wants installed",
+    );
+    write(&src.join("ok"), b"should not be transferred");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    symlink("/opt/app/v1", dst.join("current")).unwrap();
+
+    let failure = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect_err("writing over an unsupported destination entry must be refused");
+
+    let message = failure.to_string();
+    assert!(
+        message.contains("current"),
+        "the refusal names the path: {message}"
+    );
+    assert!(
+        message.contains("absolute symlink not allowed"),
+        "the refusal names the reason: {message}"
+    );
+    assert!(
+        message.contains("Remedy"),
+        "the refusal names the remedy: {message}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("current")).is_ok(),
+        "the unsupported entry is untouched: {message}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("ok")).is_err(),
+        "NOTHING was transferred before the refusal: {message}"
+    );
+}

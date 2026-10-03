@@ -48,12 +48,30 @@ ancestor or descendant is refused) · any root or entry reached through a symlin
 component — where a destination's lock cannot be taken, a component swapped
 between the check and the operation is a stated residual, not a guarantee.
 
+As a DESTINATION member, an absolute/escaping symlink or a hard link is not
+refused: the destination manifest records it, the diff reports it extraneous,
+and `Extraneous::Delete` removes it. It is never TRANSFERRED — a source entry
+at the same path is refused before any mutation. `Extraneous` is all-or-nothing
+(no per-path delete policy).
+
 ## Fidelity scope
 
 Carried: name, kind, mode (including setuid, setgid, sticky), content, symlink
 target. Not carried: ownership, extended attributes, POSIX ACLs, timestamps,
-file flags, sparseness. Refused rather than dropped: hard links. Authoritative
-statement: the `manifest` module documentation.
+file flags, sparseness. Refused rather than dropped: hard links. The loss is
+INVISIBLE TO THE DIFFER: a dropped xattr or ACL leaves `local_manifest ==
+remote_manifest` true and the sync reporting no difference, so only
+xattr/ACL-aware tooling on the destination can reveal it. Authoritative
+statement: the `manifest` module documentation; the sync entry points restate
+the scope.
+
+## A fresh destination
+
+A `PUSH` provisions its destination before reading the destination manifest: the
+destination ROOT and the caller's `Layout::bootstrap_dirs` are created, so a
+fresh remote destination works without the caller pre-creating it and
+`Layout::empty()` is enough. A `PULL` into a local destination creates that root
+lazily, on the first mutation.
 
 ## Platform
 

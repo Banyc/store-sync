@@ -353,8 +353,84 @@ fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
 /// re-spelling), duplicate paths, escaping/absolute symbolic links, devices,
 /// sockets, FIFOs, and hard links.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
+    Ok(canonicalize_tree_with(root, UnsupportedPolicy::Refuse)?.meta)
+}
+
+/// One DESTINATION entry that the manifest model can carry as PRESENT but that
+/// the strict address-fidelity rules refuse to ACCEPT as a faithful member of
+/// the tree: an absolute or escaping symlink, or a hard link. It is returned
+/// alongside the manifest by [`canonicalize_tree_destination`] (and
+/// [`canonicalize_remote_entries_destination`]) so the sync can classify the
+/// entry as destination-only and let a caller-sanctioned
+/// [`crate::sync::Extraneous::Delete`] remove it, instead of failing the whole
+/// run at destination-manifest time.
+///
+/// The entry ITSELF is present in the returned manifest, with its live kind
+/// and (where it has one) its faithfully hashed content/target — so the diff
+/// sees it, the report names it, and the removal walk addresses it under the
+/// spelling and kind it really has. Only the [`reason`](Self::reason) records
+/// why the strict rules would have refused it. This is NOT a licence to
+/// transfer such an entry: the sync REFUSES to write a source entry over a
+/// path an `UnsupportedEntry` names (see `crate::sync::apply`), so an
+/// unsupported destination entry can be deleted under a sanction, never
+/// silently overwritten, aliased, or moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedEntry {
+    /// The manifest spelling of the entry, exactly as it appears in the
+    /// returned manifest.
+    pub path: String,
+    /// The strict rule's refusal message (e.g. `absolute symlink not allowed:
+    /// <path>`), preserved verbatim so a caller sees the same reason the
+    /// strict canonicalizer would have reported.
+    pub reason: String,
+}
+
+/// The result of canonicalizing a DESTINATION tree: the manifest plus the
+/// entries the strict rules would have refused.
+///
+/// `meta` is a DESTINATION OBSERVATION, not a canonical tree object: an entry
+/// named in `unsupported` may not be one the strict canonicalizer would emit
+/// (its symlink target may be absolute, or it may be a hard link recorded as
+/// an ordinary file). Never serialize it as a `tree.json`, never feed it to
+/// [`verify_tree_metadata`], and never use it as a SOURCE manifest — the
+/// source side must stay strict, so a tree this crate cannot represent
+/// faithfully is a loud failure rather than a silent transformation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DestinationTree {
+    pub meta: TreeMetadata,
+    pub unsupported: Vec<UnsupportedEntry>,
+}
+
+/// Canonicalize a destination tree, TOLERATING the address-fidelity refusals
+/// that a destination may legitimately hold: an absolute symlink, an escaping
+/// symlink, and a hard link. Each tolerated entry is recorded in the returned
+/// [`DestinationTree::unsupported`] with the strict rule's reason, and the
+/// manifest still carries it (under its live kind) so a caller-sanctioned
+/// removal can address it.
+///
+/// Everything ELSE the strict [`canonicalize_tree`] refuses is still refused
+/// here, unchanged: an absent or non-directory root, a non-UTF-8 or non-NFC
+/// name, a wire-unrepresentable character, an absolute/traversal path, a
+/// duplicate, and a special file (FIFO/socket/device). The tolerance is a
+/// DESTINATION-ONLY concept: a source manifest is always built with
+/// [`canonicalize_tree`], so an unrepresentable SOURCE entry still fails the
+/// run.
+pub fn canonicalize_tree_destination(root: &Path) -> Result<DestinationTree> {
+    canonicalize_tree_with(root, UnsupportedPolicy::Tolerate)
+}
+
+/// Whether the shared walk REFUSES an unrepresentable entry (the strict source
+/// semantics) or RECORDS it and keeps going (the destination semantics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnsupportedPolicy {
+    Refuse,
+    Tolerate,
+}
+
+fn canonicalize_tree_with(root: &Path, policy: UnsupportedPolicy) -> Result<DestinationTree> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut unsupported: Vec<UnsupportedEntry> = Vec::new();
 
     let root_c = root
         .canonicalize()
@@ -412,6 +488,10 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
         };
         let mut content_sha256 = None;
         let mut symlink_target = None;
+        // Set when a strict address-fidelity rule refused this entry under
+        // `UnsupportedPolicy::Tolerate`; the entry is still recorded (under
+        // its live kind) and the reason joins `unsupported`.
+        let mut unsupported_reason: Option<String> = None;
 
         if meta.is_dir() {
             entry_type = "dir";
@@ -420,20 +500,21 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             let target = std::fs::read_link(path)
                 .map_err(|e| Error::materialization(format!("readlink {}: {e}", path.display())))?;
             if target.is_absolute() {
-                return Err(Error::materialization(format!(
-                    "absolute symlink not allowed: {}",
-                    path.display()
-                )));
-            }
-            // Ensure target resolves inside the artifact root.
-            let resolved = normalize_lexical(&root_c, &target);
-            match resolved {
-                Some(r) if r.starts_with(&root_c) => {}
-                _ => {
-                    return Err(Error::materialization(format!(
-                        "escaping symlink not allowed: {}",
-                        path.display()
-                    )));
+                let reason = format!("absolute symlink not allowed: {}", path.display());
+                match policy {
+                    UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                    UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
+                }
+            } else {
+                // Ensure target resolves inside the artifact root.
+                let resolved = normalize_lexical(&root_c, &target);
+                let inside = matches!(resolved.as_ref(), Some(r) if r.starts_with(&root_c));
+                if !inside {
+                    let reason = format!("escaping symlink not allowed: {}", path.display());
+                    match policy {
+                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
+                    }
                 }
             }
             // The target is LINK CONTENT, so it must be stored faithfully or
@@ -456,10 +537,11 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             {
                 use std::os::unix::fs::MetadataExt;
                 if meta.nlink() > 1 {
-                    return Err(Error::materialization(format!(
-                        "hard links not allowed: {}",
-                        path.display()
-                    )));
+                    let reason = format!("hard links not allowed: {}", path.display());
+                    match policy {
+                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Tolerate => unsupported_reason = Some(reason),
+                    }
                 }
             }
             let data = std::fs::read(path)
@@ -472,6 +554,13 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             )));
         }
 
+        if let Some(reason) = unsupported_reason.take() {
+            unsupported.push(UnsupportedEntry {
+                path: entry_path.clone(),
+                reason,
+            });
+        }
+
         entries.push(TreeEntry {
             path: entry_path,
             entry_type: entry_type.to_string(),
@@ -482,6 +571,7 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    unsupported.sort_by(|a, b| a.path.cmp(&b.path));
     let mut meta = TreeMetadata {
         tree_schema_version: TREE_SCHEMA_VERSION,
         hash_algorithm: "sha256".to_string(),
@@ -489,7 +579,7 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
         entries,
     };
     meta.tree_sha256 = compute_tree_digest(&meta);
-    Ok(meta)
+    Ok(DestinationTree { meta, unsupported })
 }
 
 /// The remote tree-verification script: walks a tree on the remote and
@@ -651,8 +741,30 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// existing empty directory, whose empty stdout is the empty manifest — may
 /// be assembled here.
 pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
+    Ok(canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Refuse)?.meta)
+}
+
+/// The destination-tolerant form of [`canonicalize_remote_entries`]: the same
+/// wire validation, but a hard link and an absolute or escaping symlink are
+/// RECORDED in [`DestinationTree::unsupported`] (and kept in the manifest
+/// under their live kind) instead of failing the whole assembly. A
+/// special-file line (`o`) is still refused: the applier's live-kind authority
+/// has no primitive for it, so the crate cannot remove it safely.
+pub fn canonicalize_remote_entries_destination(
+    output: &str,
+    root: &Path,
+) -> Result<DestinationTree> {
+    canonicalize_remote_entries_with(output, root, UnsupportedPolicy::Tolerate)
+}
+
+fn canonicalize_remote_entries_with(
+    output: &str,
+    root: &Path,
+    policy: UnsupportedPolicy,
+) -> Result<DestinationTree> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut unsupported: Vec<UnsupportedEntry> = Vec::new();
     for line in output.split('\n') {
         // The script terminates every line with a single LF and never emits a
         // CR. `str::lines()` would fold a CR that immediately precedes the LF,
@@ -724,9 +836,14 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                     Error::materialization(format!("invalid nlink {nlink:?} for {entry_path}"))
                 })?;
                 if n > 1 {
-                    return Err(Error::materialization(format!(
-                        "hard links not allowed: {entry_path}"
-                    )));
+                    let reason = format!("hard links not allowed: {entry_path}");
+                    match policy {
+                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
+                            path: entry_path.clone(),
+                            reason,
+                        }),
+                    }
                 }
                 if content_hash.is_empty() {
                     return Err(Error::materialization(format!(
@@ -772,17 +889,28 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
                 let symlink_target = validate_symlink_target(&entry_path, symlink_target)?;
                 let target = PathBuf::from(&symlink_target);
                 if target.is_absolute() {
-                    return Err(Error::materialization(format!(
-                        "absolute symlink not allowed: {entry_path}"
-                    )));
-                }
-                let resolved = normalize_lexical(root, &target);
-                match resolved {
-                    Some(r) if r.starts_with(root) => {}
-                    _ => {
-                        return Err(Error::materialization(format!(
-                            "escaping symlink not allowed: {entry_path}"
-                        )));
+                    let reason = format!("absolute symlink not allowed: {entry_path}");
+                    match policy {
+                        UnsupportedPolicy::Refuse => return Err(Error::materialization(reason)),
+                        UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
+                            path: entry_path.clone(),
+                            reason,
+                        }),
+                    }
+                } else {
+                    let resolved = normalize_lexical(root, &target);
+                    let inside = matches!(resolved.as_ref(), Some(r) if r.starts_with(root));
+                    if !inside {
+                        let reason = format!("escaping symlink not allowed: {entry_path}");
+                        match policy {
+                            UnsupportedPolicy::Refuse => {
+                                return Err(Error::materialization(reason));
+                            }
+                            UnsupportedPolicy::Tolerate => unsupported.push(UnsupportedEntry {
+                                path: entry_path.clone(),
+                                reason,
+                            }),
+                        }
                     }
                 }
                 let recomputed = sha256_bytes(symlink_target.as_bytes());
@@ -813,6 +941,7 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
     // refused rather than implicitly creating an unnamed parent.
     require_parent_closed(&entries)?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    unsupported.sort_by(|a, b| a.path.cmp(&b.path));
     let mut meta = TreeMetadata {
         tree_schema_version: TREE_SCHEMA_VERSION,
         hash_algorithm: "sha256".to_string(),
@@ -820,7 +949,7 @@ pub fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMeta
         entries,
     };
     meta.tree_sha256 = compute_tree_digest(&meta);
-    Ok(meta)
+    Ok(DestinationTree { meta, unsupported })
 }
 
 /// Verify that a stored [`TreeMetadata`] is EXACTLY the canonical metadata of
@@ -1524,6 +1653,124 @@ mod tests {
         assert!(
             remote_err.to_string().contains("hard links not allowed"),
             "remote assembler must reject the hard link, got: {remote_err}"
+        );
+    }
+
+    /// F2 (destination tolerance, LOCAL): the strict canonicalizer still
+    /// refuses an absolute/escaping symlink and a hard link, and the
+    /// DESTINATION-tolerant form records each in `unsupported` while keeping
+    /// it in the manifest under its live kind — the capability a
+    /// caller-sanctioned deletion needs.
+    #[test]
+    fn destination_tolerant_canonicalizer_records_unrepresentable_local_entries() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let links = dir.path().join("links");
+        std::fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink("/opt/app/v1", links.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../../../etc/passwd", links.join("esc")).unwrap();
+
+        // STRICT SOURCE SEMANTICS ARE UNCHANGED.
+        let strict = canonicalize_tree(&links).unwrap_err().to_string();
+        assert!(strict.contains("symlink not allowed"), "{strict}");
+
+        let tree = canonicalize_tree_destination(&links).expect("destination tolerates the links");
+        let mut recorded: Vec<(String, String)> = tree
+            .unsupported
+            .iter()
+            .map(|u| (u.path.clone(), u.reason.clone()))
+            .collect();
+        recorded.sort();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert!(
+            recorded[0].0 == "abs" && recorded[0].1.contains("absolute symlink not allowed"),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded[1].0 == "esc" && recorded[1].1.contains("escaping symlink not allowed"),
+            "{recorded:?}"
+        );
+        // PRESENT under the live kind so the diff, the report, and the removal
+        // walk can address them.
+        assert!(
+            tree.meta
+                .entries
+                .iter()
+                .any(|e| e.path == "abs" && e.entry_type == "symlink"),
+            "{:?}",
+            tree.meta.entries
+        );
+        assert!(
+            tree.meta
+                .entries
+                .iter()
+                .any(|e| e.path == "esc" && e.entry_type == "symlink")
+        );
+
+        // A hard link, likewise: both names have nlink > 1 and are recorded.
+        let hard = dir.path().join("hard");
+        std::fs::create_dir_all(&hard).unwrap();
+        std::fs::write(hard.join("a"), b"content").unwrap();
+        std::fs::hard_link(hard.join("a"), hard.join("b")).unwrap();
+        assert!(canonicalize_tree(&hard).is_err());
+        let tree = canonicalize_tree_destination(&hard).unwrap();
+        let mut paths: Vec<String> = tree.unsupported.iter().map(|u| u.path.clone()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["a".to_string(), "b".to_string()],
+            "{:?}",
+            tree.unsupported
+        );
+        assert!(
+            tree.unsupported
+                .iter()
+                .all(|u| u.reason.contains("hard links not allowed"))
+        );
+        assert!(tree.meta.entries.iter().all(|e| e.entry_type == "file"));
+    }
+
+    /// F2 (destination tolerance, REMOTE): the same tolerance through the
+    /// far-side wire assembler — and the refusals it must NOT tolerate.
+    #[test]
+    fn destination_tolerant_remote_assembler_records_unrepresentable_entries() {
+        skip_without_perl!("destination_tolerant_remote_assembler_records_unrepresentable_entries");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let links = dir.path().join("links");
+        std::fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink("/opt/app/v1", links.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../../../etc/passwd", links.join("esc")).unwrap();
+
+        let out = run_remote_script(&links);
+        assert!(canonicalize_remote_entries(&out, &links).is_err());
+        let tree = canonicalize_remote_entries_destination(&out, &links)
+            .expect("the remote destination assembler tolerates the links");
+        let mut paths: Vec<String> = tree.unsupported.iter().map(|u| u.path.clone()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["abs".to_string(), "esc".to_string()],
+            "{:?}",
+            tree.unsupported
+        );
+
+        // A special file is STILL refused on BOTH tolerant paths: the applier's
+        // live-kind authority has no primitive for it, so tolerating it would
+        // promise a removal the run cannot make.
+        let special = dir.path().join("special");
+        std::fs::create_dir_all(&special).unwrap();
+        let fifo = special.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let out = run_remote_script(&special);
+        let remote_err = canonicalize_remote_entries_destination(&out, &special).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("unsupported file type"),
+            "{remote_err}"
+        );
+        let local_err = canonicalize_tree_destination(&special).unwrap_err();
+        assert!(
+            local_err.to_string().contains("unsupported file type"),
+            "{local_err}"
         );
     }
 

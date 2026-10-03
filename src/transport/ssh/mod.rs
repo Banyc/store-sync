@@ -213,6 +213,19 @@ pub struct SshTransport {
     /// naming the remote path, the payload size, and the elapsed time, so a
     /// stalled push can be attributed to the exact file being transferred.
     verbose: bool,
+    /// The USER's private key for authentication, passed to `ssh` as
+    /// `-o IdentitiesOnly=yes -i <path>`. `None` means no key option is added:
+    /// ssh then authenticates with the AMBIENT configuration (the running
+    /// user's `~/.ssh`, the `SSH_AUTH_SOCK` agent, and `~/.ssh/config`). See
+    /// [`SshTransport::with_identity_file`].
+    identity_file: Option<PathBuf>,
+    /// Caller-supplied extra `ssh -o <value>` options, appended AFTER the
+    /// crate's own options. Because OpenSSH uses the FIRST obtained value for
+    /// a repeated keyword, a caller cannot override the crate's own host-key
+    /// or authentication policy with a conflicting option; a non-conflicting
+    /// option (a `ProxyJump`, a `CertificateFile`, a `HostKeyAlgorithms`) is
+    /// passed through verbatim. See [`SshTransport::with_ssh_option`].
+    ssh_options: Vec<String>,
 }
 
 impl SshTransport {
@@ -234,6 +247,19 @@ impl SshTransport {
     /// managed known-hosts file (from the environment snapshot at the
     /// boundary), and `env` is that snapshot: every child this transport
     /// spawns (ssh, ssh-keyscan, ssh-keygen) receives its variables.
+    ///
+    /// # Host identity vs the USER's authentication identity
+    ///
+    /// This constructor's identity material is HOST identity ONLY — which
+    /// server key to trust and pin. It does NOT carry the USER's private key:
+    /// no `-i`/`IdentityFile`/`IdentitiesOnly` option is added, so ssh
+    /// authenticates with the AMBIENT configuration — the running user's
+    /// `~/.ssh` default identities, the `SSH_AUTH_SOCK` agent, and
+    /// `~/.ssh/config` — exactly as a bare `ssh user@host` would. A tool that
+    /// owns its own private key should not rely on that ambient state: pass it
+    /// with [`SshTransport::with_identity_file`] (`.with_identity_file(path)`),
+    /// which adds `-o IdentitiesOnly=yes -i <path>`. Extra non-conflicting ssh
+    /// options are available through [`SshTransport::with_ssh_option`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         user: &str,
@@ -292,6 +318,8 @@ impl SshTransport {
             env: env.clone(),
             runner: SshRunner::new(env),
             verbose,
+            identity_file: None,
+            ssh_options: Vec::new(),
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
@@ -331,6 +359,52 @@ impl SshTransport {
         )?;
         t.runner = runner;
         Ok(t)
+    }
+
+    /// The `provision_layout` command: `mkdir -p <root> <bootstrap_dirs...>`.
+    ///
+    /// The ROOT is the FIRST operand so the transport can create a fresh
+    /// destination (see [`Remote::provision_layout`]); the bootstrap
+    /// directories follow it. Every path is single-quoted by `argv_cmd` so it
+    /// reaches `mkdir` verbatim.
+    fn provision_layout_cmd(root: &Path, layout: &Layout) -> String {
+        let mut argv: Vec<String> = vec!["mkdir".into(), "-p".into()];
+        argv.push(root.to_string_lossy().into_owned());
+        argv.extend(
+            layout
+                .bootstrap_dirs
+                .iter()
+                .map(|d| root.join(d).to_string_lossy().into_owned()),
+        );
+        Self::argv_cmd(&argv)
+    }
+
+    /// Supply the USER's private key used to authenticate to the remote,
+    /// appended to the ssh arguments as `-o IdentitiesOnly=yes -i <path>`.
+    ///
+    /// `IdentitiesOnly=yes` makes ssh use exactly this key and skip the ambient
+    /// agent/`~/.ssh` identities, so a tool that owns its own key does not need
+    /// to install it into the user's agent or `~/.ssh`. The path is passed to
+    /// ssh verbatim and must be readable by the ssh process (construction stays
+    /// side-effect-free; a missing or unreadable key fails at the first remote
+    /// request, not here). Without this method the transport relies on the
+    /// ambient ssh configuration — see [`SshTransport::new`]'s "Host identity
+    /// vs the USER's authentication identity".
+    pub fn with_identity_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.identity_file = Some(path.into());
+        self
+    }
+
+    /// Append a caller-supplied `ssh` option, passed as `-o <value>` (e.g.
+    /// `with_ssh_option("ProxyJump", "bastion")`). Options are appended AFTER
+    /// the crate's own, so OpenSSH's first-obtained-value rule keeps the
+    /// crate's host-key and authentication policy authoritative; a
+    /// non-conflicting option is passed through verbatim. The value is passed
+    /// to ssh as one argument, never through a shell.
+    pub fn with_ssh_option(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.ssh_options
+            .push(format!("{}={}", key.as_ref(), value.as_ref()));
+        self
     }
 
     /// Build the fixed `ssh` arguments (options + target). Errors if no host
@@ -390,6 +464,20 @@ impl SshTransport {
                      `host_key_fingerprint` (trust-on-first-use is disabled)",
                 ));
             }
+        }
+        // The USER's authentication identity, when the caller supplied one. The
+        // ambient configuration (agent, `~/.ssh`) is used when it is absent.
+        // Placed AFTER the crate's own options so the first-obtained-value rule
+        // keeps the crate's host-key policy authoritative.
+        if let Some(identity) = &self.identity_file {
+            args.push("-o".into());
+            args.push("IdentitiesOnly=yes".into());
+            args.push("-i".into());
+            args.push(identity.to_string_lossy().into_owned());
+        }
+        for option in &self.ssh_options {
+            args.push("-o".into());
+            args.push(option.clone());
         }
         args.push(self.target.clone());
         Ok(args)
@@ -1628,18 +1716,31 @@ impl Remote for SshTransport {
     }
 
     fn provision_layout(&self) -> Result<()> {
-        // Create the caller-supplied deployment-directory layout on the
-        // remote host. Every path is single-quoted by
+        // Create the ROOT ITSELF, then the caller-supplied bootstrap
+        // directories, in ONE `mkdir -p`. Every path is single-quoted by
         // `argv_cmd`/`shell_quote` so it reaches `mkdir` verbatim. This runs
         // only after the push engine's non-dry-run gate.
-        let mut argv: Vec<String> = vec!["mkdir".into(), "-p".into()];
-        argv.extend(
-            self.layout
-                .bootstrap_dirs
-                .iter()
-                .map(|d| self.root.join(d).to_string_lossy().into_owned()),
-        );
-        self.run_remote_ok(&Self::argv_cmd(&argv))?;
+        //
+        // The ROOT is an operand on purpose, mirroring
+        // `LocalTransport::provision_layout`'s `create_dir_all(self.base)`.
+        // The pre-fix argv omitted it, so with `Layout::empty()` (no bootstrap
+        // directories) the command was `mkdir -p` with NO OPERAND and the
+        // remote `mkdir` failed with its usage error (`missing operand` on
+        // GNU, `usage: mkdir [-pv] [-m mode] directory_name ...` on macOS);
+        // and even when bootstrap directories were supplied, the root itself
+        // was still left absent, so the first destination manifest read failed
+        // with `not a directory: <root>`. A fresh destination is now usable
+        // through the same call on either transport.
+        let cmd = Self::provision_layout_cmd(&self.root, &self.layout);
+        self.run_remote_ok(&cmd).map_err(|error| {
+            error.with_context(format!(
+                "creating the destination layout failed (stage: `mkdir -p {}`), so the \
+                 destination root and the caller's bootstrap directories were not created; \
+                 remedy: ensure the destination's parent directory exists and is writable by \
+                 the remote account",
+                self.root.display()
+            ))
+        })?;
         // The IMMUTABLE receiver-id marker: the PHYSICAL identity of this
         // deploy_dir, created ONCE at provisioning and never changed (a
         // re-provisioning adopts the existing marker).
@@ -2991,6 +3092,85 @@ mod tests_ssh {
         assert!(
             cmd[mkdir_end..].contains("mktemp"),
             "mktemp allocation must follow mkdir -p, got: {cmd}"
+        );
+    }
+
+    /// F1, BEHAVIOUR: `provision_layout` must create the destination ROOT, not
+    /// only the caller's bootstrap directories.
+    ///
+    /// Pre-fix the argv listed ONLY `layout.bootstrap_dirs`, so with
+    /// `Layout::empty()` the command was `mkdir -p` with NO OPERAND and the
+    /// remote `mkdir` failed with its usage error (`mkdir: missing operand` on
+    /// GNU, `usage: mkdir [-pv] [-m mode] directory_name ...` on macOS); with
+    /// bootstrap directories present the ROOT was still left absent, so the
+    /// first destination manifest read failed with `not a directory: <root>`.
+    /// `LocalTransport::provision_layout` already created its base, so the
+    /// same consumer call worked locally and failed only on the remote path.
+    /// This pins the ROOT as the FIRST operand.
+    #[test]
+    fn provision_layout_creates_the_destination_root() {
+        let t = transport();
+        let cmd = SshTransport::provision_layout_cmd(t.root(), &Layout::empty());
+        assert_eq!(
+            cmd, "'mkdir' '-p' '/srv/app'",
+            "an empty layout must still create the destination root"
+        );
+
+        let mut layout = Layout::empty();
+        layout.bootstrap_dirs = vec![
+            RootedRelativePath::parse(Path::new("state")).unwrap(),
+            RootedRelativePath::parse(Path::new("releases")).unwrap(),
+        ];
+        let cmd = SshTransport::provision_layout_cmd(t.root(), &layout);
+        assert_eq!(
+            cmd, "'mkdir' '-p' '/srv/app' '/srv/app/state' '/srv/app/releases'",
+            "the root is the first operand, then every bootstrap directory"
+        );
+    }
+
+    /// The USER identity channel: `with_identity_file` adds `-i <path>` and
+    /// `IdentitiesOnly=yes`; without it no key option is added (ssh uses the
+    /// ambient `~/.ssh`/agent configuration, which the constructor documents).
+    /// A caller-supplied `-o` option is appended AFTER the crate's own, so the
+    /// first-obtained-value rule keeps the crate's host-key policy
+    /// authoritative.
+    #[test]
+    fn with_identity_file_adds_the_user_key_and_identities_only() {
+        let path = Path::new("/home/deploy/.config/app/deploy_ed25519");
+        let t = transport().with_identity_file(path);
+        let args = t.ssh_args().unwrap();
+        let i = args.iter().position(|a| a == "-i").expect("an -i option");
+        assert_eq!(args[i + 1], path.to_string_lossy().into_owned());
+        assert!(
+            args.iter().any(|a| a == "IdentitiesOnly=yes"),
+            "IdentitiesOnly=yes forces the supplied key: {args:?}"
+        );
+
+        // Without it, no key option is added: the ambient configuration is the
+        // documented default.
+        let plain = transport().ssh_args().unwrap();
+        assert!(!plain.iter().any(|a| a == "-i"), "{plain:?}");
+        assert!(
+            !plain.iter().any(|a| a == "IdentitiesOnly=yes"),
+            "{plain:?}"
+        );
+
+        // A caller option is appended after the crate's own options.
+        let args = transport()
+            .with_ssh_option("ProxyJump", "bastion")
+            .ssh_args()
+            .unwrap();
+        let strict_pos = args
+            .iter()
+            .position(|a| a == "StrictHostKeyChecking=yes")
+            .expect("the crate's host-key policy is present");
+        let caller_pos = args
+            .iter()
+            .position(|a| a == "ProxyJump=bastion")
+            .expect("the caller option is present");
+        assert!(
+            strict_pos < caller_pos,
+            "crate options precede caller options: {args:?}"
         );
     }
 

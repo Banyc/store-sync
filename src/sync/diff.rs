@@ -22,7 +22,8 @@
 
 use crate::error::{Error, Result};
 use crate::manifest::{
-    TreeEntry, TreeMetadata, canonicalize_remote_entries, canonicalize_tree,
+    DestinationTree, TreeEntry, TreeMetadata, canonicalize_remote_entries,
+    canonicalize_remote_entries_destination, canonicalize_tree, canonicalize_tree_destination,
     remote_tree_verify_script,
 };
 use crate::transport::{ExecOutcome, Remote};
@@ -136,6 +137,14 @@ impl TreeDiff {
 }
 
 /// The canonical manifest of the local tree at `root`.
+///
+/// `root` must be a DIRECTORY: an ABSENT root is an error (`canonicalize`
+/// fails), never an empty manifest, and a root that is not a directory is an
+/// error too. A caller that wants an absent destination ROOT to read as the
+/// empty tree is the sync's LOCAL DESTINATION (`LocalSide`), which decides
+/// that explicitly before calling a canonicalizer; a caller that wants the
+/// destination tolerant of an unrepresentable entry calls
+/// [`crate::manifest::canonicalize_tree_destination`].
 pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
     canonicalize_tree(root)
 }
@@ -153,9 +162,14 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// or a transport error — is an ERROR, never an empty manifest. An empty
 /// manifest would read as "the remote tree is empty" and drive a transfer
 /// that deletes or rewrites a tree the far side never described. For the same
-/// reason an ABSENT or non-directory root is an error on BOTH branches: a
-/// caller pushing to a fresh destination creates the destination root (or
-/// provisions the layout) first; it is never silently described as empty.
+/// reason this PRIMITIVE reports an ABSENT or non-directory root as an error
+/// on BOTH branches; it never describes one as empty. The sync entry points do
+/// not rely on the caller: a PUSH calls `Remote::provision_layout`, which
+/// creates the destination ROOT (and the caller's bootstrap directories)
+/// before this manifest is read, so a fresh remote destination works through
+/// the public API. A caller that invokes this primitive directly must create
+/// the root or provision the layout first; [`remote_destination_manifest`] is
+/// the tolerant destination-side form and still refuses an absent root.
 ///
 /// A non-zero exit is classified by LAYER ([`remote_manifest_failure`]): the
 /// remote command is `ssh … exec -- perl -e <script> <root>`. `ssh` reserves
@@ -205,6 +219,49 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
         return Err(remote_manifest_failure(root, &out));
     }
     canonicalize_remote_entries(&out.stdout, root)
+}
+
+/// The DESTINATION-side counterpart of [`remote_manifest`]: the same branch on
+/// [`Remote::is_local`] and the same failure classification, but the manifest
+/// is built TOLERANT of the address-fidelity refusals a destination may
+/// legitimately hold (see [`canonicalize_tree_destination`] and
+/// [`canonicalize_remote_entries_destination`]). The tolerated entries are
+/// returned in [`DestinationTree::unsupported`] so the sync can classify them
+/// as destination-only and let a caller-sanctioned
+/// [`crate::sync::Extraneous::Delete`] remove them, and can REFUSE to write a
+/// source entry over them.
+///
+/// AN ABSENT or non-directory root is still an error here, exactly as in
+/// [`remote_manifest`]: tolerance covers an ENTRY the strict rules refuse, not
+/// a root that cannot be described. A PUSH provisions its destination root
+/// before reading this manifest (see `crate::sync::apply`), so a fresh
+/// destination is a real directory by the time this runs.
+pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTree> {
+    let root = remote.root();
+    if remote.is_local() {
+        return match std::fs::symlink_metadata(root) {
+            Ok(meta) if meta.is_dir() => canonicalize_tree_destination(root),
+            Ok(_) => Err(Error::transport(format!(
+                "local remote root {} is not a directory; refusing to describe it as a tree",
+                root.display()
+            ))),
+            Err(e) => Err(Error::transport(format!(
+                "local remote root {} cannot be described: {e}",
+                root.display()
+            ))),
+        };
+    }
+    let argv = vec![
+        "perl".to_string(),
+        "-e".to_string(),
+        remote_tree_verify_script().to_string(),
+        root.to_string_lossy().into_owned(),
+    ];
+    let out = remote.exec(&argv, REMOTE_MANIFEST_TIMEOUT)?;
+    if !out.success() {
+        return Err(remote_manifest_failure(root, &out));
+    }
+    canonicalize_remote_entries_destination(&out.stdout, root)
 }
 
 /// The error for a NON-ZERO exit of the far-side manifest command, classified

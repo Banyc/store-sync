@@ -257,6 +257,28 @@
 //! conflict, never a silent skip
 //! and never residue: it is not a destination path this sync left in place.
 //!
+//! ## Unsupported destination entries: delete-sanctioned, never transferred
+//!
+//! A destination may legitimately hold an entry the manifest model refuses to
+//! ACCEPT as a faithful tree member — an absolute symlink, an escaping
+//! symlink, or a hard link (see
+//! [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
+//! recorded in the DESTINATION manifest (under its live kind) and named in
+//! `DestinationTree::unsupported`, so the diff can classify it rather than the
+//! run dying at destination-manifest time. When the source does not hold that
+//! path it is an ordinary destination-only entry: it is reported in
+//! [`SyncReport::extraneous`] and, under [`Extraneous::Delete`], removed
+//! through the SAME live-kind, fold-aware, non-recursive walk as any other
+//! (so the pre-fix "one unsupported entry blocks the whole run, including its
+//! own sanctioned deletion" is gone). When the SOURCE DOES hold that path the
+//! run is REFUSED before any mutation: the entry cannot be replaced in place
+//! without destroying or aliasing data the manifest cannot describe, and the
+//! error names the path, the reason, and the remedy. A tolerated destination
+//! entry is therefore never silently transferred, aliased, or destroyed
+//! WITHOUT a sanction. An unrepresentable SOURCE entry is unaffected: the
+//! source manifest is always built strictly, so it still fails the run (the
+//! address-fidelity guarantee).
+//!
 //! ## Refusal: transfer versus destruction
 //!
 //! A path whose own entry a conflict left alone is off-limits to DESTRUCTION:
@@ -518,8 +540,12 @@
 //!   deliberately NOT a change to [`crate::lock::FileLock`] or
 //!   [`crate::atomic::ensure_private_dir_durable`], which serve the transport's
 //!   sidecar locks where the private mode IS required.)
-//! * **The DESTINATION TREE is still created lazily and only by a mutation.**
-//!   "A fully-refused pull creates NOTHING" holds for the root and everything
+//! * **A PULL's DESTINATION TREE is still created lazily and only by a
+//!   mutation.** (A PUSH instead PROVISIONS its remote destination root and
+//!   the caller's bootstrap directories before the destination manifest is
+//!   read — see [`sync`]'s "The destination root" section — which mutates the
+//!   destination's ROOT only, never anything inside it.) "A fully-refused pull
+//!   creates NOTHING" holds for the root and everything
 //!   under it: the record location is outside the root, so the run never
 //!   creates the ROOT itself. Three pieces of residue OUTSIDE the root can
 //!   outlive a blocked or later-failed run, and all three are named rather
@@ -574,9 +600,13 @@
 //! there is no directory descriptor, so the pinned-inode check does not exist
 //! (the documented weaker guarantee of the Windows port).
 //!
-//! The destination root is created LAZILY, immediately before the first
-//! mutation that needs it, so a pull whose every entry is refused leaves the
-//! root ABSENT, not merely empty. Because the diff of a root that was absent
+//! A PULL's LOCAL destination root is created LAZILY, immediately before the
+//! first mutation that needs it, so a pull whose every entry is refused leaves
+//! the root ABSENT, not merely empty. (A PUSH does not apply here: it
+//! PROVISIONS its remote destination root and the caller's bootstrap
+//! directories before reading the destination manifest, so a fresh destination
+//! is usable without the caller pre-creating it; see [`sync`]'s "The
+//! destination root".) Because the diff of a root that was absent
 //! describes the EMPTY tree, a directory that has appeared at the path since is
 //! adopted only if it is still EMPTY (exactly what this would have created); a
 //! NON-EMPTY one is an error rather than silently ignoring its entries (which
@@ -832,9 +862,12 @@ use crate::atomic::ReplaceOutcome;
 use crate::error::{Error, Result};
 use crate::lock::FileLock;
 use crate::manifest::{
-    TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata, canonicalize_tree, compute_tree_digest,
+    DestinationTree, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata, canonicalize_tree,
+    canonicalize_tree_destination, compute_tree_digest,
 };
-use crate::sync::diff::{EntryDiff, EntryKind, TreeDiff, diff_trees, remote_manifest};
+use crate::sync::diff::{
+    EntryDiff, EntryKind, TreeDiff, diff_trees, remote_destination_manifest, remote_manifest,
+};
 use crate::transport::{Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -870,6 +903,16 @@ pub enum Direction {
 /// exactly the argument an agentic caller passes wrongly. Spelling the
 /// decision at the call site is the point — `Extraneous::Keep` and
 /// `Extraneous::Delete` say what they do.
+///
+/// KNOWN COST: the choice is ALL-OR-NOTHING — there is no per-path delete
+/// policy. [`Extraneous::Delete`] removes EVERY destination-only entry, so a
+/// caller that wants to keep one path cannot express "delete these but not
+/// that" through this policy; it must [`Extraneous::Keep`] everything and
+/// remove the unwanted paths out of band, or make the kept path part of the
+/// source. A per-path policy is not offered because the deletion sanction is
+/// DERIVED from the diff (one classification per path), and a partly-deleted
+/// destination would make the report's [`SyncReport::extraneous`] list
+/// ambiguous about which paths survived.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Extraneous {
     /// Leave every destination-only entry in place and report it in
@@ -879,6 +922,20 @@ pub enum Extraneous {
     /// Remove every destination-only entry after the transfers and the
     /// verification have succeeded, under the fold-aware identity checks.
     /// This PERMANENTLY destroys destination data the source does not hold.
+    ///
+    /// This INCLUDES a destination-only entry the address-fidelity rules
+    /// refuse to ACCEPT as a faithful tree member — an absolute or escaping
+    /// symlink, or a hard link (see
+    /// [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
+    /// classified [`EntryDiff::Extraneous`] like any other destination-only
+    /// path and removed through the SAME live-kind, fold-aware, non-recursive
+    /// walk, so a run no longer dies at destination-manifest time without
+    /// ever reaching the sanctioned entry. This does NOT let such an entry be
+    /// TRANSFERRED: if the SOURCE holds a path at that spelling the run is
+    /// refused before any mutation (the entry cannot be replaced in place
+    /// without destroying or aliasing data the manifest cannot describe). The
+    /// prohibition rules are unchanged: a conflict or residue leaves the
+    /// entry in place and reports it.
     Delete,
 }
 
@@ -1129,7 +1186,26 @@ pub struct SyncReport {
     ///
     /// Both kinds are the same state: the run made no decision that could
     /// destroy the path, so it still EXISTS at report time and must be
-    /// recovered by hand. Reserved residue is
+    /// recovered by hand.
+    ///
+    /// **Recovery primitive.** Iterate this list and remove each reported path
+    /// with the DESTINATION's own removal: for a remote destination, the
+    /// [`Remote`](crate::transport::Remote) methods
+    /// [`remove_file`](crate::transport::Remote::remove_file) /
+    /// [`remove_dir_all`](crate::transport::Remote::remove_dir_all) on a
+    /// [`RootedRelativePath`](crate::transport::RootedRelativePath) parsed from
+    /// the reported path; for a local destination, `std::fs::remove_file` /
+    /// `std::fs::remove_dir_all` on the path joined under the local root. The
+    /// RESERVED `.sync-aside.` namespace is described in this module's
+    /// "Kind-changing replacement, the reserved namespace, and residue"
+    /// section (and defined by `ASIDE_PREFIX`): a reported path whose last
+    /// component is in that namespace is the sync's OWN stranded claim-aside
+    /// and HOLDS THE ORIGINAL ENTRY, so inspect it before discarding it; the
+    /// other kind is a foreign destination path the run refused to destroy.
+    /// The sync itself never removes either one, so recovery is always the
+    /// caller's explicit act.
+    ///
+    /// Reserved residue is
     /// stripped from the destination manifest BEFORE the diff, so it is NEVER
     /// transferred and NEVER removed — not even by [`Extraneous::Delete`], whose
     /// removal of a destination-only directory holding residue is refused as
@@ -1143,7 +1219,9 @@ pub struct SyncReport {
     /// [`SyncReport::extraneous`], [`SyncReport::transient_dirs`],
     /// [`SyncReport::verify_failures`], and [`SyncReport::indeterminate`] (a
     /// path whose own removal was attempted and failed is INDETERMINATE and is
-    /// named there instead). A SOURCE entry whose name collides with the
+    /// named there instead).
+    ///
+    /// A SOURCE entry whose name collides with the
     /// reserved namespace is NOT residue — it is neither a destination path
     /// nor left in place by this sync — but a [`ConflictReason::ReservedName`]
     /// conflict in [`SyncReport::conflicts`], so the caller resolves it rather
@@ -1505,13 +1583,39 @@ enum DestinationOwnership {
 ///
 /// The local root descriptor is opened (pinned) BEFORE either manifest is
 /// read, when the root exists; see the module docs for exactly what that does
-/// and does not guarantee. The local destination root is created lazily,
-/// immediately before the first mutation that needs it, so a pull whose every
-/// entry is refused leaves the root ABSENT.
+/// and does not guarantee.
+///
+/// # The destination root
+///
+/// A **PULL's local destination root is created LAZILY**, immediately before
+/// the first mutation that needs it, so a pull whose every entry is refused
+/// leaves the root ABSENT (a missing ancestor of the root path is created at
+/// the same moment).
+///
+/// A **PUSH PROVISIONS its destination before its manifest is read**: for a
+/// remote destination ([`Remote`], including `LocalTransport`) the run calls
+/// `provision_layout`, which creates the destination ROOT and the caller's
+/// `Layout::bootstrap_dirs`. A fresh destination therefore works through this
+/// entry point without the caller pre-creating it, and `Layout::empty()` (no
+/// bootstrap directories, no receiver marker) is enough. `provision_layout`
+/// creates nothing INSIDE the root beyond the caller's own bootstrap
+/// directories and the optional receiver marker: no spurious entry appears.
 ///
 /// A destination root that already exists but is not a directory is an error,
 /// and a missing local root is an error in the PUSH direction (the source must
 /// exist) — never a silently fabricated empty tree.
+///
+/// # Fidelity scope
+///
+/// A sync carries the manifest model: path, kind, mode (including
+/// setuid/setgid/sticky), file content, and symlink target. It does NOT carry
+/// ownership, extended attributes (including `security.capability` and macOS
+/// `com.apple.*`), POSIX ACLs, timestamps, file flags, or sparseness — the
+/// authoritative list is [`crate::manifest`]'s "Fidelity scope" section. The
+/// loss is **INVISIBLE TO THE DIFFER**: the two manifests compare equal, so a
+/// dropped xattr or ACL leaves `local_manifest == remote_manifest` true and
+/// the run reports no difference. A caller that needs any of them must apply
+/// them out of band after the sync.
 ///
 /// A successful `Ok(report)` is NOT by itself a clean-destination claim: the
 /// caller must consult the report's lists. In particular
@@ -1710,6 +1814,12 @@ fn run_entry(
 /// [`sync`] in [`Direction::Push`], without removing extraneous entries. The
 /// destination must be one whose lock the crate can take; use
 /// [`push_unowned`] for a destination it cannot lock.
+///
+/// A push PROVISIONS its destination before reading the destination manifest
+/// (creating the destination root and the caller's bootstrap directories), so
+/// a FRESH destination root is usable without the caller pre-creating it; see
+/// [`sync`]'s "The destination root". FIDELITY is the manifest model only and
+/// the differ cannot see what it drops; see [`sync`]'s "Fidelity scope".
 pub fn push(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> SyncResult {
     sync(
         Direction::Push,
@@ -1723,6 +1833,11 @@ pub fn push(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> Sync
 /// [`sync`] in [`Direction::Pull`], without removing extraneous entries. The
 /// destination must be one whose lock the crate can take; use
 /// [`pull_unowned`] for a destination it cannot lock.
+///
+/// A pull's LOCAL destination root is created LAZILY, so a pull whose every
+/// entry is refused leaves the root absent; see [`sync`]'s "The destination
+/// root". FIDELITY is the manifest model only and the differ cannot see what
+/// it drops; see [`sync`]'s "Fidelity scope".
 pub fn pull(local_root: &Path, remote: &dyn Remote, policy: &dyn Policy) -> SyncResult {
     sync(
         Direction::Pull,
@@ -2245,6 +2360,27 @@ fn run(
         DestinationOwnership::Locked(lock) => Some(lock),
         DestinationOwnership::Unowned => None,
     };
+    // PROVISION A REMOTE DESTINATION BEFORE ITS MANIFEST IS READ. The
+    // destination of a PUSH is a `Side::Remote`; its `provision_layout`
+    // creates the destination ROOT and the caller's bootstrap directories
+    // (a no-op for a transport that has none, and `LocalTransport` creates
+    // its base the same way). This is what lets a fresh remote destination be
+    // pushed to without the caller pre-creating it, matching "the crate
+    // enforces, never relies on the caller": without it the destination
+    // manifest read failed with `not a directory: <root>`. A PULL's
+    // destination is a `Side::Local`, unchanged: its root stays created
+    // LAZILY by the first mutation, so a fully-refused pull still creates
+    // nothing. The failure names the stage rather than surfacing a bare
+    // transport error.
+    if let Side::Remote(remote) = dest
+        && let Err(error) = remote.provision_layout()
+    {
+        return Err(SyncError::from(error.with_context(
+            "provisioning the destination layout failed before the destination manifest was \
+             read (the destination root and the caller's bootstrap directories are created at \
+             the start of a push)",
+        )));
+    }
     let source_meta = match source.manifest() {
         Ok(meta) => meta,
         Err(error) => return Err(SyncError::from(error)),
@@ -2254,10 +2390,18 @@ fn run(
     // BEFORE the reserved-namespace strip below, so a change to a reserved
     // spelling is not hidden from the comparison.
     let source_plan = source_meta.clone();
-    let dest_meta = match dest.manifest() {
-        Ok(meta) => meta,
+    // The destination manifest is built TOLERANTLY: an entry the address
+    // -fidelity rules refuse (an absolute/escaping symlink, a hard link) is
+    // recorded in `dest_unsupported` and still present in the manifest under
+    // its live kind, so the diff classifies it and the report names it. A
+    // SOURCE manifest (`source.manifest()` above) stays strict, so an
+    // unrepresentable source entry still fails the run.
+    let destination = match dest.destination_manifest() {
+        Ok(tree) => tree,
         Err(error) => return Err(SyncError::from(error)),
     };
+    let dest_unsupported = destination.unsupported;
+    let dest_meta = destination.meta;
     // The reserved claim-aside namespace is bookkeeping, never content. Strip it
     // from BOTH manifests BEFORE the diff, so residue is never classified as
     // source content (transferred) or destination content (removed), and carry
@@ -2275,6 +2419,26 @@ fn run(
     let source_meta = strip_reserved(source_meta);
     let dest_meta = strip_reserved(dest_meta);
     let diff = diff_trees(&source_meta, &dest_meta);
+    // F2: an unsupported DESTINATION entry may be DELETED under a sanction
+    // (`Extraneous::Delete`, when the source does not hold that path), but the
+    // run must never WRITE a source entry over one. The diff cannot express
+    // "present but not replaceable", so the refusal is a PREFLIGHT here, before
+    // ANY transfer: a `Changed` classification is exactly a path the run would
+    // write, and the unsupported entry is named with its reason and the
+    // remedy. (`Same` is allowed through: nothing is mutated, so a hard link
+    // the source happens to match is left alone, never aliased.)
+    for entry in &dest_unsupported {
+        if diff.classify(&entry.path) == Some(EntryDiff::Changed) {
+            return Err(SyncError::from(Error::materialization(format!(
+                "the destination entry {} cannot be represented faithfully ({}), and the source \
+                 holds an entry at the same path, so the run cannot replace it in place without \
+                 destroying or aliasing data it cannot describe. Remedy: remove that destination \
+                 entry first (a destination-only entry is cleared by Extraneous::Delete; when the \
+                 source holds the path, remove it by hand) and re-run.",
+                entry.path, entry.reason
+            ))));
+        }
+    }
     let mut applier = Applier {
         source,
         dest,
@@ -6602,6 +6766,18 @@ impl Side<'_> {
         }
     }
 
+    /// The manifest of this side as a DESTINATION: the same tree description,
+    /// but TOLERANT of the destination-only address-fidelity refusals (an
+    /// absolute or escaping symlink, a hard link), which are returned in
+    /// [`DestinationTree::unsupported`] instead of failing the run. A SOURCE
+    /// uses [`Side::manifest`], which stays strict.
+    fn destination_manifest(&self) -> Result<DestinationTree> {
+        match self {
+            Side::Local(local) => local.destination_manifest(),
+            Side::Remote(remote) => remote_destination_manifest(*remote),
+        }
+    }
+
     /// The current mode of an existing entry.
     fn mode(&self, rel: &RootedRelativePath, kind: EntryKind) -> Result<Mode> {
         match self {
@@ -6868,6 +7044,43 @@ impl LocalSide {
                     )));
                 }
                 Ok(Self::empty_tree())
+            }
+            Err(error) => Err(Error::materialization(format!(
+                "local tree root {} does not exist: {error}",
+                self.root_path.display()
+            ))),
+        }
+    }
+
+    /// The manifest of the local tree as a DESTINATION: identical to
+    /// [`LocalSide::manifest`] except that the walk TOLERATES the
+    /// destination-only address-fidelity refusals ([`DestinationTree`]'s
+    /// `unsupported`). A PULL's destination is this side, so a local
+    /// destination holding an absolute symlink, an escaping symlink, or a hard
+    /// link can be reported and, under [`Extraneous::Delete`], cleared instead
+    /// of failing the whole run at manifest time.
+    fn destination_manifest(&self) -> Result<DestinationTree> {
+        match std::fs::symlink_metadata(&self.root_path) {
+            Ok(meta) if meta.is_dir() => {
+                let tree = canonicalize_tree_destination(&self.root_path)?;
+                self.confirm_pinned_root()?;
+                Ok(tree)
+            }
+            Ok(_) => Err(Error::materialization(format!(
+                "local tree root {} is not a directory",
+                self.root_path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.ensure => {
+                if self.root.get().is_some() {
+                    return Err(Error::materialization(format!(
+                        "local tree root {} disappeared after its descriptor was pinned; refusing to describe it as an empty tree",
+                        self.root_path.display()
+                    )));
+                }
+                Ok(DestinationTree {
+                    meta: Self::empty_tree(),
+                    unsupported: Vec::new(),
+                })
             }
             Err(error) => Err(Error::materialization(format!(
                 "local tree root {} does not exist: {error}",
