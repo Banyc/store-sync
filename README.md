@@ -305,16 +305,16 @@ beyond (c).
 ### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — OWNER DECISION
 
 `sync`/`push`/`pull` take `<parent>/.<name>.operation.lock`
-(`src/sync/apply.rs:1644`, `destination_lock_path`; rationale at
-`src/sync/apply.rs:513`), while `Layout::lock` names the IN-ROOT
-`state/operation.lock` (`src/transport/mod.rs:116`, `:129`). They are
-DIFFERENT FILES, so the two locks do NOT exclude each other: a consumer that
-already holds its own in-root `operation.lock` and then calls `sync` ends up
-with two files that both claim to be "the operation lock"
-(`src/sync/apply.rs:526`). The sibling location is deliberate — an in-root
-record would create the destination ROOT and enter the destination manifest
-the run is judging — and it cannot be composed from the applier's side,
-because `Remote` exposes no accessor for its `Layout` (`src/sync/apply.rs:545`).
+(`sync::destination_lock_path`; the rationale is in the `sync` module docs),
+while `Layout::lock` names the IN-ROOT `state/operation.lock`
+(`transport::Layout::lock`). They are DIFFERENT FILES, so the two locks do NOT
+exclude each other: a consumer that already holds its own in-root
+`operation.lock` and then calls `sync` ends up with two files that both claim
+to be "the operation lock" (also in the `sync` module docs). The sibling
+location is deliberate — an in-root record would create the destination ROOT
+and enter the destination manifest the run is judging — and it cannot be
+composed from the applier's side, because `Remote` exposes no accessor for its
+`Layout`.
 
 RECOMMENDATION (owner decision, not a defect): either give the applier the
 caller's `Layout::lock` path so a run can take BOTH records, or state in the
@@ -324,11 +324,11 @@ breaks the "a fully-refused pull creates NOTHING" contract.
 
 ### (b) Ownership enforcement is unavailable for exactly the remote case — DOCUMENTED LIMITATION, OWNER DECISION
 
-`sync`/`push`/`pull` REFUSE a destination whose lock they cannot take
-(`src/sync/apply.rs:2109`, `:2260`, `:2278`), and a remote (SSH) destination
-can never be locked: the far-side sidecar `flock` lives inside a single remote
-command and dies with it (`src/sync/apply.rs:498`). Only the explicitly weaker
-`sync_unowned` (`src/sync/apply.rs:2145`) reaches a remote destination, so the
+`sync`/`push`/`pull` REFUSE a destination whose lock they cannot take (each
+entry point's own docs), and a remote (SSH) destination can never be locked:
+the far-side sidecar `flock` lives inside a single remote command and dies with
+it (the `sync` module docs). Only the explicitly weaker `sync_unowned` reaches
+a remote destination, so the
 crate's strongest guarantee applies to the case a cross-host tool uses LEAST.
 
 RECOMMENDATION (owner decision): keep the refusal (fail-closed beats silently
@@ -339,16 +339,15 @@ widening `sync`. Until then this is a documented limitation, not a defect.
 ### (c) The fd-confined tree helpers the source tool calls had no public equivalent — CRATE DEFECT, FIXED HERE
 
 `~/code/deploy` calls `copy_dir_recursive_fd` and `fsync_tree_recursive_fd`
-(`deploy/src/store/local/mod.rs:444`, `:451`, defined at
-`deploy/src/store/atomic/unix.rs:902`, `:997`), but the crate had dropped them
+(from its `store::local`, defined in its `store::atomic::unix`), but the crate
+had dropped them
 and `Remote::{copy_tree,fsync_tree}` are NOT 1:1 replacements: both require
 `RootedRelativePath` endpoints under ONE transport root (the deploy call site
 copies from an arbitrary, possibly out-of-root source), and `Remote::fsync_tree`
 is PATH-based (`WalkDir`, so a symlinked component is followed) where the
 source tool's version refuses one. The migration was blocked on this, so this
-change re-adds the PUBLIC `atomic::copy_dir_recursive_fd`
-(`src/atomic/unix.rs:2031`) and `atomic::fsync_tree_recursive_fd`
-(`src/atomic/unix.rs:2309`), ITERATIVE and descriptor-confined. Their exact
+change re-adds the PUBLIC `atomic::copy_dir_recursive_fd` and `atomic::fsync_tree_recursive_fd`,
+ITERATIVE and descriptor-confined. Their exact
 deltas from `deploy`'s originals (each documented on the primitive itself):
 
 * ITERATIVE, not recursive — the source tool's original recursed one Rust
