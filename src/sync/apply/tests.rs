@@ -12415,6 +12415,49 @@ fn sync_refuses_a_remote_destination_and_points_at_the_unowned_value() {
     );
 }
 
+/// The COMPOSED constructor refuses a REMOTE (far-side) destination exactly as
+/// the plain one does — neither the sibling record nor the in-root layout lock
+/// can be held from this host — and the refusal precedes `prepare_identity` and
+/// every mutation, so it leaves no residue and creates no in-root record.
+#[test]
+fn composed_ownership_refuses_a_remote_destination_like_the_plain_form() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(&dst).unwrap();
+    let before = canonicalize_tree(&dst).unwrap();
+    let remote = RecordingRemote::over(transport(&dst), false);
+    let err = match DestinationOwnership::lock_with_in_root_lock(
+        Direction::Push,
+        &src,
+        &remote,
+        &RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap(),
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("the composed form must refuse a destination it cannot lock"),
+    };
+    assert!(matches!(err, Error::Preflight(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("DestinationOwnership::Unowned"),
+        "the refusal must name the unowned value: {err}"
+    );
+    assert_eq!(
+        remote.identity_calls(),
+        0,
+        "the refusal must precede prepare_identity"
+    );
+    assert!(
+        !dst.join("state/operation.lock").exists(),
+        "the refused composed acquisition must not create the in-root record"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap(),
+        before,
+        "the refused run mutated nothing"
+    );
+}
+
 /// The weak path is REACHABLE and correct: an explicitly unowned run against
 /// the same remote destination transfers and verifies normally. The refusal
 /// above is a redirect, not a removal of the capability.

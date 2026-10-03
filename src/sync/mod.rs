@@ -72,8 +72,14 @@
 //!   cooperating writer that tries to acquire the same record is refused at
 //!   acquisition. That record is a SIBLING of the destination root and is a
 //!   DIFFERENT file from the in-root [`crate::transport::Layout::lock`], so the
-//!   two locks do NOT exclude each other (see
-//!   [`apply::destination_lock_path`]). A destination whose lock the crate
+//!   two locks do NOT exclude each other on their own (see
+//!   [`apply::destination_lock_path`]). A caller that needs BOTH records held
+//!   asks for it BY NAME with
+//!   [`apply::DestinationOwnership::lock_with_in_root_lock`] (the composed
+//!   [`apply::DestinationOwnership::LockedWithInRoot`] token holds the sibling
+//!   record and the caller's in-root layout lock in the one canonical order);
+//!   the plain [`apply::DestinationOwnership::lock`] is unchanged and still
+//!   takes the sibling record alone. A destination whose lock the crate
 //!   CANNOT take — a REMOTE (far-side) one, or a root with no sibling record
 //!   location — is REFUSED by the acquiring constructor rather than run
 //!   unowned. The weaker path is the [`apply::DestinationOwnership::Unowned`]
@@ -121,7 +127,7 @@ pub mod residue;
 pub use residue::Residue;
 
 pub use apply::{
-    Conflict, ConflictReason, DestinationOwnership, Direction, EntryPolicy, Extraneous,
+    Conflict, ConflictReason, DestinationOwnership, Direction, EntryPolicy, Extraneous, InRootLock,
     LockedDestination, Policy, ReplaceAll, RetireOutcome, SyncError, SyncReport, SyncResult,
     destination_lock_path, retire_destination_lock, sync,
 };

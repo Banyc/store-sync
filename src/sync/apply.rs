@@ -427,9 +427,14 @@
 //! [`crate::lock::FileLock`], the same primitive the crate documents for its
 //! push and checkpoint pipelines — and the record reuses the crate's reserved
 //! `operation.lock` FILE NAME. That is a NAME, not the same file: the sibling
-//! record does NOT compose with the in-root
-//! [`crate::transport::Layout::lock`] (see [`destination_lock_path`] and
-//! "Why the lock record is a SIBLING of the destination root").
+//! record and the in-root [`crate::transport::Layout::lock`] are DIFFERENT
+//! files that do NOT exclude each other on their own. A caller that needs BOTH
+//! records held asks for it by name with
+//! [`DestinationOwnership::lock_with_in_root_lock`], which acquires the sibling
+//! record then the caller's in-root record in that ONE order (see
+//! [`destination_lock_path`] and "Why the lock record is a SIBLING of the
+//! destination root"); the plain [`DestinationOwnership::lock`] is unchanged
+//! and takes the sibling record alone.
 //!
 //! ### The conditions the crate ENFORCES (and what a caller still owes)
 //!
@@ -458,7 +463,12 @@
 //!    reading the destination manifest and holds it for the WHOLE run. A
 //!    cooperating writer that tries to acquire the same record while the run
 //!    holds it is refused at acquisition (`FileLock::acquire` is non-blocking),
-//!    so the run's writes and reads cannot be interleaved by one. A destination
+//!    so the run's writes and reads cannot be interleaved by one. A caller whose
+//!    own writer holds the destination's in-root
+//!    [`crate::transport::Layout::lock`] needs BOTH records held, and asks for
+//!    that by name with [`DestinationOwnership::lock_with_in_root_lock`]: it
+//!    takes the sibling record and then the caller's in-root record (in that
+//!    canonical order) and holds both for the whole run. A destination
 //!    the crate CANNOT lock — a REMOTE (far-side) one, or a root with no sibling
 //!    record location — is REFUSED by [`DestinationOwnership::lock`] rather
 //!    than silently run unowned. A caller that holds such a destination itself
@@ -517,17 +527,33 @@
 //! ### Why the lock record is a SIBLING of the destination root
 //!
 //! The lock record is deliberately NOT placed inside the destination tree.
-//! Creating `<root>/state/operation.lock` would create the destination ROOT
-//! itself for a run that must create nothing, and it would enter the
-//! destination manifest the run reads, destroying the "a fully-refused pull
-//! creates NOTHING, not even the root" and "two empty trees are a no-op"
-//! contracts (both pinned by tests). [`destination_lock_path`] therefore
-//! derives a dot-prefixed sibling record in the destination root's parent:
-//! taking the lock never creates or enters the tree the run is judging. The
-//! record reuses the reserved `operation.lock` FILE NAME, not the PATH of
+//! Placing the sync's OWN record in the tree would create the destination ROOT
+//! itself for a run that must create nothing, and it would mutate the tree the
+//! run reads, destroying the "a fully-refused pull creates NOTHING, not even
+//! the root" and "two empty trees are a no-op" contracts (both pinned by
+//! tests). [`destination_lock_path`] therefore derives a dot-prefixed sibling
+//! record in the destination root's parent: taking the sync's own lock never
+//! creates or enters the tree the run is judging. The record reuses the
+//! reserved `operation.lock` FILE NAME, not the PATH of
 //! [`crate::transport::Layout::lock`].
 //!
-//! ### The sibling record does NOT compose with the in-root `Layout::lock`
+//! PREMISE CHECK (what actually happens if an in-root record IS taken): an
+//! earlier revision of this module claimed an in-root `state/operation.lock`
+//! "would enter the destination manifest the run is judging". That is FALSE for
+//! the record itself. The destination view strips it as RESIDUE:
+//! [`apply_manifests`] strips the destination with
+//! [`crate::reserved::is_residue_path`], and a component that is the
+//! application-lock spelling (`operation.lock`) is residue, so the record is
+//! invisible to the diff, never transferred, and never destroyed. What DOES
+//! remain is the record's PARENT directory when the lock creates it: an
+//! ordinary empty `state/` is destination-only content, so it appears in the
+//! diff; under [`Extraneous::Delete`] its removal is refused because it holds
+//! residue, and it is reported as residue rather than destroyed. That is why
+//! the COMPOSED form ([`DestinationOwnership::lock_with_in_root_lock`]) still
+//! requires the destination root to pre-exist and never creates the root, and
+//! why the plain form keeps the sibling location.
+//!
+//! ### The sibling record and the in-root `Layout::lock`: composed BY NAME
 //!
 //! [`crate::transport::Layout::empty`]'s `lock` is the IN-ROOT
 //! `state/operation.lock` (inside the destination root); this record is
@@ -536,27 +562,26 @@
 //! direction:
 //!
 //! * a caller holding [`crate::lock::FileLock`] on the in-root layout lock
-//!   does NOT stop a [`sync`] from taking the sibling record and running;
-//! * a [`sync`] holding the sibling record does NOT stop a caller from taking
-//!   the in-root layout lock.
+//!   does NOT stop a plain [`sync`] from taking the sibling record and running;
+//! * a plain [`sync`] holding the sibling record does NOT stop a caller from
+//!   taking the in-root layout lock.
 //!
-//! A caller that needs one lock to exclude the other must take BOTH (or
-//! serialize at a higher level); a non-cooperating writer that takes neither
-//! is still only DETECTED, never excluded (see "The lock discipline").
+//! A caller that needs one lock to exclude the other asks for BOTH by name:
+//! [`DestinationOwnership::lock_with_in_root_lock`] takes the sibling record
+//! and then the caller's in-root record (the CANONICAL ORDER, enforced in the
+//! constructor) and holds both for the whole run. A non-cooperating writer
+//! that takes neither is still only DETECTED, never excluded (see "The lock
+//! discipline").
 //!
-//! Composing the two here is NOT done, and cannot be done from this side:
-//!
-//! * [`Remote`] exposes no accessor for its [`crate::transport::Layout`], so
-//!   the applier cannot learn the caller's in-root lock path from a
-//!   `&dyn Remote`; assuming the conventional `state/operation.lock` would be
-//!   wrong for a custom layout.
-//! * Taking the in-root record would OPEN (and, when absent, CREATE) a file
-//!   INSIDE the destination root, creating the root and its `state` directory
-//!   for a run that must create nothing, entering them in the destination
-//!   manifest, and creating them at the store-private `0o700` mode the lock
-//!   helper uses — the exact three things the sibling location exists to
-//!   avoid. Taking it only "when it already exists" is a check-then-act race
-//!   and still leaves the fresh-destination case uncovered.
+//! Composing the two is opt-in rather than the default because [`Remote`]
+//! exposes no accessor for its [`crate::transport::Layout`]: the applier cannot
+//! learn the caller's in-root lock path from a `&dyn Remote`, and assuming the
+//! conventional `state/operation.lock` would be wrong for a custom layout. The
+//! caller therefore NAMES the record by passing its
+//! [`crate::transport::Layout::lock`] path (a [`RootedRelativePath`]) to
+//! [`DestinationOwnership::lock_with_in_root_lock`]; the plain
+//! [`DestinationOwnership::lock`] keeps the sibling record alone and creates
+//! nothing inside the root.
 //!
 //! Because the record is a SIBLING, placing it can touch a directory OUTSIDE
 //! the destination root that the CALLER owns — the root's parent, and any
@@ -612,6 +637,12 @@
 //!       `DEPLOY_SSH_KNOWNHOSTS_DIR` else `<temp_dir>/deploy-ssh-knownhosts`)
 //!       and the pinned `knownhosts-<hash>.txt` file (0600), likewise never
 //!       removed.
+//!
+//! The COMPOSED form is the one exception to the plain form's
+//! lazily-created-root rule: it requires the destination root to ALREADY EXIST
+//! (a typed [`Error::NotFound`] otherwise) and creates at most the caller's
+//! in-root record and its missing parent chain INSIDE that existing root, so
+//! the composed acquisition itself never creates the destination root.
 //!
 //! A single-component RELATIVE root resolves through the current directory
 //! ([`destination_lock_path`] maps an empty `Path::parent` to `.`), exactly as
@@ -1611,22 +1642,25 @@ impl From<Error> for SyncError {
 ///
 /// The record is a dot-prefixed SIBLING of the destination root, in that
 /// root's parent directory: `<parent>/.<name>.operation.lock`. It is
-/// deliberately outside the tree the run judges, because taking a lock inside
-/// the tree would create the destination root for a run that must create
-/// nothing and would enter the destination manifest — see the module docs
-/// ("Why the lock record is a SIBLING of the destination root").
+/// deliberately outside the tree the run judges: placing the sync's own record
+/// inside the tree would create the destination root for a run that must
+/// create nothing and would mutate the tree the run reads — see the module
+/// docs ("Why the lock record is a SIBLING of the destination root").
 ///
 /// The record reuses the crate's reserved `operation.lock` FILE NAME, not the
 /// path of [`crate::transport::Layout::lock`]. Those are DIFFERENT files:
 /// [`crate::transport::Layout::empty`]'s `lock` is the IN-ROOT
 /// `state/operation.lock`, while this record is
 /// `<parent>/.<name>.operation.lock`. The two locks are therefore INDEPENDENT
-/// and do NOT exclude each other: a caller holding [`crate::lock::FileLock`]
-/// on the in-root `Layout::lock` does not exclude a [`sync`], and a [`sync`]
-/// holding this record does not exclude a caller that takes the in-root layout
-/// lock. They are not composed here and cannot be composed from this side; the
-/// module docs ("Why the lock record is a SIBLING of the destination root")
-/// state exactly why.
+/// and do NOT exclude each other on their own: a caller holding
+/// [`crate::lock::FileLock`] on the in-root `Layout::lock` does not exclude a
+/// plain [`sync`], and a plain [`sync`] holding this record does not exclude a
+/// caller that takes the in-root layout lock. A caller that needs BOTH asks
+/// for the composition BY NAME with
+/// [`DestinationOwnership::lock_with_in_root_lock`], which takes this record
+/// and then the caller's in-root record (the canonical order) and holds both
+/// for the run. (The in-root record is destination residue, so its own record
+/// never appears in the destination view; see the module docs.)
 ///
 /// `None` when no sibling location can be derived: a filesystem root (`/`) has
 /// no parent, and a path with no final component names no record.
@@ -1644,7 +1678,9 @@ impl From<Error> for SyncError {
 ///
 /// Two runs of [`sync`] against the same destination root derive the same path
 /// and so exclude each other; a caller that wants to cooperate with a `sync`
-/// can acquire the same record with [`crate::lock::FileLock::acquire`].
+/// can acquire the same record with [`crate::lock::FileLock::acquire`]. The
+/// composed form additionally holds the caller's in-root `Layout::lock`, so it
+/// is excluded by (and excludes) a writer taking EITHER record.
 pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
     let root = normalize_root(dest_root);
     let parent = root.parent()?;
@@ -1928,16 +1964,90 @@ fn lock_destination(
     FileLock::acquire(&path, &op_id)
 }
 
+/// Require the destination ROOT to already exist (and be a real directory) for
+/// the COMPOSED ownership form, which takes an in-root record and must not
+/// create the root as a side effect of taking a lock.
+///
+/// PURE: it creates nothing, so a refusal leaves no residue and happens BEFORE
+/// the sibling record is created. A destination the sibling check already
+/// refused as REMOTE never reaches this (the composed form refuses remote
+/// destinations exactly as the plain form does). `dest_is_local` is checked
+/// again here only so the invariant is local to this function rather than
+/// implied by the caller's order.
+///
+/// The ABSENT case is a typed [`Error::NotFound`] (not a `Preflight`
+/// string), so a caller can branch on "the composed form needs the root to
+/// pre-exist" instead of matching message text; the NOT-A-DIRECTORY case
+/// mirrors [`LocalSide::open`]'s `materialization` refusal for a non-directory
+/// root.
+fn require_existing_root(dest_is_local: bool, dest_root: &Path) -> Result<()> {
+    if !dest_is_local {
+        return Err(Error::preflight(format!(
+            "the composed destination ownership requires a LOCAL destination, but {} names a far-side root; a far-side record cannot be held from this host",
+            dest_root.display()
+        )));
+    }
+    // `lstat`, never `stat`/`exists`: a symlink at the root is not a directory.
+    match std::fs::symlink_metadata(dest_root) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(Error::materialization(format!(
+            "the composed destination ownership requires the destination root {} to be an existing directory, but it is not a directory; create it (or provision the layout) before asking a run to hold its in-root layout lock",
+            dest_root.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::not_found(format!(
+                "the composed destination ownership requires the destination root {} to ALREADY EXIST: it takes the caller's in-root layout lock, and creating the root as a side effect of taking that lock is the surprise the sibling record location exists to avoid. Provision the destination root first (for example with `Remote::provision_layout`), or use the plain `DestinationOwnership::lock` when the sibling record alone is enough",
+                dest_root.display()
+            )))
+        }
+        Err(error) => Err(Error::preflight(format!(
+            "the composed destination ownership cannot determine whether the destination root {} exists: {error}",
+            dest_root.display()
+        ))),
+    }
+}
+
+/// Acquire the caller's in-root [`crate::transport::Layout::lock`] record at
+/// `dest_root.join(in_root_lock)` — CANONICAL ORDER step 2 of 2 (the sibling
+/// record is already held by the caller's caller).
+///
+/// `in_root_lock` is a [`RootedRelativePath`], the crate's ONE spelling
+/// authority for a root-relative path, so the record can never escape the
+/// destination root; the destination root is validated to exist by
+/// [`require_existing_root`] before the sibling record is taken, so the lock
+/// helper creates at most the record and its missing parent chain INSIDE an
+/// existing root. `FileLock::acquire` refuses a symlink at the record (the
+/// `O_NOFOLLOW` open), so the record cannot be redirected to a victim file.
+fn acquire_in_root_lock(
+    direction: Direction,
+    dest_root: &Path,
+    in_root_lock: &RootedRelativePath,
+) -> Result<FileLock> {
+    let path = dest_root.join(in_root_lock.as_path());
+    // A distinct holder identity so a refused contender's "held by ..."
+    // diagnostic names the in-root record rather than the sibling one.
+    let op_id = format!(
+        "storekit {direction:?} in-root layout lock of {} (pid {})",
+        dest_root.display(),
+        std::process::id()
+    );
+    FileLock::acquire(&path, &op_id)
+}
+
 /// Sync `local_root` and `remote` in `direction` under `policy`, reporting
 /// every action and conflict.
 ///
 /// This is the ONE entry point. `ownership` is the ownership axis: pass the
-/// token from [`DestinationOwnership::lock`] to hold the destination's
-/// operation lock for the run, or [`DestinationOwnership::Unowned`] to run
-/// without it. The lock-taking token is UNFORGEABLE and its acquisition runs
-/// the run's preflight (see [`DestinationOwnership::lock`]), so the weaker
-/// choice is stated in the TYPE at the call site and cannot be made by
-/// omission. `extraneous` selects whether destination-only entries are
+/// token from [`DestinationOwnership::lock`] to hold the destination's sibling
+/// operation lock for the run, the token from
+/// [`DestinationOwnership::lock_with_in_root_lock`] to additionally hold the
+/// caller's in-root [`crate::transport::Layout::lock`], or
+/// [`DestinationOwnership::Unowned`] to run without a lock. The lock-taking
+/// tokens are UNFORGEABLE and their acquisitions run the run's preflight (see
+/// [`DestinationOwnership::lock`] and
+/// [`DestinationOwnership::lock_with_in_root_lock`]), so the weaker choice is
+/// stated in the TYPE at the call site and cannot be made by omission.
+/// `extraneous` selects whether destination-only entries are
 /// [`Extraneous::Keep`] or [`Extraneous::Delete`]d after the transfers and the
 /// verification have succeeded.
 ///
@@ -1988,9 +2098,10 @@ fn lock_destination(
 ///
 /// 0. **The transport's host identity is prepared, and the crate ENFORCES
 ///    it** by calling [`Remote::prepare_identity`] in the preflight
-///    ([`DestinationOwnership::lock`] for the owned path, [`sync`] for the
-///    unowned path) before the first remote request and before the destination
-///    lock record is created. The default
+///    ([`DestinationOwnership::lock`] and
+///    [`DestinationOwnership::lock_with_in_root_lock`] for the owned paths,
+///    [`sync`] for the unowned path) before the first remote request and before
+///    the destination lock record is created. The default
 ///    is a no-op and [`crate::transport::LocalTransport`] does not override
 ///    it, so a local destination is unaffected; for
 ///    [`crate::transport::SshTransport`] this is what creates the
@@ -2004,9 +2115,11 @@ fn lock_destination(
 ///    record named by [`destination_lock_path`]), before the destination
 ///    manifest is read; `sync` then holds the resulting token for the whole
 ///    run, so a cooperating writer is refused at acquisition instead of
-///    interleaving. A destination the crate cannot lock is REFUSED there, not
-///    run unowned; only the [`DestinationOwnership::Unowned`] value reaches
-///    it.
+///    interleaving. A caller whose own writer holds the destination's in-root
+///    [`crate::transport::Layout::lock`] names that record and takes BOTH with
+///    [`DestinationOwnership::lock_with_in_root_lock`]. A destination the crate
+///    cannot lock is REFUSED there, not run unowned; only the
+///    [`DestinationOwnership::Unowned`] value reaches it.
 /// 2. **The source is quiescent, and the crate VERIFIES it.** The source
 ///    cannot be locked, so the run re-reads its manifest at the end and fails
 ///    closed, naming the paths that moved, if it differs from the plan.
@@ -2110,12 +2223,33 @@ pub fn sync(
     // The token is BOUND to the run it was acquired for: a token acquired for
     // another direction or destination is refused rather than used, so a caller
     // cannot take the lock on one destination and mutate another.
-    let (prepared, guard) = match ownership {
+    let (prepared, locks) = match ownership {
         DestinationOwnership::Locked(locked) => {
             if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
                 return Err(SyncError::from(error));
             }
-            (locked.prepared, Some(locked.guard))
+            (
+                locked.prepared,
+                Some(HeldLocks {
+                    _sibling: locked.guard,
+                    _in_root: None,
+                }),
+            )
+        }
+        // The COMPOSED token holds the sibling record AND the caller's in-root
+        // `Layout::lock`; both guards travel into the run so BOTH flock
+        // exclusions live until the run returns.
+        DestinationOwnership::LockedWithInRoot(locked, InRootLock(in_root)) => {
+            if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
+                return Err(SyncError::from(error));
+            }
+            (
+                locked.prepared,
+                Some(HeldLocks {
+                    _sibling: locked.guard,
+                    _in_root: Some(in_root),
+                }),
+            )
         }
         DestinationOwnership::Unowned => (
             match prepare(direction, local_root, remote, false) {
@@ -2135,7 +2269,7 @@ pub fn sync(
         &dest,
         policy,
         extraneous,
-        guard,
+        locks,
         prepared.source_meta,
     )
 }
@@ -2152,11 +2286,21 @@ pub fn sync(
 /// is stated in the TYPE as well as in the name and cannot be reached by
 /// omission.
 ///
+/// [`DestinationOwnership::LockedWithInRoot`] is the COMPOSED form: it holds
+/// the same sibling record AND the caller's in-root
+/// [`crate::transport::Layout::lock`], so it excludes a writer that takes
+/// EITHER record. It is produced only by
+/// [`DestinationOwnership::lock_with_in_root_lock`]; its extra
+/// [`InRootLock`] payload has a private field and no public constructor, so it
+/// cannot be forged either. The composed form is opt-in and named: a caller
+/// that does not ask for it gets exactly the sibling-only behaviour of
+/// [`DestinationOwnership::lock`].
+///
 /// # Unforgeability (compile-checked)
 ///
-/// The `Locked` arm cannot be built without calling the acquiring constructor.
-/// Each obvious forgery below is a `compile_fail` example, so the suite proves
-/// the hole is closed rather than claiming it:
+/// The `Locked` and `LockedWithInRoot` arms cannot be built without calling an
+/// acquiring constructor. Each obvious forgery below is a `compile_fail`
+/// example, so the suite proves the hole is closed rather than claiming it:
 ///
 /// A struct literal cannot name the private fields:
 ///
@@ -2196,17 +2340,35 @@ pub fn sync(
 /// let guard = FileLock::acquire(std::path::Path::new("/tmp/probe.lock"), "probe").unwrap();
 /// let _forged = DestinationOwnership::Locked(guard);
 /// ```
+///
+/// The composed arm's extra [`InRootLock`] payload has a private field and no
+/// constructor, so it cannot be built from a bare [`crate::lock::FileLock`]
+/// either:
+///
+/// ```compile_fail
+/// use storekit::lock::FileLock;
+/// use storekit::sync::InRootLock;
+/// let guard = FileLock::acquire(std::path::Path::new("/tmp/probe2.lock"), "probe").unwrap();
+/// let _forged = InRootLock(guard);
+/// ```
 pub enum DestinationOwnership {
-    /// The crate TAKES the destination's operation lock and holds it for the
-    /// whole run. Obtainable ONLY from [`DestinationOwnership::lock`].
+    /// The crate TAKES the destination's sibling operation lock
+    /// ([`destination_lock_path`]) and holds it for the whole run. Obtainable
+    /// ONLY from [`DestinationOwnership::lock`].
     Locked(LockedDestination),
+    /// The crate TAKES BOTH the destination's sibling operation lock AND the
+    /// caller's in-root [`crate::transport::Layout::lock`], and holds BOTH for
+    /// the whole run. Obtainable ONLY from
+    /// [`DestinationOwnership::lock_with_in_root_lock`].
+    LockedWithInRoot(LockedDestination, InRootLock),
     /// The caller has taken the destination for the run out of band; the crate
     /// holds no lock. State this at the call site.
     Unowned,
 }
 
 /// The proof a run holds its destination, produced only by
-/// [`DestinationOwnership::lock`].
+/// [`DestinationOwnership::lock`] (or, for the composed form,
+/// [`DestinationOwnership::lock_with_in_root_lock`]).
 ///
 /// The fields are private and the type has no public constructor, so a caller
 /// cannot build one — from a struct literal, a `From`/`Default` impl, a clone,
@@ -2218,6 +2380,19 @@ pub struct LockedDestination {
     prepared: Prepared,
     guard: FileLock,
 }
+
+/// The proof a run ALSO holds the caller's in-root
+/// [`crate::transport::Layout::lock`], produced only by
+/// [`DestinationOwnership::lock_with_in_root_lock`].
+///
+/// The field is private and the type has no public constructor, so a caller
+/// cannot build one — from a struct literal, a `From`/`Default` impl, a clone,
+/// or a bare [`crate::lock::FileLock`] — without calling the composed
+/// acquiring constructor. It is the guard on the record at
+/// `dest_root.join(layout_lock)`; the composed constructor validates that the
+/// destination root exists before acquiring it (see
+/// [`DestinationOwnership::lock_with_in_root_lock`]).
+pub struct InRootLock(FileLock);
 
 impl DestinationOwnership {
     /// ACQUIRE the destination's operation lock for a run in `direction`
@@ -2244,6 +2419,91 @@ impl DestinationOwnership {
             prepared,
             guard,
         }))
+    }
+
+    /// ACQUIRE BOTH the destination's sibling operation lock
+    /// ([`destination_lock_path`]) AND the caller's in-root
+    /// [`crate::transport::Layout::lock`] at `in_root_lock` (a
+    /// [`RootedRelativePath`] under the destination root), or REFUSE — the ONLY
+    /// way to obtain [`DestinationOwnership::LockedWithInRoot`].
+    ///
+    /// The two records are DIFFERENT FILES and neither excludes the other on
+    /// its own ([`destination_lock_path`]); this constructor is how a run holds
+    /// BOTH, so a consumer whose own writer takes the in-root `Layout::lock` is
+    /// excluded by the sync, and the sync is excluded by that writer. Pass the
+    /// caller's own [`crate::transport::Layout::lock`] path so the two sides
+    /// agree on the record by construction.
+    ///
+    /// # The canonical acquisition order (and why it cannot deadlock)
+    ///
+    /// The records are taken in ONE order, enforced HERE and not selectable by
+    /// the caller: **the sibling record first (`lock_destination`), then the
+    /// caller's in-root record**. The order is an outer-gate discipline — a
+    /// composed run that cannot take the sibling record fails before it touches
+    /// anything inside the destination root. Both acquisitions are
+    /// NON-BLOCKING ([`crate::lock::FileLock`] uses `flock LOCK_NB` /
+    /// `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY`), so a process can never
+    /// WAIT while holding one record: two composed runs contending for the two
+    /// records in either order fail with [`Error::LockContended`] instead of
+    /// deadlocking. The order is still fixed so that contention is reported
+    /// deterministically and the in-root record is not created for a run that
+    /// loses the sibling gate.
+    ///
+    /// # The destination ROOT must already exist
+    ///
+    /// Taking an in-root record creates the record and any missing PARENT
+    /// directory inside the root, so a composed run that let the root be
+    /// created would make the destination root appear before the destination
+    /// manifest is read — exactly the surprise the sibling location exists to
+    /// avoid, and (for a PULL) it would then contradict the lazy-root adoption
+    /// rule. This constructor therefore REFUSES a destination root that does
+    /// not already exist (a typed [`Error::NotFound`]) or that is not a real
+    /// directory, BEFORE the sibling record is created, so the refusal leaves
+    /// nothing behind. A caller that wants the crate to provision the root
+    /// first must do so itself (for example with `Remote::provision_layout`).
+    /// The in-root record's own missing parent directory INSIDE the existing
+    /// root is still created (the lock helper creates a missing chain at the
+    /// store-private mode), because refusing that would reject a legitimately
+    /// empty store directory.
+    ///
+    /// The in-root record is destination RESIDUE
+    /// ([`crate::reserved::is_residue_path`]: its final component is the
+    /// application lock record), so it is STRIPPED from the destination view
+    /// the run judges and never transferred or destroyed. Its PARENT
+    /// directory (if the lock created it) is ordinary content and may appear as
+    /// a destination-only directory; under [`Extraneous::Delete`] its removal
+    /// is refused because it holds residue, and it is reported as residue
+    /// rather than destroyed. See the module docs, "Why the lock record is a
+    /// SIBLING of the destination root".
+    ///
+    /// The acquisition runs the same preflight as [`DestinationOwnership::lock`]
+    /// (pin the local root, refuse overlapping roots, refuse an unlockable
+    /// destination, prepare the transport identity, read the strict source
+    /// manifest) and then the root check, the sibling lock, and the in-root
+    /// lock. A REMOTE (far-side) destination is REFUSED by the sibling check
+    /// exactly as for the plain form, because neither record can be taken from
+    /// this host.
+    pub fn lock_with_in_root_lock(
+        direction: Direction,
+        local_root: &Path,
+        remote: &dyn Remote,
+        in_root_lock: &RootedRelativePath,
+    ) -> Result<DestinationOwnership> {
+        let prepared = prepare(direction, local_root, remote, true)?;
+        // The composed form never creates the destination ROOT: refuse a root
+        // that is absent (or not a directory) BEFORE the sibling record is
+        // created, so the refusal leaves no residue. This is also what keeps a
+        // PULL's "a fully-refused pull creates NOTHING, not even the root" and
+        // the lazy-root adoption rule intact.
+        require_existing_root(prepared.dest_is_local, &prepared.dest_root)?;
+        // CANONICAL ORDER, step 1 of 2: the sibling record (outside the root).
+        let guard = lock_destination(direction, prepared.dest_is_local, &prepared.dest_root)?;
+        // CANONICAL ORDER, step 2 of 2: the caller's in-root layout record.
+        let in_root = acquire_in_root_lock(direction, &prepared.dest_root, in_root_lock)?;
+        Ok(DestinationOwnership::LockedWithInRoot(
+            LockedDestination { prepared, guard },
+            InRootLock(in_root),
+        ))
     }
 }
 
@@ -2892,19 +3152,32 @@ fn parent_need(kind: EntryKind, dest_kind: Option<EntryKind>) -> ParentNeed {
     }
 }
 
+/// The lock guards a run holds for its WHOLE duration, in the ONE canonical
+/// acquisition order. `_sibling` is the record [`destination_lock_path`]
+/// derives; `_in_root` is the caller's in-root `Layout::lock`, held only by
+/// [`DestinationOwnership::lock_with_in_root_lock`]. Both are dropped together
+/// when the run returns (or unwinds), and the kernel releases the flocks when
+/// the descriptors close even if the drop never runs (a `SIGKILL`ed holder).
+struct HeldLocks {
+    _sibling: FileLock,
+    _in_root: Option<FileLock>,
+}
+
 fn run(
     source: &Side<'_>,
     dest: &Side<'_>,
     policy: &dyn Policy,
     extraneous: Extraneous,
-    guard: Option<FileLock>,
+    locks: Option<HeldLocks>,
     source_meta: TreeMetadata,
 ) -> SyncResult {
-    // Hold the destination's operation lock for the WHOLE run: `_lock` lives
-    // until this function returns, so the flock is released only after the last
+    // Hold the destination's operation lock(s) for the WHOLE run: `_lock` lives
+    // until this function returns, so each flock is released only after the last
     // mutation, the verification, and the source-quiescence re-read. The
-    // `Unowned` path passes `None`.
-    let _lock = guard;
+    // `Unowned` path passes `None`; the composed owned path passes BOTH guards,
+    // so its in-root `Layout::lock` is held exactly as long as its sibling
+    // record.
+    let _lock = locks;
     // The RAW source manifest the plan is made against, kept for the
     // SOURCE-quiescence check at the END of the run. It was read by the ENTRY
     // POINT, BEFORE the destination lock was taken and before the destination

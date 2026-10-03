@@ -37,6 +37,25 @@ reads as verified, and this class has already recurred once (a `:2302` citation
 that was seven lines off). **Fixed** by citing items by NAME everywhere in
 `README.md`; line numbers are no longer used.
 
+**A — the design-conflict premise was FALSE for the record it described. FIXED.**
+README's design conflict (a) and the `sync` module docs claimed an in-root
+`state/operation.lock` "would create the destination ROOT and enter the
+destination manifest the run is judging" — the stated reason the two records
+were left uncomposed. The second half is false for the record: the DESTINATION
+view strips it as residue. `sync::diff::apply_manifests` strips the destination
+with `reserved::is_residue_path`, and `is_residue_path` is true for any path
+with a component that is the application-lock spelling (`operation.lock`), so
+the record is invisible to the diff, never transferred, and never destroyed;
+it is reported in `SyncReport::residue`. What remains true is that the lock
+CREATES the destination root when it is missing and creates the record's parent
+directory, and an empty parent directory is ordinary content (under
+`Extraneous::Delete` its removal is refused because it holds residue). The
+premise is corrected in README (a) and in the `sync` module docs; the composed
+ownership form takes the in-root record BY NAME (`DestinationOwnership::lock_with_in_root_lock`),
+requires the destination root to pre-exist, and reports the record as residue.
+The lesson is axis A's usual one: a documented objection read as verified had
+not been checked against the strip the code actually performs.
+
 **B/D — the one gate answered to two names, one of them misleading.**
 `atomic::refuse_lock_record_mutation` was `refuse_reserved_mutation(rel,
 Sanction::None)` — it runs BOTH the lock-record half and the residue half — while

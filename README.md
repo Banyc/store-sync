@@ -304,13 +304,12 @@ simplification; removing one means adding back the logic it removes.
 ## Design conflicts surfaced by the consumer audit
 
 Three places where this crate's guarantees and a real consumer's design pull
-apart. They are recorded here, with evidence and a recommendation, so the
-owner decides them deliberately rather than by omission. Only (c) is a crate
-defect, and this change fixes it; (a) and (b) are documented-limitation
-candidates that each need an owner decision. Nothing here changes behaviour
-beyond (c).
+apart. They are recorded here, with evidence and the decision, so the owner
+decides them deliberately rather than by omission. (a) and (c) are CLOSED — (a)
+by the composed ownership form below, (c) by the fd-confined tree helpers; (b)
+remains a documented limitation with its owner decision unchanged.
 
-### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — OWNER DECISION
+### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — CLOSED (composed BY NAME)
 
 The ONE entry point `sync` takes `<parent>/.<name>.operation.lock`
 (`sync::destination_lock_path`; the rationale is in the `sync` module docs)
@@ -318,19 +317,60 @@ when its `ownership` argument is the unforgeable
 `DestinationOwnership::Locked` token (acquired by
 `DestinationOwnership::lock`), while `Layout::lock` names the IN-ROOT
 `state/operation.lock` (`transport::Layout::lock`). They are DIFFERENT FILES, so
-the two locks do NOT exclude each other: a consumer that already holds its own
-in-root `operation.lock` and then calls `sync` ends up with two files that both
-claim to be "the operation lock" (also in the `sync` module docs). The sibling
-location is deliberate — an in-root record would create the destination ROOT
-and enter the destination manifest the run is judging — and it cannot be
-composed from the applier's side, because `Remote` exposes no accessor for its
-`Layout`.
+the two locks do NOT exclude each other on their own: a consumer that holds its
+own in-root `operation.lock` and then calls a plain `sync` ends up with two
+files that both claim to be "the operation lock", and that run is not excluded
+by the consumer's lock (also in the `sync` module docs).
 
-RECOMMENDATION (owner decision, not a defect): either give the acquiring
-constructor the caller's `Layout::lock` path so a run can take BOTH records, or
-state in the `sync` contract that a consumer with its own in-root record must
-serialize at a higher level. Do NOT simply move the record in-root: that
-breaks the "a fully-refused pull creates NOTHING" contract.
+DECISION (the crate's own recommendation, taken): the acquiring constructor now
+has a NAMED composed form,
+`DestinationOwnership::lock_with_in_root_lock(direction, local_root, remote,
+&layout.lock)`, which takes BOTH records and holds them for the whole run. It
+returns the unforgeable `DestinationOwnership::LockedWithInRoot(LockedDestination,
+InRootLock)` token; `DestinationOwnership::lock` is UNCHANGED and still takes the
+sibling record alone, so the plain path is byte-for-byte the same. The caller
+supplies its own `Layout::lock` path (a `RootedRelativePath`), because `Remote`
+exposes no `Layout` accessor and a hard-coded `state/operation.lock` would be
+wrong for a custom layout.
+
+The composition is honest about its costs, all pinned by tests:
+
+* **Canonical order, no deadlock.** The sibling record is taken FIRST and the
+  caller's in-root record second; the order is enforced in the constructor, not
+  selectable by the caller. Both acquisitions are NON-BLOCKING (`flock LOCK_NB`
+  / `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY`), so a process can never WAIT
+  while holding one record — two composed runs contending in either order fail
+  with the typed `Error::LockContended` instead of deadlocking. Sibling-first is
+  the outer gate: a run that loses the sibling record never touches the
+  destination root.
+* **The destination ROOT must already exist.** Taking an in-root record creates
+  the record and any missing parent directory inside the root, so a composed
+  run that let the root be created would create the destination root before the
+  destination manifest is read — the surprise the sibling location exists to
+  avoid, and (for a PULL) a contradiction of the lazy-root adoption rule. The
+  composed constructor therefore REFUSES a missing (typed `Error::NotFound`) or
+  non-directory destination root BEFORE the sibling record is created, so the
+  refusal leaves nothing behind. The in-root record's own missing parent
+  directory INSIDE the existing root is still created (at the store-private
+  mode).
+* **The in-root record is invisible to the run, but its parent directory is
+  not.** The record is destination RESIDUE
+  (`reserved::is_residue_path`: its component is the application-lock spelling),
+  so `apply_manifests` strips it from the destination view — it is never
+  transferred and never destroyed; it is reported in `SyncReport::residue`. An
+  empty parent directory the lock creates is ordinary content: under
+  `Extraneous::Delete` its removal is refused because it holds residue, so
+  neither the directory nor the record is destroyed. (The earlier claim in this
+  section that an in-root record "would enter the destination manifest the run
+  is judging" was FALSE for the record itself; see `docs/CONSISTENCY.md`.)
+* **The default does not change.** Plain `sync`/`push`/`pull` behaviour —
+  including "a fully-refused pull creates NOTHING, not even the root" — is
+  untouched: the plain constructor never creates or holds the in-root record.
+
+Do NOT move the sync's own record in-root: that still breaks the
+"a fully-refused pull creates NOTHING" contract. The composed form exists
+precisely so the in-root record is only taken when the caller names it and
+accepts the root-must-exist cost.
 
 ### (b) Ownership enforcement is unavailable for exactly the remote case — DOCUMENTED LIMITATION, OWNER DECISION
 
