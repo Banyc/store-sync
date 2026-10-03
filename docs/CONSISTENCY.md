@@ -39,13 +39,16 @@ that was seven lines off). **Fixed** by citing items by NAME everywhere in
 Sanction::None)` — it runs BOTH the lock-record half and the residue half — while
 its own doc block said there was deliberately no lock-only function. Call sites
 were split between the two names, so a reader asking "does this primitive also
-refuse a stranded aside?" could not tell from the call. **In progress:** one name
-(`refuse_reserved_mutation`), alias deleted.
+refuse a stranded aside?" could not tell from the call. **Fixed:** all 23 call
+sites were verified to be `Sanction::None` — no site intended only the lock half,
+which is what the design says cannot exist — so the alias was deleted and every
+site now names `refuse_reserved_mutation(…, Sanction::None)`.
 
 **F — a duplicated constant across the platform twins.** `MAX_ANCESTRY` was
 defined independently in `atomic/unix.rs` and `atomic/windows.rs`, both `1 << 16`.
 The two ports enforce the same rule, so the values must agree; two literals are
-free to drift. **In progress:** single-sourced.
+free to drift. **Fixed:** single-sourced as `atomic::MAX_ANCESTRY`, referenced by
+both ports.
 
 **F (resolved, no action) — `SUN_PATH_BYTES` ×2 is correct.** One definition is
 `#[cfg(unix)]` and computed from the platform's `sockaddr_un`; the other is the
@@ -73,5 +76,13 @@ the API, not to pretend they are neutral. **Open.**
 **E — the accepted set and the operations over it.** `validate_rel` accepts
 `a/./b`, `a/b/` and `a//b`; `RootedRelativePath::parse` refuses a literal `.`
 segment. Any primitive that takes a raw path therefore re-validates against a
-rule STRICTER OR LOOSER than the one at the boundary. **In progress** (API
-constraint #1).
+rule STRICTER OR LOOSER than the one at the boundary. **Fixed** by API
+constraint #1: the boundary is the type, `validate_rel` is deleted, and the
+delta was measured to be **one-directional** — the type refuses a strict
+superset, the only newly-refused inputs being spellings with a non-leading
+literal `.` segment. No input the guard refused is now accepted.
+
+**I — an audit pin moved, deliberately.** When `remove_dir_all_path` left
+production the pinned `std::fs`/`libc` counts dropped with it (`remove_file`,
+`rmdir`, `open`). That is the pin doing its job: the count changed, so the
+change had to say so.
