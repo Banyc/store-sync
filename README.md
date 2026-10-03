@@ -547,3 +547,9 @@ implied to be checked.
   route that the newer substrate already knew how to refuse.
 - **A test that cannot fail is worse than no test**, and a pre-fix proof that was
   not RUN is not a proof. Record which of the two you have.
+- **A green gate can be a stale binary.** Cargo's fingerprint does not include
+  `CARGO_MANIFEST_DIR`, so moving the crate's directory reuses objects compiled
+  at the old path — and a test that bakes `env!("CARGO_MANIFEST_DIR")` (both
+  source audits do) then reads a directory that no longer exists. Run
+  `cargo clean -p storekit` after moving the tree, and treat a gate that ran
+  without a rebuild after a path change as NOT RUN.
