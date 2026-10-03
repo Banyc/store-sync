@@ -350,6 +350,16 @@ pub trait Remote {
     /// default): a new remote transport that forgets is a compile error, not
     /// a silent local-verification bug.
     fn is_local(&self) -> bool;
+    /// Read the WHOLE entry at `rel` into memory.
+    ///
+    /// MEMORY BOUND: the entire entry is materialized as one `Vec<u8>` (and the
+    /// caller holds it, alongside any copy the sync makes), so a single 350 MB
+    /// file costs peak RSS ~362 MB — measured 362,064 KB (macOS) / 362,860 KB
+    /// (Linux) — for BOTH snapshot and restore, and a 4 GB entry needs ~4 GB.
+    /// There is no streaming read. Keep the largest entry under the process's
+    /// memory budget, or move large blobs outside the synced tree and ship them
+    /// with a tool that streams; a streaming transport API is a deliberate
+    /// future direction, not implemented here.
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
     /// Write `data` to `rel` with the final `mode`, creating or replacing the
     /// entry.
@@ -384,6 +394,18 @@ pub trait Remote {
     /// reporting no difference. The authoritative list is [`crate::manifest`]'s
     /// "Fidelity scope" section; a caller that needs any of it must apply it
     /// out of band.
+    ///
+    /// MEMORY AND TIME BOUND, and the LOCAL/REMOTE asymmetry. `data` is the
+    /// WHOLE entry, already in memory: a 350 MB file costs peak RSS ~362 MB
+    /// (measured 362,064 KB macOS / 362,860 KB Linux), so a 4 GB entry needs
+    /// ~4 GB; there is no streaming write. The two kinds are also NOT equally
+    /// protected against a slow link: [`SshTransport`] derives a size-aware
+    /// deadline from the payload (`upload_deadline` / `transfer_deadline(bytes,
+    /// min_rate, command_deadline)`), while [`LocalTransport`] has NEITHER a
+    /// deadline NOR streaming. Keep the largest entry under the process's
+    /// memory budget, or move large blobs outside the synced tree and ship them
+    /// with a tool that streams; a streaming transport API is a deliberate
+    /// future direction, not part of the residue change.
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
     /// Atomically create `rel` with `data` only if it does not already exist,
     /// and make the install DURABLE before returning: the create-new

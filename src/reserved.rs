@@ -54,7 +54,11 @@
 //! the lock-record subset ([`is_lock_record_name`]) through the ONE guard
 //! authority (`crate::atomic::guard`), so the record's stable inode cannot be
 //! unlinked, replaced, truncated, or renamed through the substrate's
-//! name-mutating funnel.
+//! name-mutating funnel. The RECURSIVE-REMOVAL primitives additionally consult
+//! the RESIDUE subset ([`is_residue_name`]) at the same chokepoint, so the
+//! crate's own `remove_dir_all`-shaped primitives can never walk over a
+//! stranded aside that HOLDS an original; the one sanctioned break is the
+//! explicit [`crate::sync::Residue::discard`].
 
 use std::path::{Component, Path};
 
@@ -65,6 +69,16 @@ pub const ASIDE_PREFIX: &str = ".sync-aside.";
 
 /// The operation-lock record spelling's suffix: `.<name>.operation.lock`.
 pub const OPERATION_LOCK_SUFFIX: &str = ".operation.lock";
+
+/// The ONE spelling of the residue refusal, shared by the sync's
+/// [`crate::sync::ConflictReason::ResidueBelow`] and the atomic substrate's
+/// refusal of an IMPLICIT recursive removal
+/// ([`crate::atomic::remove_dir_all_path`] and its siblings). A consumer that
+/// matches the reason on the sync side and the conflict token on the
+/// substrate side therefore reads ONE vocabulary rather than two. The
+/// substrate's refusal is an [`crate::error::Error::Conflict`] whose message
+/// begins with this token.
+pub const RESIDUE_BELOW: &str = "ResidueBelow";
 
 /// Whether a SINGLE path segment is one of the crate's RESERVED spellings and
 /// must not be used as caller content (an identity, a manifest path segment).

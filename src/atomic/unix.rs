@@ -667,6 +667,53 @@ fn unlinkat_fd(dir_fd: &OwnedFd, name: &OsStr) -> Result<()> {
     unlinkat_fd_io(dir_fd, name).map_err(|e| Error::store(format!("unlinkat: {e}")))
 }
 
+/// `unlinkat` WITHOUT the lock-record chokepoint. PRIVATE to this module, and
+/// reachable only from [`remove_owned_lock_record_fd`], whose first act is to
+/// present the unforgeable [`OwnedLockRecord`] capability through
+/// [`GuardedRel::new_for_owned_lock_record`]. This is the ONE syscall the lock
+/// guard is deliberately bypassed for — the sanctioned RETIREMENT of a record
+/// the caller's own authority owns — and it exists so the bypass is a single
+/// reviewed primitive rather than a raw `std::fs` call at a call site.
+fn unlinkat_fd_owned(dir_fd: &OwnedFd, name: &OsStr) -> Result<()> {
+    let c = CString::new(name.as_bytes()).map_err(|_| Error::store("unlink name with NUL"))?;
+    let r = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c.as_ptr(), 0) };
+    if r < 0 {
+        return Err(Error::store(format!(
+            "unlinkat the owned lock record: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// RETIRE the ONE lock record `owned` authorizes, by IDENTITY
+/// ([`OwnedLockRecord::owns`]). This is the sanctioned break of the lock-record
+/// guard: the caller's own protocol has decided the record is obsolete (see
+/// [`crate::sync::retire_destination_lock`]). A candidate that is not the owned
+/// record — including an ordinary path, and any lock-record spelling that
+/// resolves to a DIFFERENT on-disk entry — is refused by
+/// [`GuardedRel::new_for_owned_lock_record`] before any syscall.
+///
+/// The record must not be HELD when this runs; proving that is the caller's
+/// job (`FileLock` acquisition), because only the caller knows the record's
+/// protocol. The primitive itself does not take the flock.
+pub(crate) fn remove_owned_lock_record_fd(
+    root: &RootDir,
+    rel: &Path,
+    owned: &OwnedLockRecord,
+) -> Result<()> {
+    let guarded = GuardedRel::new_for_owned_lock_record(rel, owned)?;
+    if !guarded.is_owned_lock_record() {
+        return Err(Error::conflict(format!(
+            "refusing to retire {}: it is not the lock record the presented ownership authority \
+             owns (the record is recognized by resolved identity, never by a spelling fold)",
+            rel.display()
+        )));
+    }
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    unlinkat_fd_owned(&parent_fd, name)
+}
+
 /// `unlinkat(AT_REMOVEDIR)` — `rmdir` semantics, guarded at the chokepoint.
 fn rmdirat_fd_io(dir_fd: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
     refuse_mutation_name(name).map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -1510,6 +1557,17 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
 /// any component is refused (ELOOP) — never followed.
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
     refuse_lock_record_mutation(rel)?;
+    // The RESIDUE authority at the entry point: the walk checks each CHILD's
+    // name, so the walk ROOT would otherwise be removed implicitly even when
+    // it is a stranded aside. Both authorities run before any mutation.
+    refuse_residue_mutation(rel)?;
+    remove_dir_all_fd_inner(root, rel)
+}
+
+/// The recursive-removal worker shared by the implicit and the explicit
+/// (discard) entry points. It carries NO residue decision: the callers run the
+/// entry-point check, and the walk itself refuses every nested residue.
+fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let dir_fd = openat_no_follow(
         &parent_fd,
@@ -1521,6 +1579,34 @@ pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
     rmdirat_fd_io(&parent_fd, name)
         .map_err(|e| Error::store(format!("rmdir {}: {e}", rel.display())))?;
     Ok(())
+}
+
+/// EXPLICIT DISCARD of a stranded residue (`sync::Residue::discard`): the
+/// recursive removal of the ONE residue at `rel`, deliberately permitted.
+///
+/// The root's own residue spelling is allowed — the caller has decided the
+/// strand is disposable — but the LOCK authority still runs on the whole path,
+/// the walk still refuses any NESTED residue (a residue inside the strand is a
+/// SEPARATE stranded original the caller must discard first), and every entry's
+/// lock-record spelling is still refused. This is the only sanctioned break of
+/// the implicit-removal residue guard, and it is reachable only through the
+/// caller's explicit discard.
+pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    if !rel
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::reserved::is_residue_name)
+    {
+        return Err(Error::conflict(format!(
+            "{}: refusing to discard {} — its final component is not a residue \
+             (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
+             removes a stranded original, never ordinary content",
+            crate::reserved::RESIDUE_BELOW,
+            rel.display()
+        )));
+    }
+    remove_dir_all_fd_inner(root, rel)
 }
 
 /// The descriptor-relative single-directory creation (no parent creation,
@@ -1657,6 +1743,15 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
         };
 
         let child_name = std::ffi::OsStr::from_bytes(&name);
+        // Both authorities at the same chokepoint, LOCK first so a lock-record
+        // spelling keeps its more specific refusal. A recursive removal must
+        // never walk over a stranded original (RESIDUE) nor over the record
+        // (LOCK). The residue check is on THIS entry's own name (not the whole
+        // `child_rel`), because the walk root is deliberately permitted for an
+        // explicit discard (`remove_residue_*`); only a NESTED residue stops a
+        // discard, and the entry points refuse a residue root.
+        refuse_lock_record_mutation(Path::new(child_name))?;
+        refuse_residue_mutation(Path::new(child_name))?;
         let descend: Option<Frame> = {
             let top = stack.last().expect("the frame just examined");
             let child_rel = top.rel.join(Path::new(child_name));
@@ -1708,6 +1803,10 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 /// symlink at `path` is unlinked as the entry itself, never followed.
 pub fn remove_dir_all_path(path: &Path) -> Result<()> {
     refuse_lock_record_mutation(path)?;
+    // The RESIDUE authority here too: this PATH-BASED primitive is the one the
+    // recovery recipe documented for a local destination, and it walked
+    // straight over a stranded aside (see `refuse_residue_mutation`).
+    refuse_residue_mutation(path)?;
     let md = match std::fs::symlink_metadata(path) {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1992,8 +2091,10 @@ mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, openat_no_follow, parent_fd_of,
         path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd,
-        remove_file_fd, renameat_fd, renameat_paths, replace_order_probe, set_private_fd,
-        write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd, write_file_fd,
+        remove_dir_all_path, remove_file_fd, remove_owned_lock_record_fd,
+        remove_residue_dir_all_fd, renameat_fd, renameat_paths, replace_order_probe,
+        set_private_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
+        write_file_fd,
     };
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -3170,5 +3271,154 @@ mod tests {
         let fd = openat_no_follow(root.as_fd(), Path::new("operation.lock"), libc::O_RDONLY, 0)
             .expect("a read-only open of the record is not a mutation");
         drop(fd);
+    }
+
+    /// R1 (DATA LOSS): the recursive-removal walk consulted only the
+    /// lock-record authority, so `remove_dir_all_path`/`remove_dir_all_fd`
+    /// walked straight over a stranded `.sync-aside.` and destroyed the
+    /// caller's only copy of the original. The walk and the entry points now
+    /// consult the RESIDUE authority at the same chokepoint, and the refusal
+    /// names the sync's own `ResidueBelow` vocabulary.
+    ///
+    /// PRE-FIX MESSAGE: `remove_dir_all_path(victim)` returned `Ok`, and
+    /// `victim/.sync-aside.1234.0` no longer existed.
+    #[test]
+    fn recursive_removal_never_destroys_a_stranded_aside() {
+        let (dir, root) = owned_root();
+        let stranded = dir.path().join("victim/.sync-aside.1234.0/stranded");
+        std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
+        std::fs::write(&stranded, b"precious").unwrap();
+
+        // (a) Removing the ANCESTOR walks over the aside without the guard.
+        let err = remove_dir_all_fd(&root, Path::new("victim"))
+            .expect_err("removing an ancestor of a stranded aside must be refused");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            format!("{err}").contains(crate::reserved::RESIDUE_BELOW),
+            "the refusal reuses the sync's ResidueBelow vocabulary: {err}"
+        );
+        assert_eq!(std::fs::read(&stranded).unwrap(), b"precious".to_vec());
+
+        // (b) The PATH-BASED primitive the recovery recipe named is refused
+        // for the aside itself. PRE-FIX: returned `Ok` and removed it.
+        let aside_abs = dir.path().join("victim/.sync-aside.1234.0");
+        let err = remove_dir_all_path(&aside_abs)
+            .expect_err("removing the stranded aside itself must be refused");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(aside_abs.exists(), "the aside survives the refused removal");
+
+        // (c) The descriptor-relative primitive, for the same root spelling.
+        let err = remove_dir_all_fd(&root, Path::new("victim/.sync-aside.1234.0"))
+            .expect_err("removing the stranded aside itself must be refused");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(aside_abs.exists());
+
+        // (d) A LOCK record in a residue-free tree is still refused by the LOCK
+        // authority (the residue guard must not have replaced it).
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        std::fs::write(dir.path().join("other/.dest.operation.lock"), b"held").unwrap();
+        let err = remove_dir_all_fd(&root, Path::new("other"))
+            .expect_err("a lock record in the removed tree is still refused");
+        assert!(format!("{err}").contains("lock record"), "{err}");
+    }
+
+    /// The reviewer's EXACT primitive: `remove_dir_all_path` over the aside
+    /// path itself. PRE-FIX: returned `Ok(())` and destroyed it.
+    #[test]
+    fn path_based_removal_never_destroys_a_stranded_aside() {
+        let (dir, _root) = owned_root();
+        let aside = dir.path().join("victim/.sync-aside.4242.0");
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("stranded"), b"precious").unwrap();
+        let err = remove_dir_all_path(&aside)
+            .expect_err("removing the stranded aside itself must be refused");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read(aside.join("stranded")).unwrap(),
+            b"precious".to_vec()
+        );
+    }
+
+    /// R6 at the authority: the capability-gated retirement removes ONLY the
+    /// record the presented [`OwnedLockRecord`] owns. A DIFFERENT record — even
+    /// one of the same spelling family — and ordinary content are refused, so
+    /// the sanctioned break cannot be reached for anything but the owned
+    /// record.
+    #[test]
+    fn the_owned_record_retirement_removes_only_the_owned_record() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join(".gone.operation.lock"), b"gone").unwrap();
+        std::fs::write(dir.path().join(".keep.operation.lock"), b"keep").unwrap();
+        let layout = crate::transport::Layout {
+            lock: crate::transport::RootedRelativePath::parse(Path::new(".gone.operation.lock"))
+                .unwrap(),
+            ..crate::transport::Layout::empty()
+        };
+        let owned = crate::atomic::OwnedLockRecord::local(dir.path(), &layout);
+
+        remove_owned_lock_record_fd(&root, Path::new(".gone.operation.lock"), &owned)
+            .expect("the owned record is retired");
+        assert!(!dir.path().join(".gone.operation.lock").exists());
+
+        let err = remove_owned_lock_record_fd(&root, Path::new(".keep.operation.lock"), &owned)
+            .expect_err("a record the authority does not own must be refused");
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(dir.path().join(".keep.operation.lock").exists());
+
+        std::fs::write(dir.path().join("ordinary"), b"data").unwrap();
+        assert!(
+            remove_owned_lock_record_fd(&root, Path::new("ordinary"), &owned).is_err(),
+            "ordinary content is not reachable through the retirement primitive"
+        );
+        assert!(dir.path().join("ordinary").exists());
+    }
+
+    /// R2: the EXPLICIT discard is the only sanctioned break of the implicit
+    /// residue guard. It removes the ONE strand, still refuses the lock
+    /// authority, and still refuses a NESTED residue (a second stranded
+    /// original inside the strand).
+    #[test]
+    fn explicit_discard_removes_one_strand_but_not_a_nested_one() {
+        let (dir, root) = owned_root();
+        std::fs::create_dir_all(dir.path().join(".sync-aside.7.0/nested/deep")).unwrap();
+        std::fs::write(dir.path().join(".sync-aside.7.0/nested/deep/f"), b"x").unwrap();
+
+        // The IMPLICIT removal still refuses it.
+        assert!(remove_dir_all_fd(&root, Path::new(".sync-aside.7.0")).is_err());
+
+        // A NESTED strand stops the discard.
+        std::fs::create_dir_all(dir.path().join(".sync-aside.7.0/nested/.sync-aside.9.9")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(".sync-aside.7.0/nested/.sync-aside.9.9/held"),
+            b"y",
+        )
+        .unwrap();
+        let err = remove_residue_dir_all_fd(&root, Path::new(".sync-aside.7.0"))
+            .expect_err("a nested strand stops a discard");
+        assert!(
+            format!("{err}").contains(crate::reserved::RESIDUE_BELOW),
+            "{err}"
+        );
+        assert!(
+            dir.path()
+                .join(".sync-aside.7.0/nested/.sync-aside.9.9/held")
+                .exists()
+        );
+
+        // Once the nested strand is gone, the discard removes the outer one.
+        std::fs::remove_dir_all(dir.path().join(".sync-aside.7.0/nested/.sync-aside.9.9")).unwrap();
+        remove_residue_dir_all_fd(&root, Path::new(".sync-aside.7.0")).unwrap();
+        assert!(std::fs::symlink_metadata(dir.path().join(".sync-aside.7.0")).is_err());
+
+        // Ordinary content is not discardable by the same primitive.
+        std::fs::write(dir.path().join("ordinary"), b"data").unwrap();
+        let err = remove_residue_dir_all_fd(&root, Path::new("ordinary"))
+            .expect_err("a discard only ever removes a residue");
+        assert!(
+            format!("{err}").contains(crate::reserved::RESIDUE_BELOW),
+            "{err}"
+        );
+        assert!(dir.path().join("ordinary").exists());
     }
 }

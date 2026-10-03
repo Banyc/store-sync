@@ -134,6 +134,55 @@ pub(crate) fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
     GuardedRel::new(rel).map(|_| ())
 }
 
+/// The ONE authority an IMPLICIT recursive removal consults before it destroys
+/// a directory's contents: refuse when any component of `rel` is destination
+/// RESIDUE ([`crate::reserved::is_residue_name`]).
+///
+/// A residue spelling HOLDS a stranded original — the pre-replace state a
+/// crash left behind (a claim-aside `.sync-aside.<pid>.<n>`; a lock record).
+/// The recursive-removal walks already consulted the LOCK authority
+/// ([`refuse_lock_record_mutation`]); they never consulted the RESIDUE
+/// authority, so the crate's own durable recursive-delete primitive walked
+/// straight over a stranded aside and destroyed the caller's only copy. This
+/// is the same guarantee the sync's `ConflictReason::ResidueBelow` states, now
+/// at the substrate authority every recursive removal passes through.
+///
+/// The check spans EVERY component, so a path that NAMES or descends THROUGH a
+/// residue is refused — removing the CONTENTS of an aside destroys part of the
+/// strand even when the aside itself is not the walk root. The refusal is a
+/// [`Error::Conflict`] whose message begins with [`crate::reserved::RESIDUE_BELOW`],
+/// the sync's own vocabulary, so a caller does not have to learn a second one.
+///
+/// PRIVATE to the crate: a consumer never calls this; it is the shared
+/// decision the recursive-removal primitives consult.
+pub(crate) fn refuse_residue_mutation(rel: &Path) -> Result<()> {
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        if !name.to_str().is_some_and(crate::reserved::is_residue_name) {
+            continue;
+        }
+        return Err(residue_refusal(rel));
+    }
+    Ok(())
+}
+
+/// The ONE error an implicit recursive removal returns for a residue: a
+/// [`Error::Conflict`] whose message begins with [`crate::reserved::RESIDUE_BELOW`],
+/// the sync's own vocabulary. Shared by the Unix walk, the Windows tree probe,
+/// and the entry-point checks, so every refusal reads identically.
+pub(crate) fn residue_refusal(rel: &Path) -> Error {
+    Error::conflict(format!(
+        "{}: refusing to remove {} — it is (or holds) destination residue, a claim-aside that \
+         HOLDS a stranded original (the pre-replace state). Recovering it is \
+         `sync::Residue::recover_to`; discarding it is the deliberate `sync::Residue::discard`. \
+         An implicit recursive removal never destroys it.",
+        crate::reserved::RESIDUE_BELOW,
+        rel.display()
+    ))
+}
+
 #[cfg(unix)]
 pub use unix::*;
 #[cfg(windows)]
@@ -424,7 +473,10 @@ pub(crate) fn is_crate_temp_shape(name: &str) -> bool {
 /// carries no committed state. The `.claim.` variant is a compare-and-delete
 /// claim temp and is likewise residue once no operation is live. A genuine
 /// claim-ASIDE (no authority marker) HOLDS a stranded original and must NOT be
-/// removed by this predicate — inspect it first.
+/// removed by this predicate: recover it with [`crate::sync::Residue::recover_to`]
+/// or remove it deliberately with [`crate::sync::Residue::discard`], never by a
+/// blanket `remove_dir_all` (the crate's own recursive-removal primitives now
+/// REFUSE it).
 pub fn is_crate_temp_name(name: &str) -> bool {
     is_crate_temp_shape(name)
 }

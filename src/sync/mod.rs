@@ -113,11 +113,15 @@
 
 pub mod apply;
 pub mod diff;
+pub mod residue;
+
+pub use residue::Residue;
 
 pub use apply::{
-    Conflict, ConflictReason, Direction, EntryPolicy, Extraneous, Policy, ReplaceAll, SyncError,
-    SyncReport, SyncResult, UnsupportedDestination, destination_lock_path, pull, pull_unowned,
-    push, push_unowned, sync, sync_unowned,
+    Conflict, ConflictReason, Direction, EntryPolicy, Extraneous, Policy, ReplaceAll,
+    RetireOutcome, SyncError, SyncReport, SyncResult, UnsupportedDestination,
+    destination_lock_path, pull, pull_unowned, push, push_unowned, retire_destination_lock, sync,
+    sync_unowned,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests, diff_trees,

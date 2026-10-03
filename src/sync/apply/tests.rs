@@ -2,6 +2,7 @@ use super::Extraneous::{Delete, Keep};
 use super::*;
 use crate::env::SysEnv;
 use crate::manifest::canonicalize_tree;
+use crate::sync::Residue;
 use crate::test_support::fixture_tmpdir;
 use crate::transport::{
     CreateNewVerdict, ExecOutcome, FsBytes, Layout, LocalTransport, RemoteEntry, RemoteMeta,
@@ -1518,11 +1519,18 @@ impl Remote for RecordingRemote {
         if self.vanish_nth_rename == Some(nth) {
             // Remove the source entry and report failure: afterwards the entry
             // is at NEITHER the source nor the destination spelling.
+            //
+            // This models a FOREIGN `rename(2)` that unlinked the source, so it
+            // DELIBERATELY bypasses the crate's guarded recursive removal: since
+            // R1 that primitive REFUSES to destroy a subtree holding residue (a
+            // source can hold a nested `.sync-aside.`), and a foreign rename is
+            // exactly the case the guard does not and cannot cover.
             if let Ok(Some(meta)) = self.inner.metadata_opt(from) {
+                let absolute = self.inner.root().join(from.as_path());
                 if meta.is_dir {
-                    let _ = self.inner.remove_dir_all(from);
+                    let _ = std::fs::remove_dir_all(absolute);
                 } else {
-                    let _ = self.inner.remove_file(from);
+                    let _ = std::fs::remove_file(absolute);
                 }
             }
             return Err(Error::transport(format!(
@@ -5894,6 +5902,207 @@ fn a_stranded_aside_is_residue_never_transferred_or_deleted() {
         "a nested stranded original survives"
     );
     assert_residue_present(&report, &[&dst2]);
+}
+
+/// R2: a stranded claim-aside left by a KILLED run (reproduced deterministically
+/// as the exact on-disk state a `SIGKILL` leaves: the install fails, then the
+/// rollback rename fails, so the aside survives holding the original) can be
+/// RECOVERED to the path it belongs at, or DISCARDED deliberately. Before this
+/// surface existed the only documented action was `remove_dir_all`, which
+/// destroyed the caller's only copy of the original.
+///
+/// Cases: (d) `Extraneous::Delete` still refuses the strand; (a) recovery
+/// restores it byte-identically; (b) recovery into an OCCUPIED path fails
+/// closed leaving both intact; (c) explicit discard removes it.
+#[cfg(unix)]
+#[test]
+fn a_stranded_aside_can_be_recovered_or_deliberately_discarded() {
+    /// Build the exact strand a killed kind-changing replacement leaves: the
+    /// destination holds a DIRECTORY at `p`, the source a FILE.
+    fn strand(dir: &Path) -> (PathBuf, PathBuf, String) {
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        write(&src.join("p"), b"new");
+        write(&dst.join("p/keep"), b"keep");
+        let mut remote = RecordingRemote::over(transport(&dst), true);
+        remote.fail_writes = true;
+        remote.fail_nth_rename = Some(2);
+        let err = sync(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+        assert!(!err.restore_failures().is_empty(), "{err:?}");
+        let residue = find_residue(&dst);
+        (src, dst, residue)
+    }
+
+    // (a) Recovery restores the original byte-identically. The install never
+    // landed, so the real path is absent first.
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let (src, dst, residue_path) = strand(dir.path());
+    let residue = Residue::detect(&dst, &residue_path).unwrap();
+    assert!(
+        fs::symlink_metadata(dst.join("p")).is_err(),
+        "the failed install left no entry at the real path"
+    );
+    residue.recover_to(Path::new("p")).unwrap();
+    assert_eq!(
+        read(&dst.join("p/keep")),
+        b"keep",
+        "the original is restored"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join(residue.aside())).is_err(),
+        "the aside is gone after recovery"
+    );
+    // The destination now converges cleanly: no residue remains.
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    assert!(report.residue.is_empty(), "{report:?}");
+
+    // (d) A later `Extraneous::Delete` sync still REFUSES a strand and reports
+    // it (the original path it would have installed over is not the strand).
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let (src, dst, residue_path) = strand(dir.path());
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    assert!(report.residue.contains(&residue_path), "{report:?}");
+    assert!(
+        dst.join(&residue_path).exists(),
+        "delete_extraneous spares residue"
+    );
+
+    // (b) Recovery into an OCCUPIED path fails closed: the occupant and the
+    // aside BOTH survive. This is the ambiguous case — the target may itself
+    // hold data — so the crate never overwrites it silently.
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let (_src, dst, residue_path) = strand(dir.path());
+    let residue = Residue::detect(&dst, &residue_path).unwrap();
+    write(&dst.join("p"), b"occupant");
+    let err = residue.recover_to(Path::new("p")).unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+    assert!(
+        err.to_string().contains(crate::reserved::RESIDUE_BELOW),
+        "{err}"
+    );
+    assert_eq!(
+        read(&dst.join("p")),
+        b"occupant",
+        "the occupant is untouched"
+    );
+    assert!(
+        dst.join(residue.aside()).exists(),
+        "the aside is untouched by the refused recovery"
+    );
+
+    // (c) Explicit discard removes the strand.
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let (_src, dst, residue_path) = strand(dir.path());
+    let residue = Residue::detect(&dst, &residue_path).unwrap();
+    residue.discard().unwrap();
+    assert!(fs::symlink_metadata(dst.join(residue.aside())).is_err());
+}
+
+/// R6: every sync leaves an unremovable sibling lock record
+/// (`.<name>.operation.lock`), so a many-snapshot store accumulates one per
+/// snapshot forever. `retire_destination_lock` is the sanctioned break: it
+/// reuses the ownership authority (identity, not spelling) and REFUSES while
+/// the record is HELD or its destination still lives. Evidence: 5 snapshots ->
+/// 5 records; prune 2 and retire theirs -> 3 records; a held record survives.
+#[cfg(unix)]
+#[test]
+fn retiring_an_obsolete_snapshot_lock_record_is_explicit_and_refuses_a_held_one() {
+    use crate::lock::FileLock;
+
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let snapshots = dir.path().join("snapshots");
+    write(&src.join("f"), b"x");
+    fs::create_dir_all(&snapshots).unwrap();
+
+    let roots: Vec<PathBuf> = (0..5).map(|i| snapshots.join(format!("s{i}"))).collect();
+    for root in &roots {
+        fs::create_dir_all(root).unwrap();
+        sync(Direction::Push, &src, &transport(root), &ReplaceAll, Keep).unwrap();
+    }
+    let record_count = |dir: &Path| -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                let name = e
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+                crate::reserved::is_lock_record_name(&name)
+            })
+            .count()
+    };
+    assert_eq!(record_count(&snapshots), 5, "one record per snapshot");
+
+    // Prune two snapshots (remove their roots) and RETIRE their records.
+    for root in &roots[3..] {
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            retire_destination_lock(root).unwrap(),
+            RetireOutcome::Retired
+        );
+    }
+    assert_eq!(
+        record_count(&snapshots),
+        3,
+        "the record count tracks the snapshots that remain"
+    );
+
+    // A LIVE destination keeps its record.
+    assert_eq!(
+        retire_destination_lock(&roots[0]).unwrap(),
+        RetireOutcome::DestinationLive
+    );
+    assert!(destination_lock_path(&roots[0]).unwrap().exists());
+    // Retiring an already-gone record is idempotent.
+    assert_eq!(
+        retire_destination_lock(&roots[4]).unwrap(),
+        RetireOutcome::Absent
+    );
+
+    // A HELD record is never retired.
+    let held_path = destination_lock_path(&roots[2]).unwrap();
+    let holder = FileLock::acquire(&held_path, "test-holder").unwrap();
+    fs::remove_dir_all(&roots[2]).unwrap();
+    assert_eq!(
+        retire_destination_lock(&roots[2]).unwrap(),
+        RetireOutcome::Held,
+        "a live holder must refuse retirement"
+    );
+    assert!(held_path.exists(), "a held record survives the refusal");
+    drop(holder);
+    assert_eq!(
+        retire_destination_lock(&roots[2]).unwrap(),
+        RetireOutcome::Retired
+    );
+    assert!(!held_path.exists());
+}
+
+/// R1 at the PUBLIC transport surface: `Remote::remove_dir_all` is the
+/// primitive a consumer's `prune` names, and it refused nothing before the
+/// fix, so it destroyed the stranded aside. It now carries the substrate's
+/// residue refusal.
+#[cfg(unix)]
+#[test]
+fn the_transport_recursive_removal_refuses_a_stranded_aside() {
+    use crate::transport::RootedRelativePath;
+
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let dst = dir.path().join("dst");
+    write(&dst.join("victim/.sync-aside.1234.0/stranded"), b"precious");
+    let rel = RootedRelativePath::parse(Path::new("victim/.sync-aside.1234.0")).unwrap();
+    let err = transport(&dst).remove_dir_all(&rel).unwrap_err();
+    assert!(
+        err.to_string().contains(crate::reserved::RESIDUE_BELOW),
+        "the transport surfaces the ResidueBelow refusal: {err}"
+    );
+    assert_eq!(
+        read(&dst.join("victim/.sync-aside.1234.0/stranded")),
+        b"precious",
+        "the stranded original survives the refused removal"
+    );
 }
 
 /// Item B: residue nested inside a destination-only directory must not be

@@ -421,6 +421,31 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
 }
 
+/// RETIRE the ONE lock record `owned` authorizes, by IDENTITY — the Windows
+/// twin of the Unix `remove_owned_lock_record_fd`. The candidate is recognized
+/// only by [`GuardedRel::new_for_owned_lock_record`] (ordinary content, and any
+/// record spelling resolving to a DIFFERENT entry, is refused); the removal is
+/// a raw `std::fs::remove_file` because the whole point is to break the record
+/// the guard protects, and the capability is the authorization. A held record
+/// is never removed: proving no live holder is the caller's job
+/// ([`crate::sync::retire_destination_lock`] acquires the flock first).
+pub(crate) fn remove_owned_lock_record_fd(
+    root: &RootDir,
+    rel: &Path,
+    owned: &OwnedLockRecord,
+) -> Result<()> {
+    let guarded = GuardedRel::new_for_owned_lock_record(rel, owned)?;
+    if !guarded.is_owned_lock_record() {
+        return Err(Error::conflict(format!(
+            "refusing to retire {}: it is not the lock record the presented ownership authority \
+             owns (the record is recognized by resolved identity, never by a spelling fold)",
+            rel.display()
+        )));
+    }
+    std::fs::remove_file(rel_join(root, rel)?)
+        .map_err(|e| Error::store(format!("retire {}: {e}", rel.display())))
+}
+
 /// Path-based single-directory creation (`create_dir` semantics), guarded like
 /// the Unix port's `create_dir_fd`.
 pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
@@ -501,6 +526,45 @@ fn refuse_lock_record_in_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a recursive removal whose tree CONTAINS destination residue at any
+/// depth BELOW `root` (`root` itself is the caller's entry-point decision: an
+/// implicit removal refuses it via [`refuse_residue_mutation`], an explicit
+/// discard permits it). The Windows port delegates the walk to
+/// `std::fs::remove_dir_all`, which unlinks descendants without consulting any
+/// authority, so the residue authority is applied to the WHOLE tree before
+/// anything is removed (fail closed), exactly as
+/// [`refuse_lock_record_in_tree`] applies the lock authority. A directory
+/// entry's own `file_type` is consulted, so a symlink is classified as the
+/// entry itself and is never descended into.
+fn refuse_residue_in_tree(root: &Path) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::store(format!("read_dir {}: {e}", dir.display()))),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| Error::store(format!("read_dir {}: {e}", dir.display())))?;
+            let child = entry.path();
+            if let Some(name) = child.file_name().and_then(|name| name.to_str())
+                && crate::reserved::is_residue_name(name)
+            {
+                return Err(residue_refusal(&child));
+            }
+            let is_dir = entry
+                .file_type()
+                .map_err(|e| Error::store(format!("file_type {}: {e}", child.display())))?
+                .is_dir();
+            if is_dir {
+                stack.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Path-based rename of a path under the root to another path under the
 /// root. Windows `rename` does not overwrite an existing target: remove it
 /// first (documented weaker guarantee — not atomic).
@@ -539,10 +603,40 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
 /// here.)
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
     refuse_lock_record_mutation(rel)?;
+    // The RESIDUE authority at the entry point, exactly as on Unix. Without
+    // it, `std::fs::remove_dir_all` walked straight over a stranded aside.
+    refuse_residue_mutation(rel)?;
     let joined = rel_join(root, rel)?;
     // `std::fs::remove_dir_all` unlinks descendants itself, so the whole tree
-    // is checked BEFORE it runs.
+    // is checked BEFORE it runs — for BOTH authorities.
     refuse_lock_record_in_tree(&joined)?;
+    refuse_residue_in_tree(&joined)?;
+    std::fs::remove_dir_all(joined)
+        .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
+}
+
+/// EXPLICIT DISCARD of a stranded residue (`sync::Residue::discard`), the
+/// Windows twin of `unix::remove_residue_dir_all_fd`: the root's own residue
+/// spelling is permitted, the lock authority still runs, and a NESTED residue
+/// is still refused.
+pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_lock_record_mutation(rel)?;
+    if !rel
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::reserved::is_residue_name)
+    {
+        return Err(Error::conflict(format!(
+            "{}: refusing to discard {} — its final component is not a residue \
+             (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
+             removes a stranded original, never ordinary content",
+            crate::reserved::RESIDUE_BELOW,
+            rel.display()
+        )));
+    }
+    let joined = rel_join(root, rel)?;
+    refuse_lock_record_in_tree(&joined)?;
+    refuse_residue_in_tree(&joined)?;
     std::fs::remove_dir_all(joined)
         .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
 }

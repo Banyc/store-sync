@@ -1031,7 +1031,13 @@ mod tests {
         );
 
         for (symbol, expected) in [
-            ("unlinkat", 2usize),
+            // THREE `unlinkat` references since R6: `unlinkat_fd_io` (guarded),
+            // the `unlinkat(AT_REMOVEDIR)` rmdir wrapper, and
+            // `unlinkat_fd_owned` (the capability-gated retirement of a lock
+            // record the caller's own authority owns, reachable only through
+            // `remove_owned_lock_record_fd`). The third is the ONE deliberate
+            // bypass of the guard, reviewed and pinned here.
+            ("unlinkat", 3usize),
             ("renameat", 1),
             ("symlinkat", 1),
             ("linkat", 1),
@@ -1098,8 +1104,14 @@ mod tests {
             ("src/atomic/unix.rs", "remove_file", 1),
             ("src/atomic/unix.rs", "rename", 1),
             ("src/atomic/windows.rs", "remove_dir", 1),
-            ("src/atomic/windows.rs", "remove_dir_all", 1),
-            ("src/atomic/windows.rs", "remove_file", 4),
+            // TWO production `remove_dir_all` calls since R2: the implicit
+            // recursive removal (`remove_dir_all_fd`, refused for residue) and
+            // the EXPLICIT discard (`remove_residue_dir_all_fd`), whose caller
+            // has already decided the strand is disposable. Both run the lock
+            // authority on the whole path/tree before the call, so neither can
+            // name the record; the count is raised deliberately, not silently.
+            ("src/atomic/windows.rs", "remove_dir_all", 2),
+            ("src/atomic/windows.rs", "remove_file", 5),
             ("src/atomic/windows.rs", "rename", 2),
             ("src/transport/mod.rs", "remove_file", 8),
             ("src/transport/mod.rs", "rename", 1),

@@ -122,6 +122,50 @@ To make a freshly pushed SUBTREE durable, call `fsync_tree(child)` AND
 `RootedRelativePath` cannot be empty, so a transport rooted at the child itself
 cannot name its own root to fsync the parent directory entry.
 
+## What a snapshot costs
+
+Two costs a checkpoint tool must budget for, both measured on a 350 MB tree
+unless stated otherwise.
+
+**Memory is O(largest entry), not O(changed bytes).** `Remote::write` takes
+`data: &[u8]` and the read side materializes the whole entry, so a single
+350 MB file costs peak RSS 362,064 KB (macOS) / 362,860 KB (Linux) for
+snapshot AND for restore — a 4 GB file needs roughly 4 GB of addressable
+memory in the process doing the transfer. The two destination kinds are NOT
+equally protected against a slow link: the SSH path derives a size-aware
+deadline from the payload (`upload_deadline` / `transfer_deadline(bytes,
+min_rate, command_deadline)`), while the LOCAL path has neither a deadline
+nor streaming. Workaround: keep the largest entry under the process's memory
+budget, or move large blobs outside the synced tree and ship them with a
+tool that streams. A streaming transport API would remove the bound; it is a
+deliberate future direction, not part of this change (adding it would
+transport-layer-wide redesign under a change that is about residue).
+
+**A snapshot still scans and hashes the WHOLE tree, so it is O(bytes
+scanned), not O(bytes changed).** Content addressing makes the STORE
+deduplicated — equal content is stored once — but there is no dirty tracking
+and no reuse of the previous manifest: `canonicalize_tree`
+(`crate::manifest`) reads every file to hash it, and `install_file`
+(`crate::sync::apply`) reads the whole source again to write it. Measured on
+the 350 MB tree, changing one 4-byte file: 1.327 s before -> 1.384 s after
+(macOS); 2.739 s -> 2.690 s (Linux). A periodic checkpoint therefore pays
+O(total bytes scanned) every run, which is a design cost of the
+manifest-and-hash model, not a bug; an implementation that reused a
+previously computed manifest or skipped the second read would change it, and
+neither is built here.
+
+**A deep tree is worse than the incremental measurement suggested, and the
+shape depends on fresh vs incremental.** A LOCAL path-based destination
+re-verifies a path's ancestry before mutating it, at O(depth) per probe, so a
+depth-D chain with ONE changed leaf is O(D^2): measured 0.63 s / 3.38 s /
+21.6 s at D = 100 / 200 / 400 (macOS). A FRESH destination installs all D
+entries, and EACH install pays its own O(D^2) probe, so it is O(D^3): measured
+4.855 s / 41.39 s / 582.1 s at the same depths. `canonicalize_tree` alone is
+cheap (2.76 ms / 6.53 ms / 25.4 ms), so the engine's per-path verification is
+the cost, and a checkpoint tool that recreates its destination per snapshot
+should budget the CUBIC. All timings above are the reviewing consumer's
+measurements, not re-measured here.
+
 ## A fresh destination
 
 A `PUSH` provisions its destination before reading the destination manifest: the

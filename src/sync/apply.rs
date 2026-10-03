@@ -899,7 +899,7 @@ use crate::sync::diff::{
     EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_trees, remote_destination_manifest,
     remote_manifest,
 };
-use crate::transport::{Remote, RootedRelativePath};
+use crate::transport::{Layout, Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -1106,7 +1106,14 @@ pub enum ConflictReason {
     /// reserved claim-aside entry (residue). Removing the directory would
     /// destroy the stranded original the residue holds, so its removal — and
     /// the removal of every entry below it — is refused and reported. Nothing
-    /// is mutated.
+    /// is mutated. The SAME refusal is stated at the substrate authority every
+    /// recursive removal passes through
+    /// ([`crate::atomic::remove_dir_all_path`] and
+    /// [`crate::atomic::remove_dir_all_fd`] refuse and carry
+    /// [`crate::reserved::RESIDUE_BELOW`] in the conflict message), so a
+    /// caller that reaches the crate's durable primitive directly sees ONE
+    /// vocabulary rather than a second one. Recover or deliberately discard the
+    /// strand with [`crate::sync::Residue`].
     ResidueBelow,
     /// The entry's on-disk NAME is not the manifest spelling. A manifest entry
     /// is an ADDRESS, and on an aliasing destination filesystem — a
@@ -1266,26 +1273,28 @@ pub struct SyncReport {
     /// destroy the path, so it still EXISTS at report time and must be
     /// recovered by hand.
     ///
-    /// **Recovery primitive.** Iterate this list and remove each reported path
-    /// with the DESTINATION's own removal: for a remote destination, the
-    /// [`Remote`](crate::transport::Remote) methods
-    /// [`remove_file`](crate::transport::Remote::remove_file) /
-    /// [`remove_dir_all`](crate::transport::Remote::remove_dir_all) on a
-    /// [`RootedRelativePath`](crate::transport::RootedRelativePath) parsed from
-    /// the reported path; for a local destination, `std::fs::remove_file` /
-    /// `std::fs::remove_dir_all` on the path joined under the local root. The
-    /// RESERVED namespace — the `.sync-aside.` claim-aside prefix OR the
-    /// operation-lock record spelling `.<name>.operation.lock`, both defined by
-    /// the ONE authority [`crate::reserved`] (`ASIDE_PREFIX` names the first) —
-    /// is described in this module's "Kind-changing replacement, the reserved
-    /// namespace, and residue" section: a reported path whose last component is
-    /// a claim-aside is the sync's OWN stranded aside and HOLDS THE ORIGINAL
-    /// ENTRY, so inspect it before discarding it; a reported path whose last
-    /// component is a lock record is the caller's own lock and MUST BE LEFT to
-    /// the holder (removing it breaks the stable-inode exclusion); the other
-    /// kind is a foreign destination path the run refused to destroy.
-    /// The sync itself never removes either one, so recovery is always the
-    /// caller's explicit act.
+    /// **Recovery.** A reported path whose last component is a claim-aside is
+    /// the sync's OWN stranded aside: it HOLDS THE ORIGINAL ENTRY (the
+    /// pre-replace state), so the caller's decision is RECOVER it or
+    /// DELIBERATELY DISCARD it — never an implicit `remove_dir_all`. For a
+    /// LOCAL destination the crate provides both operations through ONE surface,
+    /// [`crate::sync::Residue`]: [`Residue::detect`](crate::sync::Residue::detect)
+    /// identifies the strand, [`Residue::recover_to`](crate::sync::Residue::recover_to)
+    /// renames it back to the path it belongs at (FAILING CLOSED when that path
+    /// is occupied, so a target that itself holds data is never overwritten),
+    /// and [`Residue::discard`](crate::sync::Residue::discard) removes it as the
+    /// caller's explicit decision. The implicit recursive-removal primitives
+    /// REFUSE a residue ([`crate::atomic::remove_dir_all_path`] and
+    /// [`Remote::remove_dir_all`](crate::transport::Remote::remove_dir_all)
+    /// carry the refusal), so the old `remove_dir_all` recipe is no longer a
+    /// silent way to destroy the original. For a REMOTE destination the crate
+    /// has no far-side recovery primitive: the caller must run the same two
+    /// steps through the far-side tools, and MUST NOT blanket-remove the aside
+    /// before deciding. A reported path whose last component is a lock record is
+    /// the caller's own lock and MUST BE LEFT to the holder (removing it breaks
+    /// the stable-inode exclusion); the other kind is a foreign destination path
+    /// the run refused to destroy. The sync itself never removes any of them, so
+    /// recovery is always the caller's explicit act.
     ///
     /// **Which root the spelling is relative to.** Every path in this list —
     /// and in [`SyncReport::indeterminate`], [`SyncReport::extraneous`], and
@@ -1606,6 +1615,114 @@ pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
     Some(parent.join(record))
 }
 
+/// The outcome of retiring a destination's operation-lock record
+/// ([`retire_destination_lock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// The record existed, was not held by any live holder, and was removed.
+    Retired,
+    /// There was no record at the derived path; nothing to do.
+    Absent,
+    /// The record is held by a LIVE holder; nothing was removed. The caller
+    /// may retry once the holder releases it.
+    Held,
+    /// The destination root still EXISTS, so its record must stay for the
+    /// destination's lifetime; nothing was removed.
+    DestinationLive,
+    /// No sibling record location can be derived for this root (the record
+    /// site would be `/` or an empty path); nothing to do.
+    NoRecordLocation,
+}
+
+/// RETIRE the operation-lock record [`destination_lock_path`] derives for
+/// `dest_root`, once its owner has decided the destination is obsolete (for
+/// example, after `prune` removed the snapshot directory).
+///
+/// This exists because the crate's STABLE-INODE discipline (`FileLock` never
+/// removes the record, and the mutation guard refuses one) makes a
+/// many-snapshot store accumulate one sibling `.<name>.operation.lock` per
+/// snapshot forever; the only workaround a caller had was a raw `std::fs`
+/// unlink that bypasses the guard. Retirement is the SANCTIONED break, and it
+/// reuses the crate's ONE ownership authority rather than inventing a second:
+///
+/// * the record is recognized by IDENTITY
+///   ([`crate::atomic::OwnedLockRecord`], built from a [`Layout`] that NAMES
+///   exactly this derived record), so a spelling that merely looks like the
+///   record — or a distinct on-disk entry a fold would equate with it — is
+///   refused by the guard's owned-record constructor;
+/// * the removal is performed by the ONE capability-gated substrate primitive
+///   ([`crate::atomic::remove_owned_lock_record_fd`]), which accepts ONLY the
+///   ownership capability and therefore cannot be reached for ordinary
+///   content.
+///
+/// SAFETY, and why this is not a weakening of the guard:
+///
+/// * **A held record is never removed.** The record's own [`FileLock`] is
+///   acquired first (non-blocking); a live holder makes that fail, and the
+///   function returns [`RetireOutcome::Held`] without touching the record. It
+///   is ONLY after proving no live holder exists that the unlink runs, so the
+///   unlock→unlink inode-split window the stable-inode discipline forbids
+///   cannot occur for this call.
+/// * **A live destination's record is never removed.** The root must NOT
+///   exist: while the destination exists its record must stay stable, exactly
+///   as for every other lock. A still-present root returns
+///   [`RetireOutcome::DestinationLive`].
+/// * **A non-cooperating writer is outside the crate's exclusion**, as for
+///   every other sync mutation; retirement is for the caller's OWN obsolete
+///   snapshots.
+///
+/// The caller names the destination whose record it owns; there is no
+/// enumeration helper here, because a caller pruning snapshots already holds
+/// the list of snapshot roots it removed.
+pub fn retire_destination_lock(dest_root: &Path) -> Result<RetireOutcome> {
+    // A destination that still exists keeps its record: the record's inode must
+    // stay stable for the destination's whole lifetime.
+    if std::fs::symlink_metadata(dest_root).is_ok() {
+        return Ok(RetireOutcome::DestinationLive);
+    }
+    let Some(lock_path) = destination_lock_path(dest_root) else {
+        return Ok(RetireOutcome::NoRecordLocation);
+    };
+    let Some(parent) = lock_path.parent() else {
+        return Ok(RetireOutcome::NoRecordLocation);
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(RetireOutcome::NoRecordLocation);
+    }
+    let Some(name) = lock_path.file_name() else {
+        return Ok(RetireOutcome::NoRecordLocation);
+    };
+    // Absent already: nothing to retire (and do NOT create it just to remove
+    // it). A concurrent creation between here and the acquire below is caught
+    // by the acquire's contention check or by the held record surviving it.
+    if std::fs::symlink_metadata(&lock_path).is_err() {
+        return Ok(RetireOutcome::Absent);
+    }
+    // Prove no LIVE holder exists BEFORE removing: the record's own flock is
+    // non-blocking, so a live holder is a typed refusal, not a wait.
+    let held = match FileLock::acquire(&lock_path, &destination_op_id(Direction::Push, dest_root)) {
+        Ok(lock) => lock,
+        Err(Error::LockContended(_)) => return Ok(RetireOutcome::Held),
+        Err(e) => return Err(e),
+    };
+    // Reuse the ONE ownership authority: declare a `Layout` that names EXACTLY
+    // this derived record (rooted at its parent), so the guard's owned-record
+    // constructor decides by resolved IDENTITY. This is the same explicit
+    // declaration the guard documents as the only way to build the authority.
+    let layout = Layout {
+        lock: RootedRelativePath::from_validated(PathBuf::from(name)),
+        ..Layout::empty()
+    };
+    let owned = crate::atomic::OwnedLockRecord::local(parent, &layout);
+    let root = crate::atomic::RootDir::open(parent)?;
+    crate::atomic::remove_owned_lock_record_fd(&root, Path::new(name), &owned)?;
+    // The record is gone; the held flock is released by the drop below (on the
+    // now-unlinked inode, which admits no successor because the destination is
+    // gone).
+    drop(held);
+    Ok(RetireOutcome::Retired)
+}
+
 /// Create the destination lock record's PARENT chain at the platform default
 /// directory mode.
 ///
@@ -1870,11 +1987,24 @@ enum DestinationOwnership {
 /// * **A LOCAL path-based destination** resolves the probed prefix
 ///   component-wise (the preflight IS the confinement there, so no prefix is
 ///   memoized), so probing the i-th prefix costs i path resolutions and a
-///   depth-D path costs O(D^2) path operations. Measured wall clock for a
-///   chain with ONE changed leaf: 0.70 s / 3.64 s / 22.05 s at D = 100 / 200 /
-///   400 (macOS), i.e. ~5x per doubling — super-linear, as O(D^2) predicts.
-///   The bound the deep-chain test pins is the OPERATION count, not this wall
-///   time.
+///   depth-D path costs O(D^2) path operations. The run pays that PER PATH,
+///   which makes the two shapes a checkpoint tool hits different by a whole
+///   factor of D. **One changed leaf:** the run probes the D ancestors once, so
+///   it is O(D^2) path operations; measured 0.63 s / 3.38 s / 21.6 s at
+///   D = 100 / 200 / 400 (macOS), ~5.4x / 6.4x per doubling — the figures this
+///   paragraph originally stated (0.70 / 3.64 / 22.05 s) to within measurement
+///   noise. That is the case the deep-chain test bounds, and it is NOT the case
+///   a fresh snapshot hits. **A FRESH destination:** all D entries are
+///   installed, and EACH install pays its own O(D^2) ancestry probe and listing,
+///   so the run is O(D^3) path operations; measured 4.855 s / 41.39 s /
+///   582.1 s at D = 100 / 200 / 400 (macOS), ~8.5x / 14x per doubling.
+///   `canonicalize_tree` is NOT the cost (it is 2.76 ms / 6.53 ms / 25.4 ms at
+///   the same depths); the engine's per-path verification is. A checkpoint tool
+///   that creates a FRESH destination per snapshot is therefore CUBIC in depth,
+///   not the quadratic the single-changed-leaf measurement suggested; where it
+///   can, it should keep the destination incremental (one changed leaf) rather
+///   than recreate it. The bound the deep-chain test pins is the OPERATION
+///   count, not this wall time.
 /// * **A REMOTE ([`SshTransport`](crate::transport::SshTransport))
 ///   destination** turns each probe and each listing into exactly ONE ssh
 ///   round trip: the far side lstat's or lists the WHOLE path in one perl
@@ -1886,10 +2016,13 @@ enum DestinationOwnership {
 ///   ~7 round trips per level of the deepest changed path, plus a constant for
 ///   the manifest, lock, and verification passes.
 ///
-/// Fixing the local quadratic would mean not re-probing a prefix the same
-/// operation already confirmed; that is deliberately not done for a
-/// path-based destination, where the per-mutation preflight is the
-/// confinement and a skipped probe would be an unverified mutation path.
+/// Fixing the local quadratic PER PATH would mean not re-probing a prefix the
+/// same operation already confirmed; that is deliberately not done for a
+/// path-based destination, where the per-mutation preflight is the confinement
+/// and a skipped probe would be an unverified mutation path. It would not by
+/// itself fix the fresh-destination CUBIC: that comes from paying the quadratic
+/// once per installed path, so the per-path fix is the prerequisite, not the
+/// whole answer.
 pub fn sync(
     direction: Direction,
     local_root: &Path,
@@ -4085,6 +4218,14 @@ impl Applier<'_, '_> {
     /// A transport whose write publishes the entry and THEN fails (a chmod,
     /// fsync, or durability check) leaves the path in `indeterminate`, which is
     /// the honest accounting of an entry that may be visible.
+    ///
+    /// COST: this reads the WHOLE source entry into memory (`self.source.read`,
+    /// O(largest entry) — see [`crate::transport::Remote::read`]) and the source
+    /// file was ALREADY read and hashed during manifest canonicalization, so a
+    /// changed file is read twice. The second read is not memoized: skipping it
+    /// would need the manifest to carry the bytes (defeating "hashes, never
+    /// bytes") or a source-cache keyed by the manifest hash, neither of which is
+    /// built. A checkpoint's cost stays O(bytes scanned).
     fn install_file(&mut self, path: &str, rel: &RootedRelativePath, mode: Mode) -> Result<()> {
         let bytes = self.source.read(rel)?;
         self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;

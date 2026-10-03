@@ -411,6 +411,15 @@ fn validate_symlink_target(entry_path: &str, target: &str) -> Result<String> {
 /// already NFC (the stored path IS the on-disk name, never a normalized
 /// re-spelling), duplicate paths, escaping/absolute symbolic links, devices,
 /// sockets, FIFOs, and hard links.
+///
+/// COST: this READS AND HASHES EVERY FILE IN THE TREE, so a snapshot's cost is
+/// O(bytes scanned), NOT O(bytes changed). Content addressing makes the STORE
+/// deduplicated, but there is no dirty tracking and no reuse of a previously
+/// computed manifest, so a periodic checkpoint that changes one 4-byte file in
+/// a 350 MB tree still pays the full scan: measured 1.327 s before -> 1.384 s
+/// after (macOS), 2.739 s -> 2.690 s (Linux). This is a design cost of the
+/// manifest-and-hash model; reusing a caller-supplied previous manifest would
+/// remove it but is not implemented.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     Ok(canonicalize_tree_with(root, UnsupportedPolicy::Refuse)?.meta)
 }
