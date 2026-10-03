@@ -3113,7 +3113,8 @@ mod tests {
         );
     }
 
-    /// The two call sites must reach the SAME verdict when the ROOT is reached
+    /// The two MANIFEST views (the local walk and the wire assembler) must reach
+    /// the SAME verdict when the ROOT is reached
     /// through a symlink, because the local walk used to canonicalize the root
     /// and the wire assembler could not. The relative walk is the same on both
     /// sides now, so a genuinely in-root target is ACCEPTED with byte-equal
