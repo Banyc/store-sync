@@ -61,8 +61,10 @@ const LSTAT_ERRNO_ENOTDIR: i32 = 20;
 /// exits with when the no-clobber publish (perl `link(2)`) hit an EXISTING
 /// destination — the conflict/verdict decision point. It is the ONLY nonzero
 /// exit the transport
-/// maps to a verdict; every other nonzero exit (a failed pre-install step OR
-/// the final parent-directory sync) is a propagated error. `17` cannot collide
+/// maps to a verdict; every other nonzero exit is a propagated error — a
+/// pre-install step's failure OR the final parent-directory sync, the latter
+/// reported through [`SSH_UPLOAD_POST_RENAME_EXIT`] as a visible-but-not-yet-
+/// durable replace. `17` cannot collide
 /// with the pre-install steps' own failures (each exits nonzero, but the
 /// transport distinguishes the verdict by code, never by `exists`-sniffing),
 /// and it is deliberately distinct from [`SSH_TWRITE_PREINSTALL_EXIT`].
@@ -80,6 +82,19 @@ pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 /// from [`SSH_TWRITE_CONFLICT_EXIT`] so the script can tell "the install never
 /// happened" from "the destination already existed".
 pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
+
+/// The exit code the remote upload script (`upload_bytes`) exits with when the
+/// PARENT-DIRECTORY fsync AFTER the rename fails. The rename has already
+/// COMMITTED — the new bytes are VISIBLE at the destination — so this is not a
+/// pre-rename failure: it means the replace is visible but its durability is
+/// UNCONFIRMED, exactly the local path's
+/// [`crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`]. The transport
+/// maps this code to the SAME "the entry is visible but its durability is
+/// unconfirmed" message the local path reports, so a caller gets the same
+/// information whether the destination is local or remote. `74` is EX_IOERR and
+/// is deliberately distinct from the upload script's pre-rename `1` and from
+/// [`SSH_TWRITE_CONFLICT_EXIT`].
+pub const SSH_UPLOAD_POST_RENAME_EXIT: i32 = 74;
 
 /// How long the SSH sidecar flock waits before giving up — mirrors
 /// `crate::transport::SIDECAR_WAIT_TIMEOUT` (2s) with a 5ms retry interval
@@ -725,6 +740,14 @@ impl SshTransport {
         // ([`PERL_FSYNC_FILE`] / [`PERL_FSYNC_DIR`]): `sync <path>` is
         // GNU-only and a silent no-op on BSD/macOS.
         //
+        // The two COMMIT POINTS are reported separately, exactly as the local
+        // path reports them: a failure BEFORE the rename is an ordinary
+        // propagated error (the previous content is intact), while a failure of
+        // the PARENT-DIRECTORY fsync AFTER the rename exits
+        // [`SSH_UPLOAD_POST_RENAME_EXIT`] and is reported as "the entry is
+        // visible but its durability is unconfirmed" — the remote counterpart
+        // of [`crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`].
+        //
         // Every operand is a single quoted word ([`shell_quote`]); the parent
         // is computed here (never by a remote `dirname`), and `--` keeps a
         // leading-dash component from being read as an option. The payload is
@@ -746,13 +769,14 @@ impl SshTransport {
             String::new()
         };
         let script = format!(
-            "mkdir -p -- {parent} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && {chmod}perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e 'exit 0 if rename($ARGV[0], $ARGV[1]); exit 1' \"$tmp\" {p}; rc=$?; if [ \"$rc\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e '{fsync_dir}' -- {parent}",
+            "mkdir -p -- {parent} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && {chmod}perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e 'exit 0 if rename($ARGV[0], $ARGV[1]); exit 1' \"$tmp\" {p}; rc=$?; if [ \"$rc\" -ne 0 ]; then rm -f \"$tmp\"; exit 1; fi; perl -e '{fsync_dir}' -- {parent}; dirc=$?; if [ \"$dirc\" -ne 0 ]; then exit {post_rename}; fi; exit 0",
             parent = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
             chmod = chmod_step,
             p = shell_quote(&remote_path_str),
             fsync_file = PERL_FSYNC_FILE,
             fsync_dir = PERL_FSYNC_DIR,
+            post_rename = SSH_UPLOAD_POST_RENAME_EXIT,
         );
         let argv = self.ssh_command_argv(&script)?;
         // Size-aware deadline: a large upload over a slow link must not be
@@ -801,10 +825,8 @@ impl SshTransport {
             );
         }
         if !out.status.success() {
-            return Err(Error::transport(format!(
-                "ssh upload failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(upload_failure(rel, out.status.code(), &stderr));
         }
         // The mode was applied to the temp BEFORE the rename by the remote
         // script, so no separate chmod round trip (and no window where the
@@ -826,6 +848,27 @@ impl SshTransport {
             )));
         }
         Ok(out.stdout)
+    }
+}
+
+/// Map a FAILED remote upload command's status and stderr to the transport
+/// error, keeping the two COMMIT POINTS distinct. A
+/// [`SSH_UPLOAD_POST_RENAME_EXIT`] code means the rename COMMITTED and the
+/// PARENT-DIRECTORY fsync failed: the entry is VISIBLE but its durability is
+/// UNCONFIRMED, the remote counterpart of the local
+/// [`crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`], reported with
+/// the SAME wording so a caller gets the same information for a local and a
+/// remote destination. Every other nonzero exit is a failure BEFORE the rename,
+/// where the previous content is intact; it stays `ssh upload failed`.
+fn upload_failure(rel: &Path, code: Option<i32>, stderr: &str) -> Error {
+    if code == Some(SSH_UPLOAD_POST_RENAME_EXIT) {
+        Error::transport(format!(
+            "write {}: the entry is visible but its durability is unconfirmed: \
+             ssh upload parent-directory fsync failed: {stderr}",
+            rel.display()
+        ))
+    } else {
+        Error::transport(format!("ssh upload failed: {stderr}"))
     }
 }
 
@@ -4389,6 +4432,67 @@ mod tests_ssh {
             std::fs::read(root.join(rel)).unwrap(),
             b"payload-data",
             "the record must be fully installed before the parent-directory fsync"
+        );
+    }
+
+    /// F3: a far-side PARENT-DIRECTORY fsync failure AFTER the rename must be
+    /// reported as the SAME "the entry is visible but its durability is
+    /// unconfirmed" condition the LOCAL path reports, not as an
+    /// undifferentiated `ssh upload failed`. A caller then gets the same
+    /// information whether the destination is local or remote.
+    ///
+    /// Driven END TO END: a test-only `ssh` shim on the snapshot's `PATH` runs
+    /// the remote command locally, and a fake `perl` (also on `PATH`) exits 9 on
+    /// the [`FSYNC_DIR_HOOK`], so the rename COMMITS and only the final
+    /// parent-directory fsync fails.
+    #[test]
+    fn upload_reports_a_post_rename_dir_fsync_failure_as_durability_unconfirmed() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().join("remote");
+        let fakebin = dir.path().join("fakebin");
+        install_fake_perl(&fakebin, FSYNC_DIR_HOOK, 9);
+        // A fake `ssh` that ignores the connection options and runs the LAST
+        // argument (the `bash -c '<script>'` remote command) locally.
+        crate::test_support::write_executable(
+            &fakebin.join("ssh"),
+            b"#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+        );
+        let env = SysEnv::from_map(std::collections::BTreeMap::from([
+            (
+                std::ffi::OsString::from("PATH"),
+                std::ffi::OsString::from(format!("{}:/usr/bin:/bin", fakebin.display())),
+            ),
+            (
+                std::ffi::OsString::from("TMPDIR"),
+                std::ffi::OsString::from(dir.path().to_string_lossy().into_owned()),
+            ),
+        ]));
+        let runner = SshRunner::new(&env);
+        let t = SshTransport::with_runner(
+            "deploy",
+            "db.example.com",
+            2222,
+            &root,
+            Some(Path::new("/dev/null")),
+            None,
+            &dir.path().join("knownhosts-cache"),
+            &env,
+            runner,
+        )
+        .unwrap();
+        let err = t
+            .upload_bytes(Path::new("state/f"), b"payload", 0o644)
+            .expect_err("the post-rename parent-directory fsync failure is a propagated error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("the entry is visible but its durability is unconfirmed"),
+            "a post-rename fsync failure must report visible-but-unconfirmed durability, got: {msg}"
+        );
+        // THE COMMIT POINT ALREADY HAPPENED: the bytes are visible.
+        assert_eq!(
+            std::fs::read(root.join("state/f")).unwrap(),
+            b"payload",
+            "the rename committed before the failing parent-directory fsync"
         );
     }
 

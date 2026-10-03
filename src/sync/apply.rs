@@ -900,6 +900,12 @@ type Mode = u32;
 /// owns the operation-lock record spelling `.<name>.operation.lock`; the sync's
 /// reserved-path check and the id rule share that one authority.
 const ASIDE_PREFIX: &str = crate::reserved::ASIDE_PREFIX;
+/// The RESERVED operation-lock record suffix, defined ONCE by
+/// [`crate::reserved`]. [`destination_lock_path`] derives the record spelling
+/// from THIS constant, so the record's file name and
+/// [`crate::reserved::is_reserved_name`] can never disagree: a change to the
+/// authority changes both together.
+const OPERATION_LOCK_SUFFIX: &str = crate::reserved::OPERATION_LOCK_SUFFIX;
 /// Owner traverse (`x`), needed to resolve an entry inside a directory.
 const OWNER_TRAVERSE: Mode = 0o100;
 /// Owner write (`w`), needed to create or unlink an entry inside a directory.
@@ -1534,7 +1540,11 @@ pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
     let base = root.file_name()?;
     let mut record = OsString::from(".");
     record.push(base);
-    record.push(".operation.lock");
+    // Derived from the ONE reserved-spelling authority (see
+    // `OPERATION_LOCK_SUFFIX`), NEVER a second hardcoded literal: the record
+    // and `is_reserved_name` must never be able to disagree about whether the
+    // record is reserved.
+    record.push(OPERATION_LOCK_SUFFIX);
     // A single-component RELATIVE root (`foo`) has `Path::parent() == Some("")`:
     // the directory the record must be placed in is the CURRENT one, and an
     // empty parent would make the lock helper run `mkdir ""` (ENOENT). Resolve
@@ -7108,14 +7118,23 @@ impl Side<'_> {
                 match expected {
                     Some(exp) => match remote.read(rel) {
                         Ok(live) if live == exp => {}
-                        // A live entry that is ABSENT, or a READ that fails
-                        // with `NotFound`, is a mismatch (the destination the
-                        // caller read is gone). A symlink/directory read is an
-                        // ordinary `Err` and propagates: it is not a mismatch
-                        // the retry loop should paper over.
                         Ok(_) => return Ok(CheckedWrite::Mismatch),
-                        Err(Error::NotFound(_)) => return Ok(CheckedWrite::Mismatch),
-                        Err(e) => return Err(e),
+                        // A FAILED read is not itself the absent signal: both
+                        // transports wrap ENOENT as a `Transport` error, so no
+                        // production `read` ever returns `Error::NotFound`.
+                        // The AUTHORITATIVE signal for absence is the live
+                        // KIND, which this crate already reads: when the entry
+                        // is GONE the destination the caller read is absent, so
+                        // the write is a MISMATCH (never an error) and the
+                        // caller re-reads and re-decides. When the entry is
+                        // still there the failure is about the live entry (a
+                        // directory, a symlink, a permission problem) and
+                        // propagates unchanged.
+                        Err(error) => match remote.metadata_opt(rel) {
+                            Ok(None) => return Ok(CheckedWrite::Mismatch),
+                            Ok(Some(_)) => return Err(error),
+                            Err(_) => return Err(error),
+                        },
                     },
                     None => {
                         if remote.metadata_opt(rel)?.is_some() {

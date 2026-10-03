@@ -312,6 +312,16 @@ pub enum CompareReplace {
 /// weaker guarantee of the Windows port (no descriptor to compare through,
 /// no atomic rename). Fail closed on an unreadable entry or a symlink (the
 /// read follows it on this port).
+///
+/// An ENTRY THAT IS ABSENT is a `Mismatch`, never an error, matching the Unix
+/// port's contract: the caller read the destination, so a live entry that is
+/// now gone is a change it must re-read and re-decide. A read that fails for
+/// any OTHER reason still propagates.
+///
+/// This port is TYPE-CHECKED ONLY in this repository — it is compiled by
+/// `cargo check --target x86_64-pc-windows-msvc --lib` and never executed
+/// here — so the absent-vs-error split above is a compile-time claim, not an
+/// observed one.
 pub fn write_atomic_if_match_fd(
     root: &RootDir,
     rel: &Path,
@@ -323,6 +333,9 @@ pub fn write_atomic_if_match_fd(
     match std::fs::read(&path) {
         Ok(existing) if existing == expected => {} // still ours: replace below
         Ok(_) => return Ok(CompareReplace::Mismatch),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CompareReplace::Mismatch);
+        }
         Err(e) => return Err(Error::store(format!("read {}: {e}", path.display()))),
     }
     let outcome = write_atomic_replace(&path, bytes, fault)?;

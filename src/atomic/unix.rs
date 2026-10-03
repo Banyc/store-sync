@@ -763,8 +763,12 @@ enum CoreReplace {
 /// and once immediately before the `renameat` (so a writer that changed the
 /// entry while the temp was being written and fsynced is still refused). The
 /// window between the SECOND check and the `renameat` is irreducible without a
-/// lock the far side does not provide; a writer inside it is lost, and the
-/// caller of [`write_atomic_if_match_fd`] is told so. A mismatch returns
+/// lock the far side does not provide: a writer that lands inside it is LOST,
+/// and NOTHING runtime-signals the caller — after the second `live_matches`
+/// there is no further observation of the entry before the `renameat`, so the
+/// caller cannot be told. This residual is stated for callers on
+/// [`crate::sync::EntryPolicy::AppendTail`]; the compare-and-swap itself makes
+/// no claim that a write in that window is detected. A mismatch returns
 /// [`CoreReplace::Mismatch`] with the entry UNTOUCHED and the temp unlinked.
 fn replace_core(
     root: &RootDir,

@@ -816,6 +816,11 @@ enum AfterWrite {
     /// between a compare-and-append's read of the destination and its write
     /// (the A2 window). The bytes are appended, never replacing what is there.
     Append(String, Vec<u8>),
+    /// DELETE the regular file at `rel`: a writer that removes the append
+    /// target between the append's destination read and its compare. The
+    /// documented contract calls the now-absent destination a MISMATCH; the
+    /// compare's re-read sees the entry GONE.
+    Delete(String),
     /// Create the parent directories of `rel` and write `bytes` there: a writer
     /// that materialises a NEW subtree (a directory plus a child no manifest
     /// spelling addresses) in one step.
@@ -877,6 +882,9 @@ impl AfterWrite {
                     .open(root.join(rel))
                     .unwrap();
                 f.write_all(bytes).unwrap();
+            }
+            AfterWrite::Delete(rel) => {
+                fs::remove_file(root.join(rel)).unwrap();
             }
             AfterWrite::WriteTree(rel, bytes) => {
                 write(&root.join(rel), bytes);
@@ -4648,6 +4656,62 @@ fn an_append_write_that_races_a_concurrent_appender_conflicts_and_preserves_it()
         "the raced append must be a Diverged conflict, never a silent success: {report:?}"
     );
     assert_report_lists_disjoint(report);
+}
+
+/// F1: a concurrent DELETION of the append target. The writer unlinks `f`
+/// immediately after the append's destination read, so the compare-and-append's
+/// re-read finds the entry GONE. The documented contract: a live entry the
+/// caller read but that is now ABSENT is a MISMATCH, never an error — the retry
+/// re-reads, sees the live kind is `None`, takes the absent-destination branch,
+/// CREATES `f = "a\nb\n"`, and reports it applied.
+///
+/// Pre-fix `Side::write_file_if_match` matched ONLY `Err(Error::NotFound(_))`,
+/// which NO transport's `read` returns (both wrap ENOENT as a transport error),
+/// so the deletion surfaced as
+/// `Err(Transport("read f: ... No such file or directory"))` and the run
+/// returned `Err` with `f` indeterminate instead of creating it.
+#[test]
+fn an_append_whose_target_is_deleted_during_the_compare_creates_it() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    // The destination is `a\n`; our append carries `a\nb\n` (a prefix). The
+    // writer DELETES `f` right after the append's destination read, before the
+    // compare's re-read.
+    write(&src.join("f"), b"a\nb\n");
+    write(&dst.join("f"), b"a\n");
+
+    let mut remote = RecordingRemote::over(transport(&dst), true);
+    // The append's own destination read is the FIRST `Remote::read` of `f`: a
+    // LOCAL remote's manifest is canonicalized in-process and never reads
+    // through the transport.
+    remote.dest_read_writer = Some(("f".to_string(), 1, AfterWrite::Delete("f".to_string())));
+    let policy = |path: &str, _: EntryKind| {
+        if path == "f" {
+            EntryPolicy::AppendTail
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let report = sync(Direction::Push, &src, &remote, &policy, Keep)
+        .expect("a deleted append target is a mismatch, never an error");
+
+    // The retry re-reads, sees the live kind is `None`, and CREATES the source
+    // bytes; the deletion is reported neither as an error nor as a conflict.
+    assert_eq!(
+        read(&dst.join("f")),
+        b"a\nb\n",
+        "the retry must create the source bytes at the deleted target: {report:?}"
+    );
+    assert!(
+        report.applied.contains(&"f".to_string()),
+        "the created append target is applied: {report:?}"
+    );
+    assert!(
+        report.conflicts.is_empty(),
+        "a deleted-then-recreated append must not conflict: {report:?}"
+    );
+    assert_report_lists_disjoint(&report);
 }
 
 /// A4: a parent sync must NEVER destroy a held nested lock record. The nested
@@ -11128,6 +11192,60 @@ fn the_sibling_record_does_not_compose_with_the_in_root_layout_lock() {
         "the in-run probe must have observed the held sibling record"
     );
     assert!(report.applied.contains(&"g".to_string()), "{report:?}");
+}
+
+/// F2 CROSS-CHECK: the record `destination_lock_path` derives must ALWAYS be a
+/// spelling [`crate::reserved::is_reserved_name`] calls reserved. The two are
+/// separate authorities over the same file name — the derivation owns what the
+/// record is CALLED, and `reserved` owns whether a parent sync must LEAVE IT
+/// ALONE — so this asserts their agreement directly, across relative, nested,
+/// and absolute destination roots.
+///
+/// LOAD-BEARING BY MUTATION: the record used to hardcode `".operation.lock"`
+/// while `is_reserved_name` consumed `reserved::OPERATION_LOCK_SUFFIX`. Change
+/// ONLY the constant (say to `".operation.lockX"`) and the hardcoded record is
+/// no longer reserved: a parent sync destroys a held lock record (the
+/// `a_parent_sync_never_destroys_a_held_nested_lock_record` failure) and THIS
+/// test fails on the suffix assertion. With the record DERIVED from the
+/// constant, mutating the constant moves both spellings together and both tests
+/// still pass — which is the invariant this test exists to protect.
+#[test]
+fn the_destination_lock_record_is_a_reserved_spelling() {
+    for dest in [
+        "/tmp/foo",
+        "/tmp/a/b/nested",
+        "/var/lib/store",
+        "foo",
+        "./foo",
+        "a/b",
+        "x/y/z/deep",
+    ] {
+        let record = destination_lock_path(Path::new(dest))
+            .unwrap_or_else(|| panic!("{dest:?} must have a record location"));
+        let name = record
+            .file_name()
+            .unwrap_or_else(|| panic!("the record for {dest:?} names a file"))
+            .to_str()
+            .unwrap_or_else(|| panic!("the record for {dest:?} is valid UTF-8"));
+        // The record spelling is DERIVED: `.` + the root's final component +
+        // the ONE authority's suffix. A hardcoded suffix cannot satisfy this
+        // once the authority moves.
+        let base = Path::new(dest)
+            .file_name()
+            .unwrap_or_else(|| panic!("{dest:?} names a final component"))
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            name,
+            format!(".{base}{OPERATION_LOCK_SUFFIX}"),
+            "the record for {dest:?} must derive from OPERATION_LOCK_SUFFIX"
+        );
+        assert!(
+            crate::reserved::is_reserved_name(name),
+            "the reserved-spelling authority must reserve the record it names: \
+             {name:?} for {dest:?}"
+        );
+    }
 }
 
 /// THE SOURCE-QUIESCENCE PRECONDITION, enforced rather than trusted. A source
