@@ -295,10 +295,13 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
 ///   OWN closed `die` prefix at the start of a stderr line (a missing root,
 ///   an unreadable directory, a name that cannot cross the wire, ...);
 /// * the far-side command RAN and EXITED, but only its bounded post-exit
-///   output DRAIN outlasted the runner's deadline (the typed
-///   [`TimeoutCause::OutputDrainOutlastedDeadline`]), so the far-side exit
-///   status could not be collected. This is NOT the transport-before-command
-///   layer — the command started and finished;
+///   output DRAIN gave up (the typed [`TimeoutCause::OutputDrainGaveUp`]): a
+///   process that outlived the command held a pipe open past the drain's
+///   bound, so the exit status the reap HAD collected could not be reported.
+///   The bound is the runner's post-exit drain bound, which is independent of
+///   the caller's deadline, so this branch does NOT assert a deadline was
+///   outlasted. It is NOT the transport-before-command layer — the command
+///   started and finished;
 /// * NONE of the above is established — the exit status and preserved stderr
 ///   are reported as UNDETERMINED, naming no layer. This is the honest
 ///   outcome for a status no rule covers (200, a signal-killed `137` with
@@ -325,16 +328,22 @@ fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
         stderr
     };
     // The typed cause is the authority, and this one is decisive: the command
-    // RAN and EXITED and only its bounded post-exit output drain outlasted the
-    // deadline. Naming the transport-before-command layer here would be false
-    // — the exact misclassification the bounded drain introduced when it gave
-    // the runner's `-1` a second meaning.
-    if out.timeout_cause == Some(TimeoutCause::OutputDrainOutlastedDeadline) {
+    // RAN and EXITED, and only its bounded post-exit output drain gave up
+    // (a pipe-holding process outlived the command). Naming the
+    // transport-before-command layer here would be false — the exact
+    // misclassification the bounded drain introduced when it gave the
+    // runner's `-1` a second meaning. The message does NOT claim a deadline
+    // was outlasted (the drain bound is independent of the deadline), and it
+    // does NOT claim the status was never collected: the reap collected it,
+    // and the `Background` error carries only the message, so the status was
+    // discarded and `exit_code` is the `-1` sentinel.
+    if out.timeout_cause == Some(TimeoutCause::OutputDrainGaveUp) {
         return Error::transport(format!(
-            "remote tree verification at {} could not collect the far-side manifest command's \
+            "remote tree verification at {} could not report the far-side manifest command's \
              output: the command ran and exited, but a process that outlived it held its output \
-             pipes open past the post-exit drain bound, so the runner gave up on the drain and no \
-             exit status was collected (exit {}): {}",
+             pipes open past the post-exit drain bound, so the runner gave up on the drain and the \
+             exit status it had already collected was discarded (the reported exit {} is the \
+             sentinel): {}",
             root.display(),
             out.exit_code,
             stderr
@@ -438,8 +447,8 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
 /// name/target refusal. Exit 255 therefore selects this branch only with a
 /// positive transport diagnostic at the START of a stderr line. A bare
 /// `exit_code == -1` selects nothing: the typed cause must say
-/// `CommandStillRunning` (a signal-killed child also reports `-1`, and a drain
-/// that outlasted an exited command is its own cause).
+/// `CommandStillRunning` (a signal-killed child also reports `-1`, and a
+/// command whose bounded post-exit drain gave up is its own cause).
 ///
 /// ANCHORING BOUND (measured with the real script): line-anchoring closes
 /// every FAR-SIDE-TREE spoof. A non-NFC entry name is echoed raw, but always
@@ -465,19 +474,19 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
 /// reject a raw LF — so the crate RELIES ON THE CALLER for a root the wire can
 /// represent. The severity is unchanged: caller-chosen, not far-side text.
 fn transport_failed_before_the_command(out: &ExecOutcome) -> bool {
-    // The TYPED cause is the authority for the deadline cases. The bare
+    // The TYPED cause is the authority for the `-1` cases. The bare
     // `exit_code == -1` sentinel is ambiguous after the post-exit drain was
     // bounded: the same status also covers a signal-killed child and a
-    // command that exited while its output drain outlasted the deadline.
+    // command that exited while its output drain gave up.
     match out.timeout_cause {
         // The runner killed the child at the deadline while the far-side
         // command was still running, so no far-side command produced this
         // outcome. The typed cause needs no textual corroboration.
         Some(TimeoutCause::CommandStillRunning) => return true,
-        // The command RAN and EXITED; only its drain outlasted the deadline.
-        // This is NOT the transport-before-command layer (its own branch in
+        // The command RAN and EXITED; only its bounded drain gave up. This is
+        // NOT the transport-before-command layer (its own branch in
         // [`remote_manifest_failure`] reports it).
-        Some(TimeoutCause::OutputDrainOutlastedDeadline) => return false,
+        Some(TimeoutCause::OutputDrainGaveUp) => return false,
         None => {}
     }
     // `ssh` exits 255 for its own failures, but the far-side perl `die` does
@@ -1672,7 +1681,7 @@ mod tests {
             stdout: String::new(),
             stderr: "command [\"perl\", …] left processes holding its output pipes open"
                 .to_string(),
-            timeout_cause: Some(TimeoutCause::OutputDrainOutlastedDeadline),
+            timeout_cause: Some(TimeoutCause::OutputDrainGaveUp),
         };
         let msg = remote_manifest_failure(Path::new("/srv/store"), &drained).to_string();
         assert!(
@@ -1685,6 +1694,23 @@ mod tests {
             "the drain case must not assert the transport-before-command layer: {msg}"
         );
         assert!(!msg.contains("is perl installed"), "{msg}");
+        // W3: the drain bound is NOT the caller's deadline, and the exit status
+        // WAS collected by the reap (then discarded by the `Background` error),
+        // so the message must not claim either the opposite.
+        assert!(
+            !msg.contains("outlasted the deadline")
+                && !msg.contains("outlasted the runner's deadline"),
+            "the drain message must not claim a deadline was outlasted: {msg}"
+        );
+        assert!(
+            !msg.contains("no exit status was collected"),
+            "the drain message must not claim the status was never collected (it was, then \
+             discarded): {msg}"
+        );
+        assert!(
+            msg.contains("sentinel"),
+            "the drain message must identify the reported exit -1 as a sentinel: {msg}"
+        );
 
         // (c) `-1` with NO typed cause is a signal-killed local child, not a
         // deadline: the layer is undetermined, never transport.

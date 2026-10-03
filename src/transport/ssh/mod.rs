@@ -2014,17 +2014,18 @@ impl Remote for SshTransport {
             Err(RunError::StdinWrite(m)) => Err(Error::transport(m)),
             Err(RunError::Wait(m)) => Err(Error::transport(m)),
             // The command RAN and EXITED; a process that outlived it held its
-            // pipes open past the post-exit drain bound. This is carried as an
-            // OUTCOME (not a bare transport error) so the manifest classifier
-            // can tell it from "the command was killed at the deadline" — the
-            // ambiguity the bounded drain introduced. `exit_code == -1` means
-            // "no exit status could be collected", never "the command did not
-            // run".
+            // pipes open past the post-exit drain bound (which is independent
+            // of the caller's deadline). This is carried as an OUTCOME (not a
+            // bare transport error) so the manifest classifier can tell it
+            // from "the command was killed at the deadline" — the ambiguity
+            // the bounded drain introduced. `exit_code == -1` is the SENTINEL
+            // meaning "the collected exit status is not reported", never "the
+            // command did not run" and never "a deadline was outlasted".
             Err(RunError::Background(m)) => Ok(crate::transport::ExecOutcome {
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: m,
-                timeout_cause: Some(TimeoutCause::OutputDrainOutlastedDeadline),
+                timeout_cause: Some(TimeoutCause::OutputDrainGaveUp),
             }),
             Err(RunError::Timeout {
                 after,

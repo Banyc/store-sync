@@ -221,24 +221,32 @@ pub struct RemoteMeta {
     pub mode: u32,
 }
 
-/// The typed cause of an [`ExecOutcome`] whose command did not complete
-/// normally, carried as a TYPE rather than re-derived from the `stderr`
-/// string. Bounding the post-exit output drain made the runner's `-1`
-/// sentinel mean TWO different things, so the cause must be explicit: a
-/// consumer (and the manifest classifier) has to tell "the deadline killed a
-/// running command" from "the command ran and exited, and only the drain
-/// outlasted the deadline".
+/// The typed cause of an [`ExecOutcome`] that carries the runner's `-1`
+/// sentinel rather than a collected exit status — the outcome shape is
+/// `exit_code == -1` either way, so the cause must be explicit. Bounding the
+/// post-exit output drain made `-1` mean TWO different things, and a consumer
+/// (and the manifest classifier) has to tell "the deadline killed a RUNNING
+/// command" from "the command ran and exited, and only its bounded output
+/// drain gave up".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeoutCause {
     /// The deadline fired while the command's child was still running: it was
-    /// killed and reaped, so no far-side exit status exists.
+    /// killed and reaped, so no exit status exists.
     CommandStillRunning,
-    /// The command RAN and EXITED; only the bounded post-exit output drain
-    /// outlasted the deadline (a process that outlived the child still held a
-    /// pipe open), so the drain gave up and the exit status could not be
-    /// collected. The failure is NOT "the transport failed before the command
-    /// started".
-    OutputDrainOutlastedDeadline,
+    /// The command RAN and EXITED (its child was reaped and its exit status
+    /// WAS collected), but a process that outlived the child still held a
+    /// pipe open, so the bounded post-exit output drain gave up and the
+    /// collected status could not be reported — the visible `exit_code` is
+    /// the `-1` sentinel, not a status.
+    ///
+    /// The bound the drain gave up at is the runner's POST-EXIT DRAIN bound
+    /// (the internal `KILL_REAP_BOUND` / `RunnerConfig::reap_bound`), which is
+    /// INDEPENDENT of the caller's deadline: a command that exits early and
+    /// leaves a pipe-holding process produces this cause at the drain bound
+    /// even though the deadline was never reached. It therefore does NOT claim
+    /// that a deadline was outlasted. It is NOT the transport-before-command
+    /// layer — the command started and finished.
+    OutputDrainGaveUp,
 }
 
 #[derive(Clone, Debug)]
@@ -246,11 +254,16 @@ pub struct ExecOutcome {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// `Some` when this outcome came from the deadline path (the runner's
-    /// `-1` sentinel): the typed cause distinguishes a deadline kill from a
-    /// drain that outlasted an already-exited command. `None` for a normally
-    /// exited command. A signal-killed child also reports `exit_code == -1`
-    /// with `None`, so a consumer must NOT infer "deadline" from `-1` alone.
+    /// `Some` when the runner reported its `-1` sentinel rather than a
+    /// collected exit status: the typed cause says WHICH case, so a consumer
+    /// never has to infer it. The two causes are
+    /// [`TimeoutCause::CommandStillRunning`] (the deadline killed a running
+    /// command) and [`TimeoutCause::OutputDrainGaveUp`] (the command ran and
+    /// exited but its bounded post-exit drain gave up; the status was
+    /// collected and then discarded, so it is not reported). `None` for a
+    /// normally exited command. A signal-killed child also reports
+    /// `exit_code == -1` with `None`, so a consumer must NOT infer "deadline"
+    /// — or any other cause — from `-1` alone.
     pub timeout_cause: Option<TimeoutCause>,
 }
 
@@ -301,8 +314,8 @@ impl Exec for ChildRunner {
                 stderr,
                 // The local runner's `TimedOut` is produced ONLY when the
                 // child was still running at the deadline (its post-exit
-                // drain reports `Background`, never a timeout), so the cause
-                // is unambiguous.
+                // drain reports `Background`, which this mapping surfaces as
+                // an ERROR, never a `TimedOut`), so the cause is unambiguous.
                 timeout_cause: Some(TimeoutCause::CommandStillRunning),
             }),
             Err(e) => Err(Error::transport(e.to_string())),
@@ -2843,6 +2856,41 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
+
+    /// W1 — the LOCAL producer of the typed timeout cause, PINNED. A real child
+    /// that outlives its deadline is killed and reaped by [`ChildRunner`], and
+    /// [`Exec for ChildRunner`] (driven here through the REAL
+    /// [`LocalTransport::exec`] entry point, i.e. the production
+    /// [`ChildRunner`] the transport builds) must report `-1` WITH the typed
+    /// [`TimeoutCause::CommandStillRunning`] cause. The mapping used to be
+    /// unpinned: inverting it (or dropping the cause) left the suite green
+    /// because no test ever asserted a producer's `Some(_)` cause. The local
+    /// runner's post-exit drain failure is an ERROR, not an outcome, so
+    /// `CommandStillRunning` is the ONLY cause this producer can emit.
+    #[cfg(unix)]
+    #[test]
+    fn local_exec_deadline_kill_reports_the_typed_cause() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        std::fs::create_dir_all(&base).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), base, Layout::empty()).unwrap();
+        let deadline = std::time::Duration::from_millis(100);
+        let out = t
+            .exec(
+                &["sh".into(), "-c".into(), "exec sleep 30".into()],
+                deadline,
+            )
+            .expect("a stalled child must surface a timeout outcome, not an error");
+        assert_eq!(
+            out.exit_code, -1,
+            "the deadline outcome keeps the -1 sentinel"
+        );
+        assert_eq!(
+            out.timeout_cause,
+            Some(TimeoutCause::CommandStillRunning),
+            "the local runner's TimedOut must map to CommandStillRunning"
+        );
+    }
 
     /// DEFECT 1 (local half): a directory holding a name that is not valid
     /// UTF-8 must make `list` an ERROR, never a lossy `Ok`. Pre-fix

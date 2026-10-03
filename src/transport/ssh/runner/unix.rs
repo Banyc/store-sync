@@ -75,7 +75,7 @@ pub(crate) fn spawn(
     let child: Arc<Mutex<Option<OwnedChild>>> =
         Arc::new(Mutex::new(Some(OwnedChild::new(child, Arc::new(RealKill)))));
     // The typed "the child has already been reaped" fact the runner's deadline
-    // path reads to tell a deadline kill from a drain that merely outlasted a
+    // path reads to tell a deadline kill from a drain that merely gave up on a
     // completed command. Armed the instant `try_wait` consumes the exit
     // status, before the bounded post-exit drain begins.
     let reaped = Arc::new(AtomicBool::new(false));

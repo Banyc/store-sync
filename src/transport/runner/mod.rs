@@ -108,9 +108,9 @@
 
 use crate::env::SysEnv;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 mod unix;
@@ -126,9 +126,11 @@ use windows as platform;
 pub use unix::{RealKill, kill_process_group};
 // The bounded pipe-drain discipline (non-blocking setup, the running-drain
 // and the bounded post-exit drain) is re-exported so the SSH runner's Unix
-// seam reuses ONE implementation instead of keeping a divergent copy.
+// seam reuses ONE implementation instead of keeping a divergent copy. The
+// [`OwnedChild`] drop backstop is NOT platform-specific (it is defined below,
+// in this module), so BOTH platforms' seams share it.
 #[cfg(unix)]
-pub(crate) use unix::{DrainState, OwnedChild, drain_available, drain_to_eof, set_nonblocking};
+pub(crate) use unix::{DrainState, drain_available, drain_to_eof, set_nonblocking};
 #[cfg(windows)]
 pub use windows::RealKill;
 
@@ -183,9 +185,10 @@ pub(crate) fn is_live_state(state: &str) -> bool {
 /// could not be delivered; an inert seam (returns `Ok` without signalling) is
 /// caught by the reap bound instead.
 ///
-/// Public so the serialized real-process lifecycle integration target
-/// (`tests/process_lifecycle.rs`) can drive the runner under injected kill
-/// faults.
+/// Public because [`RunnerConfig`] is public and takes an `Arc<dyn KillSeam>`:
+/// a caller building its own [`RunnerConfig`] (and a test injecting a
+/// syscall-level fault) needs the trait to name its seam. The crate's own
+/// tests drive the runner under injected kill faults through it.
 pub trait KillSeam: Send + Sync {
     /// Signal the whole process group `pgid`. On Windows (no process
     /// groups) the implementation falls back to the owned child.
@@ -196,6 +199,107 @@ pub trait KillSeam: Send + Sync {
     /// handle can never hit a pid the OS recycled: the handle is consumed by
     /// the single reap and nothing is signalled after it.
     fn kill_owned(&self, child: &mut Child) -> std::io::Result<()>;
+}
+
+/// The [`OwnedChild::drop`] backstop's bounded wait: after killing the group
+/// and the owned child, drop waits this long for the reap before giving up —
+/// long enough for a real SIGKILL/TerminateProcess to land (microseconds),
+/// short enough that a test-injected inert kill cannot stall a suite.
+const DROP_REAP_BOUND: Duration = Duration::from_millis(100);
+
+/// The signal [`OwnedChild::drop`] delivers to the child's process group.
+/// `SIGKILL` on Unix; unused on Windows, where [`KillSeam::kill_group`] is a
+/// no-op and the owned handle (`TerminateProcess`) is the termination path.
+#[cfg(unix)]
+const DROP_KILL_SIGNAL: i32 = libc::SIGKILL;
+#[cfg(windows)]
+const DROP_KILL_SIGNAL: i32 = 0;
+
+/// An owned child with a drop backstop, shared by BOTH real runners AND both
+/// platforms so the "every error path leaves no uncollected child" contract
+/// has ONE implementation. The local runner owns one directly; the SSH
+/// runner's seam owns one inside its shared slot (the same type, the same
+/// `Drop`), so a `drain_available`/`try_wait` error that returns early from
+/// the wait closure cannot abandon a live `Child` (whose own `Drop` neither
+/// waits nor kills — on Unix OR on Windows).
+///
+/// The handle is shared EXCLUSIVELY between a runner's deadline/kill path and
+/// its wait path. A child that exited is consumed by [`OwnedChild::wait`] (or
+/// marked with [`OwnedChild::mark_reaped`] when the reap already happened
+/// through `try_wait`), after which nothing may signal anything (a pid the OS
+/// recycled after the reap can never be hit — the drop backstop returns early).
+///
+/// The backstop's GROUP kill is a no-op on Windows (no process groups), so
+/// there it terminates the direct child only and reaps it — the documented
+/// weaker guarantee of the Windows port, with the SAME one-authority backstop
+/// shape.
+pub(crate) struct OwnedChild {
+    /// The owned child. `pub(crate)` so a seam's wait closure can drain its
+    /// pipes and poll it; the handle is never signalled directly on Unix — the
+    /// kill path goes through [`KillSeam`] / `killpg` so a group, not a bare
+    /// pid, is signalled.
+    pub(crate) child: Child,
+    kill: Arc<dyn KillSeam>,
+    /// Set once the exit status is consumed (or the OS has already reaped the
+    /// child): from then on nothing may signal anything (a pid the OS recycled
+    /// after the reap can never be hit — the drop backstop returns early).
+    reaped: bool,
+}
+
+impl OwnedChild {
+    /// Wrap a freshly spawned child with the drop backstop under the kill
+    /// `seam`. On Unix the child is assumed to be spawned into its OWN process
+    /// group (pgid == pid) by the caller, so the backstop's `kill_group`
+    /// terminates its whole group; on Windows `kill_group` is a no-op and the
+    /// owned handle is terminated.
+    pub(crate) fn new(child: Child, kill: Arc<dyn KillSeam>) -> Self {
+        OwnedChild {
+            child,
+            kill,
+            reaped: false,
+        }
+    }
+
+    /// Reap the child (a blocking wait on an already-exited zombie returns
+    /// immediately with its status) and mark the handle reaped: from here on
+    /// nothing may signal anything — the pid is released by this call.
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let st = self.child.wait()?;
+        self.reaped = true;
+        Ok(st)
+    }
+
+    /// Mark the handle collected after a `try_wait`/`waitid` peek ALREADY
+    /// reaped the child, so the kill and drop backstops never signal the
+    /// released pid.
+    pub(crate) fn mark_reaped(&mut self) {
+        self.reaped = true;
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // Final backstop: never abandon a live child. Kill the whole group
+        // (a no-op on Windows), then the owned handle, then wait (bounded) for
+        // the reap. Under the production seam a real SIGKILL/TerminateProcess
+        // lands in microseconds; under an injected inert kill the bound
+        // expires and the child is left to the test's own cleanup (the fault is
+        // exactly the kill not working).
+        let pgid = self.child.id() as i32;
+        let _ = self.kill.kill_group(pgid, DROP_KILL_SIGNAL);
+        let _ = self.kill.kill_owned(&mut self.child);
+        let budget = Instant::now() + DROP_REAP_BOUND;
+        while Instant::now() < budget {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                self.reaped = true;
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// The runner's policy knobs: termination timing, the reap bound, the kill

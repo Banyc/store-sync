@@ -100,10 +100,14 @@ pub(crate) enum RunError {
     /// child still held a pipe open: the command left a pipe-holding process
     /// behind. This is the shared local runner's `RunError::Background` —
     /// same wording, same meaning. It is returned whenever the CHILD HAD
-    /// ALREADY EXITED, at ANY deadline: the deadline never flips a completed
-    /// command's outcome to a timeout (see [`SshRunner::run`]), so this
-    /// variant is the typed carrier of "the command ran and exited, only its
-    /// drain outlasted".
+    /// ALREADY EXITED (its exit status was collected by the reap, then
+    /// discarded here), at ANY deadline: the deadline never flips a completed
+    /// command's outcome to a timeout (see [`SshRunner::run`]). The drain's
+    /// bound is the runner's POST-EXIT DRAIN bound ([`KILL_REAP_BOUND`]),
+    /// which is INDEPENDENT of the caller's deadline — a command that exits
+    /// early and leaves a pipe holder reaches this variant without any
+    /// deadline having been outlasted — so this variant is the typed carrier
+    /// of "the command ran and exited, only its bounded drain gave up".
     ///
     /// Constructed only by the Unix seam (the Windows port drains with
     /// reader threads and documents the weaker, unbounded-drain guarantee);
@@ -154,10 +158,11 @@ struct SpawnedChild {
     pid: u32,
     /// Set by the wait closure the instant the child has been REAPED (its exit
     /// status consumed), before the bounded post-exit drain begins. The
-    /// runner's deadline path reads it to tell the two meanings `-1` gained
-    /// when the drain was bounded: the child was still RUNNING when the
-    /// deadline fired (killed), or it had already EXITED and only the drain
-    /// outlasted the deadline. A typed fact, never re-derived from a message.
+    /// runner's deadline path reads it to tell the two cases that produce the
+    /// `-1` sentinel once the drain is bounded: the child was still RUNNING
+    /// when the deadline fired (killed), or it had already EXITED and only its
+    /// bounded post-exit drain gave up. A typed fact, never re-derived from a
+    /// message.
     reaped: Arc<AtomicBool>,
     /// Request the force-kill of the live child (SIGKILL on the owned
     /// handle). A no-op once the wait thread has reaped the child. The real
@@ -459,6 +464,7 @@ mod runner_property_tests {
     use crate::error::Error;
     use crate::transport::Remote;
     use crate::transport::SshTransport;
+    use crate::transport::TimeoutCause;
     #[cfg(test)]
     use proptest::prelude::*;
     #[cfg(test)]
@@ -487,6 +493,14 @@ mod runner_property_tests {
         StdinWriteError,
         /// The wait itself (`wait_with_output`) fails, after the reap attempt.
         WaitError,
+        /// The child EXITS and is reaped, but the bounded post-exit output
+        /// drain gives up while a process that outlived the child still holds a
+        /// pipe open — the fake's mirror of the real Unix seam's
+        /// [`RunError::Background`]. The deadline never killed the child, so
+        /// `SshTransport::exec` must map this to the
+        /// [`TimeoutCause::OutputDrainGaveUp`] cause (never the
+        /// deadline-kill one).
+        Background,
     }
 
     /// Every operation the fake seam records, in order.
@@ -859,6 +873,16 @@ mod runner_property_tests {
                     // the wait itself fails: surfaces as a wait error after
                     // the reap attempt.
                     Err(RunError::Wait("simulated wait failure".to_string()))
+                }
+                Stall::Background => {
+                    // The child exited and was reaped (the caller records the
+                    // single Reap — including the `reaped`/`collected` flags),
+                    // but the bounded post-exit drain gave up: the fake's
+                    // mirror of the real Unix seam's pipe-holding leftover.
+                    // The deadline never killed the child.
+                    Err(RunError::Background(
+                        "command left processes holding its output pipes open".to_string(),
+                    ))
                 }
                 Stall::SpawnError => unreachable!("spawn errors never yield a child"),
             }
@@ -1332,6 +1356,14 @@ mod runner_property_tests {
                             format!("timed out after {deadline:?}"),
                             "timeout exec stderr must keep the existing shape"
                         );
+                        // W1: the PRODUCER mapping is pinned, not inferred: a
+                        // deadline that killed a RUNNING child must carry the
+                        // CommandStillRunning cause — never the drain one.
+                        assert_eq!(
+                            o.timeout_cause,
+                            Some(TimeoutCause::CommandStillRunning),
+                            "exec must map RunError::Timeout to CommandStillRunning"
+                        );
                     }
                     _ => {
                         let msg = match &outcome {
@@ -1454,6 +1486,56 @@ mod runner_property_tests {
                     state.reap_pids(),
                     vec![spawn_pid],
                     "a non-zero child is reaped by the normal wait"
+                );
+            }
+            Stall::Background => {
+                // The child EXITED and was reaped; only the bounded post-exit
+                // drain gave up. `exec` must carry the DRAIN cause — never the
+                // deadline-kill one — and every other operation must surface it
+                // as a transport error.
+                match kind {
+                    OpKind::Exec => {
+                        let o = match outcome {
+                            PairOutcome::Exec(Ok(o)) => o,
+                            _ => panic!(
+                                "exec on a drain-gave-up child must return an ExecOutcome, got \
+                                 {outcome:?}"
+                            ),
+                        };
+                        assert_eq!(
+                            o.exit_code, -1,
+                            "the drain-gave-up outcome keeps the -1 sentinel"
+                        );
+                        assert_eq!(
+                            o.timeout_cause,
+                            Some(TimeoutCause::OutputDrainGaveUp),
+                            "exec must map RunError::Background to OutputDrainGaveUp, never the \
+                             deadline-kill cause"
+                        );
+                    }
+                    _ => {
+                        let msg = match &outcome {
+                            PairOutcome::Err(m) => m,
+                            _ => panic!(
+                                "a drain-gave-up child must fail the operation with a transport \
+                                 error, got {outcome:?}"
+                            ),
+                        };
+                        assert!(
+                            msg.contains("holding its output pipes open"),
+                            "the drain-gave-up error must keep the shared wording, got: {msg}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    state.kill_pids(),
+                    Vec::<u32>::new(),
+                    "a drain-gave-up child exited on its own and must never be killed"
+                );
+                assert_eq!(
+                    state.reap_pids(),
+                    vec![spawn_pid],
+                    "a drain-gave-up child is reaped exactly once"
                 );
             }
             Stall::StdinWriteError => {
@@ -1939,7 +2021,11 @@ mod runner_property_tests {
             && at == DelayAt::AfterReap
             && matches!(
                 stall,
-                Stall::Complete | Stall::NonZero | Stall::StdinWriteError | Stall::WaitError
+                Stall::Complete
+                    | Stall::NonZero
+                    | Stall::StdinWriteError
+                    | Stall::WaitError
+                    | Stall::Background
             )
     }
 
@@ -1994,11 +2080,35 @@ mod runner_property_tests {
             );
         }
         if deadline_fires_after_reap(stall, at, size) {
+            // The child was REAPED before the deadline fired: the deadline did
+            // not interrupt the command, so the returned outcome must be the
+            // closure's REAL result. A bare `!matches!(outcome, Timeout)` was
+            // too weak — it would accept a spurious `Background` (or any other
+            // error) for a child that simply finished — so assert the SPECIFIC
+            // expected variant instead.
+            let real = match stall {
+                Stall::Complete => matches!(&outcome, Ok(out) if out.status.code() == Some(0)),
+                Stall::NonZero => matches!(&outcome, Ok(out) if out.status.code() == Some(1)),
+                Stall::WaitError => matches!(&outcome, Err(RunError::Wait(_))),
+                Stall::Background => matches!(&outcome, Err(RunError::Background(_))),
+                // A stdin-write stall is meaningful only when the op piped a
+                // payload (the upload); the other ops pipe none, so the stall
+                // is vacuous and the child completes normally.
+                Stall::StdinWriteError if kind == OpKind::Upload => {
+                    matches!(&outcome, Err(RunError::StdinWrite(_)))
+                }
+                Stall::StdinWriteError => {
+                    matches!(&outcome, Ok(out) if out.status.code() == Some(0))
+                }
+                other => panic!(
+                    "deadline_fires_after_reap has no expected outcome for {other:?} ({label})"
+                ),
+            };
             assert!(
-                !matches!(outcome, Err(RunError::Timeout { .. })),
-                "a deadline that fired after the child was already reaped must NOT report a \
-                 timeout — the command ran and exited and only its drain outlasted the deadline \
-                 ({label}), got: {outcome:?}"
+                real,
+                "a deadline that fired after the child was already reaped must return the \
+                 command's REAL result, never a deadline Timeout and never a fabricated \
+                 Background ({label}), got: {outcome:?}"
             );
         }
     }
@@ -2007,7 +2117,9 @@ mod runner_property_tests {
     /// also draws them (6 stalls × 5 ops), but the fixed seed may not pair them
     /// with the upload op in every run. A stdin-write error is returned only
     /// AFTER the child was reaped, and a wait error surfaces after the reap
-    /// attempt — never a return-before-reap.
+    /// attempt — never a return-before-reap. (`Stall::Background` is NOT drawn
+    /// by the property's strategy; it is driven only by the dedicated producer
+    /// mapping test below.)
     #[test]
     fn stdin_write_error_is_returned_after_the_reap() {
         run_one_pair(OpKind::Upload, Stall::StdinWriteError);
@@ -2016,6 +2128,30 @@ mod runner_property_tests {
     #[test]
     fn wait_error_is_returned_after_the_reap() {
         run_one_pair(OpKind::Upload, Stall::WaitError);
+    }
+
+    /// W1 — the SSH PRODUCER mapping for the deadline-kill cause, PINNED. A
+    /// real `RunError::Timeout` from the runner (driven through the fake seam
+    /// injected into the REAL [`SshTransport::with_runner`] entry point) must
+    /// become `ExecOutcome { exit_code: -1, timeout_cause:
+    /// Some(CommandStillRunning) }`. Inverting the mapping (the ssh
+    /// `RunError::Timeout` arm) makes this assertion red — the mutation proof
+    /// is in the task log.
+    #[test]
+    fn ssh_exec_maps_a_deadline_kill_to_command_still_running() {
+        run_one_pair(OpKind::Exec, Stall::Hang);
+    }
+
+    /// W1 — the SSH PRODUCER mapping for the DRAIN cause, PINNED. A real
+    /// `RunError::Background` (the command exited and was reaped; only its
+    /// bounded post-exit drain gave up while a pipe-holding process outlived
+    /// it) must become `ExecOutcome { exit_code: -1, timeout_cause:
+    /// Some(OutputDrainGaveUp) }` — never the deadline-kill cause. Inverting
+    /// the mapping (the ssh `RunError::Background` arm) makes this assertion
+    /// red — the mutation proof is in the task log.
+    #[test]
+    fn ssh_exec_maps_a_drain_gave_up_to_output_drain_gave_up() {
+        run_one_pair(OpKind::Exec, Stall::Background);
     }
 
     /// THE reused-PID property: the fake reaps the child, then — the barrier

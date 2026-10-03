@@ -51,7 +51,7 @@ pub(crate) fn exec(
     cmd.current_dir(cwd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| RunError::Spawn(format!("spawn {argv:?}: {e}")))?;
     let pid = child.id();
@@ -62,11 +62,18 @@ pub(crate) fn exec(
     if let Some(observer) = &config.spawn_observer {
         observer(pid);
     }
+    // The platform-neutral [`OwnedChild`] backstop: every early error return
+    // below drops this handle, whose `Drop` terminates and reaps the child.
+    // A bare `std::process::Child`'s own `Drop` neither waits nor kills, so
+    // without it a `try_wait` error (or a reap-bound expiry) would abandon a
+    // live child. On Windows the group kill is a no-op — only the DIRECT child
+    // is terminated, the documented weaker guarantee of this port.
+    let mut child = OwnedChild::new(child, config.kill.clone());
     // Reader threads: drain stdout/stderr to EOF (the pipes EOF when the
     // child — and any descendant that kept them — dies). Each thread sends
     // its buffer on a channel; the main loop collects them bounded.
-    let stdout_rx = spawn_reader(child.stdout.take());
-    let stderr_rx = spawn_reader(child.stderr.take());
+    let stdout_rx = spawn_reader(child.child.stdout.take());
+    let stderr_rx = spawn_reader(child.child.stderr.take());
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -75,7 +82,7 @@ pub(crate) fn exec(
     // child is reaped by the final `wait`). On timeout, terminate the OWNED
     // child (TerminateProcess); every kill failure is recorded.
     loop {
-        match child.try_wait() {
+        match child.child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(e) => return Err(RunError::Wait(format!("wait {argv:?}: {e}"))),
@@ -86,7 +93,7 @@ pub(crate) fn exec(
             // Terminate the OWNED child. No process group: a background
             // descendant survives — the documented weaker guarantee of the
             // Windows port.
-            if let Err(e) = config.kill.kill_owned(&mut child) {
+            if let Err(e) = config.kill.kill_owned(&mut child.child) {
                 kill_error = Some(format!("kill child {pid}: {e}"));
             }
         }

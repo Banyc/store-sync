@@ -116,8 +116,8 @@ pub mod diff;
 
 pub use apply::{
     Conflict, ConflictReason, Direction, EntryPolicy, Extraneous, Policy, ReplaceAll, SyncError,
-    SyncReport, SyncResult, destination_lock_path, pull, pull_unowned, push, push_unowned, sync,
-    sync_unowned,
+    SyncReport, SyncResult, UnsupportedDestination, destination_lock_path, pull, pull_unowned,
+    push, push_unowned, sync, sync_unowned,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, diff_trees, local_manifest,

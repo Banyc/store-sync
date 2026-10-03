@@ -1285,6 +1285,45 @@ pub struct SyncReport {
     /// implementation detail, so tests use a lower bound or a set-equality
     /// except where they deliberately document a mutation sequence.
     pub transfers: usize,
+    /// WHY each tolerated UNSUPPORTED destination entry was tolerated: the
+    /// manifest spelling and the strict address-fidelity rule that refused it
+    /// (an absolute/escaping symlink, or a hard link — see
+    /// [`crate::manifest::UnsupportedEntry`]), sorted by path and unique.
+    ///
+    /// This is an ANNOTATION, not a partition list. It adds NO path to the
+    /// report and changes no outcome: the SAME path is already named by a
+    /// partition list according to what the run did with it — `extraneous`
+    /// when the entry is destination-only (whether `Extraneous::Keep` left it
+    /// in place or `Extraneous::Delete` removed it), `skipped` when its content
+    /// or target matches the source (so nothing was mutated), `conflicts` when
+    /// a sanctioned removal was blocked, or `indeterminate`/`verify_failures`
+    /// when a removal was attempted and failed. Only entries the report
+    /// already names appear here; a tolerated entry the report does not name is
+    /// omitted, because a consumer has nothing to act on. See
+    /// [`SyncReport::extraneous`] and [`SyncReport::skipped`] for the outcome.
+    ///
+    /// TWO cases this field exists for: under `Extraneous::Keep` a
+    /// destination-only unsupported entry is listed in `extraneous`, and this
+    /// field says WHY it could not be represented (a consumer can then decide
+    /// to remove it); and a destination hard-link pair whose content matches
+    /// the source is `skipped` (the run correctly mutates nothing), and this
+    /// field is the ONLY signal that the two names are aliased by a hard link,
+    /// which the caller must break before the source can be mirrored faithfully.
+    pub unsupported_destination: Vec<UnsupportedDestination>,
+}
+
+/// One tolerated unsupported destination entry, as recorded in
+/// [`SyncReport::unsupported_destination`]: the manifest spelling and the
+/// strict address-fidelity rule's reason, preserved verbatim from
+/// [`crate::manifest::UnsupportedEntry`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedDestination {
+    /// The manifest spelling of the entry, exactly as it appears in the
+    /// destination manifest.
+    pub path: String,
+    /// The strict rule's refusal message (e.g. `absolute symlink not allowed:
+    /// <path>` or `hard links not allowed: <path>`).
+    pub reason: String,
 }
 
 /// [`SyncError`]-carrying result: on failure the partial [`SyncReport`] is
@@ -2459,6 +2498,7 @@ fn run(
         unconfirmed_moves: Vec::new(),
         source_reserved,
         dest_residue,
+        dest_unsupported,
         aliased_dest: BTreeMap::new(),
         dest_case_insensitive: None,
         // The destination ROOT is verified like any other directory the run
@@ -2619,6 +2659,15 @@ struct Applier<'a, 'b> {
     /// exists. This set is derived from the RAW manifests and the removal walk;
     /// the deletion prohibition itself is derived from [`Applier::conflicts`].
     dest_residue: BTreeSet<String>,
+    /// The RAW destination manifest's TOLERATED unsupported entries (the strict
+    /// address-fidelity refusals the destination manifest kept: an
+    /// absolute/escaping symlink or a hard link, each with the strict rule's
+    /// reason). Populated from [`crate::manifest::DestinationTree::unsupported`]
+    /// before the diff. It is the source of
+    /// [`SyncReport::unsupported_destination`]: the preflight uses it to refuse
+    /// writing a source entry over such a path, and the report surfaces the
+    /// reason for every such path the report NAMES.
+    dest_unsupported: Vec<crate::manifest::UnsupportedEntry>,
     /// Destination on-disk spellings that an installed (or skipped) SOURCE
     /// entry aliases on an aliasing filesystem: keyed by the name the
     /// destination actually contains, valued by the source manifest path it
@@ -2897,6 +2946,32 @@ impl Applier<'_, '_> {
                     && !self.extraneous.contains(path)
             })
             .collect();
+        // The unsupported-destination ANNOTATION: the reason the manifest model
+        // could not represent a tolerated destination entry faithfully, attached
+        // to the path the report ALREADY names. Filtered to the named paths so
+        // the field can never introduce a path the partition does not account
+        // for; a consumer reading it always has the outcome in the list that
+        // names the path (see [`SyncReport::unsupported_destination`]).
+        let named: BTreeSet<&str> = applied
+            .iter()
+            .map(String::as_str)
+            .chain(skipped.iter().map(String::as_str))
+            .chain(conflicts.iter().map(|c| c.path.as_str()))
+            .chain(extraneous.iter().map(String::as_str))
+            .chain(transient_dirs.iter().map(String::as_str))
+            .chain(residue.iter().map(String::as_str))
+            .chain(verify_failures.iter().map(String::as_str))
+            .chain(indeterminate.iter().map(String::as_str))
+            .collect();
+        let unsupported_destination: Vec<UnsupportedDestination> = self
+            .dest_unsupported
+            .iter()
+            .filter(|entry| named.contains(entry.path.as_str()))
+            .map(|entry| UnsupportedDestination {
+                path: entry.path.clone(),
+                reason: entry.reason.clone(),
+            })
+            .collect();
         SyncReport {
             applied: applied.into_iter().collect(),
             skipped: skipped.into_iter().collect(),
@@ -2911,6 +2986,7 @@ impl Applier<'_, '_> {
             verify_failures: verify_failures.into_iter().collect(),
             indeterminate: indeterminate.into_iter().collect(),
             transfers: self.transfers,
+            unsupported_destination,
         }
     }
 

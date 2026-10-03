@@ -686,6 +686,32 @@ fn assert_report_lists_disjoint(report: &SyncReport) {
             "indeterminate+verify_failures: {path}"
         );
     }
+    // `unsupported_destination` is an ANNOTATION over paths the partition
+    // ALREADY names: it carries the reason a tolerated destination entry could
+    // not be represented faithfully, and adds no path of its own. Every entry
+    // must therefore already be named by some report list, and the list must be
+    // sorted and unique (the same invariants the partition lists have).
+    for entry in &report.unsupported_destination {
+        assert!(
+            report_names(report, &entry.path),
+            "an unsupported-destination annotation must be attached to a path the report already \
+             names (it adds no path to the partition): {entry:?}"
+        );
+        assert!(
+            !entry.reason.is_empty(),
+            "an unsupported-destination annotation must carry the strict rule's reason: {entry:?}"
+        );
+    }
+    let unsupported_paths: Vec<&str> = report
+        .unsupported_destination
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert!(
+        unsupported_paths.windows(2).all(|pair| pair[0] < pair[1]),
+        "the unsupported-destination annotation must be sorted by path and unique: \
+         {unsupported_paths:?}"
+    );
 }
 
 /// Whether ANY report list names `path`. The FAILURE-path coverage oracle: a
@@ -719,6 +745,23 @@ fn conflict_at<'a>(report: &'a SyncReport, path: &str) -> &'a Conflict {
         .iter()
         .find(|conflict| conflict.path == path)
         .unwrap_or_else(|| panic!("no conflict for {path}: {:?}", report.conflicts))
+}
+
+/// The strict address-fidelity reason the report attached to `path` (asserted
+/// to be present), for the tolerated-unsupported annotation.
+fn unsupported_reason<'a>(report: &'a SyncReport, path: &str) -> &'a str {
+    report
+        .unsupported_destination
+        .iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| {
+            panic!(
+                "no unsupported-destination annotation for {path}: {:?}",
+                report.unsupported_destination
+            )
+        })
+        .reason
+        .as_str()
 }
 
 /// When a `drop_mode_for` seam may fire.
@@ -11167,6 +11210,7 @@ fn applier_with_ancestry_memo<'a, 'b>(
         unconfirmed_moves: Vec::new(),
         source_reserved: BTreeMap::new(),
         dest_residue: BTreeSet::new(),
+        dest_unsupported: Vec::new(),
         aliased_dest: BTreeMap::new(),
         dest_case_insensitive: None,
         touched_dirs: BTreeSet::from([String::new()]),
@@ -11468,6 +11512,17 @@ fn sanctioned_delete_clears_a_hard_link_destination_entry_without_touching_its_t
     );
     assert_eq!(read(&dst.join("ok")), b"payload");
     assert!(report.conflicts.is_empty(), "{report:?}");
+    // W4: the annotation survives the sanctioned removal (the entry was
+    // observed as unsupported even though `Delete` removed it), and `hard` is
+    // still named by `extraneous`.
+    for name in ["hard", "kept"] {
+        let reason = unsupported_reason(&report, name);
+        assert!(
+            reason.starts_with("hard links not allowed: "),
+            "the report must explain why {name} is tolerated: {reason}"
+        );
+    }
+    assert_report_lists_disjoint(&report);
 }
 
 /// F2 (LOCAL destination, PULL direction): the same tolerance on the local
@@ -11532,6 +11587,64 @@ fn keep_reports_an_unsupported_destination_entry_without_failing_the_run() {
         report.extraneous.contains(&"current".to_string()),
         "the unsupported entry is reported extraneous: {report:?}"
     );
+    // W4: the OUTCOME alone left the caller unable to learn WHY the entry was
+    // tolerated, so the report must also carry the strict rule's reason. The
+    // annotation is attached to the path `extraneous` already names.
+    assert_eq!(
+        unsupported_reason(&report, "current"),
+        format!(
+            "absolute symlink not allowed: {}",
+            dst.join("current").display()
+        ),
+        "the tolerated reason must be reported verbatim: {report:?}"
+    );
+    assert_report_lists_disjoint(&report);
+}
+
+/// W4 (hard link): a destination hard-link pair whose content matches the
+/// source is `skipped` — the run correctly mutates nothing — and before the
+/// annotation the caller had NO signal that the two names are aliased. The
+/// report must name the skipped twin with the hard-link refusal so a consumer
+/// can act (break the link) before mirroring the source faithfully.
+#[cfg(unix)]
+#[test]
+fn the_report_explains_a_tolerated_hard_link_destination_entry() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    write(&src.join("ok"), b"payload");
+    // The SOURCE holds `kept` with the shared content, so the destination twin
+    // is `Same` and is SKIPPED.
+    write(&src.join("kept"), b"shared-bytes");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    write(&dst.join("kept"), b"shared-bytes");
+    fs::hard_link(dst.join("kept"), dst.join("hard")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        fs::metadata(dst.join("kept")).unwrap().nlink(),
+        2,
+        "premise: the destination entries are hard links"
+    );
+
+    let report = sync(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+        .expect("a kept unsupported destination entry must be reported, not fatal");
+
+    assert!(
+        report.skipped.contains(&"kept".to_string()),
+        "the twin the source holds is skipped (nothing mutated): {report:?}"
+    );
+    assert!(
+        report.extraneous.contains(&"hard".to_string()),
+        "the destination-only twin is kept and reported extraneous: {report:?}"
+    );
+    for name in ["kept", "hard"] {
+        let reason = unsupported_reason(&report, name);
+        assert!(
+            reason.starts_with("hard links not allowed: ") && reason.contains("dst"),
+            "the report must explain why {name} is tolerated: {reason}"
+        );
+    }
+    assert_report_lists_disjoint(&report);
 }
 
 /// F2 SOUNDNESS GATE: an unsupported destination entry may be DELETED under a
