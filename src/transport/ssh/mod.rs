@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{
-    ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Layout, OpenedEntry,
-    OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict, RootedRelativePath,
-    TimeoutCause, has_normal_component_below_root, provision_receiver_id, verified_to_verdict,
-    verify_existing,
+    ContentEquivalence, CreateNewVerdict, FarSideLockSession, FsBytes, IMMUTABLE_RECORD_MODE,
+    Layout, OpenedEntry, OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict,
+    RootedRelativePath, TimeoutCause, has_normal_component_below_root, provision_receiver_id,
+    verified_to_verdict, verify_existing,
 };
 use hostkey::{pin_known_hosts, simple_hash};
 use runner::{
@@ -208,6 +208,78 @@ const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle;
 /// file and is portable across GNU and BSD userlands; perl is already required
 /// on the far side for the fsync helpers.
 const PERL_VERIFY_LEN: &str = "my $n = -s $ARGV[0]; if (!defined $n || $n != $ARGV[1]) { print STDERR \"storekit: remote payload truncated: \", $ARGV[0], \" holds \", (defined $n ? $n : \"?\"), \" bytes, expected $ARGV[1]; refusing to publish\\n\"; exit 1; } exit 0; # STOREKIT_TEST_VERIFY_LEN";
+
+/// The PORTABLE far-side operation-lock HOLDER: the long-lived `perl` program
+/// an [`SshTransport::lock_far_side`] session runs on the remote, which takes
+/// the destination's operation-lock record NON-BLOCKING and then holds it until
+/// its stdin closes.
+///
+/// WHY PERL'S `flock`, not the `flock(1)` / `flock(2)` command: the far side
+/// may be GNU (util-linux `flock(1)`) OR BSD, and `flock(1)` DOES NOT EXIST on
+/// macOS — the crate documents macOS remotes as supported. `flock(2)` is also
+/// not in POSIX, so no shell builtin offers it. Perl is already REQUIRED on the
+/// far side for the framed `lstat` helper, `verify_open`, the sidecars, and the
+/// fsync primitives, and its built-in `flock` is the SAME `flock(2)` on Linux
+/// and macOS/BSD, so it is the ONE portable non-blocking lock available.
+///
+/// THE PROTOCOL (stdout is the channel, so the caller reads a readiness line):
+///
+/// * the record path and the holder identity arrive as positional args after
+///   `--`, so a path beginning with `-` is an operand, never an option;
+/// * a missing parent chain is created portably with `File::Path::make_path`
+///   at the platform default mode (matching the local `create_lock_parent`);
+/// * the record is opened `O_RDWR | O_CREAT | O_NOFOLLOW` at `0600`: a symlink
+///   planted at the record fails CLOSED (`ELOOP`) instead of redirecting the
+///   write into a victim, exactly as the local `O_NOFOLLOW` open does, and the
+///   mode is private by construction (the umask can only remove bits);
+/// * `flock(LOCK_EX | LOCK_NB)` is tried ONCE: a live holder is `EWOULDBLOCK`
+///   -> exit 3, a real lock failure -> exit 5 (both printed with an anchored
+///   `LOCKCONTENDED` / `LOCKERR` diagnostic); no case ever waits;
+/// * on success the holder identity is written into the record (so a refused
+///   contender can name the holder, like the local record), `LOCKOK <pid>` is
+///   printed and flushed, and the process BLOCKS reading stdin;
+/// * stdin EOF (the local client closed its pipe, or the connection dropped)
+///   ends the loop; the explicit `LOCK_UN` + `close` then release the flock,
+///   and process death releases it regardless.
+///
+/// The trailing `# STOREKIT_TEST_HOLD_LOCK` token is the stable hook a test's
+/// fake `perl` on `PATH` matches to recognise this exact program.
+const PERL_HOLD_LOCK: &str = concat!(
+    "use strict; use warnings; ",
+    "use Fcntl qw(:flock O_RDWR O_CREAT O_NOFOLLOW); ",
+    "use File::Basename qw(dirname); ",
+    "use File::Path qw(make_path); ",
+    "use Errno (); ",
+    "use IO::Handle; ",
+    "my ($path, $op_id) = @ARGV; ",
+    "my $dir = dirname($path); ",
+    "if (! -d $dir) { make_path($dir) or do { print STDERR \"LOCKERR mkdir $dir: $!\\n\"; exit 4; }; } ",
+    "sysopen(my $fh, $path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600) ",
+    "or do { print STDERR \"LOCKERR open $path: $!\\n\"; exit 4; }; ",
+    "if (!flock($fh, LOCK_EX | LOCK_NB)) { ",
+    "my $e = 0 + $!; ",
+    "if ($e == Errno::EWOULDBLOCK() || $e == Errno::EAGAIN()) { ",
+    "print STDERR \"LOCKCONTENDED $path: $!\\n\"; exit 3; } ",
+    "print STDERR \"LOCKERR flock $path: $!\\n\"; exit 5; } ",
+    "truncate($fh, 0); seek($fh, 0, 0); print $fh $op_id; $fh->flush; ",
+    "print \"LOCKOK $$\\n\"; STDOUT->flush; ",
+    "my $buf; while (1) { my $n = sysread(STDIN, $buf, 8192); last if !defined($n) || $n == 0; } ",
+    "flock($fh, LOCK_UN); close($fh); ",
+    "# STOREKIT_TEST_HOLD_LOCK",
+);
+
+/// How long [`SshTransport::lock_far_side`] waits for the far-side holder to
+/// report `LOCKOK` before giving up. It covers the whole SSH connection setup
+/// (`SSH_CONNECT_TIMEOUT_SECS`) plus the trivial far-side open/flock, so a
+/// connection that never answers cannot hang acquisition forever. CONTENTION
+/// never waits: a live holder is reported at once, not after this deadline.
+const FAR_SIDE_LOCK_ACQUIRE_GRACE: Duration = Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS + 10);
+
+/// How long the guard waits for the far-side holder to exit after its stdin is
+/// closed (the graceful release path) before it KILLS the local `ssh` client
+/// and reaps it. The kill is the backstop; either way the connection drops and
+/// the kernel releases the far-side flock when the holder process dies.
+const FAR_SIDE_LOCK_RELEASE_GRACE: Duration = Duration::from_secs(5);
 
 /// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
 /// `crate::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
@@ -2666,6 +2738,18 @@ impl Remote for SshTransport {
         })
     }
 
+    /// Acquire a REAL far-side operation-lock session (the [`FarSideLockSession`]
+    /// contract): spawn a long-lived local `ssh` client whose remote `perl`
+    /// ([`PERL_HOLD_LOCK`]) takes the record's `flock` non-blocking and then
+    /// blocks on stdin. The guard owns the child; dropping it closes stdin,
+    /// waits for the holder to exit, then kills and reaps the client if it did
+    /// not, so the record is released on every path. A connection that dies
+    /// drops the child too (the far side sees EOF), which is the documented
+    /// "a lost connection releases it" property.
+    fn lock_far_side(&self, record: &Path, op_id: &str) -> Result<Box<dyn FarSideLockSession>> {
+        Ok(Box::new(self.spawn_far_side_lock(record, op_id)?))
+    }
+
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         self.try_write_new_with(rel, data, ContentEquivalence::Exact)
     }
@@ -2840,6 +2924,347 @@ impl Remote for SshTransport {
             ))),
         }
     }
+}
+
+/// The far-side lock holder process a [`SshTransport`] session owns: the local
+/// `ssh` client (the connection) plus the remote `perl` it is running. The
+/// guard IS the lock's lifetime — see [`FarSideLockSession`].
+struct SshFarSideLock {
+    /// The local `ssh` client. Its exit means the connection (and therefore the
+    /// far-side holder) is gone.
+    child: std::process::Child,
+    /// The client's stderr, kept so a lost session can report what the client
+    /// said. Taken (drained to EOF) by [`SshFarSideLock::loss_detail`].
+    stderr: Option<std::process::ChildStderr>,
+    /// The far-side record this session holds.
+    record: PathBuf,
+    /// The local `ssh` client's pid, for diagnostics and for a caller that must
+    /// terminate exactly this connection.
+    local_pid: u32,
+    /// The exit status once the client has been observed to exit.
+    status: Option<std::process::ExitStatus>,
+    /// Set by [`FarSideLockSession::release`]/`Drop` so the release is
+    /// idempotent and `is_alive` reports `false` afterwards.
+    released: bool,
+}
+
+impl SshFarSideLock {
+    fn new(
+        child: std::process::Child,
+        stderr: Option<std::process::ChildStderr>,
+        record: PathBuf,
+        local_pid: u32,
+    ) -> Self {
+        SshFarSideLock {
+            child,
+            stderr,
+            record,
+            local_pid,
+            status: None,
+            released: false,
+        }
+    }
+}
+
+impl FarSideLockSession for SshFarSideLock {
+    fn record(&self) -> &Path {
+        &self.record
+    }
+
+    fn is_alive(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.status = Some(status);
+                false
+            }
+            Ok(None) => true,
+            // An unanswerable wait cannot establish liveness; fail CLOSED (the
+            // run must not claim the destination is still owned).
+            Err(_) => false,
+        }
+    }
+
+    fn loss_detail(&mut self) -> String {
+        let status = self
+            .status
+            .as_ref()
+            .map(|s| format!("the local ssh client exited ({s})"))
+            .unwrap_or_else(|| "the local ssh client is no longer running".to_string());
+        let stderr = match self.stderr.take() {
+            Some(mut handle) => {
+                use std::io::Read;
+                let mut text = String::new();
+                let _ = handle.read_to_string(&mut text);
+                let text = text.trim();
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    format!("; the client reported: {text}")
+                }
+            }
+            None => String::new(),
+        };
+        format!("{status}{stderr}")
+    }
+
+    fn local_pid(&self) -> u32 {
+        self.local_pid
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        // GRACEFUL FIRST: closing our end of the child's stdin pipe makes the
+        // far-side `perl`'s `sysread` return 0, so it unlocks and exits and the
+        // client then exits on its own. The record is released by the time the
+        // client is reaped, because the holder process has exited.
+        self.child.stdin.take();
+        if reap_bounded(&mut self.child, FAR_SIDE_LOCK_RELEASE_GRACE).is_none() {
+            // The child refused to exit within the grace (a hung connection):
+            // kill it and reap, which drops the connection and lets the far
+            // side notice EOF and release. The `reap_bounded` fallback already
+            // attempted the kill; this is the belt-and-braces wait.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for SshFarSideLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Wait up to `grace` for `child` to exit, then kill and reap it. Returns the
+/// exit status it was reaped with, or `None` when it had to be killed.
+fn reap_bounded(
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+impl SshTransport {
+    /// Spawn the long-lived far-side lock holder and wait (bounded) for its
+    /// `LOCKOK` readiness line. See [`PERL_HOLD_LOCK`] for the script and
+    /// [`SshFarSideLock`] for the lifetime.
+    fn spawn_far_side_lock(&self, record: &Path, op_id: &str) -> Result<SshFarSideLock> {
+        // The mux dir must exist before the `ControlPath` option is used, and a
+        // fingerprint-only identity must be pinned first — the same self-
+        // preparing step every other request takes.
+        self.prepare_for_request()?;
+        let inner = Self::argv_cmd(&[
+            "perl".into(),
+            "-e".into(),
+            PERL_HOLD_LOCK.to_string(),
+            "--".into(),
+            record.to_string_lossy().into_owned(),
+            op_id.to_string(),
+        ]);
+        // Wrap in `bash -c` exactly like every other far-side command, so the
+        // remote login shell only parses a trivial single-quoted invocation and
+        // the script runs under POSIX/bash semantics.
+        let command = format!("bash -c {}", shell_quote(&inner));
+        let mut argv: Vec<String> = vec!["ssh".into()];
+        argv.extend(self.ssh_args()?);
+        argv.push("--".into());
+        argv.push(command);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        // The child receives the SNAPSHOT environment, never the live process
+        // env — the house child-process boundary.
+        self.env.apply_to_command(&mut cmd);
+        cmd.args(&argv[1..]);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| {
+            Error::transport_kind(
+                TransportKind::BeforeCommand,
+                format!(
+                    "could not spawn the local `ssh` client that holds the far-side operation lock \
+                     on {}: {e}",
+                    record.display()
+                ),
+            )
+        })?;
+        let local_pid = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .expect("the lock session's piped stdout");
+        let stderr = child.stderr.take();
+        // Read the FIRST stdout line on a helper thread, so a connection that
+        // never answers is bounded by `recv_timeout` rather than hanging
+        // acquisition forever. On success the thread is already finished; on
+        // failure the child is killed below, which EOFs the pipe and lets the
+        // thread exit so it can be joined.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::Builder::new()
+            .name("storekit-farside-lock-ready".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let mut line = String::new();
+                let result = std::io::BufReader::new(stdout).read_line(&mut line);
+                let _ = tx.send((result, line));
+            })
+            .map_err(|e| {
+                let _ = child.kill();
+                let _ = child.wait();
+                Error::transport_kind(
+                    TransportKind::BeforeCommand,
+                    format!(
+                        "could not start the readiness reader for the far-side operation lock on \
+                         {}: {e}",
+                        record.display()
+                    ),
+                )
+            })?;
+        match rx.recv_timeout(FAR_SIDE_LOCK_ACQUIRE_GRACE) {
+            Ok((Ok(_), line)) if line.starts_with("LOCKOK") => {
+                let _ = reader.join();
+                Ok(SshFarSideLock::new(
+                    child,
+                    stderr,
+                    record.to_path_buf(),
+                    local_pid,
+                ))
+            }
+            Ok((read_result, _line)) => {
+                // EOF (read_result Ok(0)) or a read error: the holder exited
+                // without reporting readiness. Reap it, then classify from its
+                // exit status and anchored far-side diagnostic.
+                let _ = reader.join();
+                let status = reap_bounded(&mut child, FAR_SIDE_LOCK_RELEASE_GRACE);
+                let stderr_text = drain_stderr(stderr);
+                Err(far_side_lock_refusal(
+                    record,
+                    status,
+                    &stderr_text,
+                    read_result.err(),
+                ))
+            }
+            Err(_timeout) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                Err(Error::transport_kind(
+                    TransportKind::BeforeCommand,
+                    format!(
+                        "acquiring the far-side operation lock on {} timed out after {:?}: the \
+                         SSH connection or the far-side `perl` holder did not answer. The lock was \
+                         NOT acquired and nothing was mutated.",
+                        record.display(),
+                        FAR_SIDE_LOCK_ACQUIRE_GRACE
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+/// Drain a child's stderr to EOF (used only after the child has exited or been
+/// reaped, so the read cannot block).
+fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
+    let Some(mut handle) = stderr else {
+        return String::new();
+    };
+    use std::io::Read;
+    let mut text = String::new();
+    let _ = handle.read_to_string(&mut text);
+    text
+}
+
+/// Map a far-side lock holder's failure to the typed refusal a caller branches
+/// on. The layers are separated by EVIDENCE (the anchored far-side diagnostic
+/// and the exit status), never by a guess from one number: `LOCKCONTENDED` /
+/// exit 3 is the typed contention, `LOCKERR` / exit 4/5 is a far-side refusal
+/// (no perl, an uncreatable/read-only parent, a real `flock` failure), 126/127
+/// and the `perl: not found` markers are the missing interpreter, and an `ssh`
+/// exit 255 is the transport failing before the far-side command ran.
+fn far_side_lock_refusal(
+    record: &Path,
+    status: Option<std::process::ExitStatus>,
+    stderr: &str,
+    read_error: Option<std::io::Error>,
+) -> Error {
+    let code = status.and_then(|s| s.code());
+    let stderr = stderr.trim();
+    let stderr_disp = if stderr.is_empty() {
+        "(no stderr)"
+    } else {
+        stderr
+    };
+    let line_starts = |marker: &str| stderr.split('\n').any(|line| line.starts_with(marker));
+    if code == Some(3) || line_starts("LOCKCONTENDED") {
+        return Error::lock_contended(format!(
+            "far-side lock {} held by another run (the far-side `flock` is NON-BLOCKING, so this is \
+             a refusal to WAIT, not a wait): {stderr_disp}",
+            record.display()
+        ));
+    }
+    if code == Some(126)
+        || code == Some(127)
+        || line_starts("perl: command not found")
+        || line_starts("perl: not found")
+    {
+        return Error::transport_kind(
+            TransportKind::InterpreterMissing,
+            format!(
+                "the far side of {} could not start `perl` (exit {:?}): {stderr_disp}. The crate \
+                 requires perl for its portable far-side operation lock — it is the only portable \
+                 non-blocking `flock` shared by GNU and BSD/macOS userlands, and `flock(1)` does \
+                 not exist on macOS. Install perl on the remote host, or pass \
+                 `DestinationOwnership::Unowned` and serialise the run yourself.",
+                record.display(),
+                code
+            ),
+        );
+    }
+    if code == Some(4) || code == Some(5) || line_starts("LOCKERR") || read_error.is_some() {
+        return Error::transport_kind(
+            TransportKind::FarSideScript,
+            format!(
+                "the far-side operation-lock record {} could not be created or locked (exit {:?}): \
+                 {stderr_disp}. The record is a SIBLING of the destination root, so the destination's \
+                 PARENT directory must exist on the far side and be writable by the remote account. \
+                 The run did NOT proceed unowned.",
+                record.display(),
+                code
+            ),
+        );
+    }
+    Error::transport_kind(
+        TransportKind::BeforeCommand,
+        format!(
+            "the far-side operation-lock holder on {} did not start (exit {:?}): {stderr_disp} \
+             (this is a transport-level failure: connection, authentication, host key, or the ssh \
+             control socket)",
+            record.display(),
+            code
+        ),
+    )
 }
 
 #[cfg(test)]

@@ -79,12 +79,18 @@
 //!   [`apply::DestinationOwnership::LockedWithInRoot`] token holds the sibling
 //!   record and the caller's in-root layout lock in the one canonical order);
 //!   the plain [`apply::DestinationOwnership::lock`] is unchanged and still
-//!   takes the sibling record alone. A destination whose lock the crate
-//!   CANNOT take — a REMOTE (far-side) one, or a root with no sibling record
-//!   location — is REFUSED by the acquiring constructor rather than run
-//!   unowned. The weaker path is the [`apply::DestinationOwnership::Unowned`]
-//!   value written at the call site, so the weaker choice is stated in the TYPE
-//!   and cannot be made by omission.
+//!   takes the sibling record alone. A REMOTE (far-side) destination is owned
+//!   BY NAME with [`apply::DestinationOwnership::lock_remote`], which holds the
+//!   SAME sibling record on the far side for the whole run through a persistent
+//!   far-side lock session (the record path still comes from the ONE authority,
+//!   [`apply::destination_lock_path`]); that acquisition is non-blocking too,
+//!   and the record is released on every exit path — including a panic — and
+//!   when the connection dies (so it is NOT a lease). A destination whose lock
+//!   the crate CANNOT take — one with no sibling record location, or a
+//!   transport that does not implement far-side locking — is REFUSED by the
+//!   acquiring constructor rather than run unowned. The weaker path is the
+//!   [`apply::DestinationOwnership::Unowned`] value written at the call site, so
+//!   the weaker choice is stated in the TYPE and cannot be made by omission.
 //!
 //!   (b) **The SOURCE is quiescent.** The crate cannot lock the source (a
 //!   remote tree for a PULL, the caller's tree for a PUSH), so it VERIFIES
@@ -103,9 +109,11 @@
 //!   hard error naming the unplanned path) and the run does not return a clean
 //!   `Ok`. Its coverage is the paths the run reads, so it is not total. See
 //!   [`apply`]'s "The lock discipline" section, including the far-side
-//!   limitation: for a remote destination NEITHER the lock NOR any far-side
-//!   exclusion is available, and only the explicitly-named
-//!   [`apply::DestinationOwnership::Unowned`] value reaches it.
+//!   limitation: a NON-COOPERATING far-side writer that never takes the record
+//!   is outside the crate's exclusion, exactly as for a local destination, and
+//!   an owned remote run's exclusion ends with its client (no lease). A caller
+//!   that does not own the remote destination states that with the
+//!   explicitly-named [`apply::DestinationOwnership::Unowned`] value.
 //! * **The two roots must be disjoint.** Neither the local root nor the remote
 //!   root may be an ancestor of the other; [`apply::sync`] refuses a strict
 //!   nesting before any mutation because a nested destination makes the run
@@ -128,8 +136,8 @@ pub use residue::Residue;
 
 pub use apply::{
     Conflict, ConflictReason, DestinationOwnership, Direction, EntryPolicy, Extraneous, InRootLock,
-    LockedDestination, Policy, ReplaceAll, RetireOutcome, SyncError, SyncReport, SyncResult,
-    destination_lock_path, retire_destination_lock, sync,
+    LockedDestination, LockedRemoteDestination, Policy, ReplaceAll, RetireOutcome, SyncError,
+    SyncReport, SyncResult, destination_lock_path, retire_destination_lock, sync,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests,

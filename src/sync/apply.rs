@@ -455,26 +455,29 @@
 //!    pre-verified `host_key_fingerprint` supplied at construction — because a
 //!    crate that invented one would be trusting on first use, which this
 //!    crate refuses.
-//! 1. **The destination is exclusively owned. The crate enforces this for a
-//!    LOCAL destination by TAKING the lock itself.** The ONE entry point
-//!    [`sync`] acquires the destination's operation lock (a
-//!    [`crate::lock::FileLock`] on the record named by
-//!    [`destination_lock_path`]) through [`DestinationOwnership::lock`] BEFORE
-//!    reading the destination manifest and holds it for the WHOLE run. A
+//! 1. **The destination is exclusively owned. The crate enforces this by
+//!    TAKING the lock in the acquiring constructor.** The ONE entry point
+//!    [`sync`] acquires the destination's operation lock BEFORE reading the
+//!    destination manifest and holds it for the WHOLE run: for a LOCAL
+//!    destination, a [`crate::lock::FileLock`] on the record named by
+//!    [`destination_lock_path`], through [`DestinationOwnership::lock`]; for a
+//!    REMOTE destination, the SAME record held on the far side by a persistent
+//!    lock session, through [`DestinationOwnership::lock_remote`]. A
 //!    cooperating writer that tries to acquire the same record while the run
-//!    holds it is refused at acquisition (`FileLock::acquire` is non-blocking),
+//!    holds it is refused at acquisition (both acquisitions are non-blocking),
 //!    so the run's writes and reads cannot be interleaved by one. A caller whose
 //!    own writer holds the destination's in-root
 //!    [`crate::transport::Layout::lock`] needs BOTH records held, and asks for
 //!    that by name with [`DestinationOwnership::lock_with_in_root_lock`]: it
 //!    takes the sibling record and then the caller's in-root record (in that
 //!    canonical order) and holds both for the whole run. A destination
-//!    the crate CANNOT lock — a REMOTE (far-side) one, or a root with no sibling
-//!    record location — is REFUSED by [`DestinationOwnership::lock`] rather
-//!    than silently run unowned. A caller that holds such a destination itself
-//!    must say so by passing [`DestinationOwnership::Unowned`] to [`sync`]: the
-//!    VALUE at the call site is the only place the weaker choice appears, so it
-//!    cannot be made by omission.
+//!    the crate CANNOT lock — one with no sibling record location, or a
+//!    transport that does not implement far-side locking — is REFUSED by the
+//!    acquiring constructor rather than silently run unowned. A caller that
+//!    holds such a destination itself must say so by passing
+//!    [`DestinationOwnership::Unowned`] to [`sync`]: the VALUE at the call site
+//!    is the only place the weaker choice appears, so it cannot be made by
+//!    omission.
 //! 2. **The source is quiescent. The crate cannot lock the source, so it
 //!    VERIFIES it instead.** The source is a remote tree the crate does not own
 //!    (a PULL) or the caller's local tree (a PUSH), and there is no lock record
@@ -508,21 +511,40 @@
 //! writer that touches only paths the run never inspects can still escape it,
 //! and an `Ok` run is not by itself a claim that the destination is clean.
 //!
-//! ### The far-side (remote destination) limitation
+//! ### The far-side (remote destination) lock session
 //!
-//! [`destination_lock_path`] is a path on THIS host and [`crate::lock::FileLock`]
-//! is a LOCAL descriptor lock. A destination whose [`Remote::is_local`] is
-//! `false` names a far-side tree, and the existing machinery cannot hold a
-//! far-side lock across the run: the transport's sidecar `flock` is taken
-//! INSIDE a single remote command and dies when that command exits, so it
-//! serializes one lock-record mutation, not a whole run. The acquiring
-//! constructor [`DestinationOwnership::lock`] therefore REFUSES a remote
-//! destination; only the [`DestinationOwnership::Unowned`] value reaches it,
-//! and for that run the crate enforces NEITHER the destination lock NOR any
-//! far-side exclusion, so a cooperating far-side writer is not excluded and the
-//! caller must supply the serialisation itself. The SOURCE-quiescence re-read
-//! still runs. Closing the gap needs a persistent far-side session, which does
-//! not exist here.
+//! [`destination_lock_path`] is a path SPELLING; the local case opens it with
+//! [`crate::lock::FileLock`] (a LOCAL descriptor lock). A destination whose
+//! [`Remote::is_local`] is `false` names a far-side tree, so the record lives on
+//! the far side and no local descriptor can hold it: the transport's sidecar
+//! `flock` is taken INSIDE a single remote command and dies when that command
+//! exits, so it serialises one lock-record mutation, not a whole run.
+//!
+//! [`DestinationOwnership::lock`] therefore REFUSES a remote destination — it is
+//! the constructor for a LOCAL record — and gives the caller that error rather
+//! than a silent unowned run. A remote destination is owned BY NAME with
+//! [`DestinationOwnership::lock_remote`], which holds the destination's
+//! operation lock ON THE FAR SIDE for the whole run through a PERSISTENT
+//! FAR-SIDE LOCK SESSION ([`crate::transport::FarSideLockSession`]):
+//! [`SshTransport`](crate::transport::SshTransport) spawns a long-lived local
+//! `ssh` client whose remote `perl` opens the SAME sibling record the local case
+//! derives, takes a non-blocking `flock`, records the holder identity, and then
+//! blocks until the client's stdin closes. The session guard lives in [`sync`]'s
+//! stack frame for the whole run; its `Drop` releases the record on EVERY exit
+//! path (an ordinary return, an error return, and a panic unwind), and the
+//! kernel releases the `flock` when the holder process dies — so a LOST
+//! CONNECTION releases the lock, which is why a far-side lock SERIALISES
+//! concurrent runs but is NOT a lease. A run that observes its session dead
+//! before returning reports a typed transport failure naming the lost lock,
+//! never a clean `Ok`.
+//!
+//! A caller that does not own the remote destination states that with the
+//! [`DestinationOwnership::Unowned`] value, and for that run the crate enforces
+//! NEITHER the destination lock NOR any far-side exclusion, so a cooperating
+//! far-side writer is not excluded and the caller must supply the serialisation
+//! itself. The SOURCE-quiescence re-read still runs in both cases. What REMAINS
+//! outside the crate's exclusion even with [`DestinationOwnership::lock_remote`]
+//! is a NON-COOPERATING far-side writer that never takes the record.
 //!
 //! ### Why the lock record is a SIBLING of the destination root
 //!
@@ -924,7 +946,7 @@
 //! source".
 
 use crate::atomic::ReplaceOutcome;
-use crate::error::{Error, MaterializationKind, Result, StoreKind};
+use crate::error::{Error, MaterializationKind, Result, StoreKind, TransportKind};
 use crate::lock::FileLock;
 use crate::manifest::{
     DestinationTree, SymlinkContainmentIndex, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
@@ -935,7 +957,7 @@ use crate::sync::diff::{
     EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_source_and_destination, diff_trees,
     remote_destination_manifest, remote_manifest,
 };
-use crate::transport::{Layout, Remote, RootedRelativePath};
+use crate::transport::{FarSideLockSession, Layout, Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -1067,9 +1089,11 @@ pub enum EntryPolicy {
     /// same file both land because the kernel serializes the two appends on
     /// the shared inode; `AppendTail` has no such serialization. Each run
     /// reads a snapshot, decides from it, and publishes a whole new file, so:
-    /// (1) on a REMOTE destination there is no lock and no server-side
-    /// compare, so two concurrent runs can both read the same prefix and the
-    /// later `rename`/`cat` DISCARDS the other's line (a lost update); (2)
+    /// (1) on a REMOTE destination there is no server-side compare, so two
+    /// concurrent runs can both read the same prefix and the later
+    /// `rename`/`cat` DISCARDS the other's line (a lost update) — an owned
+    /// remote run ([`DestinationOwnership::lock_remote`]) serialises the two
+    /// runs but still performs no atomic compare; (2)
     /// even on a LOCAL confined destination the compare and the install do
     /// not share one atomic step against an outside writer — the residual
     /// window is the `renameat` (and on Windows, which has no atomic replace,
@@ -1077,8 +1101,8 @@ pub enum EntryPolicy {
     /// lost; and (3) the two runs are not even ordered against each other
     /// unless they took the SAME destination lock
     /// (the [`crate::sync::apply::DestinationOwnership::Locked`] token takes
-    /// the sibling record; the `Unowned` value and remote destinations take
-    /// none).
+    /// the LOCAL sibling record and [`DestinationOwnership::lock_remote`] the
+    /// FAR-SIDE one; the `Unowned` value takes none).
     ///
     /// **Why this matters at the point of use:** a consumer that reaches for
     /// `AppendTail` PRECISELY BECAUSE its own design relies on one `O_APPEND`
@@ -1127,7 +1151,9 @@ pub enum EntryPolicy {
     /// destination the comparison and the install share ONE descriptor (an
     /// fd-bound atomic compare-and-replace), so the residual window is the
     /// `renameat` itself. What it STILL CANNOT do: a REMOTE destination has
-    /// neither a lock nor a server-side compare — the live bytes are re-read
+    /// no server-side compare (an owned remote run takes the far-side lock
+    /// through [`DestinationOwnership::lock_remote`], which serialises
+    /// cooperating runs but provides no compare) — the live bytes are re-read
     /// through the transport and THEN written through it, so a writer that
     /// changes the entry during that write (after the compare) is lost; and
     /// even locally a writer that wins the window between the final comparison
@@ -1603,6 +1629,21 @@ impl SyncError {
     pub fn into_parts(self) -> (Error, SyncReport) {
         (self.error, *self.report)
     }
+
+    /// Make `error` the failure this `SyncError` reports, PRESERVING the partial
+    /// report and the restore failures, and APPENDING the original failure's
+    /// message so neither is hidden.
+    ///
+    /// Used for a RUN-LEVEL condition discovered after the engine returned — a
+    /// far-side operation-lock session lost mid-run — where the new condition
+    /// (the destination is no longer owned) is the failure the caller must act
+    /// on, but the engine's own error text must survive. The new error keeps its
+    /// own class AND typed kind; the old text rides along as context.
+    pub(crate) fn with_replaced_error(mut self, error: Error) -> Self {
+        let original = std::mem::replace(&mut self.error, Error::preflight(""));
+        self.error = error.with_context(original.to_string());
+        self
+    }
 }
 
 impl std::fmt::Display for SyncError {
@@ -1666,7 +1707,9 @@ impl From<Error> for SyncError {
 /// no parent, and a path with no final component names no record.
 /// [`DestinationOwnership::lock`] REFUSES such a destination rather than run it
 /// unowned; only the explicitly-named [`DestinationOwnership::Unowned`] value
-/// reaches it, and the caller must supply the serialisation itself.
+/// reaches it, and the caller must supply the serialisation itself. A remote
+/// destination is instead owned through [`DestinationOwnership::lock_remote`],
+/// which holds this SAME derived record on the FAR side.
 ///
 /// A writer that does not take this record is NON-COOPERATING. That includes a
 /// writer using a different version of this tool and a different tool sharing
@@ -1901,7 +1944,7 @@ fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
 fn destination_lock_record(dest_is_local: bool, dest_root: &Path) -> Result<PathBuf> {
     if !dest_is_local {
         return Err(Error::preflight(format!(
-            "refusing to sync into the REMOTE destination {} without its operation lock: the crate cannot hold a far-side lock for the whole run, so this call cannot own the destination. If the caller holds the destination for the run, pass `DestinationOwnership::Unowned` (the explicitly weaker path); otherwise sync into a LOCAL destination.",
+            "refusing to sync into the REMOTE destination {} through `DestinationOwnership::lock`: that constructor takes a lock on a LOCAL record, and this destination's record is on the far side. To OWN the remote destination, acquire its far-side record with `DestinationOwnership::lock_remote` (a persistent far-side lock session, held for the whole run); if the caller holds the destination for the run, pass `DestinationOwnership::Unowned` (the explicitly weaker path); otherwise sync into a LOCAL destination.",
             dest_root.display()
         )));
     }
@@ -2117,8 +2160,10 @@ fn acquire_in_root_lock(
 ///    run, so a cooperating writer is refused at acquisition instead of
 ///    interleaving. A caller whose own writer holds the destination's in-root
 ///    [`crate::transport::Layout::lock`] names that record and takes BOTH with
-///    [`DestinationOwnership::lock_with_in_root_lock`]. A destination the crate
-///    cannot lock is REFUSED there, not run unowned; only the
+///    [`DestinationOwnership::lock_with_in_root_lock`]. A REMOTE destination is
+///    owned instead with [`DestinationOwnership::lock_remote`], which holds the
+///    same record on the far side. A destination the crate cannot lock is
+///    REFUSED there, not run unowned; only the
 ///    [`DestinationOwnership::Unowned`] value reaches it.
 /// 2. **The source is quiescent, and the crate VERIFIES it.** The source
 ///    cannot be locked, so the run re-reads its manifest at the end and fails
@@ -2131,10 +2176,11 @@ fn acquire_in_root_lock(
 /// A non-cooperating writer that writes the destination anyway is still
 /// DETECTED and the run still FAILS CLOSED: the post-transfer verification is
 /// retained unchanged (detection is scoped to the paths the run reads, so its
-/// coverage is not total). For a REMOTE destination
-/// [`DestinationOwnership::lock`] refuses outright;
+/// coverage is not total). For a REMOTE destination,
+/// [`DestinationOwnership::lock`] refuses outright and
+/// [`DestinationOwnership::lock_remote`] holds the far-side record;
 /// [`DestinationOwnership::Unowned`] is the explicitly weaker path, and the
-/// module docs ("The lock discipline" and the far-side limitation) state the
+/// module docs ("The lock discipline" and the far-side lock session) state the
 /// residual.
 ///
 /// # The two roots must be disjoint
@@ -2223,6 +2269,13 @@ pub fn sync(
     // The token is BOUND to the run it was acquired for: a token acquired for
     // another direction or destination is refused rather than used, so a caller
     // cannot take the lock on one destination and mutate another.
+    //
+    // The FAR-SIDE session lives HERE, in this stack frame, for the whole run
+    // (exactly as `HeldLocks` does for the local records), so it is dropped
+    // when `sync` returns on every path — including a panic unwind. It is
+    // checked for liveness BEFORE the run's result is returned, so a connection
+    // that died mid-run is reported rather than read as a clean success.
+    let mut far_side: Option<Box<dyn FarSideLockSession>> = None;
     let (prepared, locks) = match ownership {
         DestinationOwnership::Locked(locked) => {
             if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
@@ -2231,7 +2284,7 @@ pub fn sync(
             (
                 locked.prepared,
                 Some(HeldLocks {
-                    _sibling: locked.guard,
+                    _sibling: Some(locked.guard),
                     _in_root: None,
                 }),
             )
@@ -2246,10 +2299,20 @@ pub fn sync(
             (
                 locked.prepared,
                 Some(HeldLocks {
-                    _sibling: locked.guard,
+                    _sibling: Some(locked.guard),
                     _in_root: Some(in_root),
                 }),
             )
+        }
+        // The FAR-SIDE token holds the remote record through a persistent
+        // session; there is no LOCAL sibling record, so `locks` is `None` and
+        // the session is held directly above.
+        DestinationOwnership::LockedRemote(locked) => {
+            if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
+                return Err(SyncError::from(error));
+            }
+            far_side = Some(locked.session);
+            (locked.prepared, None)
         }
         DestinationOwnership::Unowned => (
             match prepare(direction, local_root, remote, false) {
@@ -2264,14 +2327,43 @@ pub fn sync(
         Direction::Push => (Side::Local(local), Side::Remote(remote)),
         Direction::Pull => (Side::Remote(remote), Side::Local(local)),
     };
-    run(
+    let outcome = run(
         &source,
         &dest,
         policy,
         extraneous,
         locks,
         prepared.source_meta,
-    )
+    );
+    // THE FAR-SIDE LOCK MUST SURVIVE THE RUN. A far-side lock cannot outlive
+    // its client, so if the connection died (or the holder was killed) while
+    // the run was in flight, the destination is NO LONGER exclusively owned at
+    // this point even if every operation happened to succeed. Report that as a
+    // typed transport failure instead of returning a clean `Ok`; the partial
+    // report (when the engine already failed) is preserved, and the two
+    // failures are both in the message.
+    if let Some(session) = far_side.as_mut()
+        && !session.is_alive()
+    {
+        let detail = session.loss_detail();
+        let local_pid = session.local_pid();
+        let loss = Error::transport_kind(
+            TransportKind::BeforeCommand,
+            format!(
+                "the far-side operation-lock session (local ssh client pid {local_pid}) on {} ended \
+                 before the run returned: {detail}. The destination is no longer exclusively owned \
+                 by this run, and a far-side lock cannot outlive its client (it serialises concurrent \
+                 runs but is NOT a lease). This run is therefore reported as FAILED, not as a clean \
+                 success.",
+                session.record().display()
+            ),
+        );
+        return match outcome {
+            Ok(_) => Err(SyncError::from(loss)),
+            Err(original) => Err(original.with_replaced_error(loss)),
+        };
+    }
+    outcome
 }
 
 /// The ownership a run establishes over its destination: the ONE axis that
@@ -2351,6 +2443,14 @@ pub fn sync(
 /// let guard = FileLock::acquire(std::path::Path::new("/tmp/probe2.lock"), "probe").unwrap();
 /// let _forged = InRootLock(guard);
 /// ```
+///
+/// The FAR-SIDE arm's [`LockedRemoteDestination`] payload is private too, so a
+/// caller cannot manufacture a held far-side session either:
+///
+/// ```compile_fail
+/// use storekit::sync::{DestinationOwnership, LockedRemoteDestination};
+/// let _forged = DestinationOwnership::LockedRemote(LockedRemoteDestination {});
+/// ```
 pub enum DestinationOwnership {
     /// The crate TAKES the destination's sibling operation lock
     /// ([`destination_lock_path`]) and holds it for the whole run. Obtainable
@@ -2361,6 +2461,10 @@ pub enum DestinationOwnership {
     /// the whole run. Obtainable ONLY from
     /// [`DestinationOwnership::lock_with_in_root_lock`].
     LockedWithInRoot(LockedDestination, InRootLock),
+    /// The crate TAKES the destination's operation lock ON THE FAR SIDE and
+    /// holds it for the whole run. Obtainable ONLY from
+    /// [`DestinationOwnership::lock_remote`].
+    LockedRemote(LockedRemoteDestination),
     /// The caller has taken the destination for the run out of band; the crate
     /// holds no lock. State this at the call site.
     Unowned,
@@ -2394,6 +2498,37 @@ pub struct LockedDestination {
 /// [`DestinationOwnership::lock_with_in_root_lock`]).
 pub struct InRootLock(FileLock);
 
+/// The proof a run holds its REMOTE destination: a persistent far-side
+/// operation-lock session ([`crate::transport::FarSideLockSession`]) produced
+/// only by [`DestinationOwnership::lock_remote`].
+///
+/// The fields are private and the type has no public constructor, so a caller
+/// cannot build one — from a struct literal, a `From`/`Default` impl, a clone,
+/// or a bare [`crate::lock::FileLock`] — without calling the acquiring
+/// constructor. It carries the preflight the acquisition performed (the pinned
+/// local root, the strict source manifest, and the destination identity) so the
+/// run uses exactly the tree the far-side lock was taken for, and the session
+/// that holds the far-side record.
+///
+/// # What this DOES and DOES NOT guarantee
+///
+/// It guarantees that a COOPERATING run contends on the SAME far-side record
+/// the local case uses ([`destination_lock_path`], a sibling of the destination
+/// root), that the far-side acquisition is NON-BLOCKING (a live holder is
+/// [`crate::error::Error::LockContended`], never a wait), and that the record is
+/// released on every exit path (the session's `Drop`).
+///
+/// It does NOT guarantee the run outlives the CLIENT: a far-side lock cannot
+/// outlive its client, because the far-side holder exits when the connection
+/// drops and the kernel then releases its `flock`. It serialises CONCURRENT runs
+/// that cooperate on the record; it is NOT a lease, and a NON-COOPERATING
+/// far-side writer that never takes the record is outside the crate's exclusion
+/// exactly as for a local destination.
+pub struct LockedRemoteDestination {
+    prepared: Prepared,
+    session: Box<dyn FarSideLockSession>,
+}
+
 impl DestinationOwnership {
     /// ACQUIRE the destination's operation lock for a run in `direction`
     /// against `local_root` and `remote`, or REFUSE — the ONLY way to obtain
@@ -2405,9 +2540,10 @@ impl DestinationOwnership {
     /// only then takes the lock, so a destination the crate cannot lock — a
     /// REMOTE (far-side) one, or a root with no sibling record location — is
     /// REFUSED before any residue is created, and a run refused for its SOURCE
-    /// has created no lock record. The guard is held inside the returned token;
-    /// [`sync`] consumes the token and releases the lock only when the run
-    /// returns.
+    /// has created no lock record. A remote destination is owned instead with
+    /// [`DestinationOwnership::lock_remote`]. The guard is held inside the
+    /// returned token; [`sync`] consumes the token and releases the lock only
+    /// when the run returns.
     pub fn lock(
         direction: Direction,
         local_root: &Path,
@@ -2419,6 +2555,82 @@ impl DestinationOwnership {
             prepared,
             guard,
         }))
+    }
+
+    /// ACQUIRE the destination's operation lock ON THE FAR SIDE for a run in
+    /// `direction` against `local_root` and `remote`, or REFUSE — the ONLY way
+    /// to obtain [`DestinationOwnership::LockedRemote`].
+    ///
+    /// This is the explicitly-named way to OWN a REMOTE (SSH) destination, which
+    /// the plain [`DestinationOwnership::lock`] refuses because its record is on
+    /// the far side. The crate holds the record through a PERSISTENT FAR-SIDE
+    /// LOCK SESSION — a long-lived SSH command whose remote holder takes a
+    /// non-blocking `perl` `flock` on the SAME record the local case uses and
+    /// then blocks until the client's stdin closes — so the exclusion and the
+    /// release on every exit path are real. See
+    /// [`crate::transport::FarSideLockSession`] for the mechanism, what a
+    /// third-party transport must implement, and the honest limitation: a
+    /// far-side lock serialises concurrent runs but cannot outlive its client,
+    /// so it is not a lease.
+    ///
+    /// # Preflight and refusal
+    ///
+    /// The acquisition runs the run's whole preflight first (pin the local root,
+    /// refuse overlapping roots, prepare the transport identity, read the strict
+    /// source manifest) with the LOCAL sibling-record refusal DISABLED, then:
+    ///
+    /// * a LOCAL destination is REFUSED (a PULL's destination is always local) —
+    ///   use [`DestinationOwnership::lock`];
+    /// * a destination whose record cannot be derived is REFUSED;
+    /// * a transport whose [`crate::transport::Remote::lock_far_side`] is the
+    ///   default (it does not implement far-side locking) REFUSES with a typed
+    ///   error naming the override it needs.
+    ///
+    /// A far-side acquisition that CONTENDS (a live holder) returns the typed
+    /// [`crate::error::Error::LockContended`] IMMEDIATELY — never a wait. A far
+    /// side that cannot be used (no `perl`, an uncreatable or read-only parent
+    /// directory) fails CLOSED with a typed transport error, and the run does
+    /// NOT proceed unowned.
+    pub fn lock_remote(
+        direction: Direction,
+        local_root: &Path,
+        remote: &dyn Remote,
+    ) -> Result<DestinationOwnership> {
+        // The whole preflight EXCEPT the local sibling-record refusal: a remote
+        // destination has no local record, and the remote-specific checks live
+        // below. The identity is prepared and the source manifest read BEFORE
+        // the far-side record is created, so a run refused for its SOURCE (or an
+        // unreachable host) leaves no far-side lock record behind.
+        let prepared = prepare(direction, local_root, remote, false)?;
+        if prepared.dest_is_local {
+            return Err(Error::preflight(format!(
+                "refusing to acquire a FAR-SIDE lock for {}: it names a LOCAL destination (a \
+                 PULL's destination is always local), whose record is on this host. Use \
+                 `DestinationOwnership::lock` for a local destination.",
+                prepared.dest_root.display()
+            )));
+        }
+        // ONE authority for the record's spelling: the SAME derivation the local
+        // case uses, applied to the far-side root spelling.
+        let Some(record) = destination_lock_path(&prepared.dest_root) else {
+            return Err(Error::preflight(format!(
+                "refusing to own the remote destination {}: no operation-lock record can be placed \
+                 as a SIBLING of that root on the far side. If the caller holds the destination for \
+                 the run, pass `DestinationOwnership::Unowned`.",
+                prepared.dest_root.display()
+            )));
+        };
+        let op_id = format!(
+            "storekit {direction:?} of {} (client pid {})",
+            prepared.dest_root.display(),
+            std::process::id()
+        );
+        // Fail closed: the transport default for `lock_far_side` refuses, so a
+        // transport that cannot hold a far-side lock can never run unowned here.
+        let session = remote.lock_far_side(&record, &op_id)?;
+        Ok(DestinationOwnership::LockedRemote(
+            LockedRemoteDestination { prepared, session },
+        ))
     }
 
     /// ACQUIRE BOTH the destination's sibling operation lock
@@ -3159,7 +3371,10 @@ fn parent_need(kind: EntryKind, dest_kind: Option<EntryKind>) -> ParentNeed {
 /// when the run returns (or unwinds), and the kernel releases the flocks when
 /// the descriptors close even if the drop never runs (a `SIGKILL`ed holder).
 struct HeldLocks {
-    _sibling: FileLock,
+    /// The sibling record [`destination_lock_path`] derives. `None` for the
+    /// FAR-SIDE (remote) ownership, which has no local record: its record is
+    /// held by the [`FarSideLockSession`] in `sync`'s stack frame instead.
+    _sibling: Option<FileLock>,
     _in_root: Option<FileLock>,
 }
 

@@ -305,9 +305,9 @@ simplification; removing one means adding back the logic it removes.
 
 Three places where this crate's guarantees and a real consumer's design pull
 apart. They are recorded here, with evidence and the decision, so the owner
-decides them deliberately rather than by omission. (a) and (c) are CLOSED — (a)
-by the composed ownership form below, (c) by the fd-confined tree helpers; (b)
-remains a documented limitation with its owner decision unchanged.
+decides them deliberately rather than by omission. (a), (b) and (c) are CLOSED —
+(a) by the composed ownership form below, (b) by the persistent far-side lock
+session below, (c) by the fd-confined tree helpers.
 
 ### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — CLOSED (composed BY NAME)
 
@@ -372,28 +372,67 @@ Do NOT move the sync's own record in-root: that still breaks the
 precisely so the in-root record is only taken when the caller names it and
 accepts the root-must-exist cost.
 
-### (b) Ownership enforcement is unavailable for exactly the remote case — DOCUMENTED LIMITATION, OWNER DECISION
+### (b) Ownership enforcement was unavailable for exactly the remote case — CLOSED (a persistent far-side lock session)
 
-The ONE entry point `sync` takes the destination's operation lock only through
+The ONE entry point `sync` took the destination's operation lock only through
 the unforgeable `DestinationOwnership::Locked` token, which
-`DestinationOwnership::lock` produces by ACTUALLY taking the lock; a remote
-(SSH) destination can never be locked, because the far-side sidecar `flock`
-lives inside a single remote command and dies with it (the `sync` module docs).
-The acquiring constructor therefore REFUSES such a destination, and the only
-way to reach it is to pass `DestinationOwnership::Unowned` at the call site.
-The consolidation did NOT remove the limitation — a far-side destination still
-cannot be held for a run, and for an unowned run the crate enforces NEITHER the
-destination lock NOR any far-side exclusion — but it removed the SECOND entry
-point that used to express it: there is no `sync_unowned` whose existence
-implies the weak path is a normal choice, only a value the caller must name. So
-the crate's strongest guarantee still applies to the case a cross-host tool
-uses LEAST.
+`DestinationOwnership::lock` produces by ACTUALLY taking the lock on a LOCAL
+record; a remote (SSH) destination could never be locked, because a one-shot
+far-side `flock` lived inside a single remote command and died with it (the
+`sync` module docs). The acquiring constructor therefore REFUSED such a
+destination, and the only way to reach it was to pass
+`DestinationOwnership::Unowned` at the call site. The crate's strongest
+guarantee therefore applied to the case a cross-host tool uses LEAST.
 
-RECOMMENDATION (owner decision): keep the refusal (fail-closed beats silently
-unowned) and, if the remote case must be owned, build a persistent far-side
-lock session (a long-lived SSH mux command holding the record) rather than
-widening the one entry point. Until then this is a documented limitation, not a
-defect.
+DECISION (the crate's own recommendation, taken): a remote destination can now be
+OWNED, BY NAME, through
+`DestinationOwnership::lock_remote(direction, local_root, remote)`, which holds
+the destination's operation lock ON THE FAR SIDE for the whole run. The refusal
+is KEPT: `DestinationOwnership::lock` still refuses a remote destination exactly
+as before, and `DestinationOwnership::Unowned` still reaches it; `lock_remote`
+is an ADDITIONAL, explicitly-named way to own it, not a widening of the weak
+path.
+
+* **The record is the SAME one the local case uses.**
+  `destination_lock_path`'s derivation — a SIBLING of the destination root,
+  `.<name>.operation.lock` — is applied to the far-side root spelling, so a
+  far-side holder and a local one contend on one record by construction.
+* **The mechanism is a persistent far-side lock session, not a widened
+  `sync`.** `lock_remote` spawns a long-lived local `ssh` client whose remote
+  `perl` opens the record `O_RDWR|O_CREAT|O_NOFOLLOW` at `0600`, takes
+  `flock(LOCK_EX|LOCK_NB)`, writes the holder identity into the record, prints a
+  `LOCKOK` readiness line, and then BLOCKS reading stdin. `perl`'s built-in
+  `flock` is used deliberately: the far side may be GNU or BSD, `flock(1)` does
+  not exist on macOS, and perl is already required for the crate's other
+  far-side primitives.
+* **Acquisition is NON-BLOCKING.** A live holder is the typed
+  `Error::LockContended` IMMEDIATELY, never a wait (the far-side `flock` is
+  `LOCK_EX|LOCK_NB`).
+* **The lock is held for the run's duration and released on EVERY exit path.**
+  The session guard lives for the whole `sync` call (it is in `sync`'s stack
+  frame, exactly as `HeldLocks` is); its `Drop` closes the client's stdin, waits
+  bounded for the far-side holder to exit, then kills and reaps the client — so
+  an ordinary return, an error return, and a panic unwind all release it.
+* **A lost connection releases it, and is REPORTED.** A far-side lock cannot
+  outlive its client: if the connection dies, the holder sees EOF and exits and
+  the kernel releases the `flock`. That is a real property with a consequence
+  the crate STATES rather than hides — the far-side lock SERIALISES concurrent
+  runs but is NOT a lease. A run whose session died mid-run returns a typed
+  transport failure naming the lost lock, never a clean `Ok`.
+* **Fail closed on an unusable far side.** No `perl` is
+  `TransportKind::InterpreterMissing`; an uncreatable or read-only parent, or a
+  real `flock` failure, is `TransportKind::FarSideScript` with an actionable
+  message; a transport that does not implement far-side locking
+  (`Remote::lock_far_side`'s DEFAULT) is a typed `Preflight` refusal naming the
+  override it needs. The run never proceeds unowned.
+* **The unowned path is UNCHANGED.** A remote destination without `lock_remote`
+  is still refused by `DestinationOwnership::lock` exactly as before, and
+  `DestinationOwnership::Unowned` still reaches it.
+
+The limitation that REMAINS: a NON-COOPERATING far-side writer that never takes
+the record is outside the crate's exclusion, exactly as for a local
+destination — the crate cannot force another program to take the lock — and a
+far-side lock cannot outlive its client, so it is not a lease.
 
 ### (c) The fd-confined tree helpers the source tool calls had no public equivalent — CRATE DEFECT, FIXED HERE
 

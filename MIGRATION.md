@@ -55,13 +55,21 @@ domain. This file is the ordered checklist and the record of what does NOT map.
   acquisitions non-blocking so the order cannot deadlock. A `deploy` destination
   that has its own in-root record should take this form, and it must already
   exist (the composed form refuses a missing root without creating anything).
-- **(b) A remote destination cannot be locked — STATED LIMITATION, unresolved.**
-  A far-side lock cannot be held by a run, so `sync`/`push` REFUSE a remote
-  destination they cannot lock and the caller must write
-  `DestinationOwnership::Unowned`. The migration must therefore keep `deploy`'s
-  own far-side serialisation and accept that the crate's ownership guarantee
-  does not apply to a remote destination. Closing this needs a persistent
-  far-side lock session, which the crate does not have.
+- **(b) A remote destination can now be locked — CLOSED.**
+  `DestinationOwnership::lock_remote(direction, local_root, remote)` holds the
+  destination's operation lock ON THE FAR SIDE for the whole run through a
+  persistent far-side lock session (a long-lived `ssh` client whose remote
+  `perl` takes a non-blocking `flock` on the SAME sibling record the local case
+  uses). A `deploy` push into a remote destination should prefer this over
+  `DestinationOwnership::Unowned`: it serialises concurrent cooperating runs and
+  the record is released on every exit path. It is NOT a lease — a far-side lock
+  cannot outlive its client — so `deploy`'s own far-side serialisation need not
+  be DELETED for correctness while the run still depends on it; `lock_remote` is
+  the crate-level exclusion, and `deploy`'s own protocol can be retired once the
+  run no longer needs it. A NON-COOPERATING far-side writer is still outside the
+  crate's exclusion. The pre-existing refusal is unchanged: `sync` still refuses
+  a remote destination the caller does not own, and `Unowned` still names the
+  weaker path.
 
 ## The one real data migration: the receiver marker
 
@@ -97,5 +105,4 @@ existing production state, and neither side's tests cover it as it stands.
 ## Out of scope
 
 - the Windows runtime (`deploy`'s Windows port is type-checked only, and the
-  crate's Windows test target compiles but has never executed);
-- design conflict (b).
+  crate's Windows test target compiles but has never executed).

@@ -330,6 +330,80 @@ pub struct FsBytes {
     pub available: u64,
 }
 
+/// A HELD far-side operation-lock session: the proof that a run owns a REMOTE
+/// destination for its whole duration, obtained only from
+/// [`Remote::lock_far_side`] and carried by
+/// [`crate::sync::DestinationOwnership::LockedRemote`].
+///
+/// # Why a session, and how it works
+///
+/// A local destination is owned by a `flock` on a record file this host can
+/// open ([`crate::sync::sync`]'s sibling `.<name>.operation.lock`). A REMOTE
+/// destination has no such local record: the far side is only reachable
+/// through [`Remote::exec`], and a one-shot far-side `flock` dies with the
+/// command that took it. This trait is the seam for a transport that KEEPS a
+/// far-side holder alive for the run — [`SshTransport`] spawns a long-lived
+/// `ssh` client whose remote `perl` takes a non-blocking `flock` on the SAME
+/// record the local case uses and then blocks reading its stdin.
+///
+/// The session ends when the guard is DROPPED (a normal return, an error
+/// return, and a panic unwind all run `Drop`), when [`Self::release`] is
+/// called, or when the CONNECTION DIES. A dropped connection therefore
+/// releases the record: the far-side holder sees EOF on the closed channel
+/// and exits, and the kernel releases the `flock` when its process dies. Two
+/// consequences a caller MUST internalise, and the crate states rather than
+/// hides:
+///
+/// * **A far-side lock cannot outlive its client.** It serialises CONCURRENT
+///   runs that cooperate on the record, but it is NOT a lease: if the client
+///   dies, the lock is gone while any far-side work it triggered may not be.
+/// * **A connection lost mid-run is reported, never a clean success.** A run
+///   checks [`Self::is_alive`] before returning; a dead session turns the run
+///   into a typed transport error naming the lost lock, because the
+///   destination is no longer exclusively owned at that point.
+///
+/// # What a third-party implementor must do
+///
+/// [`Remote::lock_far_side`] has a DEFAULT that REFUSES (fail closed), so a
+/// transport that does not override it can never silently run an unowned
+/// remote destination — `crate::sync::DestinationOwnership::lock_remote`
+/// returns a typed error instead. A transport that wants to support owning a
+/// remote destination MUST override [`Remote::lock_far_side`] and return a
+/// session that:
+///
+/// * acquires the record NON-BLOCKING and maps a live holder to the typed
+///   [`crate::error::Error::LockContended`] (a refusal, never a wait);
+/// * holds the record until the guard is dropped, and releases it on drop on
+///   EVERY path (return, error, panic);
+/// * releases it when its connection dies, so no stale lock is left; and
+/// * reports `is_alive() == false` once the session is gone.
+///
+/// The record is always the path derived by
+/// [`crate::sync::destination_lock_path`] from [`Remote::root`] — the crate's
+/// ONE spelling authority — so a far-side holder and a local one contend on
+/// exactly the same record.
+pub trait FarSideLockSession: Send {
+    /// The far-side record this session holds (for diagnostics). It is the
+    /// absolute path ON THE FAR SIDE passed to [`Remote::lock_far_side`].
+    fn record(&self) -> &Path;
+    /// Whether the session is STILL held. `false` once the connection dropped
+    /// or the far-side holder exited (or after [`Self::release`]), so a run
+    /// can refuse to report a clean success for a destination it no longer
+    /// owns.
+    fn is_alive(&mut self) -> bool;
+    /// A human-readable description of how the session ended, for the
+    /// connection-loss diagnostic. Empty while alive.
+    fn loss_detail(&mut self) -> String;
+    /// The OS pid of the LOCAL process backing the session (the `ssh` client
+    /// for [`SshTransport`]), for diagnostics and for a caller that must
+    /// terminate exactly this connection. Never `0`.
+    fn local_pid(&self) -> u32;
+    /// Release the session NOW (idempotent). Dropping the guard releases it
+    /// too; this exists for a caller that wants the record released before the
+    /// token is dropped.
+    fn release(&mut self);
+}
+
 /// Filesystem + execution surface for one server's remote root.
 ///
 /// Every path a transport operation receives is a validated
@@ -741,6 +815,40 @@ pub trait Remote {
     /// reserve is a percentage of the TOTAL size, while the fit check
     /// compares against the AVAILABLE space.
     fn filesystem_bytes(&self) -> Result<FsBytes>;
+
+    /// Acquire a PERSISTENT far-side lock session on the operation-lock record
+    /// at `record` (an absolute path ON THE FAR SIDE, derived by
+    /// [`crate::sync::destination_lock_path`] from [`Remote::root`]), or
+    /// refuse.
+    ///
+    /// `op_id` is the holder identity to record at the far side, so a refused
+    /// contender's diagnostic can name the run that holds the record; it is the
+    /// far-side twin of the identity [`crate::lock::FileLock::acquire`] writes
+    /// into the local record.
+    ///
+    /// The acquisition MUST be NON-BLOCKING: a record held by a live holder is
+    /// the typed [`crate::error::Error::LockContended`], never a wait. The
+    /// returned session holds the record until it is dropped (see
+    /// [`FarSideLockSession`]).
+    ///
+    /// The DEFAULT REFUSES (fail closed): a transport that does not override
+    /// this cannot own a remote destination, so
+    /// [`crate::sync::DestinationOwnership::lock_remote`] returns a typed error
+    /// telling the caller to override [`Remote::lock_far_side`] or to state the
+    /// weaker guarantee with `DestinationOwnership::Unowned`. Only
+    /// [`SshTransport`] overrides it. See [`FarSideLockSession`] for the full
+    /// contract a third-party override must satisfy.
+    fn lock_far_side(&self, record: &Path, op_id: &str) -> Result<Box<dyn FarSideLockSession>> {
+        let _ = (record, op_id);
+        Err(Error::preflight(format!(
+            "this transport cannot hold a far-side operation lock for the remote root {}: \
+             `DestinationOwnership::lock_remote` requires a transport that overrides \
+             `Remote::lock_far_side` (only `SshTransport` does). If the caller holds the \
+             destination for the run, pass `DestinationOwnership::Unowned` (the explicitly \
+             weaker path).",
+            self.root().display()
+        )))
+    }
 
     /// Atomic recover of the operation lock: remove `rel` iff it equals
     /// `observed`, then install `new_data`, all while holding the sidecar

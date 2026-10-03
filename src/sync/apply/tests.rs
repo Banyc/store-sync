@@ -12458,6 +12458,40 @@ fn composed_ownership_refuses_a_remote_destination_like_the_plain_form() {
     );
 }
 
+/// The FAR-SIDE ownership seam's DEFAULT is FAIL-CLOSED. A transport that
+/// does not override [`Remote::lock_far_side`] (here the [`RecordingRemote`]
+/// double, which declares itself remote but has no far-side locking) cannot be
+/// used to OWN a remote destination: [`DestinationOwnership::lock_remote`]
+/// returns a typed [`Error::Preflight`] refusal naming the override a
+/// third-party implementor must supply, and NEVER falls back to an unowned run.
+/// The preflight (identity preparation and the strict source manifest) runs
+/// BEFORE the far-side acquisition, so the refusal comes from the seam itself
+/// and the destination root is untouched.
+#[test]
+fn lock_remote_refuses_a_transport_without_far_side_locking() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(&dst).unwrap();
+    let before = canonicalize_tree(&dst).unwrap();
+    let remote = RecordingRemote::over(transport(&dst), false);
+    let error = match DestinationOwnership::lock_remote(Direction::Push, &src, &remote) {
+        Err(error) => error,
+        Ok(_) => panic!("a transport without far-side locking must be refused"),
+    };
+    assert!(matches!(error, Error::Preflight(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("lock_far_side"),
+        "the refusal must name the override a transport needs: {error}"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap(),
+        before,
+        "the refused far-side acquisition mutated nothing"
+    );
+}
+
 /// The weak path is REACHABLE and correct: an explicitly unowned run against
 /// the same remote destination transfers and verifies normally. The refusal
 /// above is a redirect, not a removal of the capability.
