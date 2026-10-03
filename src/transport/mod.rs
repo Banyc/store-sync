@@ -2533,9 +2533,11 @@ impl Remote for LocalTransport {
         // other spelling are refused before any mutation, because claiming one
         // away would swap its inode and admit a second holder. The owned record
         // is serialized through the sidecar mutex so its compare-then-delete is
-        // operation-atomic. The selection is FOLD-AWARE (case and trailing
-        // dot/space aliases of the layout lock count as the layout lock), so a
-        // `state/OPERATION.LOCK` spelling cannot skip the sidecar.
+        // operation-atomic. The selection is IDENTITY-AWARE: a case alias that
+        // resolves to the layout lock's OWN inode (macOS `state/OPERATION.LOCK`)
+        // counts as the layout lock and takes the sidecar; a spelling that is a
+        // DISTINCT on-disk entry (a trailing-dot alias, or a case alias on a
+        // case-sensitive filesystem) is refused.
         let guarded = self.guarded_mutation_target(rel)?;
         if guarded.is_owned_lock_record() {
             return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
@@ -2739,18 +2741,22 @@ impl LocalTransport {
     /// Mint the ONE capability every lock-record-breaking local mutation must
     /// present, through the guard's owned-lock-record constructor. It refuses
     /// every lock-record spelling EXCEPT the single layout lock the protocol
-    /// OWNS ([`crate::reserved::is_same_lock_record_path`], the crate's ONE
-    /// case/trailing-dot fold), so a future `*_if`-style primitive cannot
+    /// OWNS, decided by IDENTITY (the layout lock's resolved device/inode) and
+    /// not by a spelling fold, so a future `*_if`-style primitive cannot
     /// repeat the D1 hole: it either mints a capability (which runs the guard)
     /// or cannot call a mutation worker, whose argument is that capability.
     fn guarded_mutation_target<'a>(
         &self,
         rel: &'a RootedRelativePath,
     ) -> Result<crate::atomic::GuardedRel<'a>> {
-        crate::atomic::GuardedRel::new_for_owned_lock_record(
-            rel.as_path(),
-            self.layout.lock.as_path(),
-        )
+        // The ownership authority is built from THIS transport's own layout,
+        // never from the candidate path: the guard compares the candidate's
+        // resolved (device, inode) against the layout lock's, so only the
+        // record that IS the layout lock's on-disk entry is granted, and every
+        // other lock-record spelling (including a case/dot alias that is a
+        // distinct entry on this filesystem) is refused.
+        let owned = crate::atomic::OwnedLockRecord::local(&self.base, &self.layout);
+        crate::atomic::GuardedRel::new_for_owned_lock_record(rel.as_path(), &owned)
     }
 
     fn remove_file_if_inner(
@@ -3699,19 +3705,23 @@ mod tests {
         );
     }
 
-    /// D2 — the sidecar selection must fold a case alias of the layout lock.
-    /// On macOS `state/OPERATION.LOCK` resolves to `state/operation.lock`, but
-    /// the byte-exact comparison sent it down the claim-by-rename fallback, so
-    /// the sanctioned mutex was skipped for the protocol's OWN record. After
-    /// the fix the alias is recognised through the reserved-name fold and goes
-    /// through the sidecar, so a mismatched compare leaves the inode in place
-    /// and a second holder is refused. The on-disk half is skipped on a
-    /// case-sensitive filesystem (Linux), where the two spellings are distinct
-    /// entries; the predicate is pinned on every platform by
-    /// `reserved::tests::same_lock_record_path_folds_case_and_trailing_dots`.
+    /// D2 (identity) — the owned-record selection is decided by IDENTITY, not
+    /// by a spelling fold. Runs on macOS AND Linux with NO skip.
+    ///
+    /// * Where `state/OPERATION.LOCK` resolves to the SAME inode as
+    ///   `state/operation.lock` (macOS APFS), the alias IS the owned record: the
+    ///   mutation takes the sidecar route (a mismatch is a Mismatch, the inode
+    ///   stays, a second holder is refused) and the sanctioned break works
+    ///   through the alias.
+    /// * Where it is a DISTINCT entry (any case-sensitive filesystem), the
+    ///   mutation is REFUSED before anything runs, the owned record's inode is
+    ///   unchanged, a second holder is refused, and the legitimate break of the
+    ///   OWNED spelling still works. Pre-fix the fold granted ownership to the
+    ///   distinct entry; `remove_file_if_grants_ownership_only_to_the_owned_inode`
+    ///   additionally makes that distinct entry a live second holder.
     #[cfg(unix)]
     #[test]
-    fn remove_file_if_folds_a_case_alias_of_the_layout_lock_into_the_sidecar_route() {
+    fn remove_file_if_decides_the_owned_record_by_identity_not_by_a_fold() {
         use crate::error::Error;
         use std::os::unix::fs::MetadataExt;
 
@@ -3720,46 +3730,172 @@ mod tests {
         let t =
             LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
         let record = base.join("state/operation.lock");
-        let alias = base.join("state/OPERATION.LOCK");
         let holder = crate::lock::FileLock::acquire(&record, "A").unwrap();
-        if std::fs::metadata(&alias).is_err() {
-            crate::test_support::announce_skip(
-                "this filesystem is case-SENSITIVE, so `state/OPERATION.LOCK` is a DIFFERENT path \
-                 from `state/operation.lock` and the fold-aware sidecar selection cannot be \
-                 exercised on disk here; the fold rule is pinned by \
-                 reserved::tests::same_lock_record_path_folds_case_and_trailing_dots",
-            );
-            return;
-        }
         let before = std::fs::metadata(&record).unwrap().ino();
+        let alias = base.join("state/OPERATION.LOCK");
+        let same_entry = std::fs::metadata(&alias)
+            .map(|m| m.ino())
+            .is_ok_and(|ino| ino == before);
         let rel = RootedRelativePath::parse(Path::new("state/OPERATION.LOCK")).unwrap();
-        // A mismatch is a Mismatch verdict — the alias went through the sidecar
-        // as the OWNED record — and leaves the inode intact.
-        assert_eq!(
-            t.remove_file_if(&rel, b"not-the-record").unwrap(),
-            RemoveIfVerdict::Mismatch,
-            "the alias must be the owned record (sidecar route), not a refused foreign spelling"
-        );
-        assert_eq!(
-            std::fs::metadata(&record).unwrap().ino(),
-            before,
-            "the mismatched compare must not touch the record's inode"
-        );
-        let second = crate::lock::FileLock::acquire(&record, "B");
-        assert!(
-            matches!(&second, Err(Error::LockContended(_))),
-            "a second holder must stay contended"
-        );
-        // A matching compare is the SANCTIONED break: the record is removed,
-        // proving the alias is authorized rather than merely refused.
-        let current = std::fs::read(&record).unwrap();
-        assert_eq!(
-            t.remove_file_if(&rel, &current).unwrap(),
-            RemoveIfVerdict::Removed,
-            "a matching alias removal is the sanctioned owned-record break"
-        );
-        assert!(!record.exists(), "the sanctioned break removes the record");
+        if same_entry {
+            // macOS: the alias IS the owned record (same inode) -> sidecar.
+            assert_eq!(
+                t.remove_file_if(&rel, b"not-the-record").unwrap(),
+                RemoveIfVerdict::Mismatch,
+                "the same-inode alias must be the owned record (sidecar route)"
+            );
+            assert_eq!(
+                std::fs::metadata(&record).unwrap().ino(),
+                before,
+                "the mismatched compare must not touch the record's inode"
+            );
+            let second = crate::lock::FileLock::acquire(&record, "B");
+            assert!(
+                matches!(&second, Err(Error::LockContended(_))),
+                "a second holder must stay contended"
+            );
+            let current = std::fs::read(&record).unwrap();
+            assert_eq!(
+                t.remove_file_if(&rel, &current).unwrap(),
+                RemoveIfVerdict::Removed,
+                "a matching alias removal is the sanctioned owned-record break"
+            );
+            assert!(!record.exists(), "the sanctioned break removes the record");
+        } else {
+            // Case-sensitive filesystem: the alias is a DISTINCT entry.
+            let err = t
+                .remove_file_if(&rel, b"not-the-record")
+                .expect_err("a distinct on-disk entry must be REFUSED, never granted ownership");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("lock record"),
+                "the refusal must name the lock record, got: {msg}"
+            );
+            assert_eq!(
+                std::fs::metadata(&record).unwrap().ino(),
+                before,
+                "the refused alias must not touch the owned record's inode"
+            );
+            let second = crate::lock::FileLock::acquire(&record, "B");
+            assert!(
+                matches!(&second, Err(Error::LockContended(_))),
+                "the owned record must stay contended"
+            );
+            // The owned spelling is still the legitimate, sanctioned break.
+            let current = std::fs::read(&record).unwrap();
+            let owned_rel = RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap();
+            assert_eq!(
+                t.remove_file_if(&owned_rel, &current).unwrap(),
+                RemoveIfVerdict::Removed,
+                "the legitimate break of the owned record still works"
+            );
+            assert!(!record.exists(), "the sanctioned break removes the record");
+        }
         drop(holder);
+    }
+
+    /// F1 — ownership is granted by IDENTITY, not by a fold. For each lock-record
+    /// alias that is a DISTINCT on-disk entry on this filesystem, make it a live
+    /// second holder, then assert `remove_file_if` is REFUSED and neither entry's
+    /// inode moves. For an alias that resolves to the owned record's OWN inode
+    /// (macOS case aliases), assert the sidecar route still authorizes the break.
+    ///
+    /// Pre-fix, the fold granted ownership to every row, so the sidecar/claim
+    /// route removed the DISTINCT alias entry — freeing the second holder's inode
+    /// and admitting a third acquisition. Every assertion below fails pre-fix on
+    /// macOS (trailing dot/space) and Linux (case and trailing dot/space alike).
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_grants_ownership_only_to_the_owned_inode() {
+        use crate::error::Error;
+        use std::os::unix::fs::MetadataExt;
+
+        for (case, alias_text) in [
+            ("trailing-dot", "state/operation.lock."),
+            ("trailing-space", "state/operation.lock "),
+            ("case", "state/OPERATION.LOCK"),
+            ("dir-case", "STATE/operation.lock"),
+        ] {
+            let dir =
+                crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let base = dir.path().join("r");
+            let t = LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty())
+                .unwrap();
+            let record = base.join("state/operation.lock");
+            let holder = crate::lock::FileLock::acquire(&record, "A").unwrap();
+            let record_ino = std::fs::metadata(&record).unwrap().ino();
+            let alias = base.join(alias_text);
+            let alias_same_entry = std::fs::metadata(&alias)
+                .map(|m| m.ino())
+                .is_ok_and(|ino| ino == record_ino);
+            let rel = RootedRelativePath::parse(Path::new(alias_text)).unwrap();
+            if alias_same_entry {
+                // The alias IS the owned entry: the sidecar route authorizes it.
+                let before = std::fs::metadata(&record).unwrap().ino();
+                assert_eq!(
+                    t.remove_file_if(&rel, b"not-the-record").unwrap(),
+                    RemoveIfVerdict::Mismatch,
+                    "{case}: a same-inode alias is the owned record (sidecar route)"
+                );
+                assert_eq!(
+                    std::fs::metadata(&record).unwrap().ino(),
+                    before,
+                    "{case}: the mismatched compare leaves the record's inode intact"
+                );
+                let second = crate::lock::FileLock::acquire(&record, "B");
+                assert!(
+                    matches!(&second, Err(Error::LockContended(_))),
+                    "{case}: a second holder must stay contended"
+                );
+                let current = std::fs::read(&record).unwrap();
+                assert_eq!(
+                    t.remove_file_if(&rel, &current).unwrap(),
+                    RemoveIfVerdict::Removed,
+                    "{case}: the sanctioned break still works through the alias"
+                );
+                assert!(!record.exists(), "{case}: the sanctioned break removes it");
+            } else {
+                // A DISTINCT on-disk entry: make it a live second holder.
+                let second_holder = crate::lock::FileLock::acquire(&alias, "B").unwrap();
+                let alias_ino = std::fs::metadata(&alias).unwrap().ino();
+                assert_ne!(
+                    alias_ino, record_ino,
+                    "{case}: the alias is a distinct entry"
+                );
+                let alias_content = std::fs::read(&alias).unwrap();
+                for expected in [b"wrong".as_slice(), alias_content.as_slice()] {
+                    let verdict = t.remove_file_if(&rel, expected);
+                    assert!(
+                        verdict.is_err(),
+                        "{case}: remove_file_if on a DISTINCT lock-record entry must be REFUSED, \
+                         got {verdict:?} (pre-fix the fold granted ownership and freed it)"
+                    );
+                    assert_eq!(
+                        std::fs::metadata(&alias).unwrap().ino(),
+                        alias_ino,
+                        "{case}: the distinct alias entry's inode must be unchanged"
+                    );
+                }
+                assert_eq!(
+                    std::fs::metadata(&record).unwrap().ino(),
+                    record_ino,
+                    "{case}: the owned record's inode must be unchanged"
+                );
+                let alias_second = crate::lock::FileLock::acquire(&alias, "C");
+                assert!(
+                    matches!(&alias_second, Err(Error::LockContended(_))),
+                    "{case}: the DISTINCT alias's holder must survive — a second acquire must be \
+                     contended (pre-fix it succeeded, proving two holders)"
+                );
+                let owned_second = crate::lock::FileLock::acquire(&record, "D");
+                assert!(
+                    matches!(&owned_second, Err(Error::LockContended(_))),
+                    "{case}: the owned record's holder must survive"
+                );
+                drop(second_holder);
+            }
+            drop(holder);
+        }
     }
 
     /// D1/D2 — the LEGITIMATE case, on both platforms: the ONE record the

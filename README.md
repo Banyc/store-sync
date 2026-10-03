@@ -200,6 +200,17 @@ simplification; removing one means adding back the logic it removes.
 - An oracle must be able to express the failure it is meant to catch — in the
   inputs it varies and in the paths it samples.
 - A document that contradicts the code is a defect in whichever is wrong.
+- A fold is a DENIAL tool, never a PERMISSION tool. Unifying spellings (case,
+  trailing dot/space) may only make the crate refuse MORE; it must never decide
+  that two spellings are one thing when the thing grants a right. Ownership of
+  a resource is decided by IDENTITY — the resolved on-disk entry (device and
+  inode) — not by whether two spellings fold together, because on some
+  filesystems a folded spelling is a different entry that another holder owns.
+  The one spelling fallback allowed is byte-exact equality while the entry does
+  not exist yet (creating it). Concretely: refusing a lock-record spelling folds
+  case and the Win32 trailing dot/space, while the protocol's authority to
+  break the lock record it owns compares the candidate's resolved identity with
+  the layout lock's and refuses every alias that is a distinct entry.
 - Refusing a case beats transforming it; deleting a capability beats shipping a
   broken one.
 - State every bound with the reason it holds.

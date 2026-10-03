@@ -2408,13 +2408,12 @@ impl Remote for SshTransport {
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
         // The sanctioned protocol may break EXACTLY the ONE record the layout
         // OWNS: the guard refuses every other lock-record spelling before any
-        // remote command runs, and the fold-aware scope selects the sidecar for
-        // a case/trailing-dot alias of the owned record (the same authority
-        // [`LocalTransport`] uses).
-        let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(
-            rel.as_path(),
-            self.layout.lock.as_path(),
-        )?;
+        // remote command runs, and the scope selects the sidecar only for the
+        // layout lock's OWN spelling. A REMOTE transport cannot stat the far
+        // side, so ownership is byte-exact here; a case/dot alias may be a
+        // distinct far-side entry and is therefore REFUSED, never granted.
+        let owned = crate::atomic::OwnedLockRecord::remote(&self.layout);
+        let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(rel.as_path(), &owned)?;
         // The remote compare runs a shell command carrying `expected` as an
         // argv token: a non-UTF-8 `expected` could only be embedded LOSSILY,
         // so the compare would be against a different byte string than the
@@ -2636,12 +2635,11 @@ impl Remote for SshTransport {
         // can refuse to publish a short (connection-loss-truncated) payload.
         let expected_len = data.len() as u64;
         // The same ONE guard/scope authority as the local transport: a foreign
-        // lock-record spelling is refused before any remote command, and a
-        // case/trailing-dot alias of the owned record takes the sidecar route.
-        let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(
-            rel.as_path(),
-            self.layout.lock.as_path(),
-        )?;
+        // lock-record spelling is refused before any remote command, and the
+        // sidecar route is taken only for the owned record's byte-exact
+        // spelling (the far side cannot be stat'ed from here).
+        let owned = crate::atomic::OwnedLockRecord::remote(&self.layout);
+        let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(rel.as_path(), &owned)?;
         let cmd = if guarded.is_owned_lock_record() {
             self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE, expected_len)
         } else {
@@ -2752,7 +2750,8 @@ impl Remote for SshTransport {
         new_data: &[u8],
     ) -> Result<Option<()>> {
         // Only the operation lock's recover is sidecar-serialized; other paths are not supported.
-        if !crate::reserved::is_same_lock_record_path(rel.as_path(), self.layout.lock.as_path()) {
+        let owned = crate::atomic::OwnedLockRecord::remote(&self.layout);
+        if !owned.owns(rel.as_path()) {
             return Ok(None);
         }
         // `observed` and `new_data` cross into the remote perl command as argv

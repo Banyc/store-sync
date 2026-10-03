@@ -72,8 +72,8 @@
 //!   [`openat_no_follow_io`] run the guard at the PRIMITIVE, so a new caller
 //!   of an existing wrapper is guarded without remembering to be;
 //! * the wrappers are private and every direct name-mutating `libc` call in
-//!   the crate lives in [`unix`] (enforced by the source audits in
-//!   `guard::tests::no_raw_name_mutating_syscall_outside_the_funnel` and
+//!   the crate lives in [`unix`] (enforced by the source audits
+//!   `guard::tests::no_libc_reference_outside_the_funnel` and
 //!   `guard::tests::std_fs_name_mutation_counts_are_pinned`), so a new
 //!   primitive must either present the capability or fail an audit.
 //!
@@ -119,8 +119,10 @@ mod windows;
 // THE one lock-record guard authority and its unforgeable capability. The
 // `guard` module's fields are private, so no other module can build a
 // `GuardedRel` without running the guard; the rel-path mutators demand one.
+// `OwnedLockRecord` is the unforgeable OWNERSHIP authority the guard consults;
+// it can only be built from the transport's own `Layout`.
 // The alias keeps the historical spelling used throughout the primitives.
-pub(crate) use guard::GuardedRel;
+pub(crate) use guard::{GuardedRel, OwnedLockRecord};
 
 /// Run the lock-record guard through the capability's constructors
 /// ([`GuardedRel::new`] for ordinary content and
