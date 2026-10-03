@@ -50,13 +50,18 @@
 //! out of the way itself and retry. The crate never makes that decision for the
 //! caller.
 //!
-//! The check-then-rename window is closed against a COOPERATING writer by the
-//! destination's operation lock, which a sync run holds for its whole duration;
-//! a NON-cooperating writer is outside the crate's exclusion, exactly as it is
-//! for every other sync mutation (see [`crate::sync`]'s lock discipline).
+//! The check-then-rename window is closed against a COOPERATING writer because
+//! [`Residue::recover_to`] takes the destination's operation lock
+//! ([`crate::sync::destination_lock_path`], through the SAME
+//! [`crate::lock::FileLock`] authority a sync run holds for its whole duration)
+//! for the duration of the recovery; a live holder is the typed contention
+//! refusal. A NON-cooperating writer is outside the crate's exclusion, exactly
+//! as it is for every other sync mutation (see [`crate::sync`]'s lock
+//! discipline). The rename is made DURABLE by fsyncing the parent directory
+//! after it lands.
 
 use crate::atomic::{self, PathKind, RootDir};
-use crate::error::{Error, Result};
+use crate::error::{Error, ReservedKind, Result};
 use std::path::{Path, PathBuf};
 
 /// One stranded claim-aside at a LOCAL destination root, identified by its own
@@ -88,13 +93,16 @@ impl Residue {
             .and_then(|name| name.to_str())
             .is_some_and(crate::reserved::is_residue_name);
         if !final_is_residue {
-            return Err(Error::conflict(format!(
-                "{}: {} is not destination residue — its final component is not a claim-aside \
-                 spelling (`.sync-aside.<pid>.<n>`) or another unaddressable spelling; a crate \
-                 temp holds no original and is removed by the ordinary extraneous sweep",
-                crate::reserved::RESIDUE_BELOW,
-                aside.display()
-            )));
+            return Err(Error::reserved(
+                ReservedKind::NotResidue,
+                format!(
+                    "{}: {} is not destination residue — its final component is not a claim-aside \
+                     spelling (`.sync-aside.<pid>.<n>`) or another unaddressable spelling; a crate \
+                     temp holds no original and is removed by the ordinary extraneous sweep",
+                    crate::reserved::RESIDUE_BELOW,
+                    aside.display()
+                ),
+            ));
         }
         let dir = RootDir::open(&root)?;
         match atomic::path_kind_fd(&dir, &aside)? {
@@ -128,6 +136,29 @@ impl Residue {
     /// live filesystem before `Ok` is returned.
     pub fn recover_to(&self, target: impl AsRef<Path>) -> Result<()> {
         let target = target.as_ref();
+        // SERIALIZE against a cooperating writer. A sync run holds the
+        // destination's operation lock for its whole duration, so recovering a
+        // strand takes the SAME lock through the SAME authority
+        // ([`crate::lock::FileLock`]) for this recovery's duration. A live
+        // holder is the typed contention refusal — the check-then-rename window
+        // is therefore closed against a cooperating writer, as the module docs
+        // claim.
+        let lock_path = crate::sync::destination_lock_path(&self.root).ok_or_else(|| {
+            Error::preflight(format!(
+                "cannot recover the residue at {}: the destination root {} has no derivable \
+                 operation-lock path, so the recovery cannot be serialized against a sync run",
+                self.aside.display(),
+                self.root.display()
+            ))
+        })?;
+        let _operation_lock = crate::lock::FileLock::acquire(
+            &lock_path,
+            &format!(
+                "store-sync residue recover at {} (pid {})",
+                self.root.display(),
+                std::process::id()
+            ),
+        )?;
         let dir = RootDir::open(&self.root)?;
         // The aside must STILL be there. A `detect`-then-`recover` gap in which
         // something removed it is a refusal, not a silent success naming no
@@ -138,22 +169,37 @@ impl Residue {
                 self.aside.display()
             )));
         }
-        if atomic::path_state_fd(&dir, target)? {
-            return Err(Error::conflict(format!(
-                "{}: refusing to recover the residue {} to {} — the target path is OCCUPIED, so \
-                 overwriting it could destroy the entry that is there. Both are left intact: \
-                 inspect them, then either keep the target and discard the residue, or move the \
-                 target aside yourself and retry",
-                crate::reserved::RESIDUE_BELOW,
-                self.aside.display(),
-                target.display()
-            )));
+        // A target that EXISTS as anything — a regular file, a directory, or a
+        // SYMLINK — is OCCUPIED. Using the live KIND (not the tri-state presence
+        // probe, which REFUSES a symlink with a raw `ELOOP` store error) makes
+        // the symlink-occupant case a TYPED conflict, exactly like a regular
+        // occupant, instead of a `Store("openat ... ELOOP")` a consumer cannot
+        // classify.
+        if atomic::path_kind_fd(&dir, target)?.is_some() {
+            return Err(Error::reserved(
+                ReservedKind::RecoverTargetOccupied,
+                format!(
+                    "{}: refusing to recover the residue {} to {} — the target path is OCCUPIED, so \
+                     overwriting it could destroy the entry that is there. Both are left intact: \
+                     inspect them, then either keep the target and discard the residue, or move the \
+                     target aside yourself and retry",
+                    crate::reserved::RESIDUE_BELOW,
+                    self.aside.display(),
+                    target.display()
+                ),
+            ));
         }
         // The guarded, descriptor-relative rename (both endpoints validated and
-        // refused for a lock-record spelling). The aside's own residue spelling
-        // is deliberately NOT refused here: recovering a strand is the whole
-        // point of this operation.
-        atomic::renameat_paths(&dir, &self.aside, target)?;
+        // refused for a lock-record spelling) through the SANCTIONED
+        // residue-movement primitive: recovering a strand is the whole point of
+        // this operation, so the aside's own residue spelling is permitted (the
+        // public `renameat_paths` refuses it).
+        atomic::rename_residue_paths(&dir, &self.aside, target)?;
+        // The rename's DURABILITY: fsync the parent directory (the aside and the
+        // target are siblings in ONE directory, so this covers both the removal
+        // of the aside and the appearance of the target). A recovery a crash can
+        // undo would be a poor recovery.
+        atomic::sync_parent_dir_fd(&dir, target)?;
         // Read back: a rename that reported success but did not land would
         // otherwise be an `Ok` naming a recovered original that is not there.
         if atomic::path_kind_fd(&dir, &self.aside)?.is_some() {
@@ -193,20 +239,26 @@ impl Residue {
             .and_then(|name| name.to_str())
             .is_some_and(crate::reserved::is_residue_name)
         {
-            return Err(Error::conflict(format!(
-                "{}: refusing to discard {} — its final component is not a residue \
-                 (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
-                 removes a stranded original, never ordinary content",
-                crate::reserved::RESIDUE_BELOW,
-                self.aside.display()
-            )));
+            return Err(Error::reserved(
+                ReservedKind::NotResidue,
+                format!(
+                    "{}: refusing to discard {} — its final component is not a residue \
+                     (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
+                     removes a stranded original, never ordinary content",
+                    crate::reserved::RESIDUE_BELOW,
+                    self.aside.display()
+                ),
+            ));
         }
         match atomic::path_kind_fd(&dir, &self.aside)? {
             None => Ok(()),
             Some(PathKind::Dir) => atomic::remove_residue_dir_all_fd(&dir, &self.aside),
-            // A file or symlink aside: one non-recursive unlink. The aside is
-            // already proven to be a residue spelling by `detect`.
-            Some(_) => atomic::remove_file_fd(&dir, &self.aside),
+            // A file or symlink aside: one non-recursive unlink through the
+            // sanctioned FILE primitive — the implicit `remove_file_fd` now
+            // refuses a residue, and this strand is the ONE the caller has
+            // explicitly decided to discard. The aside is already proven to be
+            // a residue spelling by `detect`.
+            Some(_) => atomic::remove_residue_file_fd(&dir, &self.aside),
         }
     }
 }
@@ -242,7 +294,16 @@ mod tests {
             .to_owned();
         write(&root.join(&temp), b"temp");
         let err = Residue::detect(root, Path::new(&temp)).unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::NotResidue,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
 
         write(&root.join("ordinary"), b"data");
         assert!(Residue::detect(root, Path::new("ordinary")).is_err());
@@ -279,7 +340,16 @@ mod tests {
         write(&root.join("occupied"), b"occupant");
         let residue = Residue::detect(root, Path::new(".sync-aside.999.0")).unwrap();
         let err = residue.recover_to(Path::new("occupied")).unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::RecoverTargetOccupied,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(
             err.to_string().contains(crate::reserved::RESIDUE_BELOW),
             "{err}"
@@ -325,7 +395,16 @@ mod tests {
         );
         let residue = Residue::detect(root, Path::new(".sync-aside.1.0")).unwrap();
         let err = residue.discard().unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::ResidueBelow,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(
             fs::symlink_metadata(root.join(".sync-aside.1.0/inner/.sync-aside.9.9/held")).is_ok(),
             "the nested strand survives a refused discard"
@@ -345,7 +424,16 @@ mod tests {
             aside: PathBuf::from("ordinary"),
         };
         let err = forged.discard().unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::NotResidue,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(root.join("ordinary").is_file());
         let forged = Residue {
             root: root.to_path_buf(),
@@ -353,5 +441,82 @@ mod tests {
         };
         assert!(forged.discard().is_err());
         assert!(root.join(".dest.operation.lock").is_file());
+    }
+
+    /// A4: `recover_to` HOLDS the destination operation lock (the SAME
+    /// `FileLock` authority a sync run holds) for its duration. PRE-FIX it took
+    /// no lock at all, so a cooperating writer could install the target inside
+    /// the check-then-rename window and be silently replaced by the rename.
+    #[test]
+    fn recover_to_is_serialized_by_the_destination_operation_lock() {
+        use crate::lock::FileLock;
+        let dir = tmpdir();
+        let root = dir.path();
+        write(&root.join(".sync-aside.999.0"), b"stranded original");
+        let residue = Residue::detect(root, Path::new(".sync-aside.999.0")).unwrap();
+        let lock_path = crate::sync::destination_lock_path(root)
+            .expect("the root names a derivable lock record");
+        let held = FileLock::acquire(&lock_path, "held").expect("hold the operation lock");
+        let err = residue.recover_to(Path::new("restored")).unwrap_err();
+        assert!(matches!(err, Error::LockContended(_)), "{err:?}");
+        assert!(
+            root.join(".sync-aside.999.0").exists(),
+            "the strand survives"
+        );
+        assert!(!root.join("restored").exists(), "nothing was renamed");
+        // Once the lock is released the recovery lands (and fsyncs the parent).
+        drop(held);
+        residue.recover_to(Path::new("restored")).unwrap();
+        assert_eq!(
+            fs::read(root.join("restored")).unwrap(),
+            b"stranded original"
+        );
+    }
+
+    /// A6: a consumer can tell DESTROYING A STRAND (`ResidueBelow`) from an
+    /// OCCUPIED recovery target (`RecoverTargetOccupied`) via the TYPED reason,
+    /// without string-matching; and a SYMLINK occupant is that same typed
+    /// conflict, not a raw `Store("openat ... ELOOP")`.
+    #[test]
+    #[cfg(unix)]
+    fn the_reserved_kind_distinguishes_strand_from_occupied_target() {
+        let dir = tmpdir();
+        let root = dir.path();
+        write(&root.join(".sync-aside.999.0"), b"strand");
+        write(&root.join("occupied"), b"occupant");
+        std::os::unix::fs::symlink("somewhere", root.join("occupied_link")).unwrap();
+        let residue = Residue::detect(root, Path::new(".sync-aside.999.0")).unwrap();
+
+        let occupied = residue.recover_to(Path::new("occupied")).unwrap_err();
+        assert_eq!(
+            occupied.reserved_kind(),
+            Some(ReservedKind::RecoverTargetOccupied)
+        );
+        let linked = residue.recover_to(Path::new("occupied_link")).unwrap_err();
+        assert_eq!(
+            linked.reserved_kind(),
+            Some(ReservedKind::RecoverTargetOccupied),
+            "a symlink occupant is a typed conflict, not a raw Store error: {linked:?}"
+        );
+
+        let strand = Residue::detect(root, Path::new("ordinary"));
+        assert!(strand.is_err());
+    }
+
+    /// A1/A6: the substrate refusal itself carries the typed reason, and the
+    /// message keeps the historical `ResidueBelow` token.
+    #[test]
+    fn the_substrate_refusal_carries_a_typed_residue_reason() {
+        let dir = tmpdir();
+        let root = dir.path();
+        write(&root.join(".sync-aside.7.0"), b"precious");
+        let owned = RootDir::open(root).unwrap();
+        let err = atomic::remove_file_fd(&owned, Path::new(".sync-aside.7.0")).unwrap_err();
+        assert_eq!(err.reserved_kind(), Some(ReservedKind::ResidueBelow));
+        assert!(
+            err.to_string().contains(crate::reserved::RESIDUE_BELOW),
+            "the historical token survives: {err}"
+        );
+        assert_eq!(fs::read(root.join(".sync-aside.7.0")).unwrap(), b"precious");
     }
 }

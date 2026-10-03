@@ -2200,6 +2200,22 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     }
 }
 
+/// The unguarded `rm -f` body shared by [`Remote::remove_file`] and
+/// [`Remote::remove_residue_file`]: the caller has already run the ONE gate
+/// (`refuse_reserved_mutation`) with the right sanction.
+fn ssh_remove_file_remote(transport: &SshTransport, rel: &RootedRelativePath) -> Result<()> {
+    let p = transport.root.join(rel).to_string_lossy().into_owned();
+    // Ignore "not found".
+    let out = transport.run_remote(&SshTransport::argv_cmd(&["rm".into(), "-f".into(), p]))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("No such file") && !stderr.contains("No such") {
+            return Err(Error::transport(format!("ssh rm failed: {stderr}")));
+        }
+    }
+    Ok(())
+}
+
 impl Remote for SshTransport {
     fn root(&self) -> &Path {
         &self.root
@@ -2288,13 +2304,15 @@ impl Remote for SshTransport {
     }
 
     fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
+        // CREATE only: a residue spelling is permitted (mkdir cannot destroy);
+        // the lock authority still runs.
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::Residue)?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), p]))
     }
 
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::Residue)?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), "-p".into(), p]))
     }
@@ -2321,8 +2339,23 @@ impl Remote for SshTransport {
     }
 
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(from.as_path())?;
-        crate::atomic::refuse_lock_record_mutation(to.as_path())?;
+        // The public rename applies BOTH authorities: a lock-record spelling and
+        // a residue spelling are refused at either end.
+        crate::atomic::refuse_reserved_mutation(from.as_path(), crate::atomic::Sanction::None)?;
+        crate::atomic::refuse_reserved_mutation(to.as_path(), crate::atomic::Sanction::None)?;
+        self.run_remote_ok(&SshTransport::rename_cmd(
+            &self.root,
+            from.as_path(),
+            to.as_path(),
+        ))
+    }
+
+    /// The sanctioned residue-movement rename for the sync's OWN claim-aside
+    /// (either endpoint may carry a residue spelling). The lock authority still
+    /// runs on both ends; the public [`Remote::rename`] refuses residue.
+    fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_reserved_mutation(from.as_path(), crate::atomic::Sanction::Residue)?;
+        crate::atomic::refuse_reserved_mutation(to.as_path(), crate::atomic::Sanction::Residue)?;
         self.run_remote_ok(&SshTransport::rename_cmd(
             &self.root,
             from.as_path(),
@@ -2392,17 +2425,27 @@ impl Remote for SshTransport {
     }
 
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
-        let p = self.root.join(rel).to_string_lossy().into_owned();
-        // Ignore "not found".
-        let out = self.run_remote(&Self::argv_cmd(&["rm".into(), "-f".into(), p]))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.contains("No such file") && !stderr.contains("No such") {
-                return Err(Error::transport(format!("ssh rm failed: {stderr}")));
-            }
-        }
-        Ok(())
+        // The ONE gate: a lock-record spelling AND a residue spelling are both
+        // refused before the remote command is built. The sync's OWN
+        // claim-aside is removed through `remove_residue_file` below.
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::None)?;
+        ssh_remove_file_remote(self, rel)
+    }
+
+    /// The sanctioned explicit-discard route for a REMOTE claim-aside FILE: the
+    /// final residue is permitted, the lock authority still runs (and a residue
+    /// in any non-final component is still refused). The engine's `drop_claim`
+    /// reaches this for a file aside on a remote destination.
+    fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::Residue)?;
+        ssh_remove_file_remote(self, rel)
+    }
+
+    /// The sanctioned explicit-discard route for a REMOTE claim-aside DIRECTORY
+    /// that the removal walk has already emptied (`rmdir` semantics).
+    fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::Residue)?;
+        Remote::remove_dir(self, rel)
     }
 
     fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
@@ -2451,7 +2494,12 @@ impl Remote for SshTransport {
     }
 
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        crate::atomic::refuse_lock_record_mutation(rel.as_path())?;
+        // A3: the remote recursive removal carries the SAME residue refusal the
+        // local primitive does. The strand's NAME is known locally, so the gate
+        // runs before the `rm -rf` command is built — a consumer naming a
+        // PARENT directory of a strand is refused, never allowed to destroy the
+        // original.
+        crate::atomic::refuse_reserved_mutation(rel.as_path(), crate::atomic::Sanction::None)?;
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["rm".into(), "-rf".into(), p]))
     }
@@ -2832,6 +2880,34 @@ mod tests_ssh {
             false,
         )
         .unwrap()
+    }
+
+    /// A3: the SSH recursive and file removals carry the SAME residue refusal
+    /// as the local substrate, and run it BEFORE any remote command is built.
+    /// The refusal is returned with no far side reachable, which is exactly the
+    /// property: a consumer naming a strand on a remote destination cannot
+    /// destroy it (the strand's name is knowable locally).
+    #[test]
+    fn ssh_removals_refuse_a_stranded_aside_before_any_command() {
+        use crate::error::ReservedKind;
+        use crate::transport::RootedRelativePath;
+        let t = transport();
+        let strand = RootedRelativePath::parse(Path::new(".sync-aside.1234.0")).unwrap();
+        for (label, err) in [
+            ("remove_dir_all", t.remove_dir_all(&strand).unwrap_err()),
+            ("remove_file", t.remove_file(&strand).unwrap_err()),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Error::Reserved {
+                        reason: ReservedKind::ResidueBelow,
+                        ..
+                    }
+                ),
+                "{label}: {err:?}"
+            );
+        }
     }
 
     // Host identity must be EXACTLY ONE source: both set is ambiguous, neither

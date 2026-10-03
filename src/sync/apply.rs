@@ -957,8 +957,12 @@ pub enum Direction {
 /// BAND through the destination's own removal primitives
 /// ([`crate::transport::Remote::remove_file`] /
 /// [`crate::transport::Remote::remove_dir_all`], or `std::fs` for a local
-/// root), or to make every path the caller wants kept part of the source
-/// before the run. A per-path policy is not offered because the deletion
+/// root). Those primitives REFUSE a destination RESIDUE (a stranded
+/// claim-aside that HOLDS the original): such a path is RECOVERED with
+/// [`Residue::recover_to`](crate::sync::Residue::recover_to) or DESTROYED only
+/// by the deliberate [`Residue::discard`](crate::sync::Residue::discard), never
+/// by a blanket removal. Or make every path the caller wants kept part of the
+/// source before the run. A per-path policy is not offered because the deletion
 /// sanction is DERIVED from the diff (one classification per path), and a
 /// partly-deleted destination would make the report's
 /// [`SyncReport::extraneous`] list ambiguous about which paths survived.
@@ -1284,10 +1288,14 @@ pub struct SyncReport {
     /// is occupied, so a target that itself holds data is never overwritten),
     /// and [`Residue::discard`](crate::sync::Residue::discard) removes it as the
     /// caller's explicit decision. The implicit recursive-removal primitives
-    /// REFUSE a residue ([`crate::atomic::remove_dir_all_path`] and
-    /// [`Remote::remove_dir_all`](crate::transport::Remote::remove_dir_all)
-    /// carry the refusal), so the old `remove_dir_all` recipe is no longer a
-    /// silent way to destroy the original. For a REMOTE destination the crate
+    /// REFUSE a residue ([`crate::atomic::remove_dir_all_path`],
+    /// [`crate::atomic::remove_file_fd`], and the transport's
+    /// [`Remote::remove_file`](crate::transport::Remote::remove_file) /
+    /// [`Remote::remove_dir_all`](crate::transport::Remote::remove_dir_all) all
+    /// carry the refusal — the remote `remove_dir_all` checks the strand's
+    /// locally-knowable name before it builds its command), so the old
+    /// `remove_dir_all` recipe is no longer a silent way to destroy the
+    /// original. For a REMOTE destination the crate
     /// has no far-side recovery primitive: the caller must run the same two
     /// steps through the far-side tools, and MUST NOT blanket-remove the aside
     /// before deciding. A reported path whose last component is a lock record is
@@ -1676,9 +1684,20 @@ pub enum RetireOutcome {
 /// the list of snapshot roots it removed.
 pub fn retire_destination_lock(dest_root: &Path) -> Result<RetireOutcome> {
     // A destination that still exists keeps its record: the record's inode must
-    // stay stable for the destination's whole lifetime.
-    if std::fs::symlink_metadata(dest_root).is_ok() {
-        return Ok(RetireOutcome::DestinationLive);
+    // stay stable for the destination's whole lifetime. FAIL CLOSED: `NotFound`
+    // is the only outcome that means "the destination is gone"; any other
+    // metadata error (EACCES on a `000` parent, EIO, ...) is a typed failure,
+    // never a silent "gone" that could let the record be removed under a live
+    // destination.
+    match std::fs::symlink_metadata(dest_root) {
+        Ok(_) => return Ok(RetireOutcome::DestinationLive),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::preflight(format!(
+                "retire_destination_lock: cannot determine whether the destination {} exists: {e}",
+                dest_root.display()
+            )));
+        }
     }
     let Some(lock_path) = destination_lock_path(dest_root) else {
         return Ok(RetireOutcome::NoRecordLocation);
@@ -1695,8 +1714,17 @@ pub fn retire_destination_lock(dest_root: &Path) -> Result<RetireOutcome> {
     // Absent already: nothing to retire (and do NOT create it just to remove
     // it). A concurrent creation between here and the acquire below is caught
     // by the acquire's contention check or by the held record surviving it.
-    if std::fs::symlink_metadata(&lock_path).is_err() {
-        return Ok(RetireOutcome::Absent);
+    // FAIL CLOSED: only a GENUINE `NotFound` is `Absent`; any other error is a
+    // typed failure rather than a silent "no record".
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RetireOutcome::Absent),
+        Err(e) => {
+            return Err(Error::preflight(format!(
+                "retire_destination_lock: cannot determine whether the record {} exists: {e}",
+                lock_path.display()
+            )));
+        }
     }
     // Prove no LIVE holder exists BEFORE removing: the record's own flock is
     // non-blocking, so a live holder is a typed refusal, not a wait.
@@ -4043,7 +4071,17 @@ impl Applier<'_, '_> {
                             // descendants the sync walks and needs no per-child
                             // authority.
                             self.begin_mutation(&entry_path, MutationKind::Content);
-                            match self.dest.remove_file(&entry_rel) {
+                            // Under `OwnClaim` the WHOLE walk is inside the sync's
+                            // own claim-aside, so every path includes the residue
+                            // root and must use the sanctioned primitive; a nested
+                            // strand is still stopped by the ADVANCE
+                            // `is_dest_residue_name` check.
+                            let removal = if matches!(sanction, Sanction::OwnClaim(_)) {
+                                self.dest.remove_residue_file(&entry_rel)
+                            } else {
+                                self.dest.remove_file(&entry_rel)
+                            };
+                            match removal {
                                 Ok(()) => {
                                     self.commit_mutation(&entry_path, MutationKind::Content);
                                     completed = Some(Removal::Removed);
@@ -4151,7 +4189,12 @@ impl Applier<'_, '_> {
                 // fail LOUDLY instead of being destroyed unnamed. This is the
                 // only removal primitive the walk removes a directory with; the
                 // per-entry authority is re-run for every child in ADVANCE.
-                match self.dest.remove_dir(&frame.rel) {
+                let removal = if matches!(sanction, Sanction::OwnClaim(_)) {
+                    self.dest.remove_residue_dir(&frame.rel)
+                } else {
+                    self.dest.remove_dir(&frame.rel)
+                };
+                match removal {
                     Ok(()) => {
                         self.commit_mutation(&frame.path, MutationKind::Content);
                         self.journal.mark_removed(&frame.path);
@@ -4262,7 +4305,7 @@ impl Applier<'_, '_> {
         let path = manifest_spelling(rel);
         self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::Unresolved)?;
         self.begin_mutation(&path, MutationKind::Content);
-        match self.dest.rename(rel, &aside) {
+        match self.dest.rename_aside(rel, &aside) {
             Ok(()) => self.commit_mutation(&path, MutationKind::Content),
             Err(error) => {
                 // A rename that REPORTS an error may still have LANDED: the far
@@ -4576,7 +4619,7 @@ impl Applier<'_, '_> {
             )));
         }
         self.begin_mutation(&path, MutationKind::Content);
-        match self.dest.rename(from, to) {
+        match self.dest.rename_aside(from, to) {
             Ok(()) => {
                 self.commit_mutation(&path, MutationKind::Content);
                 Ok(())
@@ -6804,7 +6847,7 @@ impl Applier<'_, '_> {
         let path = manifest_spelling(rel);
         self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
         self.begin_mutation(&path, MutationKind::Content);
-        match self.dest.remove_dir(rel) {
+        match self.dest.remove_residue_dir(rel) {
             Ok(()) => {
                 self.commit_mutation(&path, MutationKind::Content);
                 Ok(())
@@ -7530,6 +7573,17 @@ impl Side<'_> {
         }
     }
 
+    /// Remove a FILE (or symlink) that IS the sync's own stranded claim-aside,
+    /// through the sanctioned explicit-discard route. Used by
+    /// [`Applier::remove_subtree`] for the `OwnClaim` WALK ROOT only; the
+    /// children of a claim are ordinary content removed by [`Self::remove_file`].
+    fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        match self {
+            Side::Local(local) => local.remove_residue_file(rel),
+            Side::Remote(remote) => remote.remove_residue_file(rel),
+        }
+    }
+
     /// Remove the DIRECTORY at `rel` NON-RECURSIVELY (rmdir semantics). The
     /// caller ([`Applier::remove_subtree`]'s `Dir` arm) has already removed
     /// every child it enumerated and authorized, so the directory must be
@@ -7543,6 +7597,16 @@ impl Side<'_> {
         match self {
             Side::Local(local) => local.remove_dir(rel),
             Side::Remote(remote) => remote.remove_dir(rel),
+        }
+    }
+
+    /// Remove the (already-emptied) DIRECTORY that IS the sync's own stranded
+    /// claim-aside, through the sanctioned explicit-discard route. Used by
+    /// [`Applier::remove_subtree`] for the `OwnClaim` WALK ROOT only.
+    fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        match self {
+            Side::Local(local) => local.remove_residue_dir(rel),
+            Side::Remote(remote) => remote.remove_residue_dir(rel),
         }
     }
 
@@ -7624,13 +7688,13 @@ impl Side<'_> {
         }
     }
 
-    /// Rename a destination entry within the tree (the claim-by-rename
-    /// primitive). A symlink or directory is moved as the entry itself, never
-    /// followed.
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+    /// Rename an entry where EITHER endpoint is the sync's own claim-aside (a
+    /// residue spelling): the sanctioned route used by `claim_aside` and
+    /// `rename_back`. The public `rename` refuses a residue spelling.
+    fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         match self {
-            Side::Local(local) => local.rename(from, to),
-            Side::Remote(remote) => remote.rename(from, to),
+            Side::Local(local) => local.rename_aside(from, to),
+            Side::Remote(remote) => remote.rename_aside(from, to),
         }
     }
 }
@@ -8059,6 +8123,25 @@ impl LocalSide {
         crate::atomic::remove_dir_fd(self.root_dir()?, rel.as_path())
     }
 
+    /// Remove a FILE (or symlink) that IS the sync's own stranded claim-aside,
+    /// through the residue-sanctioning primitive. Only
+    /// [`Applier::remove_subtree`]'s `OwnClaim` walk root reaches this.
+    fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        match crate::atomic::remove_claim_file_fd(self.root_dir()?, rel.as_path()) {
+            Ok(()) => Ok(()),
+            Err(error) => match crate::atomic::path_kind_fd(self.root_dir()?, rel.as_path())? {
+                None => Ok(()),
+                Some(_) => Err(error),
+            },
+        }
+    }
+
+    /// Remove the (already-emptied) DIRECTORY that IS the sync's own stranded
+    /// claim-aside, through the residue-sanctioning `rmdir` primitive.
+    fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        crate::atomic::remove_claim_dir_fd(self.root_dir()?, rel.as_path())
+    }
+
     /// Whether any entry exists at `rel` (kind-agnostic, so a symlink counts
     /// and a non-file/dir/symlink entry still counts as present).
     fn exists(&self, rel: &RootedRelativePath) -> Result<bool> {
@@ -8176,11 +8259,10 @@ impl LocalSide {
                 .unwrap_or(false)
     }
 
-    /// Rename an entry within the tree, component-wise with `O_NOFOLLOW` on
-    /// both sides, so a symlink in any path component is refused and the final
-    /// component is moved (never followed).
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
-        crate::atomic::renameat_paths(self.root_dir()?, from.as_path(), to.as_path())
+    /// The SANCTIONED residue-movement rename: the claim-aside spelling is the
+    /// point of the operation.
+    fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        crate::atomic::rename_residue_paths(self.root_dir()?, from.as_path(), to.as_path())
     }
 }
 

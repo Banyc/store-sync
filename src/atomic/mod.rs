@@ -56,13 +56,20 @@
 //! [`Error::integrity`]): an unsupported `schema_version` is a
 //! marker-format violation, not an I/O failure.
 //!
-//! # The lock-record guard is STRUCTURAL, not a list of call sites
+//! # The reserved-spelling guard is STRUCTURAL, not a list of call sites
 //!
 //! The single-holder guarantee rests on the lock record's inode never
 //! changing. Four earlier passes each fixed the call sites they could find
-//! and missed one, so the guard is no longer applied by enumeration:
+//! and missed one, so the guard is no longer applied by enumeration. The SAME
+//! shape now also protects a stranded ORIGINAL (destination residue): a
+//! primitive that carried the lock authority and skipped the residue authority
+//! destroyed a strand file, so BOTH authorities live behind ONE gate
+//! ([`guard::refuse_reserved_mutation`]) that every name-mutating primitive
+//! consults, with an explicit [`guard::Sanction`] naming the ONE reserved
+//! spelling that may be broken.
 //!
-//! * the private [`guard`] module owns the ONE spelling authority and the
+//! * the private [`guard`] module owns the ONE reserved-spelling gate (the
+//!   lock-record authority AND the residue authority) and the
 //!   unforgeable [`GuardedRel`] capability (private fields; `new` and
 //!   `new_for_owned_lock_record` are the only constructors and the only
 //!   callers of the guard); every rel-path mutator mints one, and the rename
@@ -103,7 +110,7 @@
 //! `rename` does not overwrite), and no Unix mode bits. The rest of the
 //! crate calls the re-exported surface below and never sees the switch.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ReservedKind, Result};
 #[cfg(unix)]
 use std::ffi::OsStr;
 #[cfg(unix)]
@@ -122,64 +129,72 @@ mod windows;
 // `OwnedLockRecord` is the unforgeable OWNERSHIP authority the guard consults;
 // it can only be built from the transport's own `Layout`.
 // The alias keeps the historical spelling used throughout the primitives.
-pub(crate) use guard::{GuardedRel, OwnedLockRecord};
+pub(crate) use guard::{GuardedRel, OwnedLockRecord, Sanction};
 
-/// Run the lock-record guard through the capability's constructors
-/// ([`GuardedRel::new`] for ordinary content and
-/// [`GuardedRel::new_for_owned_lock_record`] for the protocol's own record);
-/// `guard::refuse_lock_record` itself is private to `guard`, so this
-/// convenience wrapper — and every rel-path mutator that calls it — must still
-/// mint the capability. There is no other way to run the guard.
+/// THE one reserved-spelling gate, re-exported from the private
+/// [`guard`] module so every name-mutating primitive in this module and its
+/// `unix`/`windows` submodules presents the SAME check. See
+/// [`guard::refuse_reserved_mutation`] for the design and for why a primitive
+/// cannot carry one authority and skip the other.
+pub(crate) fn refuse_reserved_mutation(rel: &Path, sanction: Sanction<'_>) -> Result<()> {
+    guard::refuse_reserved_mutation(rel, sanction)
+}
+
+/// The NO-SANCTION spelling of the ONE gate: refuse when `rel` NAMES or
+/// descends THROUGH any reserved spelling (a lock record or a residue).
+///
+/// This used to be the lock-record authority ALONE, and its call sites then
+/// diverged from the residue authority by a line each; it is now a thin,
+/// documented alias for [`refuse_reserved_mutation`] with [`Sanction::None`],
+/// so a primitive that reaches for it gets BOTH authorities. There is
+/// deliberately no function that runs only the lock half; the per-component
+/// lock check ([`guard::refuse_lock_record`]) is private, and the residue loop
+/// lives inside the gate.
 pub(crate) fn refuse_lock_record_mutation(rel: &Path) -> Result<()> {
-    GuardedRel::new(rel).map(|_| ())
+    refuse_reserved_mutation(rel, Sanction::None)
 }
 
-/// The ONE authority an IMPLICIT recursive removal consults before it destroys
-/// a directory's contents: refuse when any component of `rel` is destination
-/// RESIDUE ([`crate::reserved::is_residue_name`]).
-///
-/// A residue spelling HOLDS a stranded original — the pre-replace state a
-/// crash left behind (a claim-aside `.sync-aside.<pid>.<n>`; a lock record).
-/// The recursive-removal walks already consulted the LOCK authority
-/// ([`refuse_lock_record_mutation`]); they never consulted the RESIDUE
-/// authority, so the crate's own durable recursive-delete primitive walked
-/// straight over a stranded aside and destroyed the caller's only copy. This
-/// is the same guarantee the sync's `ConflictReason::ResidueBelow` states, now
-/// at the substrate authority every recursive removal passes through.
-///
-/// The check spans EVERY component, so a path that NAMES or descends THROUGH a
-/// residue is refused — removing the CONTENTS of an aside destroys part of the
-/// strand even when the aside itself is not the walk root. The refusal is a
-/// [`Error::Conflict`] whose message begins with [`crate::reserved::RESIDUE_BELOW`],
-/// the sync's own vocabulary, so a caller does not have to learn a second one.
-///
-/// PRIVATE to the crate: a consumer never calls this; it is the shared
-/// decision the recursive-removal primitives consult.
-pub(crate) fn refuse_residue_mutation(rel: &Path) -> Result<()> {
-    for component in rel.components() {
-        let std::path::Component::Normal(name) = component else {
-            continue;
-        };
-        if !name.to_str().is_some_and(crate::reserved::is_residue_name) {
-            continue;
-        }
-        return Err(residue_refusal(rel));
-    }
-    Ok(())
-}
-
-/// The ONE error an implicit recursive removal returns for a residue: a
-/// [`Error::Conflict`] whose message begins with [`crate::reserved::RESIDUE_BELOW`],
-/// the sync's own vocabulary. Shared by the Unix walk, the Windows tree probe,
+/// The ONE error an implicit recursive removal returns for a residue: an
+/// [`Error::Reserved`] with reason [`ReservedKind::ResidueBelow`] whose message
+/// begins with [`crate::reserved::RESIDUE_BELOW`], the sync's own vocabulary.
+/// Shared by the Unix walk, the Windows tree probe,
 /// and the entry-point checks, so every refusal reads identically.
 pub(crate) fn residue_refusal(rel: &Path) -> Error {
-    Error::conflict(format!(
-        "{}: refusing to remove {} — it is (or holds) destination residue, a claim-aside that \
-         HOLDS a stranded original (the pre-replace state). Recovering it is \
-         `sync::Residue::recover_to`; discarding it is the deliberate `sync::Residue::discard`. \
-         An implicit recursive removal never destroys it.",
-        crate::reserved::RESIDUE_BELOW,
-        rel.display()
+    Error::reserved(
+        ReservedKind::ResidueBelow,
+        format!(
+            "{}: refusing to remove {} — it is (or holds) destination residue, a claim-aside that \
+             HOLDS a stranded original (the pre-replace state). Recovering it is \
+             `sync::Residue::recover_to`; discarding it is the deliberate `sync::Residue::discard`. \
+             An implicit recursive removal never destroys it.",
+            crate::reserved::RESIDUE_BELOW,
+            rel.display()
+        ),
+    )
+}
+
+/// The shared guard for the EXPLICIT discard primitives
+/// (`remove_residue_file_fd` / `remove_residue_dir_all_fd`): the FINAL component
+/// must BE a residue, so a discard handle can only ever remove a strand, never
+/// ordinary content. The LOCK half is enforced separately by
+/// [`refuse_reserved_mutation`]`(rel, `[`Sanction::FinalResidue`]`)`.
+pub(crate) fn require_final_residue(rel: &Path) -> Result<()> {
+    if rel
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::reserved::is_residue_name)
+    {
+        return Ok(());
+    }
+    Err(Error::reserved(
+        ReservedKind::NotResidue,
+        format!(
+            "{}: refusing to discard {} — its final component is not a residue \
+             (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
+             removes a stranded original, never ordinary content",
+            crate::reserved::RESIDUE_BELOW,
+            rel.display()
+        ),
     ))
 }
 

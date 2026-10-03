@@ -485,6 +485,16 @@ pub trait Remote {
     fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()>;
     fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>>;
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()>;
+    /// Rename an entry where EITHER endpoint is the sync's OWN claim-aside (a
+    /// residue spelling): the sanctioned engine route used by the claim and
+    /// rollback renames. The public [`Remote::rename`] refuses a residue
+    /// spelling so a caller cannot replace or move a strand; the production
+    /// transports override this so the sync's own `claim_aside`/`rename_back`
+    /// keep working. The default delegates to [`Remote::rename`] (a test
+    /// wrapper inherits its inner transport's policy).
+    fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        self.rename(from, to)
+    }
     /// Create a symlink at `link` (a rooted relative path) pointing at
     /// `target`. `target` is a LINK TARGET, relative to the link's own
     /// directory — it legitimately traverses up to the object store
@@ -498,6 +508,23 @@ pub trait Remote {
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
+    /// Remove a FILE (or symlink) that IS the sync's OWN stranded claim-aside —
+    /// the explicit-discard route used by `sync::Residue::discard` and the
+    /// sync engine's `drop_claim`. The residue guard is SANCTIONED here (the
+    /// final component may be a residue), exactly as the local substrate's
+    /// `atomic::remove_residue_file_fd` sanctions it. The default delegates to
+    /// [`Remote::remove_file`] (a test wrapper inherits its inner transport's
+    /// policy); the production transports override it with the sanctioned
+    /// primitive so the residue guard does not block the sync's own cleanup.
+    fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_file(rel)
+    }
+    /// Remove the (already-emptied) DIRECTORY at `rel` that IS the sync's OWN
+    /// stranded claim-aside — the explicit-discard twin of
+    /// [`Remote::remove_residue_file`], with `rmdir` semantics.
+    fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_dir(rel)
+    }
     /// Remove the DIRECTORY at `rel` NON-RECURSIVELY (`rmdir` semantics): the
     /// call fails when the directory is not empty, so a child created after the
     /// caller enumerated the directory is REFUSED LOUDLY, never destroyed
@@ -2428,6 +2455,50 @@ impl Remote for LocalTransport {
         self.remove_dir_confined(rel)
     }
 
+    /// The sanctioned explicit-discard route for a LOCAL destination: the
+    /// sync's own claim-aside (a residue spelling) is removed through the
+    /// residue-sanctioning atomic primitive. Without this override the ordinary
+    /// `remove_file` would refuse the strand once the residue authority joined
+    /// the ONE gate (A1), breaking the engine's own `drop_claim`.
+    fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("remove residue {}: {e}", rel.display())))?;
+        match crate::atomic::remove_claim_file_fd(&root, rel.as_path()) {
+            Ok(()) => Ok(()),
+            Err(error) => match crate::atomic::path_kind_fd(&root, rel.as_path()) {
+                Ok(None) => Ok(()),
+                _ => Err(Error::transport(format!(
+                    "remove residue {}: {error}",
+                    rel.display()
+                ))),
+            },
+        }
+    }
+
+    /// The sanctioned explicit-discard route for a LOCAL claim-aside DIRECTORY
+    /// that the removal walk has already emptied (non-recursive `rmdir`).
+    fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("rmdir residue {}: {e}", rel.display())))?;
+        crate::atomic::remove_claim_dir_fd(&root, rel.as_path())
+            .map_err(|e| Error::transport(format!("rmdir residue {}: {e}", rel.display())))
+    }
+
+    /// The sanctioned residue-movement rename for the sync's OWN claim-aside
+    /// (either endpoint may carry a residue spelling). The public
+    /// [`Remote::rename`] refuses a residue spelling.
+    fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        let root = crate::atomic::RootDir::open(&self.base)
+            .map_err(|e| Error::transport(format!("rename aside {}: {e}", from.display())))?;
+        crate::atomic::rename_residue_paths(&root, from.as_path(), to.as_path()).map_err(|e| {
+            Error::transport(format!(
+                "rename aside {} -> {}: {e}",
+                from.display(),
+                to.display()
+            ))
+        })
+    }
+
     #[cfg(not(unix))]
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         // R4: no direct `std::fs` mutation here any more. The path-based
@@ -4332,6 +4403,9 @@ mod tests {
         fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
+        fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename_aside(from, to)
+        }
         fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
@@ -4341,11 +4415,17 @@ mod tests {
         fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
+        fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_residue_file(rel)
+        }
         fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
         fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir(rel)
+        }
+        fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_residue_dir(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)

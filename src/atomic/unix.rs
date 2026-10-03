@@ -255,7 +255,9 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    refuse_lock_record_mutation(path)?;
+    // Creation only: a residue spelling is permitted (mkdir cannot destroy),
+    // and the lock authority still runs.
+    refuse_reserved_mutation(path, Sanction::Residue)?;
     std::fs::create_dir_all(path)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
     let perms = std::fs::Permissions::from_mode(0o700);
@@ -287,7 +289,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// ran the syncs), `false` when everything already existed (the fast path of
 /// every later append: nothing created, nothing to sync).
 pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
-    refuse_lock_record_mutation(path)?;
+    refuse_reserved_mutation(path, Sanction::Residue)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
     let mut missing: Vec<PathBuf> = Vec::new();
@@ -586,8 +588,8 @@ pub fn fsync_dir_fd(fd: &OwnedFd) -> Result<()> {
 /// one component is COMPLETE for the syscall's own effect. The rel-path
 /// primitives ([`openat_no_follow_io`]) check every component instead,
 /// because they resolve a multi-component spelling.
-fn refuse_mutation_name(name: &OsStr) -> Result<()> {
-    refuse_lock_record_mutation(Path::new(name))
+fn refuse_mutation_name(name: &OsStr, sanction: Sanction<'_>) -> Result<()> {
+    refuse_reserved_mutation(Path::new(name), sanction)
 }
 
 /// renameat between two names in (possibly different) directory fds.
@@ -597,9 +599,15 @@ fn refuse_mutation_name(name: &OsStr) -> Result<()> {
 /// renamed the lock record straight through it. The name checks live HERE
 /// now, and the function is PRIVATE: there is no public rename primitive
 /// left to bypass.
-fn renameat_fd(dir_fd: &OwnedFd, from: &OsStr, to_dir: &OwnedFd, to: &OsStr) -> Result<()> {
-    refuse_mutation_name(from)?;
-    refuse_mutation_name(to)?;
+fn renameat_fd(
+    dir_fd: &OwnedFd,
+    from: &OsStr,
+    to_dir: &OwnedFd,
+    to: &OsStr,
+    sanction: Sanction<'_>,
+) -> Result<()> {
+    refuse_mutation_name(from, sanction)?;
+    refuse_mutation_name(to, sanction)?;
     let from_c =
         CString::new(from.as_bytes()).map_err(|_| Error::store("rename source with NUL"))?;
     let to_c = CString::new(to.as_bytes()).map_err(|_| Error::store("rename target with NUL"))?;
@@ -624,8 +632,8 @@ fn renameat_fd(dir_fd: &OwnedFd, from: &OsStr, to_dir: &OwnedFd, to: &OsStr) -> 
 /// to a symlink's target). Returns the raw io error so a caller can
 /// distinguish the EEXIST race from a real failure.
 fn linkat_fd(dir_fd: &OwnedFd, from: &OsStr, to_dir: &OwnedFd, to: &OsStr) -> std::io::Result<()> {
-    refuse_mutation_name(from).map_err(|e| std::io::Error::other(e.to_string()))?;
-    refuse_mutation_name(to).map_err(|e| std::io::Error::other(e.to_string()))?;
+    refuse_mutation_name(from, Sanction::None).map_err(|e| std::io::Error::other(e.to_string()))?;
+    refuse_mutation_name(to, Sanction::None).map_err(|e| std::io::Error::other(e.to_string()))?;
     let from_c = CString::new(from.as_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "link source with NUL")
     })?;
@@ -650,8 +658,8 @@ fn linkat_fd(dir_fd: &OwnedFd, from: &OsStr, to_dir: &OwnedFd, to: &OsStr) -> st
 /// unlinkat (no AT_REMOVEDIR — a file or symlink; the symlink itself is
 /// removed, never its target). The lock-record guard runs at the chokepoint,
 /// so no caller can unlink the record through this wrapper.
-fn unlinkat_fd_io(dir_fd: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
-    refuse_mutation_name(name).map_err(|e| std::io::Error::other(e.to_string()))?;
+fn unlinkat_fd_io(dir_fd: &OwnedFd, name: &OsStr, sanction: Sanction<'_>) -> std::io::Result<()> {
+    refuse_mutation_name(name, sanction).map_err(|e| std::io::Error::other(e.to_string()))?;
     let c = CString::new(name.as_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "unlink name with NUL")
     })?;
@@ -663,8 +671,8 @@ fn unlinkat_fd_io(dir_fd: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
 }
 
 /// [`unlinkat_fd_io`] with the store error context.
-fn unlinkat_fd(dir_fd: &OwnedFd, name: &OsStr) -> Result<()> {
-    unlinkat_fd_io(dir_fd, name).map_err(|e| Error::store(format!("unlinkat: {e}")))
+fn unlinkat_fd(dir_fd: &OwnedFd, name: &OsStr, sanction: Sanction<'_>) -> Result<()> {
+    unlinkat_fd_io(dir_fd, name, sanction).map_err(|e| Error::store(format!("unlinkat: {e}")))
 }
 
 /// `unlinkat` WITHOUT the lock-record chokepoint. PRIVATE to this module, and
@@ -715,8 +723,8 @@ pub(crate) fn remove_owned_lock_record_fd(
 }
 
 /// `unlinkat(AT_REMOVEDIR)` — `rmdir` semantics, guarded at the chokepoint.
-fn rmdirat_fd_io(dir_fd: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
-    refuse_mutation_name(name).map_err(|e| std::io::Error::other(e.to_string()))?;
+fn rmdirat_fd_io(dir_fd: &OwnedFd, name: &OsStr, sanction: Sanction<'_>) -> std::io::Result<()> {
+    refuse_mutation_name(name, sanction).map_err(|e| std::io::Error::other(e.to_string()))?;
     let c = CString::new(name.as_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "rmdir name with NUL")
     })?;
@@ -730,7 +738,7 @@ fn rmdirat_fd_io(dir_fd: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
 /// `mkdirat` — the directory at `name` is created; the name is guarded at
 /// the chokepoint.
 fn mkdirat_fd(dir_fd: &OwnedFd, name: &OsStr) -> Result<()> {
-    refuse_mutation_name(name)?;
+    refuse_mutation_name(name, Sanction::None)?;
     let c = CString::new(name.as_bytes()).map_err(|_| Error::store("mkdir name with NUL"))?;
     let r = unsafe { libc::mkdirat(dir_fd.as_raw_fd(), c.as_ptr(), 0o777) };
     if r < 0 {
@@ -746,7 +754,7 @@ fn mkdirat_fd(dir_fd: &OwnedFd, name: &OsStr) -> Result<()> {
 /// removed by the caller through [`unlinkat_fd_io`]); the name is guarded at
 /// the chokepoint.
 fn symlinkat_fd(dir_fd: &OwnedFd, target: &Path, name: &OsStr) -> Result<()> {
-    refuse_mutation_name(name)?;
+    refuse_mutation_name(name, Sanction::None)?;
     let name_c =
         CString::new(name.as_bytes()).map_err(|_| Error::store("symlink name with NUL"))?;
     let target_c = CString::new(target.as_os_str().as_bytes())
@@ -768,7 +776,10 @@ fn symlinkat_fd(dir_fd: &OwnedFd, target: &Path, name: &OsStr) -> Result<()> {
 /// directory whose name is a lock-record spelling would occupy the record's
 /// path.
 fn open_or_create_dir(cur: &OwnedFd, comp: &[u8]) -> Result<OwnedFd> {
-    refuse_mutation_name(OsStr::from_bytes(comp))?;
+    // OPEN-OR-CREATE only: a residue spelling is permitted (the openat cannot
+    // destroy; a fresh create is not a destruction), and the lock authority
+    // still runs.
+    refuse_mutation_name(OsStr::from_bytes(comp), Sanction::Residue)?;
     let c = CString::new(comp).map_err(|_| Error::store("path component with NUL"))?;
     let fd = unsafe {
         libc::openat(
@@ -899,7 +910,7 @@ fn fstatat_mode_io(dir_fd: &OwnedFd, name: &[u8]) -> std::io::Result<libc::mode_
 /// swallowed cleanup failure. NEVER called after a successful rename (the
 /// temp name no longer exists).
 fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Error {
-    match unlinkat_fd(parent_fd, tmp_name) {
+    match unlinkat_fd(parent_fd, tmp_name, Sanction::None) {
         Ok(()) => original,
         Err(e) => original.with_context(format!(
             "additionally failed to unlink the failed replace's temp {}: {e}",
@@ -1121,7 +1132,7 @@ fn replace_core(
     if let Some(expected) = expected
         && !live_matches(&parent_fd, file_name, expected)?
     {
-        let _ = unlinkat_fd(&parent_fd, &tmp_name);
+        let _ = unlinkat_fd(&parent_fd, &tmp_name, Sanction::None);
         return Ok(CoreReplace::Mismatch);
     }
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
@@ -1131,7 +1142,7 @@ fn replace_core(
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
     probe_rename();
-    if let Err(e) = renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name) {
+    if let Err(e) = renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name, Sanction::None) {
         return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
     }
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
@@ -1249,7 +1260,7 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<(
     // The install is done (our content, or the racing winner's): removing the
     // temp name is the protocol's own bookkeeping, so a failure there must NOT
     // turn a committed CAS into an error — best-effort, as before.
-    let _ = unlinkat_fd(&parent_fd, &tmp_name);
+    let _ = unlinkat_fd(&parent_fd, &tmp_name, Sanction::None);
     if !installed {
         // Lost the race: the winner's content must match ours or refuse.
         let f = openat_readable_regular(&parent_fd, Path::new(file_name), libc::O_RDONLY)?;
@@ -1338,8 +1349,11 @@ pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool>
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(Error::store(format!("openat {}: {e}", rel.display())));
             }
-            // The component is guarded: see [`open_or_create_dir`].
-            refuse_mutation_name(OsStr::from_bytes(comp))?;
+            // The component is guarded: see [`open_or_create_dir`]. A residue
+            // spelling is permitted here because the component did not exist
+            // (the openat above returned NotFound), so this is a fresh create,
+            // never a destruction.
+            refuse_mutation_name(OsStr::from_bytes(comp), Sanction::Residue)?;
             let r = unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o700) };
             if r < 0 {
                 let e2 = std::io::Error::last_os_error();
@@ -1492,7 +1506,9 @@ fn refuse_lock_record_in_moved_subtree(root: &RootDir, rel: &Path) -> Result<()>
         for entry in dir_entry_names(&dir_fd)? {
             let child_name = std::ffi::OsStr::from_bytes(&entry);
             let child_rel = dir_rel.join(child_name);
-            refuse_lock_record_mutation(&child_rel)?;
+            // LOCK authority only: a residue that MOVES with the subtree is not
+            // destroyed, so it is permitted here.
+            refuse_reserved_mutation(&child_rel, Sanction::Residue)?;
             let mode = fstatat_mode_io(&dir_fd, &entry)
                 .map_err(|e| Error::store(format!("fstatat {}: {e}", child_rel.display())))?;
             if (mode & libc::S_IFMT) == libc::S_IFDIR {
@@ -1512,9 +1528,9 @@ fn refuse_lock_record_in_moved_subtree(root: &RootDir, rel: &Path) -> Result<()>
 /// The descriptor-relative remove of a single file (or symlink — the
 /// symlink itself is removed, never its target).
 pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
-    unlinkat_fd(&parent_fd, name)
+    unlinkat_fd(&parent_fd, name, Sanction::None)
 }
 
 /// The descriptor-relative rename of a path under the root to another path
@@ -1527,14 +1543,46 @@ pub fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
 pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
     // BOTH ends: renaming the record AWAY destroys the inode under the path a
     // successor acquires, and renaming ONTO it replaces the record's entry.
+    // The public rename ALSO applies the residue authority at both ends, so a
+    // caller cannot replace (or move) a strand through it.
     let from = GuardedRel::new(from)?;
     let to = GuardedRel::new(to)?;
-    renameat_paths_guarded(root, from, to)
+    renameat_paths_guarded(root, from, to, Sanction::None)
+}
+
+/// The SANCTIONED residue-movement rename (crate-internal): the engine's own
+/// claim-aside rename and `sync::Residue::recover_to` present it. Both ends may
+/// carry a residue spelling (that is the point — the claim-aside IS the
+/// destination, the stranded aside IS the source), and the lock authority still
+/// runs on both.
+pub(crate) fn rename_residue_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+    // A residue `to` that ALREADY EXISTS is a stranded ORIGINAL the rename
+    // would REPLACE: refuse it, exactly as the public rename does. An ABSENT
+    // residue `to` is a fresh claim-aside (the engine's own), and a residue
+    // `from` is a MOVE (the strand survives), so both remain permitted. This
+    // keeps the SANCTIONED route from becoming the old hole for a caller that
+    // names an existing strand as the destination.
+    if to
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::reserved::is_residue_name)
+        && path_kind_fd(root, to)?.is_some()
+    {
+        return Err(super::residue_refusal(to));
+    }
+    let from = GuardedRel::new_for_residue(from)?;
+    let to = GuardedRel::new_for_residue(to)?;
+    renameat_paths_guarded(root, from, to, Sanction::Residue)
 }
 
 /// [`renameat_paths`]'s worker: it accepts only capability tokens, so the
 /// guard is structurally unavoidable here too.
-fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'_>) -> Result<()> {
+fn renameat_paths_guarded(
+    root: &RootDir,
+    from: GuardedRel<'_>,
+    to: GuardedRel<'_>,
+    sanction: Sanction<'_>,
+) -> Result<()> {
     let from = from.as_path();
     let to = to.as_path();
     // F-A2: the endpoints' names are not enough. A rename MOVES the source
@@ -1547,7 +1595,7 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
     refuse_lock_record_in_moved_subtree(root, from)?;
     let (from_fd, from_name) = parent_fd_of(root.as_fd(), from)?;
     let (to_fd, to_name) = parent_fd_of(root.as_fd(), to)?;
-    renameat_fd(&from_fd, from_name, &to_fd, to_name)
+    renameat_fd(&from_fd, from_name, &to_fd, to_name, sanction)
 }
 
 /// The descriptor-relative recursive removal of a directory tree: every
@@ -1556,18 +1604,16 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
 /// recursed into, and the tree root is removed last. A symlink injected at
 /// any component is refused (ELOOP) — never followed.
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
-    // The RESIDUE authority at the entry point: the walk checks each CHILD's
-    // name, so the walk ROOT would otherwise be removed implicitly even when
-    // it is a stranded aside. Both authorities run before any mutation.
-    refuse_residue_mutation(rel)?;
-    remove_dir_all_fd_inner(root, rel)
+    // ONE gate: this refuses a lock-record spelling AND a residue spelling, on
+    // the walk ROOT (the walk itself refuses every nested spelling).
+    refuse_reserved_mutation(rel, Sanction::None)?;
+    remove_dir_all_fd_inner(root, rel, Sanction::None)
 }
 
 /// The recursive-removal worker shared by the implicit and the explicit
-/// (discard) entry points. It carries NO residue decision: the callers run the
-/// entry-point check, and the walk itself refuses every nested residue.
-fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path) -> Result<()> {
+/// (discard) entry points. It carries the ENTRY-ROOT sanction only: the walk
+/// itself refuses every nested residue.
+fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Result<()> {
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let dir_fd = openat_no_follow(
         &parent_fd,
@@ -1576,7 +1622,7 @@ fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path) -> Result<()> {
         0,
     )?;
     remove_dir_contents_fd(&dir_fd, rel)?;
-    rmdirat_fd_io(&parent_fd, name)
+    rmdirat_fd_io(&parent_fd, name, sanction)
         .map_err(|e| Error::store(format!("rmdir {}: {e}", rel.display())))?;
     Ok(())
 }
@@ -1592,27 +1638,51 @@ fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path) -> Result<()> {
 /// the implicit-removal residue guard, and it is reachable only through the
 /// caller's explicit discard.
 pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
-    if !rel
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(crate::reserved::is_residue_name)
-    {
-        return Err(Error::conflict(format!(
-            "{}: refusing to discard {} — its final component is not a residue \
-             (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
-             removes a stranded original, never ordinary content",
-            crate::reserved::RESIDUE_BELOW,
-            rel.display()
-        )));
-    }
-    remove_dir_all_fd_inner(root, rel)
+    // The FINAL-residue sanction lets the walk root through; the gate still
+    // refuses a lock-record spelling (including a residue-shaped one) and a
+    // residue in any NON-final component.
+    refuse_reserved_mutation(rel, Sanction::FinalResidue)?;
+    require_final_residue(rel)?;
+    remove_dir_all_fd_inner(root, rel, Sanction::FinalResidue)
+}
+
+/// EXPLICIT DISCARD of a stranded residue that is a FILE or SYMLINK: the single
+/// non-recursive unlink of the ONE residue at `rel`, deliberately permitted.
+///
+/// This is the FILE analogue of [`remove_residue_dir_all_fd`] and exists for
+/// `sync::Residue::discard`. The FINAL-residue sanction lets the strand
+/// through; the gate still refuses a lock-record spelling and a residue in any
+/// non-final component.
+pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_reserved_mutation(rel, Sanction::FinalResidue)?;
+    require_final_residue(rel)?;
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    unlinkat_fd(&parent_fd, name, Sanction::FinalResidue)
+}
+
+/// Remove ONE entry of the sync engine's own CLAIM-ASIDE walk. The path
+/// necessarily includes the residue root the sync renamed aside, so residues
+/// are permitted ANYWHERE on it (the engine's walk has already stopped on a
+/// nested strand); the LOCK authority still runs.
+pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_reserved_mutation(rel, Sanction::Residue)?;
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
+    unlinkat_fd(&parent_fd, name, Sanction::Residue)
+}
+
+/// The non-recursive `rmdir` of one (already-emptied) directory of the sync
+/// engine's own claim-aside walk; residues are permitted anywhere on the path
+/// (see [`remove_claim_file_fd`]), the LOCK authority still runs.
+pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    remove_dir_fd_inner(root, rel, Sanction::Residue)
 }
 
 /// The descriptor-relative single-directory creation (no parent creation,
 /// no chmod — `create_dir` semantics). The name is guarded at the chokepoint.
 pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+    // CREATE only: a residue spelling is permitted (mkdir fails `EEXIST` if the
+    // strand is already there, and never destroys it); the lock authority runs.
+    refuse_reserved_mutation(rel, Sanction::Residue)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     mkdirat_fd(&parent_fd, name)
 }
@@ -1625,7 +1695,11 @@ pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// This is the ONE rmdir authority: it guards the full path AND the syscall
 /// chokepoint guards the final name, so no caller can rmdir the record.
 pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+    remove_dir_fd_inner(root, rel, Sanction::None)
+}
+
+fn remove_dir_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Result<()> {
+    refuse_reserved_mutation(rel, sanction)?;
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     let parent_fd = if parent_rel.as_os_str().is_empty() {
         root.as_fd()
@@ -1649,7 +1723,7 @@ pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
     let name = rel
         .file_name()
         .ok_or_else(|| Error::store(format!("rmdir {}: no file name", rel.display())))?;
-    match rmdirat_fd_io(&parent_fd, name) {
+    match rmdirat_fd_io(&parent_fd, name, sanction) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::store(format!("rmdir {}: {e}", rel.display()))),
@@ -1671,7 +1745,7 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
         ensure_private_dir_durable_fd(root, parent_rel)?;
     }
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
-    match unlinkat_fd_io(&parent_fd, name) {
+    match unlinkat_fd_io(&parent_fd, name, Sanction::None) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
@@ -1735,9 +1809,13 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
             };
             // The SAME authority the entry point consults, applied here too:
             // a subdirectory whose name is a lock-record spelling must not be
-            // rmdir'd by the walk even though the walk root was not one.
-            refuse_lock_record_mutation(&done.rel)?;
-            rmdirat_fd_io(&parent.fd, &file_name)
+            // rmdir'd by the walk even though the walk root was not one. The
+            // residue authority is NOT applied to the full `done.rel` here —
+            // that path includes the walk ROOT, which an explicit discard
+            // deliberately permits; the child's own name was already checked
+            // for residue when the walk entered it.
+            refuse_reserved_mutation(&done.rel, Sanction::Residue)?;
+            rmdirat_fd_io(&parent.fd, &file_name, Sanction::None)
                 .map_err(|e| Error::store(format!("rmdir {}: {e}", done.rel.display())))?;
             continue;
         };
@@ -1746,12 +1824,11 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
         // Both authorities at the same chokepoint, LOCK first so a lock-record
         // spelling keeps its more specific refusal. A recursive removal must
         // never walk over a stranded original (RESIDUE) nor over the record
-        // (LOCK). The residue check is on THIS entry's own name (not the whole
-        // `child_rel`), because the walk root is deliberately permitted for an
-        // explicit discard (`remove_residue_*`); only a NESTED residue stops a
-        // discard, and the entry points refuse a residue root.
-        refuse_lock_record_mutation(Path::new(child_name))?;
-        refuse_residue_mutation(Path::new(child_name))?;
+        // (LOCK). The check is on THIS entry's own name (not the whole
+        // `child_rel`), because the walk root is deliberately permitted for
+        // an explicit discard (`remove_residue_*`); only a NESTED residue
+        // stops a discard, and the entry points refuse a residue root.
+        refuse_reserved_mutation(Path::new(child_name), Sanction::None)?;
         let descend: Option<Frame> = {
             let top = stack.last().expect("the frame just examined");
             let child_rel = top.rel.join(Path::new(child_name));
@@ -1775,8 +1852,10 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
                 // symlink is removed, never its target). The guard runs on
                 // EVERY entry the walk unlinks, so removing an ANCESTOR can
                 // never take the record with it (F3).
-                refuse_lock_record_mutation(&child_rel)?;
-                unlinkat_fd(&top.fd, child_name)?;
+                // record, not on the full `child_rel` (which includes a
+                // deliberately permitted discard root).
+                refuse_reserved_mutation(&child_rel, Sanction::Residue)?;
+                unlinkat_fd(&top.fd, child_name, Sanction::None)?;
                 None
             }
         };
@@ -1802,11 +1881,10 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 /// on: a MISSING `path` is a successful no-op (idempotent removal), and a
 /// symlink at `path` is unlinked as the entry itself, never followed.
 pub fn remove_dir_all_path(path: &Path) -> Result<()> {
-    refuse_lock_record_mutation(path)?;
-    // The RESIDUE authority here too: this PATH-BASED primitive is the one the
-    // recovery recipe documented for a local destination, and it walked
-    // straight over a stranded aside (see `refuse_residue_mutation`).
-    refuse_residue_mutation(path)?;
+    // The ONE gate covers both authorities: the lock-record spelling AND the
+    // residue spelling (this path-based primitive walked straight over a
+    // stranded aside before).
+    refuse_reserved_mutation(path, Sanction::None)?;
     let md = match std::fs::symlink_metadata(path) {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2089,13 +2167,15 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, openat_no_follow, parent_fd_of,
-        path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd,
-        remove_dir_all_path, remove_file_fd, remove_owned_lock_record_fd,
-        remove_residue_dir_all_fd, renameat_fd, renameat_paths, replace_order_probe,
-        set_private_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
+        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, Sanction, openat_no_follow,
+        parent_fd_of, path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd,
+        remove_dir_all_fd, remove_dir_all_path, remove_dir_fd, remove_file_fd,
+        remove_owned_lock_record_fd, remove_residue_dir_all_fd, remove_residue_file_fd,
+        rename_residue_paths, renameat_fd, renameat_paths, replace_order_probe, set_private_fd,
+        symlink_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
         write_file_fd,
     };
+    use crate::error::ReservedKind;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
@@ -3214,8 +3294,14 @@ mod tests {
         let (dir, root) = owned_root();
         std::fs::write(dir.path().join("operation.lock"), b"HELD").unwrap();
         let (parent_fd, name) = parent_fd_of(root.as_fd(), Path::new("operation.lock")).unwrap();
-        let err = renameat_fd(&parent_fd, name, &parent_fd, std::ffi::OsStr::new("moved"))
-            .expect_err("the raw rename primitive must refuse the record as source");
+        let err = renameat_fd(
+            &parent_fd,
+            name,
+            &parent_fd,
+            std::ffi::OsStr::new("moved"),
+            Sanction::None,
+        )
+        .expect_err("the raw rename primitive must refuse the record as source");
         assert!(
             format!("{err}").contains("lock record"),
             "the refusal must name the lock record, got: {err}"
@@ -3236,6 +3322,7 @@ mod tests {
             std::ffi::OsStr::new("benign"),
             &parent_fd,
             std::ffi::OsStr::new("operation.lock"),
+            Sanction::None,
         )
         .expect_err("the raw rename primitive must refuse the record as destination");
         assert!(format!("{err}").contains("lock record"), "got: {err}");
@@ -3292,7 +3379,16 @@ mod tests {
         // (a) Removing the ANCESTOR walks over the aside without the guard.
         let err = remove_dir_all_fd(&root, Path::new("victim"))
             .expect_err("removing an ancestor of a stranded aside must be refused");
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::ResidueBelow,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(
             format!("{err}").contains(crate::reserved::RESIDUE_BELOW),
             "the refusal reuses the sync's ResidueBelow vocabulary: {err}"
@@ -3304,13 +3400,31 @@ mod tests {
         let aside_abs = dir.path().join("victim/.sync-aside.1234.0");
         let err = remove_dir_all_path(&aside_abs)
             .expect_err("removing the stranded aside itself must be refused");
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::ResidueBelow,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(aside_abs.exists(), "the aside survives the refused removal");
 
         // (c) The descriptor-relative primitive, for the same root spelling.
         let err = remove_dir_all_fd(&root, Path::new("victim/.sync-aside.1234.0"))
             .expect_err("removing the stranded aside itself must be refused");
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::ResidueBelow,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(aside_abs.exists());
 
         // (d) A LOCK record in a residue-free tree is still refused by the LOCK
@@ -3332,7 +3446,16 @@ mod tests {
         std::fs::write(aside.join("stranded"), b"precious").unwrap();
         let err = remove_dir_all_path(&aside)
             .expect_err("removing the stranded aside itself must be refused");
-        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Reserved {
+                    reason: ReservedKind::ResidueBelow,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert_eq!(
             std::fs::read(aside.join("stranded")).unwrap(),
             b"precious".to_vec()
@@ -3420,5 +3543,115 @@ mod tests {
             "{err}"
         );
         assert!(dir.path().join("ordinary").exists());
+    }
+
+    /// A1: EVERY name-mutating primitive that could touch a strand FILE refuses
+    /// it with the TYPED `ResidueBelow` reason, and the strand's bytes AND mode
+    /// are intact. PRE-FIX: each of these returned `Ok` (or clobbered/replaced)
+    /// and destroyed the caller's only copy.
+    #[test]
+    fn every_mutating_primitive_refuses_an_existing_strand_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let strand = Path::new(".sync-aside.1.0");
+        let seed = || {
+            let (dir, root) = owned_root();
+            std::fs::write(dir.path().join(strand), b"precious original").unwrap();
+            std::fs::set_permissions(
+                dir.path().join(strand),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+            (dir, root)
+        };
+        let intact = |dir: &tempfile::TempDir| {
+            assert_eq!(
+                std::fs::read(dir.path().join(strand)).unwrap(),
+                b"precious original"
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path().join(strand))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640,
+                "the strand's mode is untouched"
+            );
+        };
+        let assert_residue = |err: Error| {
+            assert!(
+                matches!(
+                    err,
+                    Error::Reserved {
+                        reason: ReservedKind::ResidueBelow,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        };
+
+        // 1. remove_file_fd — unlink.
+        let (dir, root) = seed();
+        assert_residue(remove_file_fd(&root, strand).unwrap_err());
+        intact(&dir);
+
+        // 2. write_file_fd — create-or-truncate.
+        let (dir, root) = seed();
+        assert_residue(write_file_fd(&root, strand, b"CLOBBERED").unwrap_err());
+        intact(&dir);
+
+        // 3. write_atomic_replace_fd — atomic replace.
+        let (dir, root) = seed();
+        assert_residue(
+            write_atomic_replace_fd(&root, strand, b"CLOBBERED", &mut |_| None).unwrap_err(),
+        );
+        intact(&dir);
+
+        // 4. write_atomic_replace (PATH-BASED).
+        let (dir, _root) = seed();
+        assert_residue(
+            write_atomic_replace(&dir.path().join(strand), b"CLOBBERED", &mut |_| None)
+                .unwrap_err(),
+        );
+        intact(&dir);
+
+        // 5. renameat_paths — ordinary content renamed ONTO the strand.
+        let (dir, root) = seed();
+        std::fs::write(dir.path().join("ordinary"), b"ordinary").unwrap();
+        assert_residue(renameat_paths(&root, Path::new("ordinary"), strand).unwrap_err());
+        intact(&dir);
+        assert!(dir.path().join("ordinary").exists(), "the source survives");
+
+        // 6. symlink_fd — unlink-then-link.
+        let (dir, root) = seed();
+        assert_residue(symlink_fd(&root, Path::new("target"), strand).unwrap_err());
+        intact(&dir);
+
+        // 7. remove_dir_fd — an EMPTY strand DIRECTORY.
+        let (dir, root) = owned_root();
+        std::fs::create_dir(dir.path().join(".sync-aside.2.0")).unwrap();
+        assert_residue(remove_dir_fd(&root, Path::new(".sync-aside.2.0")).unwrap_err());
+        assert!(dir.path().join(".sync-aside.2.0").is_dir());
+
+        // The ONE sanctioned break still works: the explicit file discard.
+        let (dir, root) = seed();
+        remove_residue_file_fd(&root, strand).unwrap();
+        assert!(!dir.path().join(strand).exists());
+
+        // The SANCTIONED residue-movement rename still REFUSES to replace an
+        // EXISTING strand (it must not become the old hole), while a FRESH
+        // (absent) aside destination is permitted — that is the engine's own
+        // claim-aside rename.
+        let (dir, root) = seed();
+        std::fs::write(dir.path().join("ordinary2"), b"ordinary2").unwrap();
+        assert_residue(rename_residue_paths(&root, Path::new("ordinary2"), strand).unwrap_err());
+        intact(&dir);
+        rename_residue_paths(&root, Path::new("ordinary2"), Path::new(".sync-aside.5.0")).unwrap();
+        assert!(!dir.path().join("ordinary2").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(".sync-aside.5.0")).unwrap(),
+            b"ordinary2"
+        );
     }
 }

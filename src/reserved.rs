@@ -54,11 +54,15 @@
 //! the lock-record subset ([`is_lock_record_name`]) through the ONE guard
 //! authority (`crate::atomic::guard`), so the record's stable inode cannot be
 //! unlinked, replaced, truncated, or renamed through the substrate's
-//! name-mutating funnel. The RECURSIVE-REMOVAL primitives additionally consult
-//! the RESIDUE subset ([`is_residue_name`]) at the same chokepoint, so the
-//! crate's own `remove_dir_all`-shaped primitives can never walk over a
-//! stranded aside that HOLDS an original; the one sanctioned break is the
-//! explicit [`crate::sync::Residue::discard`].
+//! name-mutating funnel. The crate's mutating
+//! primitives consult the lock-record subset ([`is_lock_record_name`]) through
+//! the ONE gate authority (`crate::atomic::guard`), so the record's stable
+//! inode cannot be unlinked, replaced, truncated, or renamed through the
+//! substrate's name-mutating funnel. The SAME gate consults the RESIDUE subset
+//! ([`is_residue_name`]) on every component, so a mutating primitive can no
+//! longer destroy a stranded aside that HOLDS an original; the sanctioned
+//! breaks are the explicit [`crate::sync::Residue::discard`], the engine's own
+//! claim-aside walk, and the sanctioned rename that creates or moves an aside.
 
 use std::path::{Component, Path};
 
@@ -76,8 +80,10 @@ pub const OPERATION_LOCK_SUFFIX: &str = ".operation.lock";
 /// ([`crate::atomic::remove_dir_all_path`] and its siblings). A consumer that
 /// matches the reason on the sync side and the conflict token on the
 /// substrate side therefore reads ONE vocabulary rather than two. The
-/// substrate's refusal is an [`crate::error::Error::Conflict`] whose message
-/// begins with this token.
+/// substrate's refusal is an [`crate::error::Error::Reserved`] whose message
+/// begins with this token and whose typed reason is
+/// [`crate::error::ReservedKind::ResidueBelow`] (or `NotResidue` /
+/// `RecoverTargetOccupied` for the recovery pair).
 pub const RESIDUE_BELOW: &str = "ResidueBelow";
 
 /// Whether a SINGLE path segment is one of the crate's RESERVED spellings and

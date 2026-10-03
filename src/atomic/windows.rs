@@ -150,7 +150,9 @@ pub fn sync_parent_dir(_path: &Path) -> Result<()> {
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    refuse_lock_record_mutation(path)?;
+    // Creation only: a residue spelling is permitted (mkdir cannot destroy),
+    // and the lock authority still runs.
+    refuse_reserved_mutation(path, Sanction::Residue)?;
     std::fs::create_dir_all(path)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
     // Windows has no Unix mode bits: the private chmod is a no-op.
@@ -162,7 +164,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// commit is a no-op) — the documented weaker guarantee of the Windows
 /// port. Returns `true` when this call created at least one directory.
 pub fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
-    refuse_lock_record_mutation(path)?;
+    refuse_reserved_mutation(path, Sanction::Residue)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
     let mut missing: Vec<PathBuf> = Vec::new();
@@ -449,7 +451,9 @@ pub(crate) fn remove_owned_lock_record_fd(
 /// Path-based single-directory creation (`create_dir` semantics), guarded like
 /// the Unix port's `create_dir_fd`.
 pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+    // CREATE only: a residue spelling is permitted (mkdir fails if the strand
+    // is already there, and never destroys it); the lock authority runs.
+    refuse_reserved_mutation(rel, Sanction::Residue)?;
     std::fs::create_dir(rel_join(root, rel)?)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", rel.display())))
 }
@@ -457,7 +461,7 @@ pub fn create_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// Path-based NON-RECURSIVE directory removal (`rmdir` semantics), guarded
 /// like the Unix port's `remove_dir_fd`. A confirmed absence is success.
 pub fn remove_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
+    refuse_reserved_mutation(rel, Sanction::None)?;
     match std::fs::remove_dir(rel_join(root, rel)?) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -528,8 +532,8 @@ fn refuse_lock_record_in_tree(root: &Path) -> Result<()> {
 
 /// Refuse a recursive removal whose tree CONTAINS destination residue at any
 /// depth BELOW `root` (`root` itself is the caller's entry-point decision: an
-/// implicit removal refuses it via [`refuse_residue_mutation`], an explicit
-/// discard permits it). The Windows port delegates the walk to
+/// implicit removal refuses it through the ONE gate, an explicit discard
+/// permits it). The Windows port delegates the walk to
 /// `std::fs::remove_dir_all`, which unlinks descendants without consulting any
 /// authority, so the residue authority is applied to the WHOLE tree before
 /// anything is removed (fail closed), exactly as
@@ -574,6 +578,28 @@ pub fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
     renameat_paths_guarded(root, from, to)
 }
 
+/// The SANCTIONED residue-movement rename (crate-internal), the Windows twin of
+/// `unix::rename_residue_paths`: both ends may carry a residue spelling (the
+/// engine's own claim-aside rename and `sync::Residue::recover_to`), and the
+/// lock authority still runs on both.
+pub(crate) fn rename_residue_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+    // A residue `to` that ALREADY EXISTS is a stranded ORIGINAL the rename
+    // would REPLACE: refuse it, exactly as the public rename does. An ABSENT
+    // residue `to` is a fresh claim-aside (the engine's own), and a residue
+    // `from` is a MOVE (the strand survives), so both remain permitted.
+    if to
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::reserved::is_residue_name)
+        && path_kind_fd(root, to)?.is_some()
+    {
+        return Err(residue_refusal(to));
+    }
+    let from = GuardedRel::new_for_residue(from)?;
+    let to = GuardedRel::new_for_residue(to)?;
+    renameat_paths_guarded(root, from, to)
+}
+
 /// [`renameat_paths`]'s worker: it accepts only capability tokens, so the
 /// rel-path rename cannot be named without the guard on this port either.
 fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'_>) -> Result<()> {
@@ -602,10 +628,10 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
 /// path gets from its own walk. (Windows is type-checked only, never run
 /// here.)
 pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
-    // The RESIDUE authority at the entry point, exactly as on Unix. Without
-    // it, `std::fs::remove_dir_all` walked straight over a stranded aside.
-    refuse_residue_mutation(rel)?;
+    // The ONE gate at the entry point refuses a lock-record spelling AND a
+    // residue spelling. Without the residue half, `std::fs::remove_dir_all`
+    // walked straight over a stranded aside.
+    refuse_reserved_mutation(rel, Sanction::None)?;
     let joined = rel_join(root, rel)?;
     // `std::fs::remove_dir_all` unlinks descendants itself, so the whole tree
     // is checked BEFORE it runs — for BOTH authorities.
@@ -620,25 +646,47 @@ pub fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
 /// spelling is permitted, the lock authority still runs, and a NESTED residue
 /// is still refused.
 pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
-    refuse_lock_record_mutation(rel)?;
-    if !rel
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(crate::reserved::is_residue_name)
-    {
-        return Err(Error::conflict(format!(
-            "{}: refusing to discard {} — its final component is not a residue \
-             (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
-             removes a stranded original, never ordinary content",
-            crate::reserved::RESIDUE_BELOW,
-            rel.display()
-        )));
-    }
+    // The FINAL-residue sanction lets the walk root through; the gate still
+    // refuses a lock-record spelling (including a residue-shaped one) and a
+    // residue in any NON-final component.
+    refuse_reserved_mutation(rel, Sanction::FinalResidue)?;
+    require_final_residue(rel)?;
     let joined = rel_join(root, rel)?;
     refuse_lock_record_in_tree(&joined)?;
     refuse_residue_in_tree(&joined)?;
     std::fs::remove_dir_all(joined)
         .map_err(|e| Error::store(format!("remove_dir_all {}: {e}", rel.display())))
+}
+
+/// EXPLICIT DISCARD of a stranded residue that is a FILE or SYMLINK, the
+/// Windows twin of `unix::remove_residue_file_fd`: the FINAL-residue sanction
+/// lets the strand through, the lock authority still runs, and a residue in any
+/// non-final component is still refused.
+pub(crate) fn remove_residue_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_reserved_mutation(rel, Sanction::FinalResidue)?;
+    require_final_residue(rel)?;
+    std::fs::remove_file(rel_join(root, rel)?)
+        .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
+}
+
+/// Remove ONE entry of the sync engine's own CLAIM-ASIDE walk. Residues are
+/// permitted anywhere on the path; the LOCK authority still runs.
+pub(crate) fn remove_claim_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_reserved_mutation(rel, Sanction::Residue)?;
+    std::fs::remove_file(rel_join(root, rel)?)
+        .map_err(|e| Error::store(format!("remove {}: {e}", rel.display())))
+}
+
+/// The non-recursive `rmdir` of one (already-emptied) directory of the sync
+/// engine's own claim-aside walk; residues are permitted anywhere on the path
+/// (see [`remove_claim_file_fd`]).
+pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    refuse_reserved_mutation(rel, Sanction::Residue)?;
+    match std::fs::remove_dir(rel_join(root, rel)?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::store(format!("rmdir {}: {e}", rel.display()))),
+    }
 }
 
 /// Path-based plain file write (create-or-truncate).

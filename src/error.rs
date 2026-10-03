@@ -8,7 +8,7 @@
 //! could not be made durable ([`Error::Store`]), a transport failure
 //! ([`Error::Transport`]), and the closed refusals a caller reacts to
 //! ([`Error::Preflight`], [`Error::NotFound`], [`Error::Ref`],
-//! [`Error::Conflict`], [`Error::LockContended`]).
+//! [`Error::Conflict`], [`Error::Reserved`], [`Error::LockContended`]).
 
 use thiserror::Error;
 
@@ -47,6 +47,17 @@ pub enum Error {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A TYPED reserved-spelling / residue refusal from the substrate's ONE gate
+    /// (or a residue recovery). A consumer branches on [`ReservedKind`] instead
+    /// of string-matching the message. The message KEEPS the historical
+    /// `ResidueBelow` token, so a caller that already matches the text is
+    /// unaffected.
+    #[error("reserved spelling: {reason:?}: {message}")]
+    Reserved {
+        reason: ReservedKind,
+        message: String,
+    },
+
     /// The advisory lock is held by a LIVE holder. This is a TYPED contention
     /// signal, distinct from a real open/flock failure (which stays
     /// [`Error::Preflight`]): a caller that wants to RETRY a contended lock
@@ -58,6 +69,43 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The TYPED reason a reserved-spelling refusal was raised, carried by
+/// [`Error::Reserved`] so a consumer can branch without string-matching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedKind {
+    /// The path names or descends through a destination RESIDUE: a stranded
+    /// claim-aside that HOLDS the pre-replace original. Recover it with
+    /// `sync::Residue::recover_to` or destroy it only with
+    /// `sync::Residue::discard`.
+    ResidueBelow,
+    /// A discard/detection was handed a path whose final component is NOT a
+    /// residue spelling.
+    NotResidue,
+    /// `sync::Residue::recover_to` found the target path already occupied (a
+    /// regular file, a directory, OR a symlink), so overwriting it could
+    /// destroy the entry there. Both the strand and the target are intact.
+    RecoverTargetOccupied,
+}
+
+impl Error {
+    /// A TYPED reserved-spelling refusal (see [`ReservedKind`]). The message
+    /// keeps the `ResidueBelow` token for textual compatibility.
+    pub fn reserved(kind: ReservedKind, msg: impl Into<String>) -> Self {
+        Error::Reserved {
+            reason: kind,
+            message: msg.into(),
+        }
+    }
+
+    /// The typed reserved-spelling reason, when this error is one.
+    pub fn reserved_kind(&self) -> Option<ReservedKind> {
+        match self {
+            Error::Reserved { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+}
 
 impl Error {
     pub fn path(msg: impl Into<String>) -> Self {
@@ -120,6 +168,10 @@ impl Error {
             Error::NotFound(m) => Error::NotFound(format!("{m}; {context}")),
             Error::Ref(m) => Error::Ref(format!("{m}; {context}")),
             Error::Conflict(m) => Error::Conflict(format!("{m}; {context}")),
+            Error::Reserved { reason, message } => Error::Reserved {
+                reason,
+                message: format!("{message}; {context}"),
+            },
             Error::LockContended(m) => Error::LockContended(format!("{m}; {context}")),
         }
     }

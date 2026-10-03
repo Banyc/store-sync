@@ -242,6 +242,91 @@ fn refuse_lock_record(rel: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Which reserved spelling, if any, a mutation is SANCTIONED to break.
+///
+/// The crate has exactly TWO reserved-spelling authorities: the LOCK-record
+/// spelling ([`crate::reserved::is_lock_record_name`]) and the RESIDUE
+/// spelling ([`crate::reserved::is_residue_name`], an unaddressable,
+/// non-temp name that HOLDS a stranded original). A primitive that consulted
+/// one and not the other is exactly how a stranded ORIGINAL was destroyed, so
+/// there is ONE gate ([`refuse_reserved_mutation`]) and this parameter names
+/// the ONE reserved spelling it may let through.
+#[derive(Clone, Copy)]
+pub(crate) enum Sanction<'a> {
+    /// No reserved spelling may be broken. Every name-mutating primitive that
+    /// is not one of the two deliberate exceptions presents this.
+    None,
+    /// The ONE lock record the presented [`OwnedLockRecord`] owns (by resolved
+    /// identity, or by the byte-exact creation spelling while no entry exists).
+    /// EVERY other lock-record spelling and EVERY residue spelling is still
+    /// refused.
+    OwnedLockRecord(&'a OwnedLockRecord),
+    /// The residue at the FINAL component only: the explicit discard path
+    /// (`sync::Residue::discard` -> `atomic::remove_residue_*`). The LOCK
+    /// authority still refuses a lock-record spelling (a record is also a
+    /// residue spelling), and a residue in any NON-final component is still
+    /// refused, so a discard can never touch a NESTED strand.
+    FinalResidue,
+    /// EVERY residue spelling is permitted, because the operation cannot
+    /// DESTROY an existing strand BY ITS SPELLING: it only CREATES a fresh
+    /// entry (a directory or a symlink) or MOVES one (a rename endpoint).
+    /// `mkdir`/`symlink` fail on an existing entry, and a rename only replaces
+    /// what the caller explicitly names — so the engine's own claim-aside
+    /// renames and case-probe directory still work, while the LOCK authority
+    /// is still enforced. The public rename nevertheless applies the residue
+    /// authority (a rename CAN replace a strand), so this sanction is used
+    /// only by the crate's own sanctioned rename/creation primitives.
+    Residue,
+}
+
+/// THE one reserved-spelling gate. Every name-mutating primitive passes
+/// through it, and it runs BOTH authorities:
+///
+/// * the LOCK-record authority ([`refuse_lock_record`]) unless `sanction`
+///   proves the candidate IS the owned record; and
+/// * the RESIDUE authority ([`crate::reserved::is_residue_name`]) on EVERY
+///   component, except (a) the owned lock record itself and (b) the FINAL
+///   component under [`Sanction::FinalResidue`].
+///
+/// A primitive therefore CANNOT carry the lock authority and skip the residue
+/// authority: this function is the only reachable way to run either check
+/// (`refuse_lock_record` is private to this module, and the residue loop lives
+/// here), and it always runs both. A future mutator that wants a lock-record
+/// grant presents [`Sanction::OwnedLockRecord`] and still gets the residue
+/// refusal on every spelling that is not the granted record; one that wants the
+/// explicit discard presents [`Sanction::FinalResidue`] and still gets the lock
+/// refusal and the nested-residue refusal. [`GuardedRel`] is the unforgeable
+/// proof that this gate ran.
+pub(crate) fn refuse_reserved_mutation(rel: &Path, sanction: Sanction<'_>) -> Result<()> {
+    let owned_grant = match sanction {
+        Sanction::OwnedLockRecord(owned) => owned.owns(rel),
+        _ => false,
+    };
+    if !owned_grant {
+        refuse_lock_record(rel)?;
+    }
+    if matches!(sanction, Sanction::Residue) {
+        return Ok(());
+    }
+    let last = rel.components().count().checked_sub(1);
+    for (index, component) in rel.components().enumerate() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        if !name.to_str().is_some_and(crate::reserved::is_residue_name) {
+            continue;
+        }
+        if owned_grant {
+            continue;
+        }
+        if matches!(sanction, Sanction::FinalResidue) && Some(index) == last {
+            continue;
+        }
+        return Err(super::residue_refusal(rel));
+    }
+    Ok(())
+}
+
 /// The scope of a mutation the guard authorized: ordinary content, or the ONE
 /// lock record the crate's own protocol OWNS ([`crate::transport::Layout::lock`]).
 /// Carried by [`GuardedRel`] so a caller can pick the sidecar-serialized route
@@ -278,7 +363,7 @@ impl<'a> GuardedRel<'a> {
     /// (verified by the source audit), so a value of this type IS proof the
     /// guard ran.
     pub(crate) fn new(rel: &'a Path) -> Result<Self> {
-        refuse_lock_record(rel)?;
+        refuse_reserved_mutation(rel, Sanction::None)?;
         Ok(Self {
             rel,
             scope: GuardScope::Ordinary,
@@ -312,13 +397,27 @@ impl<'a> GuardedRel<'a> {
         rel: &'a Path,
         owned: &OwnedLockRecord,
     ) -> Result<Self> {
-        if owned.owns(rel) {
-            return Ok(Self {
-                rel,
-                scope: GuardScope::OwnedLockRecord,
-            });
-        }
-        refuse_lock_record(rel)?;
+        let grant = owned.owns(rel);
+        refuse_reserved_mutation(rel, Sanction::OwnedLockRecord(owned))?;
+        Ok(Self {
+            rel,
+            scope: if grant {
+                GuardScope::OwnedLockRecord
+            } else {
+                GuardScope::Ordinary
+            },
+        })
+    }
+
+    /// The SANCTIONED residue-movement constructor: run the gate with
+    /// [`Sanction::Residue`] (every residue spelling is permitted; the lock
+    /// authority is still enforced). Used ONLY by the crate's own rename of a
+    /// claim-aside and by `sync::Residue::recover_to`, where the residue
+    /// spelling is the point of the operation. The PUBLIC
+    /// [`GuardedRel::new`] refuses residue spellings, so a caller that reaches
+    /// for the ordinary rename cannot move or replace a strand.
+    pub(crate) fn new_for_residue(rel: &'a Path) -> Result<Self> {
+        refuse_reserved_mutation(rel, Sanction::Residue)?;
         Ok(Self {
             rel,
             scope: GuardScope::Ordinary,
@@ -965,10 +1064,13 @@ mod tests {
             ("src/atomic/mod.rs", "libc::O_DIRECTORY", 1),
             ("src/atomic/mod.rs", "libc::O_NOFOLLOW", 1),
             ("src/lock/unix.rs", "libc::EAGAIN", 1),
+            ("src/lock/unix.rs", "libc::ELOOP", 1),
             ("src/lock/unix.rs", "libc::EWOULDBLOCK", 2),
             ("src/lock/unix.rs", "libc::LOCK_EX", 1),
             ("src/lock/unix.rs", "libc::LOCK_NB", 1),
             ("src/lock/unix.rs", "libc::LOCK_UN", 1),
+            ("src/lock/unix.rs", "libc::O_CLOEXEC", 1),
+            ("src/lock/unix.rs", "libc::O_NOFOLLOW", 1),
             ("src/lock/unix.rs", "libc::flock", 2),
             ("src/sync/apply.rs", "libc::O_DIRECTORY", 2),
             ("src/sync/apply.rs", "libc::O_RDONLY", 4),
@@ -1103,7 +1205,7 @@ mod tests {
             ("src/atomic/mod.rs", "remove_file", 1),
             ("src/atomic/unix.rs", "remove_file", 1),
             ("src/atomic/unix.rs", "rename", 1),
-            ("src/atomic/windows.rs", "remove_dir", 1),
+            ("src/atomic/windows.rs", "remove_dir", 2),
             // TWO production `remove_dir_all` calls since R2: the implicit
             // recursive removal (`remove_dir_all_fd`, refused for residue) and
             // the EXPLICIT discard (`remove_residue_dir_all_fd`), whose caller
@@ -1111,7 +1213,11 @@ mod tests {
             // authority on the whole path/tree before the call, so neither can
             // name the record; the count is raised deliberately, not silently.
             ("src/atomic/windows.rs", "remove_dir_all", 2),
-            ("src/atomic/windows.rs", "remove_file", 5),
+            // SEVEN production `remove_file` calls: the pre-A1 five plus the two
+            // sanctioned claim-aside walk primitives (`remove_claim_file_fd`
+            // and the discard `remove_residue_file_fd`), whose paths include
+            // the claim root and therefore permit residues.
+            ("src/atomic/windows.rs", "remove_file", 7),
             ("src/atomic/windows.rs", "rename", 2),
             ("src/transport/mod.rs", "remove_file", 8),
             ("src/transport/mod.rs", "rename", 1),

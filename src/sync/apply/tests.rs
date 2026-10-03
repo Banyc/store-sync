@@ -1322,6 +1322,126 @@ impl RecordingRemote {
             .unwrap()
             .push((op.to_string(), rel.to_string()));
     }
+
+    /// Shared claim/ordinary rename logic. `aside` selects the SANCTIONED
+    /// residue-movement primitive on the inner transport (the engine's own
+    /// claim-aside rename), while the fault accounting and recording are the
+    /// SAME for both so the existing injections still fire.
+    fn rename_impl(
+        &self,
+        from: &RootedRelativePath,
+        to: &RootedRelativePath,
+        aside: bool,
+    ) -> Result<()> {
+        self.maybe_swap_before_first_op();
+        self.record("rename", from);
+        self.rename_targets.lock().unwrap().push(to.to_string());
+        let nth = self.renames.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_nth_rename == Some(nth) {
+            return Err(Error::transport(format!("injected rename failure #{nth}")));
+        }
+        if self.fail_nth_rename_after_rename == Some(nth) {
+            // Move the entry FIRST, then report the failure: the rename LANDED.
+            if aside {
+                self.inner.rename_aside(from, to)?;
+            } else {
+                self.inner.rename(from, to)?;
+            }
+            return Err(Error::transport(format!(
+                "injected rename failure #{nth} after the entry moved"
+            )));
+        }
+        if self.vanish_nth_rename == Some(nth) {
+            // Remove the source entry and report failure: afterwards the entry
+            // is at NEITHER the source nor the destination spelling.
+            //
+            // This models a FOREIGN `rename(2)` that unlinked the source, so it
+            // DELIBERATELY bypasses the crate's guarded recursive removal: since
+            // R1 that primitive REFUSES to destroy a subtree holding residue (a
+            // source can hold a nested `.sync-aside.`), and a foreign rename is
+            // exactly the case the guard does not and cannot cover.
+            if let Ok(Some(meta)) = self.inner.metadata_opt(from) {
+                let absolute = self.inner.root().join(from.as_path());
+                if meta.is_dir {
+                    let _ = std::fs::remove_dir_all(absolute);
+                } else {
+                    let _ = std::fs::remove_file(absolute);
+                }
+            }
+            return Err(Error::transport(format!(
+                "injected rename failure #{nth} after the entry vanished"
+            )));
+        }
+        if aside {
+            self.inner.rename_aside(from, to)?;
+        } else {
+            self.inner.rename(from, to)?;
+        }
+        if let Some((nth, action)) = &self.after_rename
+            && self.renames.load(Ordering::SeqCst) == *nth
+        {
+            action.apply(self.inner.root());
+        }
+        Ok(())
+    }
+
+    /// Shared remove-file logic; `residue` selects the sanctioned claim-aside
+    /// primitive on the inner transport, while the fault accounting and
+    /// recording are the SAME so the existing injections still fire.
+    fn remove_file_impl(&self, rel: &RootedRelativePath, residue: bool) -> Result<()> {
+        self.maybe_swap_before_first_op();
+        self.record("remove_file", rel);
+        self.removals.fetch_add(1, Ordering::SeqCst);
+        if let Some(nth) = self.fail_nth_remove_after_remove {
+            let call = self.remove_files.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == nth {
+                // Unlink FIRST, then report the failure: the entry is gone
+                // while the caller sees an error.
+                if residue {
+                    self.inner.remove_residue_file(rel)?;
+                } else {
+                    self.inner.remove_file(rel)?;
+                }
+                return Err(Error::transport(format!(
+                    "injected remove_file failure #{call} after the entry was unlinked"
+                )));
+            }
+        }
+        if self.fail_remove_file {
+            return Err(Error::transport("injected remove_file failure"));
+        }
+        if residue {
+            self.inner.remove_residue_file(rel)?;
+        } else {
+            self.inner.remove_file(rel)?;
+        }
+        if let Some((nth, action)) = &self.after_removal
+            && self.removals.load(Ordering::SeqCst) == *nth
+        {
+            action.apply(self.inner.root());
+        }
+        Ok(())
+    }
+
+    /// Shared remove-dir logic; `residue` selects the sanctioned claim-aside
+    /// primitive on the inner transport.
+    fn remove_dir_impl(&self, rel: &RootedRelativePath, residue: bool) -> Result<()> {
+        self.maybe_swap_before_first_op();
+        self.record("remove_dir", rel);
+        self.removals.fetch_add(1, Ordering::SeqCst);
+        self.maybe_mutate_before_dir_removal();
+        if residue {
+            self.inner.remove_residue_dir(rel)?;
+        } else {
+            self.inner.remove_dir(rel)?;
+        }
+        if let Some((nth, action)) = &self.after_removal
+            && self.removals.load(Ordering::SeqCst) == *nth
+        {
+            action.apply(self.inner.root());
+        }
+        Ok(())
+    }
 }
 
 impl Remote for RecordingRemote {
@@ -1502,48 +1622,16 @@ impl Remote for RecordingRemote {
         self.inner.list(rel)
     }
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
-        self.maybe_swap_before_first_op();
-        self.record("rename", from);
-        self.rename_targets.lock().unwrap().push(to.to_string());
-        let nth = self.renames.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.fail_nth_rename == Some(nth) {
-            return Err(Error::transport(format!("injected rename failure #{nth}")));
-        }
-        if self.fail_nth_rename_after_rename == Some(nth) {
-            // Move the entry FIRST, then report the failure: the rename LANDED.
-            self.inner.rename(from, to)?;
-            return Err(Error::transport(format!(
-                "injected rename failure #{nth} after the entry moved"
-            )));
-        }
-        if self.vanish_nth_rename == Some(nth) {
-            // Remove the source entry and report failure: afterwards the entry
-            // is at NEITHER the source nor the destination spelling.
-            //
-            // This models a FOREIGN `rename(2)` that unlinked the source, so it
-            // DELIBERATELY bypasses the crate's guarded recursive removal: since
-            // R1 that primitive REFUSES to destroy a subtree holding residue (a
-            // source can hold a nested `.sync-aside.`), and a foreign rename is
-            // exactly the case the guard does not and cannot cover.
-            if let Ok(Some(meta)) = self.inner.metadata_opt(from) {
-                let absolute = self.inner.root().join(from.as_path());
-                if meta.is_dir {
-                    let _ = std::fs::remove_dir_all(absolute);
-                } else {
-                    let _ = std::fs::remove_file(absolute);
-                }
-            }
-            return Err(Error::transport(format!(
-                "injected rename failure #{nth} after the entry vanished"
-            )));
-        }
-        self.inner.rename(from, to)?;
-        if let Some((nth, action)) = &self.after_rename
-            && self.renames.load(Ordering::SeqCst) == *nth
-        {
-            action.apply(self.inner.root());
-        }
-        Ok(())
+        self.rename_impl(from, to, false)
+    }
+    fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        self.rename_impl(from, to, true)
+    }
+    fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_file_impl(rel, true)
+    }
+    fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        self.remove_dir_impl(rel, true)
     }
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         self.maybe_swap_before_first_op();
@@ -1558,30 +1646,7 @@ impl Remote for RecordingRemote {
         self.inner.read_link(rel)
     }
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
-        self.maybe_swap_before_first_op();
-        self.record("remove_file", rel);
-        self.removals.fetch_add(1, Ordering::SeqCst);
-        if let Some(nth) = self.fail_nth_remove_after_remove {
-            let call = self.remove_files.fetch_add(1, Ordering::SeqCst) + 1;
-            if call == nth {
-                // Unlink FIRST, then report the failure: the entry is gone
-                // while the caller sees an error.
-                self.inner.remove_file(rel)?;
-                return Err(Error::transport(format!(
-                    "injected remove_file failure #{call} after the entry was unlinked"
-                )));
-            }
-        }
-        if self.fail_remove_file {
-            return Err(Error::transport("injected remove_file failure"));
-        }
-        self.inner.remove_file(rel)?;
-        if let Some((nth, action)) = &self.after_removal
-            && self.removals.load(Ordering::SeqCst) == *nth
-        {
-            action.apply(self.inner.root());
-        }
-        Ok(())
+        self.remove_file_impl(rel, false)
     }
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.maybe_swap_before_first_op();
@@ -1597,17 +1662,7 @@ impl Remote for RecordingRemote {
         Ok(())
     }
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        self.maybe_swap_before_first_op();
-        self.record("remove_dir", rel);
-        self.removals.fetch_add(1, Ordering::SeqCst);
-        self.maybe_mutate_before_dir_removal();
-        self.inner.remove_dir(rel)?;
-        if let Some((nth, action)) = &self.after_removal
-            && self.removals.load(Ordering::SeqCst) == *nth
-        {
-            action.apply(self.inner.root());
-        }
-        Ok(())
+        self.remove_dir_impl(rel, false)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.maybe_swap_before_first_op();
@@ -5975,7 +6030,16 @@ fn a_stranded_aside_can_be_recovered_or_deliberately_discarded() {
     let residue = Residue::detect(&dst, &residue_path).unwrap();
     write(&dst.join("p"), b"occupant");
     let err = residue.recover_to(Path::new("p")).unwrap_err();
-    assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            Error::Reserved {
+                reason: crate::error::ReservedKind::RecoverTargetOccupied,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
     assert!(
         err.to_string().contains(crate::reserved::RESIDUE_BELOW),
         "{err}"
@@ -6078,6 +6142,44 @@ fn retiring_an_obsolete_snapshot_lock_record_is_explicit_and_refuses_a_held_one(
         RetireOutcome::Retired
     );
     assert!(!held_path.exists());
+}
+
+/// A5: `retire_destination_lock` FAILS CLOSED when it cannot DETERMINE whether
+/// the destination or the record exists. PRE-FIX any `symlink_metadata` error
+/// (an EACCES on a `000` parent) read as "gone"/"no record" (`Absent`), which
+/// contradicts the crate's fail-closed doctrine. A genuinely-absent path still
+/// returns `Absent`.
+#[cfg(unix)]
+#[test]
+fn retire_destination_lock_fails_closed_when_presence_cannot_be_determined() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let parent = dir.path().join("locked");
+    fs::create_dir(&parent).unwrap();
+    let dest = parent.join("snap0");
+    // The record exists and the destination does not; the parent denies all
+    // access, so NEITHER presence probe can be answered.
+    write(&parent.join(".snap0.operation.lock"), b"record");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let err = retire_destination_lock(&dest).unwrap_err();
+    assert!(
+        matches!(err, Error::Preflight(_)),
+        "an undeterminable presence is a typed failure, never a silent Absent: {err:?}"
+    );
+    assert!(
+        err.reserved_kind().is_none(),
+        "it is not a reserved-spelling refusal: {err:?}"
+    );
+
+    // Restore so the fixture can be cleaned up; the genuinely-absent case still
+    // returns `Absent`.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_file(parent.join(".snap0.operation.lock")).unwrap();
+    assert_eq!(
+        retire_destination_lock(&dest).unwrap(),
+        RetireOutcome::Absent
+    );
 }
 
 /// R1 at the PUBLIC transport surface: `Remote::remove_dir_all` is the

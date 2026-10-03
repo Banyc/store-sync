@@ -157,20 +157,39 @@ impl FileLock {
         // itself; this helper makes the lock path itself durable for every
         // caller.
         if let Some(parent) = path.parent() {
+            // A symlink at the record's OWN PARENT would redirect the whole
+            // record (and every subsequent open) elsewhere; refuse it before
+            // creating anything. (A symlink in a GRANDPARENT component is still
+            // followed by this path-based helper — the documented residual.)
+            if let Ok(meta) = std::fs::symlink_metadata(parent)
+                && meta.file_type().is_symlink()
+            {
+                return Err(Error::preflight(format!(
+                    "refusing to acquire the lock at {}: its parent directory {} is a symlink, \
+                     which would redirect the lock record (and the victim it names) elsewhere",
+                    path.display(),
+                    parent.display()
+                )));
+            }
             crate::atomic::ensure_private_dir_durable(parent)
                 .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
         }
-        let mut file = {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+        let mut file = platform::open_lock_file(path).map_err(|e| {
+            // A symlink at the record path makes the `O_NOFOLLOW` open fail
+            // ELOOP (Unix) or the handle inspection fail (Windows): fail closed
+            // with a message that NAMES the condition rather than a raw open
+            // error. The victim is never opened, truncated, or chmodded.
+            if platform::is_symlink_open_error(&e) {
+                Error::preflight(format!(
+                    "refusing to acquire the lock at {}: the lock record path is a symlink (or is \
+                     itself a reparse point), so opening it could truncate or chmod an arbitrary \
+                     victim file; the record must be a regular file",
+                    path.display()
+                ))
+            } else {
+                Error::preflight(format!("open lock {}: {e}", path.display()))
             }
-            opts.open(path)
-                .map_err(|e| Error::preflight(format!("open lock {}: {e}", path.display())))?
-        };
+        })?;
         // Exclusive, non-blocking advisory lock (flock on Unix, LockFileEx
         // on Windows — the platform split lives in the [`platform`]
         // submodule). Only one holder at a time.
@@ -589,6 +608,68 @@ mod tests {
         drop(last);
 
         Ok(())
+    }
+
+    /// A2: a SYMLINK at the lock-record path must not be followed. PRE-FIX the
+    /// `create(true).truncate(false)` open plus `set_permissions`/`set_len(0)`/
+    /// write opened THROUGH the link: the victim was truncated to the op id and
+    /// chmodded 0600. Now the open fails closed (`O_NOFOLLOW` -> ELOOP) with a
+    /// typed `Preflight` refusal naming the symlink, and the victim's content
+    /// AND mode are intact while the record is untouched.
+    #[test]
+    fn acquire_refuses_a_symlink_at_the_record_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious victim data").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let record = dir.path().join("operation.lock");
+        std::os::unix::fs::symlink(&victim, &record).unwrap();
+
+        let err = match FileLock::acquire(&record, "op") {
+            Err(e) => e,
+            Ok(_) => panic!("a symlink record must be refused"),
+        };
+        assert!(matches!(err, Error::Preflight(_)), "{err:?}");
+        assert!(
+            format!("{err}").contains("symlink"),
+            "the refusal names the condition: {err}"
+        );
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious victim data");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the victim's mode must be untouched"
+        );
+        let meta = std::fs::symlink_metadata(&record).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the record must be untouched (still a symlink)"
+        );
+    }
+
+    /// A2 (parent): a SYMLINK at the record's OWN PARENT must be refused before
+    /// anything is created, so the record cannot be redirected into a victim
+    /// directory.
+    #[test]
+    fn acquire_refuses_a_symlinked_parent_directory() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let victim_dir = dir.path().join("victim_dir");
+        std::fs::create_dir(&victim_dir).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&victim_dir, &linked).unwrap();
+        let record = linked.join("operation.lock");
+        let err = match FileLock::acquire(&record, "op") {
+            Err(e) => e,
+            Ok(_) => panic!("a symlinked parent must be refused"),
+        };
+        assert!(matches!(err, Error::Preflight(_)), "{err:?}");
+        assert!(format!("{err}").contains("symlink"), "{err}");
+        assert!(
+            !victim_dir.join("operation.lock").exists(),
+            "nothing is created in the victim directory"
+        );
     }
 
     proptest::proptest! {
