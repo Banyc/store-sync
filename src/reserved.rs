@@ -136,9 +136,10 @@ pub fn is_application_lock_name(name: &str) -> bool {
 }
 
 /// Whether `name` is a CASE ALIAS of a spelling the crate reserves for its own
-/// bookkeeping: its Unicode case fold (`str::to_lowercase` — the SAME fold the
-/// sync's destination-alias model uses) is a reserved spelling or the
-/// application lock record while `name` itself is byte-different.
+/// bookkeeping: its FULL Unicode case fold ([`crate::casefold`], the same fold
+/// the containment index and the sync's destination-alias model use) is a
+/// reserved spelling or the application lock record while `name` itself is
+/// byte-different.
 ///
 /// On a case-insensitive filesystem (macOS APFS by default, Windows by
 /// default) `name` and the reserved spelling are the SAME directory entry, so
@@ -152,7 +153,7 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    let folded = name.to_lowercase();
+    let folded = crate::casefold::case_fold(name);
     folded != name && (is_reserved_name(&folded) || is_application_lock_name(&folded))
 }
 
@@ -212,7 +213,7 @@ fn is_crate_temp_case_alias(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    let folded = name.to_lowercase();
+    let folded = crate::casefold::case_fold(name);
     folded != name && crate::atomic::is_crate_temp_shape(&folded)
 }
 
@@ -363,8 +364,8 @@ pub fn is_lock_record_name(name: &str) -> bool {
         };
         !base.is_empty()
     }
-    // ONE fold decides every spelling ALIAS: Unicode lowercase then strip
-    // trailing `.`/` ` (see [`fold_lock_record_component`]). Byte-exact
+    // ONE fold decides every spelling ALIAS: the full Unicode case fold then
+    // strip trailing `.`/` ` (see [`fold_lock_record_component`]). Byte-exact
     // matching is deliberately NOT used here — a trailing dot is a distinct
     // entry on macOS/Linux but Win32 strips it from a short absolute drive
     // path, so recognising the alias is correct everywhere and only load
@@ -374,21 +375,27 @@ pub fn is_lock_record_name(name: &str) -> bool {
 }
 
 /// The ONE normalization used to DENY a lock-record spelling
-/// ([`is_lock_record_name`]): Unicode lowercase (`str::to_lowercase`, the fold
-/// the crate's case-alias model already uses) followed by stripping trailing
-/// `.` and ` ` (the Win32 final-component normalization that removes a
-/// trailing dot/space on a short absolute drive path; `is_lock_record_name`
-/// must recognise that alias everywhere so a Windows path cannot slip a record
-/// past the guard, and folding is harmless on a case-sensitive,
-/// dot-preserving filesystem).
+/// ([`is_lock_record_name`]): the FULL Unicode case fold
+/// ([`crate::casefold`], the fold the crate's case-alias model uses) followed
+/// by stripping trailing `.` and ` ` (the Win32 final-component normalization
+/// that removes a trailing dot/space on a short absolute drive path;
+/// `is_lock_record_name` must recognise that alias everywhere so a Windows
+/// path cannot slip a record past the guard, and folding is harmless on a
+/// case-sensitive, dot-preserving filesystem).
 ///
-/// A fold may only ever make the crate REFUSE MORE. It is deliberately NOT used
-/// to decide OWNERSHIP: folding two distinct on-disk entries together would
+/// The fold is the FULL case fold, not `str::to_lowercase`: a case-insensitive
+/// host folds `ß` to `ss`, the `ﬁ`/`ﬂ` ligatures to `fi`/`fl`, and long s
+/// (U+017F) to `s`, so a lower-case fold would UNDER-refuse an alias such as
+/// `.ſync-aside.1` (which IS `.sync-aside.1` on `ext4 -O casefold`). A fold
+/// may only ever make the crate REFUSE MORE. It is deliberately NOT used to
+/// decide OWNERSHIP: folding two distinct on-disk entries together would
 /// GRANT the protocol permission to mutate an entry a live holder owns. The
 /// ownership decision is identity-based
 /// ([`crate::atomic::OwnedLockRecord::owns`]).
 fn fold_lock_record_component(name: &str) -> String {
-    name.to_lowercase().trim_end_matches(['.', ' ']).to_string()
+    crate::casefold::case_fold(name)
+        .trim_end_matches(['.', ' '])
+        .to_string()
 }
 
 /// Whether ANY component of a canonical manifest path is reserved (see

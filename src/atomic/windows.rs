@@ -418,6 +418,53 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     // is judged against the destination root, exactly as `canonicalize_tree`
     // will judge the result.
     let dst_root_abs = root.path().to_path_buf();
+
+    // THE ONE CONTAINMENT AUTHORITY — see the Unix port for the full argument:
+    // the copy builds the SAME [`crate::manifest::SymlinkContainmentIndex`] the
+    // two manifest views build, from a filesystem enumeration of the source
+    // subtree (at `dst_rel`) and the destination entries the run leaves in
+    // place, then runs the indexed rule. This replaces a LIVE
+    // `symlink_metadata` probe that erred in BOTH directions (missed a
+    // fold-equal symlink, ignored destination-only symlinks under `dst_rel`,
+    // and collapsed every error to `Absent`). The destination walk is skipped
+    // when the source holds no symlink; an enumeration failure is an `Err`
+    // (fail closed).
+    let source_entries = crate::manifest::live_entry_kinds(src)?;
+    let has_source_symlink = source_entries.iter().any(|(_, is_link)| *is_link);
+    let dst_entries: Vec<(String, bool)> = if has_source_symlink {
+        crate::manifest::live_entry_kinds(&dst_root_abs)?
+    } else {
+        Vec::new()
+    };
+    let dst_spelling = crate::manifest::canonical_rel_string(dst_rel).ok_or_else(|| {
+        Error::store(format!(
+            "copy_dir_recursive_fd: destination {} is not a canonical relative path",
+            dst_rel.display()
+        ))
+    })?;
+    let source_paths: std::collections::BTreeSet<String> = source_entries
+        .iter()
+        .map(|(sub, _)| crate::manifest::relocate_under(&dst_spelling, sub))
+        .collect();
+    let mut combined: Vec<(String, bool)> =
+        Vec::with_capacity(dst_entries.len() + source_entries.len());
+    for (path, is_link) in &dst_entries {
+        if source_paths.contains(path) {
+            continue;
+        }
+        combined.push((path.clone(), *is_link));
+    }
+    for (sub, is_link) in &source_entries {
+        combined.push((
+            crate::manifest::relocate_under(&dst_spelling, sub),
+            *is_link,
+        ));
+    }
+    let containment_index = crate::manifest::SymlinkContainmentIndex::from_pairs(
+        combined
+            .iter()
+            .map(|(path, is_link)| (path.as_str(), *is_link)),
+    );
     ensure_private_dir_fd(root, dst_rel)?;
     crate::platform::chmod(&rel_join(root, dst_rel)?, (root_mode | 0o200) & 0o7777)
         .map_err(|e| Error::store(format!("chmod {}: {e}", dst_rel.display())))?;
@@ -476,20 +523,11 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                         child_src.display()
                     ))
                 })?;
-            let mut resolve = |rel: &Path| -> crate::manifest::ComponentResolution {
-                let probe = match rel.strip_prefix(dst_rel) {
-                    Ok(sub) => src.join(sub),
-                    Err(_) => dst_root_abs.join(rel),
-                };
-                match std::fs::symlink_metadata(probe) {
-                    Ok(m) if m.is_symlink() => crate::manifest::ComponentResolution::Symlink,
-                    Ok(_) => crate::manifest::ComponentResolution::NotSymlink,
-                    Err(_) => crate::manifest::ComponentResolution::Absent,
-                }
-            };
-            if let Err(refusal) =
-                crate::manifest::check_relative_symlink_target(&child_rel, &link, &mut resolve)
-            {
+            if let Err(refusal) = crate::manifest::check_relative_symlink_target_indexed(
+                &child_rel,
+                &link,
+                &containment_index,
+            ) {
                 return Err(Error::store(format!(
                     "refusing to copy symlink {}: {}",
                     child_src.display(),
@@ -526,6 +564,21 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     }
     crate::platform::chmod(&rel_join(root, dst_rel)?, root_mode)
         .map_err(|e| Error::store(format!("chmod {}: {e}", dst_rel.display())))?;
+    // SOURCE-QUIESCENCE DETECTION — see the Unix port. Only when the source
+    // held a symlink, since only then was a containment verdict made. The
+    // window between this check and the `symlink_fd` calls is NOT closed.
+    if has_source_symlink {
+        let after = crate::manifest::live_entry_kinds(src)?;
+        if after != source_entries {
+            return Err(Error::store(format!(
+                "copy_dir_recursive_fd: the source {} changed shape while it was being copied \
+                 (its entries no longer match the view the symlink-containment verdict was made \
+                 against), so the copied tree cannot be trusted; the destination may hold a \
+                 partial tree",
+                src.display()
+            )));
+        }
+    }
     Ok(())
 }
 

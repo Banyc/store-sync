@@ -2022,6 +2022,52 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// caller is expected to pass a fresh destination (the source tool removes a
 /// stale staging directory first).
 ///
+/// SYMLINK CONTAINMENT uses the SAME ONE AUTHORITY as the two manifest views:
+/// the copy builds a [`crate::manifest::SymlinkContainmentIndex`] from a
+/// filesystem ENUMERATION — the source subtree relocated under `dst_rel`, plus
+/// the destination entries the run leaves in place — and runs the indexed rule
+/// ([`crate::manifest::check_relative_symlink_target_indexed`]). One rule, one
+/// fold, all three views. The destination's existing entries are part of the
+/// post-copy view: a destination-only symlink at a component a copied link
+/// walks through is REFUSED (the run may not install a link whose kernel
+/// resolution leaves the root, even when the escaping component is a
+/// destination entry the run did not create). This primitive therefore
+/// TOLERATES an existing `dst_rel` (it merges into it) but never tolerates a
+/// surviving destination symlink on a copied link's path. A source entry
+/// SHADOWS a destination entry at the same path. When the source holds no
+/// symlink the rule is never consulted and the destination is not enumerated.
+/// If a tree cannot be enumerated (a walk or `stat` error), the copy fails
+/// CLOSED rather than guessing.
+///
+/// SOURCE QUIESCENCE: a containment verdict is made from the source's SHAPE
+/// enumerated before the walk, and the copy holds no source lock. When the
+/// source holds a symlink the copy re-enumerates the source at the end and
+/// fails if its shape changed, so a source that moved during the copy is a
+/// LOUD error rather than a silent divergence. This is the copy's analogue of
+/// `sync`'s end-of-run source re-read. It DETECTS a persistent change; it does
+/// NOT close the window between the final check and the `symlinkat` syscalls,
+/// so a caller that cannot guarantee a quiescent source must serialize it
+/// itself (a lock, or copying from a snapshot) — the crate does not lock an
+/// arbitrary source path.
+///
+/// ERROR CLASSES (H3): the old live `symlink_metadata` probe collapsed EVERY
+/// error — ENOENT, ENOTDIR, ELOOP, EACCES, ENAMETOOLONG — into `Absent` ("no
+/// symlink here", i.e. ACCEPT), a fail-OPEN arm. The containment index has no
+/// error arm: it answers `Absent`/`NotSymlink`/`Symlink` from enumerated
+/// entries, so none of those classes can arise INSIDE the rule. They surface
+/// in the ENUMERATION and fail CLOSED — the copy refuses rather than guessing
+/// a component is absent:
+///
+/// * `ENOENT`: an entry that vanished between enumeration and the copy is a
+///   tree that moved; refused (and the end-of-run source re-check reports a
+///   source that changed shape).
+/// * `ENOTDIR` / `ELOOP`: a component that is not a directory (or is a symlink
+///   loop) cannot be enumerated; refused.
+/// * `EACCES`: an unreadable directory cannot be enumerated; refused.
+/// * `ENAMETOOLONG`: a spelling too long to enumerate is refused (the fd-based
+///   copy walk itself still handles a deep tree; the enumeration is the
+///   bound).
+///
 /// `dst_rel` must not name the destination ROOT itself (an empty path is
 /// refused): use [`copy_dir_recursive_fd`] on a non-empty relative path.
 /// Ancestors created for `dst_rel` use the store-private `0o700` mode (the
@@ -2063,6 +2109,69 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
     // copy), but outside it only the destination root can, which is exactly
     // what `canonicalize_tree` will see.
     let dst_root_abs = owned_root_self_path(root)?;
+
+    // THE ONE CONTAINMENT AUTHORITY. The two manifest views build a
+    // [`crate::manifest::SymlinkContainmentIndex`] from their entry list and
+    // run the indexed rule over it; this copy builds the SAME index from a
+    // filesystem ENUMERATION of the source subtree (at `dst_rel`) and the
+    // destination entries the run leaves in place, so all three views apply
+    // exactly one rule over one fold and cannot disagree. Before this the copy
+    // passed a LIVE `symlink_metadata` probe closure, which erred in BOTH
+    // directions: its exact-string probe missed a fold-equal symlink the index
+    // refuses (an accepted escape on a case-sensitive source copied to a
+    // folding destination), it had NO destination result-view (a destination-
+    // only symlink under `dst_rel` was invisible because the probe answered
+    // from the source), and it collapsed EVERY `symlink_metadata` error to
+    // `Absent` (fail-open).
+    //
+    // The source is enumerated with `WalkDir` (no follow) and the destination
+    // root likewise; a source-relative path is relocated under `dst_rel`. A
+    // destination entry at a path the source also provides is SHADOWED by the
+    // source (the source is installed over it, or already matches it) and does
+    // not constrain the link; a destination-only entry survives (`Extraneous::
+    // Keep` is not a parameter of this primitive) and does. The destination
+    // walk is skipped when the source holds NO symlink, because the rule is
+    // consulted only for symlinks. An enumeration failure is an `Err` (fail
+    // closed): an entry the walk could not describe could be a symlink the rule
+    // must see.
+    let source_entries = crate::manifest::live_entry_kinds(src)?;
+    let has_source_symlink = source_entries.iter().any(|(_, is_link)| *is_link);
+    let dst_entries: Vec<(String, bool)> = if has_source_symlink {
+        crate::manifest::live_entry_kinds(&dst_root_abs)?
+    } else {
+        Vec::new()
+    };
+    let dst_spelling = crate::manifest::canonical_rel_string(dst_rel).ok_or_else(|| {
+        Error::store(format!(
+            "copy_dir_recursive_fd: destination {} is not a canonical relative path",
+            dst_rel.display()
+        ))
+    })?;
+    // A source entry is spelled at `dst_rel/<sub>` in the index's root-relative
+    // coordinates; the SOURCE view is the relocation of its own spelling.
+    let source_paths: std::collections::BTreeSet<String> = source_entries
+        .iter()
+        .map(|(sub, _)| crate::manifest::relocate_under(&dst_spelling, sub))
+        .collect();
+    let mut combined: Vec<(String, bool)> =
+        Vec::with_capacity(dst_entries.len() + source_entries.len());
+    for (path, is_link) in &dst_entries {
+        if source_paths.contains(path) {
+            continue;
+        }
+        combined.push((path.clone(), *is_link));
+    }
+    for (sub, is_link) in &source_entries {
+        combined.push((
+            crate::manifest::relocate_under(&dst_spelling, sub),
+            *is_link,
+        ));
+    }
+    let containment_index = crate::manifest::SymlinkContainmentIndex::from_pairs(
+        combined
+            .iter()
+            .map(|(path, is_link)| (path.as_str(), *is_link)),
+    );
 
     // Create the destination chain (guarded, component-wise O_NOFOLLOW) and
     // widen the FINAL directory during the walk; the exact mode is restored
@@ -2143,20 +2252,11 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
                             child_src.display()
                         ))
                     })?;
-                let mut resolve = |rel: &Path| -> crate::manifest::ComponentResolution {
-                    let probe = match rel.strip_prefix(dst_rel) {
-                        Ok(sub) => src.join(sub),
-                        Err(_) => dst_root_abs.join(rel),
-                    };
-                    match std::fs::symlink_metadata(probe) {
-                        Ok(m) if m.is_symlink() => crate::manifest::ComponentResolution::Symlink,
-                        Ok(_) => crate::manifest::ComponentResolution::NotSymlink,
-                        Err(_) => crate::manifest::ComponentResolution::Absent,
-                    }
-                };
-                if let Err(refusal) =
-                    crate::manifest::check_relative_symlink_target(&child_rel, &link, &mut resolve)
-                {
+                if let Err(refusal) = crate::manifest::check_relative_symlink_target_indexed(
+                    &child_rel,
+                    &link,
+                    &containment_index,
+                ) {
                     return Err(Error::store(format!(
                         "refusing to copy symlink {}: {}",
                         child_src.display(),
@@ -2230,6 +2330,30 @@ pub fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Resu
         set_dir_mode_fd(root, &rel, mode)?;
     }
     set_dir_mode_fd(root, dst_rel, root_mode)?;
+
+    // SOURCE-QUIESCENCE DETECTION (the copy's analogue of `sync`'s end-of-run
+    // source re-read). The containment verdict for every copied link was made
+    // from the source SHAPE enumerated before the walk; a source that changed
+    // its shape (a component turned into or out of a symlink, an entry added or
+    // removed) after that enumeration could be copied into a tree the verdict
+    // did not describe. The copy holds no source lock, so rather than trust the
+    // caller's quiescent-source obligation it re-enumerates the source and
+    // compares the shape the verdict used, turning a silent divergence into a
+    // LOUD `Err`. This runs only when the source held a symlink (otherwise no
+    // containment verdict was made). The window between this check and the
+    // `symlinkat` syscalls is NOT closed — see the primitive doc.
+    if has_source_symlink {
+        let after = crate::manifest::live_entry_kinds(src)?;
+        if after != source_entries {
+            return Err(Error::store(format!(
+                "copy_dir_recursive_fd: the source {} changed shape while it was being copied \
+                 (its entries no longer match the view the symlink-containment verdict was made \
+                 against), so the copied tree cannot be trusted; the destination may hold a \
+                 partial tree",
+                src.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -4722,6 +4846,301 @@ mod tests {
             err.to_string().contains("escaping symlink"),
             "the refusal must reuse the crate's symlink vocabulary, got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // H2: the copy uses the SAME index as the two manifest views.
+    // ------------------------------------------------------------------
+
+    /// A CASE-SENSITIVE source directory, with the platform resource that
+    /// provides it kept alive until drop.
+    ///
+    /// A Linux tempdir (ext4) is case-sensitive. macOS's default APFS is
+    /// case-INsensitive, so the helper creates and mounts a case-sensitive
+    /// APFS image (no privileges needed); the image is detached and deleted on
+    /// drop. Returns `None` after announcing a skip when no case-sensitive
+    /// filesystem can be provided, so a run that cannot host the case is never
+    /// silent.
+    struct CaseSensitiveSource {
+        path: PathBuf,
+        _tmp: tempfile::TempDir,
+        #[cfg(target_os = "macos")]
+        _mount: Option<MacCaseSensitiveMount>,
+    }
+
+    impl CaseSensitiveSource {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacCaseSensitiveMount {
+        mountpoint: PathBuf,
+        dmg: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for MacCaseSensitiveMount {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.mountpoint)
+                .output();
+            let _ = std::fs::remove_file(&self.dmg);
+        }
+    }
+
+    fn case_sensitive_source() -> Option<CaseSensitiveSource> {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(not(target_os = "macos"))]
+        {
+            let path = tmp.path().join("cs-src");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("Case-Probe"), b"x").unwrap();
+            if std::fs::symlink_metadata(path.join("cASE-pROBE")).is_ok() {
+                crate::test_support::announce_skip(
+                    "this host filesystem folds ASCII case, so a case-sensitive source cannot be \
+                     provided here; the case-sensitive-source reproductions are untestable",
+                );
+                return None;
+            }
+            Some(CaseSensitiveSource { path, _tmp: tmp })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dmg = tmp.path().join(format!("cs-{n}.dmg"));
+            let mountpoint = tmp.path().join(format!("mnt-{n}"));
+            std::fs::create_dir_all(&mountpoint).unwrap();
+            let created = std::process::Command::new("hdiutil")
+                .args([
+                    "create",
+                    "-size",
+                    "32m",
+                    "-fs",
+                    "Case-sensitive APFS",
+                    "-volname",
+                ])
+                .arg(format!("storesynccs{n}"))
+                .args(["-ov"])
+                .arg(&dmg)
+                .output();
+            if !matches!(&created, Ok(o) if o.status.success()) {
+                crate::test_support::announce_skip(
+                    "hdiutil could not create a case-sensitive APFS image, so a case-sensitive \
+                     source cannot be provided here",
+                );
+                return None;
+            }
+            let attached = std::process::Command::new("hdiutil")
+                .args(["attach", "-nobrowse", "-mountpoint"])
+                .arg(&mountpoint)
+                .arg(&dmg)
+                .output();
+            if !matches!(&attached, Ok(o) if o.status.success()) {
+                let _ = std::fs::remove_file(&dmg);
+                crate::test_support::announce_skip(
+                    "hdiutil could not mount a case-sensitive APFS image, so a case-sensitive \
+                     source cannot be provided here",
+                );
+                return None;
+            }
+            let mount = MacCaseSensitiveMount {
+                mountpoint: mountpoint.clone(),
+                dmg,
+            };
+            let path = mountpoint.join("cs-src");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("Case-Probe"), b"x").unwrap();
+            if std::fs::symlink_metadata(path.join("cASE-pROBE")).is_ok() {
+                crate::test_support::announce_skip(
+                    "the mounted APFS image unexpectedly folds ASCII case, so a case-sensitive \
+                     source cannot be provided here",
+                );
+                return None;
+            }
+            Some(CaseSensitiveSource {
+                path,
+                _tmp: tmp,
+                _mount: Some(mount),
+            })
+        }
+    }
+
+    /// H2a: on a CASE-SENSITIVE source the old live `symlink_metadata` probe
+    /// missed a component the crate's full case fold matches, so the copy
+    /// LANDED an escaping link that `canonicalize_tree(dst)` then refused. The
+    /// copy now uses the manifest's index and refuses before landing it.
+    /// PRE-FIX this test FAILED on a case-sensitive source: the copy returned
+    /// `Ok`, `root/dst/dir/link/secret` reached the canary, and
+    /// `canonicalize_tree(dst)` refused the tree the copy produced.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_fold_escape_from_a_case_sensitive_source() {
+        let Some(cs) = case_sensitive_source() else {
+            return;
+        };
+        let src = cs.path().join("tree");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::create_dir_all(src.join("other")).unwrap();
+        std::fs::write(src.join("other/file"), b"inside").unwrap();
+        std::os::unix::fs::symlink("../other", src.join("dir/stra\u{df}e")).unwrap();
+        std::os::unix::fs::symlink("STRASSE/../../outside", src.join("dir/link")).unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("root")).unwrap();
+        let root = RootDir::open(&base.path().join("root")).unwrap();
+        // The canary is a sibling of `dst` under the owned root: the landed
+        // link's `..` after the symlink component reaches the root's parent.
+        std::fs::create_dir_all(base.path().join("root/outside")).unwrap();
+        std::fs::write(base.path().join("root/outside/secret"), b"SECRET").unwrap();
+
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a full-fold-equal symlink component must be refused");
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the refusal must reuse the crate's symlink vocabulary, got: {err}"
+        );
+        assert!(
+            !base.path().join("root/dst/dir/link").exists(),
+            "the escaping link must never be landed"
+        );
+        assert!(
+            std::fs::read(base.path().join("root/dst/dir/link/secret")).is_err(),
+            "the canary must be unreachable through the refused copy"
+        );
+    }
+
+    /// H2b: a destination-only symlink INSIDE `dst_rel` is part of the
+    /// post-copy view. The old probe answered from the SOURCE, so it was
+    /// invisible and `src/link -> evil/secret` landed on top of a pre-existing
+    /// `dst/evil -> ../../outside` and escaped. The copy now consults the
+    /// destination's surviving entries, so it refuses.
+    /// PRE-FIX this test FAILED: the copy returned `Ok`, `root/dst/esc` reached
+    /// the canary, and `canonicalize_tree(dst)` refused the result.
+    #[test]
+    fn copy_dir_recursive_fd_refuses_a_destination_only_symlink_component() {
+        let (base, root, src) = out_of_root_fixture();
+        std::fs::create_dir_all(base.path().join("root/dst")).unwrap();
+        std::os::unix::fs::symlink("../../outside", base.path().join("root/dst/evil")).unwrap();
+        std::fs::create_dir_all(base.path().join("outside")).unwrap();
+        std::fs::write(base.path().join("outside/secret"), b"SECRET").unwrap();
+        // `dst/esc -> evil/secret` walks through the pre-existing `dst/evil`.
+        std::os::unix::fs::symlink("evil/secret", src.join("esc")).unwrap();
+
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("a destination-only symlink component must be refused");
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the refusal must reuse the crate's symlink vocabulary, got: {err}"
+        );
+        assert!(!base.path().join("root/dst/esc").exists());
+        assert!(
+            std::fs::read(base.path().join("root/dst/esc/secret")).is_err(),
+            "the canary must be unreachable through the refused copy"
+        );
+    }
+
+    /// H2c: with NO host folding, the copy and `canonicalize_tree` must reach
+    /// the SAME verdict on a fold-equal symlink component. The old live probe
+    /// (case-sensitive source) missed `Sub`, accepted the tree, and
+    /// contradicted the manifest. The copy now uses the manifest's index, so
+    /// both refuse. PRE-FIX this test FAILED on a case-sensitive source: the
+    /// manifest refused while the copy returned `Ok`.
+    #[test]
+    fn copy_dir_recursive_fd_agrees_with_canonicalize_tree_on_a_fold_equal_component() {
+        let Some(cs) = case_sensitive_source() else {
+            return;
+        };
+        let src = cs.path().join("tree");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::create_dir_all(src.join("other")).unwrap();
+        std::fs::write(src.join("other/file"), b"inside").unwrap();
+        std::os::unix::fs::symlink("../other", src.join("dir/sub")).unwrap();
+        std::os::unix::fs::symlink("Sub/../other/file", src.join("dir/link")).unwrap();
+
+        let manifest_err = crate::manifest::canonicalize_tree(&src)
+            .expect_err("the manifest must refuse the fold-equal symlink component");
+        assert!(
+            manifest_err.to_string().contains("escaping symlink"),
+            "the manifest refusal must name the escape, got: {manifest_err}"
+        );
+
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("root")).unwrap();
+        let root = RootDir::open(&base.path().join("root")).unwrap();
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("the copy must reach the manifest's SAME verdict");
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the copy refusal must name the escape, got: {err}"
+        );
+        assert!(!base.path().join("root/dst/dir/link").exists());
+    }
+
+    /// H2d: on a host that folds `STRASSE` onto `straße`, the old copy's LIVE
+    /// probe REFUSED a tree the manifest (narrow fold) ACCEPTED. After H1+H2
+    /// both views refuse, so they AGREE. PRE-FIX this test FAILED: the manifest
+    /// accepted the tree (the narrow fold missed the pair).
+    #[test]
+    fn copy_dir_recursive_fd_and_manifest_agree_on_a_host_folded_component() {
+        let (base, root, src) = out_of_root_fixture();
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::create_dir_all(src.join("other")).unwrap();
+        std::fs::write(src.join("other/file"), b"inside").unwrap();
+        std::os::unix::fs::symlink("../other", src.join("dir/stra\u{df}e")).unwrap();
+        std::os::unix::fs::symlink("STRASSE/../../outside", src.join("dir/link")).unwrap();
+
+        let manifest_err = crate::manifest::canonicalize_tree(&src)
+            .expect_err("the manifest must refuse the full-fold-equal component");
+        assert!(
+            manifest_err.to_string().contains("escaping symlink"),
+            "the manifest refusal must name the escape, got: {manifest_err}"
+        );
+
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("the copy must reach the manifest's SAME verdict");
+        assert!(
+            err.to_string().contains("escaping symlink"),
+            "the copy refusal must name the escape, got: {err}"
+        );
+        assert!(!base.path().join("root/dst/dir/link").exists());
+    }
+
+    /// H3: the copy no longer collapses a filesystem error to "no symlink
+    /// here". An unreadable destination subtree makes the enumeration fail, and
+    /// the copy fails CLOSED rather than guessing the escaped component is
+    /// absent. (Reproducible only where a mode-0000 directory really refuses
+    /// reads; the premise is probed with a REAL `read_dir`.)
+    /// PRE-FIX this test FAILED: the live probe only `symlink_metadata`d the
+    /// specific target components, which did not touch the unreadable sibling,
+    /// so the copy returned `Ok`.
+    #[test]
+    fn copy_dir_recursive_fd_fails_closed_when_the_destination_cannot_be_enumerated() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, root, src) = out_of_root_fixture();
+        let unreadable = base.path().join("root/unreadable");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&unreadable).is_ok() {
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::announce_skip(
+                "this process can still enumerate a mode-0000 directory, so the enumeration-\
+                 failure premise is untestable here",
+            );
+            return;
+        }
+        // `out_of_root_fixture`'s source holds `link`, so the destination is
+        // enumerated and the unreadable subtree is reached.
+        let err = copy_dir_recursive_fd(&root, &src, Path::new("dst"))
+            .expect_err("an unenumerable destination must fail closed");
+        assert!(
+            err.to_string().contains("enumerate"),
+            "the refusal must name the failed enumeration, got: {err}"
+        );
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     // ------------------------------------------------------------------

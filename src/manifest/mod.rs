@@ -74,8 +74,8 @@
 //! [`SymlinkContainmentIndex`] they build from their own entry list — the local
 //! walk from the entries its `WalkDir` produced, the assembler from the entries
 //! the far side's listing produced — and both apply the crate's ONE
-//! component-identity fold (Unicode NFC, Unicode lowercase, trailing `.`/space;
-//! see [`fold_component`]). Neither canonicalizes the root, so a root reached
+//! containment fold (full Unicode case fold, Unicode NFC around it, trailing
+//! `.`/space; see [`fold_component`]). Neither canonicalizes the root, so a root reached
 //! through a symlink can no longer make the two verdicts differ, and because
 //! the fold is platform-independent the two views cannot disagree about the
 //! same tree on any host. (Before this the local walk asked `symlink_metadata`
@@ -101,6 +101,22 @@
 //! fail the lookup (`ENOENT`) and the link would simply dangle. That is a
 //! fail-closed over-refusal, and it is the residual this rule accepts rather
 //! than letting the two views — or two hosts — disagree about the same tree.
+//!
+//! CORRECTION (this revision): the paragraph above was written when the fold
+//! was `str::to_lowercase`, and the claim that the fold's only cost is a
+//! fail-closed over-refusal was FALSE of that fold. `to_lowercase` UNDER-folds
+//! a case-insensitive host (`ß` stays `ß` instead of `ss`, `ﬁ` stays `ﬁ`
+//! instead of `fi`, FINAL SIGMA stays itself instead of `σ`, long s stays `ſ`
+//! instead of `s`), so a target component the kernel resolved onto a symlink
+//! was answered `Absent` and ACCEPTED — an under-refusal, i.e. an escape, not
+//! an over-refusal. The fold is now the FULL Unicode case fold
+//! ([`crate::casefold`]) taken to NFC, which is at least as broad as the
+//! measured folds of macOS APFS and Linux `ext4 -O casefold`; the
+//! over-refusal residual above is now true. The added over-refusal is exactly
+//! the extra spellings those hosts fold together and a case-sensitive host
+//! would leave dangling (`straße`/`SS`, `ﬁle`/`FILE`, `ς`/`σ`, ...): refused
+//! on every host, which is the safe direction for a decision that otherwise
+//! GRANTS acceptance.
 //!
 //! This section is also the corrected RESIDUAL LIST for the physical-walk
 //! change. The previous revision claimed no legitimate tree was newly refused
@@ -329,20 +345,35 @@ pub(crate) enum SymlinkTargetRefusal {
     ThroughSymlink(PathBuf),
 }
 
-/// The crate's ONE component-identity fold for the containment walk.
+/// The CONTAINMENT fold for the physical walk: the full Unicode case fold
+/// ([`crate::casefold`]), not `str::to_lowercase`.
 ///
-/// A component is folded by taking its Unicode NFC form, applying the Unicode
-/// lowercase fold (`str::to_lowercase` — the SAME fold the reserved-name
-/// authority uses, see [`crate::reserved::is_unaddressable_name`]), and
-/// stripping any trailing `.`/space (the Win32 name fold
+/// `str::to_lowercase` is the Unicode *lowercase* mapping, which UNDER-matches
+/// a case-insensitive host: it maps `ß` to `ß` (not `ss`), the `ﬁ`/`ﬂ`/`ﬃ`
+/// ligatures to themselves, and U+03C2 FINAL SIGMA to itself, while macOS APFS
+/// and Linux `ext4 -O casefold` resolve all of those onto each other. This
+/// fold feeds a decision that GRANTS acceptance ("this component is not a
+/// symlink"), so it must be at least as broad as ANY supported host's fold; a
+/// narrower fold lets the kernel resolve a spelled component onto a symlink
+/// the index called absent, which is the escape class this module closes.
+/// Over-refusal (a spelling with no exact entry that fold-equals a symlink
+/// entry) is the safe direction.
+///
+/// A component is taken to NFC, full-case-folded, taken to NFC again (the case
+/// fold can emit a decomposed sequence, and the host compares canonically),
+/// and stripped of any trailing `.`/space (the Win32 name fold
 /// [`crate::reserved`] already models for the lock record). The fold is
 /// deliberately PLATFORM-INDEPENDENT, exactly like the reserved-name rules: a
 /// manifest must mean the same thing on every host, so the walk cannot ask the
 /// host filesystem what it folds without making the manifest's verdict depend
-/// on which filesystem happened to describe it.
+/// on which filesystem happened to describe it. The reserved-name,
+/// lock-record, and crate-temp DENIAL rules ([`crate::reserved`]) share the
+/// same [`crate::casefold`] primitive, so the containment view and the denial
+/// rules cannot disagree about what a host can fold together.
 fn fold_component(name: &str) -> String {
     let nfc: String = name.nfc().collect();
-    nfc.to_lowercase().trim_end_matches(['.', ' ']).to_string()
+    let folded: String = crate::casefold::case_fold(&nfc).nfc().collect();
+    folded.trim_end_matches(['.', ' ']).to_string()
 }
 
 /// The fold of a `/`-joined manifest path: each component folded, joined with
@@ -513,6 +544,76 @@ pub(crate) fn check_relative_symlink_target_indexed(
 ) -> std::result::Result<(), SymlinkTargetRefusal> {
     let mut resolve = |rel: &Path| index.resolve(rel);
     check_relative_symlink_target(link_rel, target, &mut resolve)
+}
+
+/// The canonical `/`-joined spelling of a relative path, or `None` when any
+/// component is not a UTF-8 [`Component::Normal`]. This is the spelling the
+/// manifest and the containment index use; nothing here normalizes or folds.
+pub(crate) fn canonical_rel_string(rel: &Path) -> Option<String> {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                if count > 0 {
+                    out.push('/');
+                }
+                out.push_str(name);
+                count += 1;
+            }
+            _ => return None,
+        }
+    }
+    if count == 0 { None } else { Some(out) }
+}
+
+/// Relocate the canonical `/`-joined relative spelling `sub` under the
+/// canonical `/`-joined spelling `parent`, joining with a single `/`.
+///
+/// Both inputs are already canonical (no leading/trailing separator, no `.`/
+/// `..`), so the result is canonical; an empty `sub` yields `parent` and an
+/// empty `parent` yields `sub`.
+pub(crate) fn relocate_under(parent: &str, sub: &str) -> String {
+    match (parent.is_empty(), sub.is_empty()) {
+        (_, true) => parent.to_string(),
+        (true, false) => sub.to_string(),
+        (false, false) => format!("{parent}/{sub}"),
+    }
+}
+
+/// Enumerate a LIVE tree's entries as `(canonical path, is_symlink)` pairs, in
+/// the manifest's `/`-joined spelling and relative to `root`.
+///
+/// This is how a caller that only has a filesystem view (the [`crate::atomic`]
+/// tree copy) builds the SAME [`SymlinkContainmentIndex`] the two manifest
+/// views build from their entry lists, so all three apply one rule.
+///
+/// The walk does NOT follow symlinks (`WalkDir::follow_links(false)`), which is
+/// exactly the kernel's non-following view the containment rule must model. It
+/// fails CLOSED: any walk error (an unreadable directory, a failed `stat`) is
+/// returned, because an entry the walk could not describe could be a symlink
+/// the rule must see.
+///
+/// A path that cannot be spelled canonically (a non-UTF-8 name, or a component
+/// that is not `Normal`) is SKIPPED. That cannot hide a reachable symlink: a
+/// symlink target is a UTF-8 string, so it can only name UTF-8 components, and
+/// a component it cannot spell can never be one the target walks THROUGH. The
+/// tree copy's own name gate refuses such a name if the copy reaches it.
+pub(crate) fn live_entry_kinds(root: &Path) -> Result<Vec<(String, bool)>> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(root).min_depth(1).follow_links(false) {
+        let entry =
+            entry.map_err(|e| Error::store(format!("enumerate {}: {e}", root.display())))?;
+        let rel = entry.path().strip_prefix(root).map_err(|_| {
+            Error::store(format!("enumerate {}: entry left the tree", root.display()))
+        })?;
+        let Some(spelled) = canonical_rel_string(rel) else {
+            continue;
+        };
+        out.push((spelled, entry.file_type().is_symlink()));
+    }
+    Ok(out)
 }
 
 /// The refusal message for [`SymlinkTargetRefusal`], naming the offending
@@ -2699,6 +2800,18 @@ mod tests {
         std::fs::symlink_metadata(dir.path().join("fOLD-pROBE")).is_ok()
     }
 
+    /// Whether THIS filesystem resolves `written` and `spelled` onto the SAME
+    /// entry — the full-case-fold host behaviour (macOS APFS folds `ß`/`SS`,
+    /// `ﬁ`/`FI`, and final sigma; Linux `ext4 -O casefold` folds the first two).
+    /// Probed with a REAL write and a cross-spelling lookup, never a platform
+    /// guess.
+    #[cfg(unix)]
+    fn filesystem_folds_pair(written: &str, spelled: &str) -> bool {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        std::fs::write(dir.path().join(written), b"probe").unwrap();
+        std::fs::symlink_metadata(dir.path().join(spelled)).is_ok()
+    }
+
     /// Whether THIS filesystem resolves the composed and decomposed forms of a
     /// name to the same entry (macOS APFS does; Linux/ext4 does not). Probed
     /// with a REAL write + a cross-spelling lookup.
@@ -2910,6 +3023,133 @@ mod tests {
                 .symlink_target
                 .as_deref(),
             Some("Sub/file")
+        );
+    }
+
+    /// Build the escape shape for a full-case-fold pair and require BOTH views
+    /// to refuse it, naming the SPELLED component the walk reached: a `symlink`
+    /// named `on_disk` resolves to `../other`, and a link targets
+    /// `<folded>/../../outside`, so the kernel reaches the symlink at the
+    /// spelled component and a lexical `..` after it is not the resolution.
+    /// Where the host really folds the pair the live escape is asserted first,
+    /// so the refusal is shown to close a real hole and not a hypothetical.
+    #[cfg(unix)]
+    fn assert_full_fold_escape_is_refused_by_both(on_disk: &str, spelled: &str, live_folds: bool) {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(dir.path().join("outside/secret"), b"SECRET").unwrap();
+        std::os::unix::fs::symlink("../other", root.join("dir").join(on_disk)).unwrap();
+        std::os::unix::fs::symlink(format!("{spelled}/../../outside"), root.join("dir/link"))
+            .unwrap();
+        if live_folds {
+            assert_eq!(
+                std::fs::read(root.join("dir/link/secret")).unwrap(),
+                b"SECRET",
+                "the escape must be REAL on a host that folds {on_disk:?} onto {spelled:?}"
+            );
+        }
+        let local_msg = canonicalize_tree(&root).unwrap_err().to_string();
+        assert!(
+            local_msg.contains("escaping symlink") && local_msg.contains(spelled),
+            "the local walk must refuse the full-fold escape, naming {spelled:?}, got: {local_msg}"
+        );
+        let out = run_remote_script(&root);
+        let remote_msg = canonicalize_remote_entries(&out, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            remote_msg.contains("escaping symlink") && remote_msg.contains(spelled),
+            "the wire assembler must refuse the SAME full-fold escape, naming {spelled:?}, \
+             got: {remote_msg}"
+        );
+    }
+
+    /// H1, `ß`/`SS`: `str::to_lowercase` maps NEITHER `ß` to `ss` NOR `SS` to
+    /// `ß`, so the old fold answered `Absent` for a spelled `SS`/`STRASSE`
+    /// component the kernel resolves onto the `ß` symlink and accepted the
+    /// escape. The full Unicode case fold matches them, so BOTH views refuse.
+    /// PRE-FIX this test FAILED: the local walk and the wire assembler both
+    /// returned `Ok` (the wire assembler only agrees because it shares the
+    /// index; the local walk's old exact-string/`to_lowercase` lookup also
+    /// missed).
+    #[test]
+    #[cfg(unix)]
+    fn full_fold_sharp_s_component_is_refused_by_both_canonicalizers() {
+        skip_without_perl!("full_fold_sharp_s_component_is_refused_by_both_canonicalizers");
+        assert_full_fold_escape_is_refused_by_both(
+            "stra\u{df}e",
+            "STRASSE",
+            filesystem_folds_pair("stra\u{df}e", "STRASSE"),
+        );
+    }
+
+    /// H1, the `ﬁ`/`FI` ligature: `to_lowercase` leaves U+FB01 alone, so a
+    /// spelled `FILE` component was answered `Absent` and accepted although the
+    /// host resolves it onto the `ﬁle` symlink. The full case fold maps the
+    /// ligature to `fi`, so both views refuse. PRE-FIX this FAILED on both
+    /// views.
+    #[test]
+    #[cfg(unix)]
+    fn full_fold_ligature_component_is_refused_by_both_canonicalizers() {
+        skip_without_perl!("full_fold_ligature_component_is_refused_by_both_canonicalizers");
+        assert_full_fold_escape_is_refused_by_both(
+            "\u{fb01}le",
+            "FILE",
+            filesystem_folds_pair("\u{fb01}le", "FILE"),
+        );
+    }
+
+    /// H1, final sigma: `to_lowercase` keeps U+03C2 (final sigma) distinct from
+    /// U+03C3/U+03A3, so a spelled `Σ` component was answered `Absent` and
+    /// accepted although APFS resolves final sigma onto sigma. The full case
+    /// fold maps `ς`/`Σ` to `σ`, so both views refuse. PRE-FIX this FAILED on
+    /// both views (macOS APFS folds the pair; the fold is platform-independent,
+    /// so it is refused on every host after the fix).
+    #[test]
+    #[cfg(unix)]
+    fn full_fold_final_sigma_component_is_refused_by_both_canonicalizers() {
+        skip_without_perl!("full_fold_final_sigma_component_is_refused_by_both_canonicalizers");
+        assert_full_fold_escape_is_refused_by_both(
+            "\u{3c2}",
+            "\u{3a3}",
+            filesystem_folds_pair("\u{3c2}", "\u{3a3}"),
+        );
+    }
+
+    /// H1, the ACCEPT direction that must survive the widened fold: an
+    /// ordinary in-root `../other` target (a DIRECTORY, not a symlink) is still
+    /// accepted by both views and stored verbatim, and a target naming an exact
+    /// non-symlink component is accepted even on a case-sensitive host. This is
+    /// the regression guard against a fold that refuses a lawful tree.
+    #[test]
+    fn full_fold_keeps_an_in_root_relative_target_accepted() {
+        skip_without_perl!("full_fold_keeps_an_in_root_relative_target_accepted");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("R");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/file"), b"inside").unwrap();
+        std::os::unix::fs::symlink("../other/file", root.join("dir/link")).unwrap();
+
+        let local = canonicalize_tree(&root).expect("an in-root `../other/file` target is lawful");
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root)
+            .expect("the wire assembler must reach the SAME accept verdict");
+        assert_eq!(remote.entries, local.entries);
+        assert_eq!(
+            local
+                .entries
+                .iter()
+                .find(|e| e.path == "dir/link")
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("../other/file"),
+            "the target is data and is stored verbatim"
         );
     }
 

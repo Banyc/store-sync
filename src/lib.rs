@@ -26,6 +26,7 @@
 //! comparison of two manifests.
 
 pub mod atomic;
+mod casefold;
 pub mod digest;
 pub mod env;
 pub mod error;

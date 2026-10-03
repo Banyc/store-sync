@@ -397,11 +397,18 @@ deltas from `deploy`'s originals (each documented on the primitive itself):
 * A source/destination OVERLAP (either inside the other, or equal) is refused
   before anything is created, so a destination inside the source cannot be
   re-yielded by the source read and recurse without bound.
-* A symlink's TARGET is judged by the crate's own containment rule
-  (`manifest::check_relative_symlink_target`), so a target that escapes the
-  root or resolves through a symlink component (inside the copied subtree or in
-  the destination root outside it) is refused and the destination always
-  `canonicalize_tree`s cleanly.
+* A symlink's TARGET is judged by the crate's own containment rule through the
+  SAME indexed authority the two manifest views use
+  (`manifest::SymlinkContainmentIndex` + `check_relative_symlink_target_indexed`,
+  full-Unicode-case-fold), built from a filesystem enumeration of the source
+  subtree and the destination entries the run leaves in place, so a target that
+  escapes the root or resolves through a symlink component (inside the copied
+  subtree, or a surviving destination-only symlink in the destination root) is
+  refused and the destination always `canonicalize_tree`s cleanly. A tree that
+  cannot be enumerated is refused (fail closed), and a source that changes
+  shape during the copy is detected by an end-of-run re-enumeration (the copy's
+  analogue of `sync`'s source re-read); the copy does not lock an arbitrary
+  source, so a caller that needs a hard guarantee must serialize the source.
 * NOT atomic, NOT durable, and PARTIAL ON FAILURE: there is no temp directory
   and no final rename, so entries appear in place, an error mid-walk leaves a
   partial destination tree, and nothing is fsynced; a caller that needs more
